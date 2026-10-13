@@ -1,7 +1,7 @@
 # PR #2138: Size Metal `gather_qmm_rhs` by the broadcast x rows
 
-**Date**: 2026-10-13
-**Status**: The kernel fix passed focused Metal and model-smoke validation on M1 Ultra at exact head `25202198`; the current candidate passes Linux build, focused tests, contracts, and independent review and awaits a fresh Metal nightly
+**Date**: 2026-10-14
+**Status**: The kernel fix passed focused Metal and model-smoke validation on M1 Ultra at exact head `25202198`; the refreshed #1599 change passes Linux build, focused tests, contracts, and independent review and awaits a fresh Metal nightly
 **Risk**: Low (no-op for every production caller; changes behavior only for an x that `gather_qmm_rhs` has to broadcast)
 
 ## Summary
@@ -39,8 +39,9 @@ The split-MTP test for `.` and `..` outputs now compares the staging parent with
 - Historical exact-head Metal gate: Apple M1 Ultra (128 GB), macOS 27.0 (26A428), full Xcode 27 RC, PR head `25202198` on base `b34d517b`. All five `models::switch_layers::mxfp_tests` passed with the Metal overlay rebuilt, and the release build passed.
 - Historical exact-head model smoke: Qwen3-30B-A3B-4bit, greedy 64 tokens, produced byte-identical text on base, repeated base, and PR; SHA-256 `d2f40b2d5831c3d7790d467fb51123f0d1f615fb7300aa2f92d86a9d8831a0de`.
 - CUDA (GB10): the original PR branch built and all 32 `models::switch_layers` tests passed. This does not validate Metal.
-- Current Linux candidate: the exact `mlxcel` plus `mlxcel-surgery` CUDA test graph compiled successfully in 25m54s. Both focused portability tests pass (2/2), repository contracts pass (123 Python tests and 49 WebUI fixtures), and formatting and diff checks pass.
+- Refreshed #1599 Linux candidate: the exact `mlxcel` plus `mlxcel-surgery` CUDA test graph compiled successfully in 25m54s. Both focused portability tests pass (2/2), repository contracts pass (123 Python tests and 49 WebUI fixtures), and formatting and diff checks pass.
 - Independent review found no source, security, or documentation issue in the three-source-file change, canonical source SHA-256 `2e36ccb93dfe3fa49206f5741249ebb45c49d3e9e19195f94f6d1282e55155a5`.
+- Main `398f9ba8`, containing the independently tested Kimi Linear chunked-prefill fix, was merged afterward without overlap. The #1599 native graph was not rebuilt for that unrelated sync; PR CI and the final integrated gate cover it.
 - The current branch retains the historical M1 evidence while awaiting a fresh candidate Metal nightly. No current-head model smoke is claimed.
 
 ## 5. Follow-up

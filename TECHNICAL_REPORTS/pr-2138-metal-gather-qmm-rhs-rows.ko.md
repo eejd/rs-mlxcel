@@ -1,7 +1,7 @@
 # PR #2138: Metal `gather_qmm_rhs`의 행 수를 broadcast된 x 기준으로 지정
 
-**작성일**: 2026-10-13
-**상태**: 커널 수정은 정확한 head `25202198`에서 M1 Ultra 집중 Metal 검증과 모델 스모크를 통과. 현재 후보는 Linux 빌드, 집중 테스트, 계약 검사, 독립 리뷰를 통과했고 새 Metal nightly 대기 중
+**작성일**: 2026-10-14
+**상태**: 커널 수정은 정확한 head `25202198`에서 M1 Ultra 집중 Metal 검증과 모델 스모크를 통과. 갱신한 #1599 변경은 Linux 빌드, 집중 테스트, 계약 검사, 독립 리뷰를 통과했고 새 Metal nightly 대기 중
 **위험도**: 낮음 (모든 프로덕션 호출에서 no-op이며, `gather_qmm_rhs`가 x를 broadcast해야 하는 경우에만 동작이 바뀜)
 
 ## 요약
@@ -39,8 +39,9 @@ mxfp 테스트는 2026-09-30 #2071 (2cee9cf4)과 함께 추가되었으므로, �
 - 이전 정확한 head의 Metal gate: Apple M1 Ultra (128 GB), macOS 27.0 (26A428), full Xcode 27 RC, base `b34d517b` 위 PR head `25202198`. Metal overlay를 다시 빌드한 뒤 `models::switch_layers::mxfp_tests` 다섯 개가 모두 통과했고 release 빌드도 통과했다.
 - 이전 정확한 head의 모델 스모크: Qwen3-30B-A3B-4bit, greedy 64 tokens에서 base, base 반복, PR이 byte-identical text를 생성했다. SHA-256은 `d2f40b2d5831c3d7790d467fb51123f0d1f615fb7300aa2f92d86a9d8831a0de`다.
 - CUDA (GB10): 기존 PR 브랜치가 빌드됐고 `models::switch_layers` 테스트 32개가 모두 통과했다. 이는 Metal 검증이 아니다.
-- 현재 Linux 후보: 정확한 `mlxcel` 및 `mlxcel-surgery` CUDA 테스트 그래프가 25분 54초에 성공적으로 컴파일됐다. 이식성 집중 테스트 두 개가 모두 통과했고, 저장소 계약 검사도 Python 테스트 123개와 WebUI fixture 49개 모두 통과했다. formatting과 diff 검사도 통과했다.
+- 갱신한 #1599 Linux 후보: 정확한 `mlxcel` 및 `mlxcel-surgery` CUDA 테스트 그래프가 25분 54초에 성공적으로 컴파일됐다. 이식성 집중 테스트 두 개가 모두 통과했고, 저장소 계약 검사도 Python 테스트 123개와 WebUI fixture 49개 모두 통과했다. formatting과 diff 검사도 통과했다.
 - 세 소스 파일 변경에 대한 독립 소스·보안·문서 리뷰에서 발견 사항이 없었다. 정규 source SHA-256은 `2e36ccb93dfe3fa49206f5741249ebb45c49d3e9e19195f94f6d1282e55155a5`다.
+- 별도로 검증된 Kimi Linear chunked-prefill 수정이 담긴 main `398f9ba8`을 그 뒤 충돌 없이 병합했다. 이 비중첩 동기화 때문에 #1599 native graph를 다시 빌드하지 않았으며 PR CI와 최종 통합 gate가 이를 검증한다.
 - 현재 브랜치는 이전 M1 증거를 보존하며 새 후보 Metal nightly를 기다린다. 현재 head에서 모델 스모크를 다시 실행했다고 주장하지 않는다.
 
 ## 5. 후속 작업
