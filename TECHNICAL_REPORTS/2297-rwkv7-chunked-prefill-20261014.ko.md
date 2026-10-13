@@ -28,6 +28,8 @@ Focused GPU 검증 중 실제 one-layer fixture가 `(2,4)`와 `(1,1,2,4,1)` shap
 
 최초 root 및 surgery CUDA `test-fast` build graph는 14분 26초에 통과했습니다. 이어진 첫 focused GPU 실행은 실제 RWKV7 forward 경로에 도달해 위 native broadcast 예외로 shape 결함을 재현했습니다. 수정 후 CUDA graph는 2분 22초에 다시 빌드됐습니다. GPU lock 아래 `rwkv7_` suite는 5개 테스트 모두 통과했고, 실제 one-layer loaded-model contract 회귀는 0.64초에 통과했습니다. Fixture는 production loader를 통해 0이 아닌 결정적 synthetic weight를 적재하며, 외부 체크포인트 실행을 수행하거나 주장하지 않습니다. `git diff --check`는 통과했습니다.
 
+전체 contract gate도 통제된 재실행을 거쳐 통과했습니다. 최초 실행은 Python tooling 이전의 모든 단계를 통과했지만, concurrent native build와 외부 부하가 호스트를 포화시킨 동안 timing-sensitive ROCm guard fixture에서 2.5초 monitor sample 누락 1건과 holder metadata `FileNotFoundError` 1건이 발생했습니다. Product 및 test source는 변경하지 않았습니다. 경쟁 build의 우선순위를 낮춘 뒤 해당 guard 테스트 두 개가 모두 통과했고, 전체 Python tooling 123개와 WebUI 49개 테스트도 통과했습니다.
+
 ## 트레이드오프
 
 이제 DirectEngine과 cache-less caller를 포함해 model capability를 따르는 모든 호출자가 whole-prompt prefill plan을 사용합니다. 긴 프롬프트에서는 chunk-bounded prefill보다 peak transient memory가 늘 수 있습니다. DirectEngine은 계속 안정적인 sequence ID를 제공하며, 이 변경은 기존 DirectEngine 상태 처리가 프롬프트를 잘랐다고 주장하지 않습니다.

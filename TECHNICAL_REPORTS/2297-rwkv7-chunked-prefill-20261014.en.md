@@ -28,6 +28,8 @@ During focused GPU validation, the real one-layer fixture aborted with a native 
 
 The initial root and surgery CUDA `test-fast` build graph passed in 14 minutes 26 seconds. The first focused GPU run then reached the real RWKV7 forward path and reproduced the shape defect with the native broadcast exception recorded above. After the fix, the CUDA graph rebuilt successfully in 2 minutes 22 seconds. The GPU-locked `rwkv7_` suite passed 5 of 5 tests, including the loaded one-layer contract regression in 0.64 seconds. The fixture loads deterministic nonzero synthetic weights through the production model loader; no external checkpoint run was performed or claimed. `git diff --check` passes.
 
+The broader contract gate also passed across a controlled retry. The initial run passed every stage before Python tooling, then the timing-sensitive ROCm guard fixtures reported one missed 2.5-second monitor sample and one holder-metadata `FileNotFoundError` while concurrent native builds and external load saturated the host. No product or test source was changed. After lowering the competing build priority, both named guard tests passed; the full Python tooling suite passed 123 tests and the WebUI suite passed 49 tests.
+
 ## Tradeoff
 
 Every caller that honors the model capability, including DirectEngine and cache-less callers, now receives a whole-prompt prefill plan. This can use more peak transient memory for long prompts than chunk-bounded prefill. DirectEngine still supplies a stable sequence ID, and this change does not claim that its previous state handling truncated prompts.
