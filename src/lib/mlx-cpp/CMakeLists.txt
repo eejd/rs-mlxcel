@@ -35,6 +35,11 @@ function(mlx_apply_source_overlays mlx_source_dir)
   # takes from the pre-broadcast x so a shared activation row gathered
   # against sorted slots leaves most output rows unwritten (issue #1599).
   # Refresh the file wholesale on a bump and re-apply both marked hunks.
+  # gated_delta_update_nax.h strips the local `thread` address space from the
+  # cooperative-tensor operand types passed to the MPP destination factory.
+  # The pinned source fails that constraint under Xcode 27; upstream #4594
+  # carries the same compatibility fix and postdates this pin. Drop this
+  # overlay when a future pin includes it.
   # device.cpp carries a runtime override of the per-command-buffer input
   # budget (`mlxcel_set_mb_per_buffer_override`), which mlxcel raises around
   # decode steps and leaves at the device default for prefill. Upstream latches
@@ -43,6 +48,7 @@ function(mlx_apply_source_overlays mlx_source_dir)
   set(_metal_patch_files
       "mlx/backend/metal/compiled.cpp"
       "mlx/backend/metal/device.cpp"
+      "mlx/backend/metal/kernels/gated_delta_update_nax.h"
       "mlx/backend/metal/kernels/utils.h"
       "mlx/backend/metal/quantized.cpp")
   foreach(_patch_file ${_metal_patch_files})
