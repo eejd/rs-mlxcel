@@ -31,6 +31,10 @@ The test inspects every cache rather than one representative layer, so a partial
 
 The source passed independent implementation review. The root and surgery CUDA `test-fast` build graph passed in 14 minutes 05 seconds. Under the GPU lock, the complete `models::afmoe::tests::` module passed 29 of 29 tests in 0.85 seconds, including the loaded-model lifecycle regression and existing snapshot restore coverage. The contract gate passed all earlier checks, 123 Python tooling tests, and 49 WebUI schema, DTO, and fixture checks. Formatting and patch-whitespace checks pass. The fixture loads deterministic nonzero synthetic weights; no external AFMoE checkpoint run was performed or claimed.
 
+## Dependency refresh
+
+The validation above was recorded before the branch merged main commit `4b0c4519` from PR #2298. The merge commit `4cc9b87d` brings in the new MLX pin and CUDA/Metal overlay bases without changing the reviewed model files: `afmoe.rs` remains SHA-256 `7f00690db48937f9e5a2810f9c26307e50dd1d5b14ea1810cd216f75d1d3466c`, and `afmoe_tests.rs` remains `844cbce7258e750cface1aa24b7f64a925b2c8c79524159a411c53de25d71a12`. Focused runtime revalidation on the new pin is pending and is not claimed by this report.
+
 ## Memory tradeoff
 
 `PrefillCaps` applies this model-wide capability to every token-ID prefill planner. Every honoring caller, including DirectEngine and cache-less callers, therefore uses one whole-prompt graph for AFMoE. This prevents unsafe no-ID state loss but gives up chunk-bounded transient memory, so long prompts can have higher peak memory use.

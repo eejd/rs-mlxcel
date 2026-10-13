@@ -31,6 +31,10 @@ DirectEngine은 이미 prefill 조각 전체에 같은 sequence ID를 전달하�
 
 소스는 독립 구현 리뷰를 통과했습니다. Root 및 surgery CUDA `test-fast` build graph는 14분 05초에 통과했습니다. GPU lock 아래 전체 `models::afmoe::tests::` 모듈은 loaded-model lifecycle regression과 기존 snapshot restore coverage를 포함해 29개 테스트 모두 0.85초에 통과했습니다. Contract gate는 앞선 모든 검사와 Python tooling 123개, WebUI schema·DTO·fixture 검사 49개를 통과했습니다. Formatting 및 patch whitespace 검사도 통과했습니다. Fixture는 결정적이고 0이 아닌 synthetic weight를 적재하며, 외부 AFMoE 체크포인트 실행을 수행하거나 주장하지 않습니다.
 
+## 의존성 갱신
+
+위 검증 결과는 브랜치가 PR #2298의 main commit `4b0c4519`를 병합하기 전에 기록했습니다. Merge commit `4cc9b87d`는 새 MLX pin과 CUDA/Metal overlay base를 가져오지만 검토한 model file을 바꾸지 않았습니다. `afmoe.rs`의 SHA-256은 `7f00690db48937f9e5a2810f9c26307e50dd1d5b14ea1810cd216f75d1d3466c`, `afmoe_tests.rs`는 `844cbce7258e750cface1aa24b7f64a925b2c8c79524159a411c53de25d71a12`로 유지됩니다. 새 pin의 focused runtime 재검증은 대기 중이며 이 보고서는 해당 결과를 주장하지 않습니다.
+
 ## 메모리 트레이드오프
 
 `PrefillCaps`는 이 model-wide capability를 모든 token-ID prefill planner에 적용합니다. 따라서 DirectEngine과 cache-less caller를 포함해 capability를 따르는 모든 호출자가 AFMoE에서 하나의 whole-prompt graph를 사용합니다. 이 동작은 안전하지 않은 no-ID state 손실을 막지만 chunk-bounded transient memory를 포기하므로 긴 프롬프트의 peak memory 사용량이 늘 수 있습니다.
