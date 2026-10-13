@@ -1836,6 +1836,16 @@ impl LanguageModel for AfmoeModel {
         false
     }
 
+    fn supports_chunked_prefill(&self) -> bool {
+        // A multi-token no-ID forward starts an independent prompt by resetting
+        // the model-owned sliding and full-attention KV caches. Stable-ID
+        // continuation is preserved, but legacy no-ID chunks would lose state.
+        // This capability disables token-ID chunking for all honoring callers,
+        // including DirectEngine: the whole prompt graph replaces the bounded
+        // transient memory of chunked prefill.
+        false
+    }
+
     fn eos_token_ids(&self) -> Vec<i32> {
         self.eos_token_ids.clone()
     }
