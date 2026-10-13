@@ -52,6 +52,7 @@ KDA RMS 정규화는 의도적으로 바꾸지 않았습니다. 최신 upstream�
 
 - `cargo test --locked -p mlxcel -p mlxcel-surgery --lib --test chat_template_kwargs --profile test-fast --features cuda -j4 --no-run`이 5분 58초에 통과했습니다.
 - 최종 집중 회귀는 3개 통과, 0개 실패입니다. 새 MLA mask 테스트 두 개와 PR #2293의 loaded-model chunk-capability 테스트를 포함합니다.
+- 공용 이슈 contract는 Python 123개와 WebUI 49개가 exit 0으로 통과했습니다.
 - Main 병합 뒤 포맷과 patch whitespace 검사가 통과했습니다.
 - 독립 correctness 및 security 리뷰에서 이 범위의 추가 지적이 없었습니다.
 

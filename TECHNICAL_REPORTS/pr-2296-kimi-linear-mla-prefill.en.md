@@ -52,6 +52,7 @@ The final branch merged main commit `398f9ba8`, which contains PR #2293, at head
 
 - `cargo test --locked -p mlxcel -p mlxcel-surgery --lib --test chat_template_kwargs --profile test-fast --features cuda -j4 --no-run`: passed in 5 minutes 58 seconds.
 - Focused final regressions: 3 passed, 0 failed. They include both new MLA mask tests and PR #2293's loaded-model chunk-capability test.
+- Shared issue contracts: 123 Python checks and 49 WebUI checks passed with exit 0.
 - Formatting and patch whitespace checks passed after the main merge.
 - Independent correctness and security review: clear, with no finding in scope.
 
