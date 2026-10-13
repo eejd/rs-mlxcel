@@ -1,7 +1,7 @@
 # PR #2138: Size Metal `gather_qmm_rhs` by the broadcast x rows
 
 **Date**: 2026-10-14
-**Status**: The kernel fix passed focused Metal and model-smoke validation on M1 Ultra at exact head `25202198`; the refreshed #1599 change passes Linux build, focused tests, contracts, and independent review and awaits a fresh Metal nightly
+**Status**: The kernel fix passed focused Metal and model-smoke validation on M1 Ultra at exact head `25202198`; the refreshed #1599 change passes Linux build, focused tests, contracts, and independent review and the refreshed candidate Metal nightly
 **Risk**: Low (no-op for every production caller; changes behavior only for an x that `gather_qmm_rhs` has to broadcast)
 
 ## Summary
@@ -42,7 +42,7 @@ The split-MTP test for `.` and `..` outputs now compares the staging parent with
 - Refreshed #1599 Linux candidate: the exact `mlxcel` plus `mlxcel-surgery` CUDA test graph compiled successfully in 25m54s. Both focused portability tests pass (2/2), repository contracts pass (123 Python tests and 49 WebUI fixtures), and formatting and diff checks pass.
 - Independent review found no source, security, or documentation issue in the three-source-file change, canonical source SHA-256 `2e36ccb93dfe3fa49206f5741249ebb45c49d3e9e19195f94f6d1282e55155a5`.
 - Main `398f9ba8`, containing the independently tested Kimi Linear chunked-prefill fix, was merged afterward without overlap. The #1599 native graph was not rebuilt for that unrelated sync; PR CI and the final integrated gate cover it.
-- The current branch retains the historical M1 evidence while awaiting a fresh candidate Metal nightly. No current-head model smoke is claimed.
+- Candidate Metal nightly [38418557399](https://github.com/lablup/mlxcel/actions/runs/38418557399) passed at source head `2dbffe6d` on `lablup-macmini01`: formatting, Clippy, 12,283 tests (390 ignored), and 51 video tests. No current-head model smoke is claimed; the historical exact-head checkpoint evidence remains separate.
 
 ## 5. Follow-up
 
