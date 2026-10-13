@@ -30,6 +30,10 @@ Focused GPU 검증 중 실제 one-layer fixture가 `(2,4)`와 `(1,1,2,4,1)` shap
 
 전체 contract gate도 통제된 재실행을 거쳐 통과했습니다. 최초 실행은 Python tooling 이전의 모든 단계를 통과했지만, concurrent native build와 외부 부하가 호스트를 포화시킨 동안 timing-sensitive ROCm guard fixture에서 2.5초 monitor sample 누락 1건과 holder metadata `FileNotFoundError` 1건이 발생했습니다. Product 및 test source는 변경하지 않았습니다. 경쟁 build의 우선순위를 낮춘 뒤 해당 guard 테스트 두 개가 모두 통과했고, 전체 Python tooling 123개와 WebUI 49개 테스트도 통과했습니다.
 
+## 의존성 갱신
+
+위 검증 결과는 브랜치가 PR #2298의 main commit `4b0c4519`를 병합하기 전에 기록했습니다. Merge commit `9b05507b`는 새 MLX pin과 CUDA/Metal overlay base를 가져오지만 `src/models/rwkv7.rs`를 바꾸지 않았고, 해당 파일의 SHA-256은 `fa18e8e5e33f4af42fe7c7c8574e55db8578f90724d3a70d0cad4a7cf10adea7`로 유지됩니다. 새 pin의 focused runtime 재검증은 대기 중이며 이 보고서는 해당 결과를 주장하지 않습니다.
+
 ## 트레이드오프
 
 이제 DirectEngine과 cache-less caller를 포함해 model capability를 따르는 모든 호출자가 whole-prompt prefill plan을 사용합니다. 긴 프롬프트에서는 chunk-bounded prefill보다 peak transient memory가 늘 수 있습니다. DirectEngine은 계속 안정적인 sequence ID를 제공하며, 이 변경은 기존 DirectEngine 상태 처리가 프롬프트를 잘랐다고 주장하지 않습니다.

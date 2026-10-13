@@ -30,6 +30,10 @@ The initial root and surgery CUDA `test-fast` build graph passed in 14 minutes 2
 
 The broader contract gate also passed across a controlled retry. The initial run passed every stage before Python tooling, then the timing-sensitive ROCm guard fixtures reported one missed 2.5-second monitor sample and one holder-metadata `FileNotFoundError` while concurrent native builds and external load saturated the host. No product or test source was changed. After lowering the competing build priority, both named guard tests passed; the full Python tooling suite passed 123 tests and the WebUI suite passed 49 tests.
 
+## Dependency refresh
+
+The validation above was recorded before the branch merged main commit `4b0c4519` from PR #2298. The merge commit `9b05507b` brings in the new MLX pin and CUDA/Metal overlay bases without changing `src/models/rwkv7.rs`; its SHA-256 remains `fa18e8e5e33f4af42fe7c7c8574e55db8578f90724d3a70d0cad4a7cf10adea7`. Focused runtime revalidation on the new pin is pending and is not claimed by this report.
+
 ## Tradeoff
 
 Every caller that honors the model capability, including DirectEngine and cache-less callers, now receives a whole-prompt prefill plan. This can use more peak transient memory for long prompts than chunk-bounded prefill. DirectEngine still supplies a stable sequence ID, and this change does not claim that its previous state handling truncated prompts.
