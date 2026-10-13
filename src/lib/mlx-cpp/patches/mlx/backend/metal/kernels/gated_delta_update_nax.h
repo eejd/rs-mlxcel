@@ -1,3 +1,5 @@
+// Copyright © 2026 Apple Inc.
+//
 // Modified from upstream MLX 59d600b5e mlx/backend/metal/kernels/gated_delta_update_nax.h
 // Patched by mlxcel for Xcode 27: strip local `thread` address-space
 // qualifiers before forming MPP destination cooperative tensors. This
