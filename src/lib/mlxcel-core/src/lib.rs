@@ -31,6 +31,9 @@ mod ffi {
 
         /// Opaque wrapper for mlx::core::array
         type MlxArray;
+        type MlxRngSnapshot;
+        fn rng_snapshot() -> Result<UniquePtr<MlxRngSnapshot>>;
+        fn restore_rng_snapshot(snapshot: &MlxRngSnapshot);
 
         /// Opaque wrapper for one MLX quantize() result triple.
         type MlxQuantizedWeights;
@@ -215,7 +218,12 @@ mod ffi {
         /// `fused_sample` output); a non-contiguous array falls back to the safe
         /// `array_to_raw_bytes` copy rather than reading past the allocation.
         /// Used by: the #632 lookahead decode pipeline.
-        fn array_evaluated_bytes(arr: &MlxArray) -> Vec<u8>;
+        fn array_evaluated_bytes(arr: &MlxArray) -> Result<Vec<u8>>;
+
+        /// Test-only. Build an evaluated uint32 array whose real, signalled
+        /// event carries a synthetic backend error. Each call owns an
+        /// independent error so tests can exercise consuming read boundaries.
+        fn array_with_failed_event_for_test() -> UniquePtr<MlxArray>;
 
         /// Fallible counterpart of [`array_to_raw_bytes`].
         ///
@@ -1388,36 +1396,6 @@ mod ffi {
             scale: f32,
         ) -> UniquePtr<MlxArray>;
 
-        /// Decode-only paged attention over dense compatibility KV caches.
-        ///
-        /// `q` is `[B, Hq, 1, D]`. `cache_keys[i]` / `cache_values[i]` are
-        /// per-sequence dense KV buffers, while `kv_lens`, `block_tables`, and
-        /// `block_table_offsets` describe the logical paged layout.
-        unsafe fn paged_decode_attention_dense_compat(
-            q: &MlxArray,
-            cache_keys: &[*const MlxArray],
-            cache_values: &[*const MlxArray],
-            kv_lens: &[i32],
-            block_tables: &[i32],
-            block_table_offsets: &[i32],
-            block_size: i32,
-            scale: f32,
-        ) -> UniquePtr<MlxArray>;
-
-        /// Decode-only paged attention over rotating ring-buffer KV caches.
-        ///
-        /// `logical_starts[i]` identifies the physical start of the logical
-        /// visible window within `cache_keys[i]` / `cache_values[i]`.
-        unsafe fn paged_decode_attention_rotating_compat(
-            q: &MlxArray,
-            cache_keys: &[*const MlxArray],
-            cache_values: &[*const MlxArray],
-            kv_lens: &[i32],
-            logical_starts: &[i32],
-            block_size: i32,
-            scale: f32,
-        ) -> UniquePtr<MlxArray>;
-
         /// Fused paged-attention decode Metal kernel (epic #116 Phase 6, #123).
         ///
         /// Reads scattered KV blocks directly out of the global pool via the
@@ -2332,6 +2310,13 @@ mod ffi {
         /// for the graph that produces the given pair of arrays.
         fn astype_breakdown_pair(a: &MlxArray, b: &MlxArray) -> String;
 
+        /// Sorted flags of every `GatherMM` / `GatherQMM` node in the
+        /// unevaluated graph that produces `out`, three bytes per node in
+        /// depth-first discovery order: `[quantized, left_sorted,
+        /// right_sorted]` as 0 or 1. Traversal only, no eval; the typed form
+        /// is [`gather_sorted_flags`].
+        fn gather_sorted_flags_raw(out: &MlxArray) -> Vec<u8>;
+
         /// Set default stream for subsequent operations
         fn set_default_stream(stream: &MlxStream);
 
@@ -2376,6 +2361,12 @@ mod ffi {
         /// RDNA, 64 on CDNA, 0 off ROCm or when the query fails. Never the
         /// `MLX_ROCM_FORCE_WARP_SIZE` launch-width override (issue #2147).
         fn rocm_device_warp_size() -> i32;
+
+        /// Raw counters of the ROCm QuantizedMatmul dequantized-weight
+        /// cache (issue #2151): hits, misses, inserts, evictions, bypasses,
+        /// entries, bytes. Seven zeros off ROCm. Prefer
+        /// [`crate::rocm_qmm_cache::dequant_cache_stats`].
+        fn rocm_dequant_cache_stats() -> Vec<u64>;
 
         /// Test-only seam (issue #2147): replaces the wavefront width the
         /// ROCm port tables are checked against for the rest of the process
@@ -2665,6 +2656,14 @@ mod ffi {
         /// combination is capped at the vocabulary where it measured a win.
         /// Pure host arithmetic, so it answers on a CPU-only build too.
         fn sampling_rejection_routes(vocab: i32, top_k: i32, top_p: f32, min_p: f32) -> bool;
+
+        /// The vocabulary ceiling [`sampling_rejection_routes`] applies to
+        /// top-k and top-p together on this build: the compile-time
+        /// `REJECTION_JOINT_VOCAB_MAX` in `mlx_cxx_bridge.cpp`, 152064 on a
+        /// ROCm build (gfx1151, #2157) and 32768 on every other build (M1
+        /// Ultra, #901). It is chosen by build flag, never by a runtime
+        /// backend check.
+        fn sampling_rejection_joint_vocab_max() -> i32;
 
         /// Threads per threadgroup the rejection kernel launches with. The
         /// determinism argument rests on this being fixed, so it is exposed.
@@ -3414,6 +3413,37 @@ mod ffi {
 // Re-export the FFI types and functions
 pub use ffi::*;
 
+/// The sorted flags of one `GatherMM` or `GatherQMM` node, as the primitive
+/// carries them (issue #2241).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GatherSortedFlags {
+    /// `GatherQMM` (true) or `GatherMM` (false).
+    pub quantized: bool,
+    /// Upstream sets this to `sorted_indices && !rhs_indices`.
+    pub left_sorted: bool,
+    /// Upstream sets this to `sorted_indices && !lhs_indices`; every
+    /// backend's sorted MoE prefill kernel keys on it.
+    pub right_sorted: bool,
+}
+
+/// Sorted flags of every `GatherMM` / `GatherQMM` node in the unevaluated
+/// graph that produces `out`, in depth-first discovery order. Traversal only,
+/// no eval; an evaluated array has no graph left to walk and gives an empty
+/// list.
+///
+/// Used by: the `SwitchGLU` sorted-path regression tests (issue #2241)
+#[must_use]
+pub fn gather_sorted_flags(out: &MlxArray) -> Vec<GatherSortedFlags> {
+    ffi::gather_sorted_flags_raw(out)
+        .chunks_exact(3)
+        .map(|node| GatherSortedFlags {
+            quantized: node[0] != 0,
+            left_sorted: node[1] != 0,
+            right_sorted: node[2] != 0,
+        })
+        .collect()
+}
+
 /// Deprecated name for [`default_device_is_gpu`] (issue #1421).
 ///
 /// The old name read as a hardware query, but the answer is whether the
@@ -3862,10 +3892,13 @@ pub mod weights;
 
 // Token generation
 pub mod generate;
+// `LanguageModel` for `&M`, so a raw-completion client can open an
+// `Engine<&M>` over a model its caller keeps (#2176).
+mod language_model_ref;
 
 // Inference-session contract (issue #448, ADR 0004). The engine-neutral
-// `InferenceSession` trait plus the MLX `MlxInferenceSession` that wraps
-// `CxxGenerator`. The CLI single-sequence paths drive generation through this.
+// `InferenceSession` trait plus the MLX `MlxInferenceSession`, a one-sequence
+// client of the batch-native engine (`engine::DirectEngine`, ADR 0007).
 pub mod session;
 
 // Backend-neutral owned tensors produced by host-side multimodal preprocessing.
@@ -3935,6 +3968,10 @@ pub mod dtype;
 pub mod cuda_arch;
 pub mod rocm_arch;
 
+// Counters of the ROCm QuantizedMatmul dequantized-weight cache (#2151), for
+// tests and memory diagnostics.
+pub mod rocm_qmm_cache;
+
 // Deliberate ROCm GPU failures for tests (#1804): a typed wrapper over the
 // bridge's fault-probe fixture, so `tests/rocm_gpu_faults.rs` can provoke a
 // rejected launch and a queue fault without knowing the bridge's integers.
@@ -3977,6 +4014,12 @@ pub mod prefill_span;
 // boundary, chunking, tile padding and the trim that undoes it, shared by the
 // CLI generator and the server scheduler (ADR 0007, #2170).
 pub mod prefill_plan;
+
+// The batch-native decode engine: owns the model and the KV pool and runs
+// every forward through `open` / `prefill` / `step` / `close`; a single
+// sequence is a batch of one (ADR 0007, #2172).
+pub mod engine;
+mod eval_faults;
 
 pub mod runtime_lora;
 
@@ -4021,12 +4064,23 @@ pub(crate) mod test_support;
 #[path = "ffi_tests.rs"]
 mod ffi_tests;
 
+#[cfg(test)]
+#[path = "array_evaluated_bytes_tests.rs"]
+mod array_evaluated_bytes_tests;
+
 // Affine 1-bit quantization (issue #1370): fused Metal qmv / qmm parity against
 // a host f64 oracle, the dequantize reference, load validation and layer
 // routing.
 #[cfg(test)]
 #[path = "one_bit_tests.rs"]
 mod one_bit_tests;
+
+// CPU quantized matmul accumulates in f32 for bf16 and f16 activations (issue
+// #2248): affine transposed and plain, 3/4/6/8-bit, and MXFP4, each against a
+// host f64 reference on the CPU stream. Runs on every backend.
+#[cfg(test)]
+#[path = "cpu_qmm_accum_tests.rs"]
+mod cpu_qmm_accum_tests;
 
 // CUDA architecture-list parsing and the coverage/mismatch predicate. Pure
 // functions over strings and tuples, so these run on every host including
@@ -4112,6 +4166,12 @@ mod sampling_rejection_tests;
 #[cfg(test)]
 #[path = "sampling_fixed_key_tests.rs"]
 mod sampling_fixed_key_tests;
+
+// A `top_k` at or above the vocabulary is "no top-k" on every fused sampler
+// entry point instead of aborting the process in `argpartition` (#2247).
+#[cfg(test)]
+#[path = "sampling_top_k_vocab_tests.rs"]
+mod sampling_top_k_vocab_tests;
 
 // Numeric-parity, Gemma `(1 + w)` convention, kill-switch and greedy-argmax
 // tests for the fused residual-add RMSNorm kernel (#905). GPU-only; they skip

@@ -468,10 +468,7 @@ void hipblaslt_gemm_impl(
   int32_t trans_a_val = static_cast<int32_t>(op_a);
   int32_t trans_b_val = static_cast<int32_t>(op_b);
 
-  static const bool no_epi =
-      std::getenv("MLX_ROCM_NO_HIPBLASLT_EPILOGUE") != nullptr;
-  hipblasLtEpilogue_t epilogue =
-      static_cast<hipblasLtEpilogue_t>(no_epi ? 1 : epilogue_i);
+  hipblasLtEpilogue_t epilogue = static_cast<hipblasLtEpilogue_t>(epilogue_i);
 
   // Fast path: full pipeline cache (no bias). ~all train dense + MoE segment
   // GEMMs hit this after warm-up.
@@ -657,8 +654,8 @@ void hipblaslt_gemm_impl(
 
   // Fused epilogue (bias / GELU / Swish). Bias vector length = D rows after the
   // col-major M/N swap → matches original row-major N (feature dim).
-  // no_epi / epilogue already computed above for the pipe-cache fast path.
-  if (!no_epi && bias_ptr != nullptr &&
+  // epilogue already computed above for the pipe-cache fast path.
+  if (bias_ptr != nullptr &&
       epilogue != HIPBLASLT_EPILOGUE_DEFAULT) {
     status = hipblasLtMatmulDescSetAttribute(
         matmul_guard.desc,
@@ -686,7 +683,7 @@ void hipblaslt_gemm_impl(
       throw std::runtime_error("hipblasLt set BIAS_DATA_TYPE failed");
     }
   } else if (
-      !no_epi && bias_ptr == nullptr &&
+      bias_ptr == nullptr &&
       epilogue != HIPBLASLT_EPILOGUE_DEFAULT &&
       epilogue != HIPBLASLT_EPILOGUE_BIAS &&
       epilogue != HIPBLASLT_EPILOGUE_RELU_BIAS &&
@@ -1184,27 +1181,8 @@ void hipblaslt_gemm_ptrs(
   hipblasOperation_t op_a = to_hipblas_op(transpose_b);
   hipblasOperation_t op_b = to_hipblas_op(transpose_a);
 
-  // hipBLASLt may retain host alpha/beta pointers until the stream kernel
-  // finishes. Never pass addresses of [=]-captured stack floats — under a
-  // full train graph those die before the launch runs (status 3 INVALID).
-  // Process-lifetime constants for the common scales (same as
-  // rowmajor_on_stream).
-  const float* alpha_p;
-  const float* beta_p;
-  if (alpha == 1.0f && beta == 0.0f) {
-    static const float kOne = 1.0f, kZero = 0.0f;
-    alpha_p = &kOne;
-    beta_p = &kZero;
-  } else if (alpha == 1.0f && beta == 1.0f) {
-    static const float kOne = 1.0f;
-    alpha_p = &kOne;
-    beta_p = &kOne;
-  } else {
-    // Rare scales: leak a stable pair (MoE uses only 1/0 and 1/1).
-    float* p = new float[2]{alpha, beta};
-    alpha_p = &p[0];
-    beta_p = &p[1];
-  }
+  // Host-mode scalars are read at enqueue, and launch_kernel runs its functor
+  // synchronously, so the lambda's by-value captures are valid for the call.
 
   encoder.launch_kernel([=](hipStream_t stream) {
     hipblaslt_gemm_impl(
@@ -1215,14 +1193,14 @@ void hipblaslt_gemm_ptrs(
         N, // swap M/N for col-major trick
         M,
         K,
-        alpha_p,
+        &alpha,
         b_ptr, // swap A/B
         ldb,
         0,
         a_ptr,
         lda,
         0,
-        beta_p,
+        &beta,
         c_ptr,
         ldc,
         0,
@@ -1253,26 +1231,7 @@ void hipblaslt_gemm_rowmajor_on_stream(
   hipDataType hip_dtype = to_hipblaslt_dtype(dtype);
   hipblasOperation_t op_a = to_hipblas_op(transpose_b);
   hipblasOperation_t op_b = to_hipblas_op(transpose_a);
-  // hipBLASLt may keep host alpha/beta pointers until the stream kernel
-  // completes. Use process-lifetime constants for the common 1/0 case; heap
-  // a pair only for unusual scales (leaked deliberately — rare).
-  const float* a_ptr_s;
-  const float* b_ptr_s;
-  if (alpha == 1.0f && beta == 0.0f) {
-    static const float kOne = 1.0f;
-    static const float kZero = 0.0f;
-    a_ptr_s = &kOne;
-    b_ptr_s = &kZero;
-  } else if (alpha == 1.0f && beta == 1.0f) {
-    static const float kOne = 1.0f;
-    a_ptr_s = &kOne;
-    b_ptr_s = &kOne;
-  } else {
-    // Rare path: leak a stable pair (MoE async always uses 1/0).
-    float* p = new float[2]{alpha, beta};
-    a_ptr_s = &p[0];
-    b_ptr_s = &p[1];
-  }
+  // Host-mode scalars are read at enqueue; the parameters outlive the call.
   hipblaslt_gemm_impl(
       handle,
       device_id,
@@ -1281,14 +1240,14 @@ void hipblaslt_gemm_rowmajor_on_stream(
       N,
       M,
       K,
-      a_ptr_s,
+      &alpha,
       b_ptr,
       ldb,
       0,
       a_ptr,
       lda,
       0,
-      b_ptr_s,
+      &beta,
       c_ptr,
       ldc,
       0,

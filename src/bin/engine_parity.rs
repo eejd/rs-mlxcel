@@ -16,10 +16,16 @@
 //!
 //! Runs one prompt and one `SamplingConfig` through
 //!
-//! - (a) `CxxGenerator`, the way `mlxcel generate` calls it,
+//! - (a) the engine's raw-completion client, the way `mlxcel generate` calls it,
 //! - (b) the server `BatchScheduler` in-process at B=1 with dense decode
 //!   storage, and
 //! - (c) the same at B=1 with paged decode storage,
+//! - (d) a direct `Engine` run (#2172), and
+//! - (e) `mlxcel run -p`: the in-process server `run` starts, configured by
+//!   the same `CliServerSettings` and driven through the same chat request
+//!   path (template render, worker options, `StreamFilter`), against
+//! - (f) the same chat request on the `mlxcel-server` default configuration,
+//!   greedy case only (#2173),
 //!
 //! and prints, for every pair, `identical` or the first divergent token index
 //! with the id each side produced. On (b) it also compares a prompt-cache miss
@@ -37,19 +43,25 @@
 mod report;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use mlxcel::server::DecodeStorageBackend;
+use mlxcel::cli::in_process_client::{CliServerSettings, chat_request_body};
 use mlxcel::server::engine_probe::cases::{
     cache_prime_len, default_dry_breaker_ids, greedy_case, seeded_penalties_case,
 };
 use mlxcel::server::engine_probe::cli_engine::generate_like_cli;
+use mlxcel::server::engine_probe::engine_direct::DirectEngine;
 use mlxcel::server::engine_probe::prompt::render_chat_prompt;
 use mlxcel::server::engine_probe::{
     ParityCase, ProbeCacheKey, ServerEngine, ServerEngineOptions, ServerEngineRequest,
     describe_prefill_partition,
 };
+use mlxcel::server::in_process::InProcessServer;
+use mlxcel::server::in_process::chat::chat_request_from_json;
+use mlxcel::server::{DecodeStorageBackend, ServerStartupConfig};
 use mlxcel_core::cache::KVCacheMode;
 
 use report::{PairRow, PathStream, Report, Side};
@@ -242,6 +254,26 @@ fn main() -> Result<()> {
             )?;
             report.push_stream(case.name, Side::Cli, PathStream::ran(tokens, "cli"));
         }
+
+        // (d) the engine itself, B=1 on dense storage with no scheduler: the
+        // same model instance, moved into an `Engine`, one request at a time
+        // (#2172). Its prefill plan uses the one chunk policy (`MLXCEL_PREFILL_CHUNK`)
+        // unless `--server-prefill-chunk` pins the server's.
+        let chunk = args
+            .server_prefill_chunk
+            .unwrap_or_else(mlxcel_core::prefill_plan::prefill_chunk_len);
+        let mut direct = DirectEngine::new(model, chunk);
+        for case in &cases {
+            let tokens = direct
+                .run(&prompt.tokens, args.max_tokens, &case.sampling)
+                .with_context(|| format!("direct engine run failed for case {}", case.name))?;
+            report.push_stream(
+                case.name,
+                Side::Engine,
+                PathStream::ran(tokens, &format!("engine B=1 dense chunk={chunk}")),
+            );
+        }
+        drop(direct);
     }
     mlxcel_core::clear_memory_cache();
 
@@ -280,6 +312,66 @@ fn main() -> Result<()> {
             report.push_stream(case.name, side, stream);
         }
         engine.shutdown()?;
+    }
+
+    // (e) `mlxcel run -p` and (f) `mlxcel-server`, greedy, on the same chat
+    // request: the user prompt as one message with `temperature: 0` and
+    // `max_tokens`, rendered by the server's chat request path (so its
+    // length can differ from the harness's own CLI-style render that arms
+    // (a) to (d) share). (e) is the in-process server `run` starts, from the
+    // settings `run -p --temp 0 -n N` builds; (f) is the same request path on
+    // the `mlxcel-server` default configuration (four slots, paged storage
+    // when the model supports it), prompt cache off on both (ADR 0007).
+    if !args.no_chat_template {
+        let run_settings = CliServerSettings {
+            temperature: Some(0.0),
+            max_tokens: Some(args.max_tokens),
+            prompt_cache: false,
+            warmup: true,
+            ..CliServerSettings::default()
+        };
+        let mut server_startup = ServerStartupConfig::default();
+        server_startup.model_path = args.model.clone();
+        server_startup.prompt_cache.enabled = false;
+        let arms = [
+            (Side::Run, "run -p", run_settings.startup(&args.model)),
+            (Side::ServerChat, "mlxcel-server", server_startup),
+        ];
+        for (side, name, mut startup) in arms {
+            // `--server-prefill-chunk` pins the chunk on every server arm.
+            if let Some(chunk) = args.server_prefill_chunk {
+                startup.prefill_chunk_size = chunk;
+                startup.prefill_chunk_size_contended = chunk;
+            }
+            let server = InProcessServer::start(&startup)?;
+            for case in &cases {
+                let stream = if case.name == "greedy" {
+                    let mut body = chat_request_body(
+                        serde_json::json!([{ "role": "user", "content": args.prompt }]),
+                        &CliServerSettings::default(),
+                    );
+                    body["temperature"] = serde_json::json!(0.0);
+                    body["max_tokens"] = serde_json::json!(args.max_tokens);
+                    let request = chat_request_from_json(body)?;
+                    let turn = server.chat(request, Arc::new(AtomicBool::new(false)), |_| {})?;
+                    PathStream::ran(
+                        turn.result.generated_token_ids,
+                        &format!(
+                            "{name} parallel={} pc=off prompt-tokens={} chunk={}",
+                            server.config().max_batch_size,
+                            turn.result.prompt_tokens,
+                            server.config().prefill_chunk_size
+                        ),
+                    )
+                } else {
+                    PathStream::not_applicable(
+                        "the chat-request arms cover the greedy case".to_string(),
+                    )
+                };
+                report.push_stream(case.name, side, stream);
+            }
+            server.shutdown()?;
+        }
     }
 
     // (b) with the prompt cache on. Miss: the request arrives cold. Hit: a

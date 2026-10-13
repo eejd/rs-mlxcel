@@ -27,6 +27,7 @@
 //! forward runs.
 
 use super::*;
+use mlxcel_core::prefill_plan::{PrefillCaps, PrefillInput, PrefillPlan};
 
 /// The scheduler operations the block reclaim loop drives.
 pub(super) trait PagedBlockReclaimer {
@@ -282,7 +283,7 @@ pub(super) fn take_paged_room(room: &mut Option<usize>, need: usize) -> bool {
 
 impl PagedBlockReclaimer for BatchScheduler {
     fn pool_free_blocks(&self) -> Option<usize> {
-        self.cache_pool.free_paged_block_budget()
+        self.engine.pool().free_paged_block_budget()
     }
 
     fn evict_cold_prefix(&mut self) -> bool {
@@ -312,7 +313,7 @@ impl PagedBlockReclaimer for BatchScheduler {
     }
 
     fn blocks_to_append(&self, id: SequenceId, tokens: usize) -> usize {
-        self.cache_pool.paged_blocks_to_append(id, tokens)
+        self.engine.pool().paged_blocks_to_append(id, tokens)
     }
 
     fn is_active(&self, id: SequenceId) -> bool {
@@ -336,11 +337,26 @@ impl BatchScheduler {
         self.chunked_prefill_seq.as_ref().map_or(0, |seq| {
             let total = seq.prompt_tokens.len();
             let remaining = total.saturating_sub(seq.prefill_offset);
-            let pad = self
-                .prefill_plan_for(seq)
-                .piece_starting_at(seq.prefill_offset)
-                .map_or(0, |piece| piece.pad_excess());
-            self.cache_pool
+            let input = if seq.vlm_embeddings.is_some() {
+                PrefillInput::Embeddings {
+                    executor_pads: false,
+                }
+            } else {
+                PrefillInput::Tokens
+            };
+            let caps = PrefillCaps::for_model(self.engine.model(), should_align_prefill())
+                .with_input(input);
+            let pad = PrefillPlan::next_piece_at(
+                total,
+                seq.prefill_start_offset,
+                self.history_boundary_split(seq),
+                seq.prefill_offset,
+                self.prefill_chunk_for_tick(),
+                caps,
+            )
+            .map_or(0, |piece| piece.pad_excess());
+            self.engine
+                .pool()
                 .paged_blocks_to_append(seq.seq_id, remaining + pad)
         })
     }
@@ -373,8 +389,8 @@ impl BatchScheduler {
         seq_id: SequenceId,
         write_len: usize,
     ) -> bool {
-        let need = self.cache_pool.paged_blocks_to_append(seq_id, write_len);
-        let free_before = self.cache_pool.free_paged_block_budget();
+        let need = self.engine.pool().paged_blocks_to_append(seq_id, write_len);
+        let free_before = self.engine.pool().free_paged_block_budget();
         if free_before.is_none_or(|free| free >= need) {
             return true;
         }
@@ -384,7 +400,7 @@ impl BatchScheduler {
             %seq_id,
             need,
             free_before = free_before.unwrap_or_default(),
-            free_after = self.cache_pool.free_paged_block_budget().unwrap_or_default(),
+            free_after = self.engine.pool().free_paged_block_budget().unwrap_or_default(),
             evicted_prefixes = outcome.evicted,
             dropped_adoptions = outcome.dropped_adoptions,
             preempted = outcome.preempted,
@@ -406,7 +422,7 @@ impl BatchScheduler {
         &mut self,
         seq_ids: &[SequenceId],
     ) -> Option<Vec<SequenceId>> {
-        self.cache_pool.paged_block_budget()?;
+        self.engine.pool().paged_block_budget()?;
         // A tick writes one position per row. The lookahead prime that may
         // follow a synchronous step writes one more; it is gated separately by
         // `prime_fits_block_budget`, so it never needs a reservation here.
@@ -432,7 +448,7 @@ impl BatchScheduler {
             );
         }
         for &id in &reservation.shed {
-            let total = self.cache_pool.paged_block_budget().unwrap_or_default();
+            let total = self.engine.pool().paged_block_budget().unwrap_or_default();
             Self::abort_sequence_with_error(
                 self.active_batch.get_mut(id),
                 "KV cache budget exhausted",

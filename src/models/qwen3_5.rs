@@ -3649,7 +3649,8 @@ impl LanguageModel for Qwen35Model {
     }
 
     fn reset_runtime_state(&self) {
-        // Used by: CxxGenerator single-row generation paths. Qwen 3.5 Next
+        // Used by: bare single-row runs outside an engine sequence (the engine
+        // resets through prepare_sequence_state / release_sequence_state_by_id). Qwen 3.5 Next
         // owns mixed attention / GatedDelta cache state in
         // `ModelOwnedSequenceState`; reset the fallback cache slot for fresh
         // CLI / benchmark runs without touching scheduler-owned sequence
@@ -3745,16 +3746,15 @@ impl LanguageModel for Qwen35Model {
         batch_caches: &mut [&mut [KVCache]],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        self.forward_batched_with_context_and_ids(input_ids, None, batch_caches, mask, None)
+        self.forward_batched_with_ids(input_ids, None, batch_caches, mask)
     }
 
-    fn forward_batched_with_context_and_ids(
+    fn forward_batched_with_ids(
         &self,
         input_ids: &MlxArray,
         seq_ids: Option<&[SequenceId]>,
         batch_caches: &mut [&mut [KVCache]],
         mask: Option<&MlxArray>,
-        _context: Option<&mlxcel_core::generate::DecodeBatchContext>,
     ) -> UniquePtr<MlxArray> {
         let shape = mlxcel_core::array_shape(input_ids);
         if batch_caches.len() <= 1 || shape[1] <= 1 {

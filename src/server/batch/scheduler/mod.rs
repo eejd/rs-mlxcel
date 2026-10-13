@@ -36,18 +36,13 @@ use mlxcel_core::cache::{
     BatchKvQuantConfig, CachePool, DetachedPagedCacheSet, KVCacheMode, PagedKvLayout, SequenceId,
     SequenceStateBackend, SequenceStateLayout,
 };
-use mlxcel_core::generate::{
-    DecodeBatchContext, DecodeStorageBackend as CoreDecodeStorageBackend, LanguageModel,
-};
+use mlxcel_core::engine::{Engine, PrefillStep, RowError, RowOutcome, StepBatch};
+use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::generation_policy::{
     initial_token_history, merged_eos_token_ids, seed_rng_if_needed,
 };
-use mlxcel_core::sampling::{
-    FusedSampleParams, LogprobSource, TokenBiasMap, apply_row_filters, apply_token_bias_rows,
-    batched_fused_sample_with_bias, compute_logprobs, compute_post_sampling_probs,
-    row_supports_fused_batch_except_bias,
-};
-use mlxcel_core::sampling_row_step::{LogitMask, RowSampler, TokenDraw};
+use mlxcel_core::sampling::{FusedSampleParams, TokenBiasMap};
+use mlxcel_core::sampling_row_step::{LogitMask, RowSampler};
 use mlxcel_core::sampling_token_bias::compose_token_bias;
 use mlxcel_core::streams::{
     install_thread_local_default_stream, new_thread_local_generation_stream,
@@ -85,7 +80,7 @@ use crate::vision::feature_cache::ModelVisionCaches;
 use crate::vlm_runtime::prepared_embedding_refs;
 
 use super::active::ActiveBatch;
-use super::finish::{ContextBound, finish_decode_token};
+use super::finish::{ContextBound, apply_finish_cause};
 use super::prefill_cohort::{
     PrefillCohortKind, PrefillRow, batched_window_admits, batched_window_admits_lora,
     default_batched_prefill_token_budget, plan_prefill_cohorts,
@@ -100,8 +95,7 @@ use super::tick_policy::{
     TickChoice, TickState, decide_tick, mixed_step_enabled, resolve_prefill_grant_interval,
 };
 
-use pad_trim::{should_align_prefill, trim_padded_prefill};
-use run_loop::StructuredMask;
+use pad_trim::should_align_prefill;
 
 pub(crate) const DEFAULT_PAGED_BLOCK_SIZE: usize = 32;
 
@@ -294,13 +288,20 @@ fn boundary_capture_applies(
 /// partition is the `mlxcel_core::prefill_plan::PrefillPlan` of each sequence
 /// (see `planned_prefill`).
 pub struct BatchScheduler {
-    // -- Pool & scheduling structures --
-    cache_pool: CachePool,
+    // -- Execution --
+    /// The batch-native engine (ADR 0007, #2172): it owns the model and the
+    /// KV pool, and every model forward and sampler draw the scheduler needs
+    /// runs through it. The scheduler keeps admission, tick policy,
+    /// preemption, prompt-cache lookup/donate/adopt, handoff and the
+    /// speculative burst generators, and reaches the model and the pool only
+    /// through the engine's accessors for those jobs.
+    engine: Engine<LoadedModel>,
+
+    // -- Scheduling structures --
     prefill_queue: PrefillQueue,
     active_batch: ActiveBatch,
 
-    // -- Model & tokenizer --
-    model: LoadedModel,
+    // -- Tokenizer --
     tokenizer: MlxcelTokenizer,
     /// Memo for the tokenized `--reasoning-budget-message` (#1470), keyed by
     /// the message text so a changed live setting re-encodes. One entry is
@@ -339,8 +340,8 @@ pub struct BatchScheduler {
 
     // -- Configuration --
     config_eos: Vec<i32>,
-    /// Number of prompt tokens per prefill chunk. 0 = chunking disabled.
-    prefill_chunk_size: usize,
+    /// Prompt tokens per prefill chunk with and without live decode streams.
+    prefill_chunk_policy: mlxcel_core::prefill_plan::PrefillChunkPolicy,
     /// Whether preemptive eviction is enabled.
     enable_preemption: bool,
     /// Policy for selecting the eviction victim.
@@ -350,6 +351,12 @@ pub struct BatchScheduler {
     /// Sequence currently undergoing chunked prefill. `None` when no chunked
     /// prefill is in progress.
     chunked_prefill_seq: Option<SequenceInfo>,
+
+    /// Logical token lengths handed to the engine by `run_prefill_piece`.
+    /// Test-only proof that adaptive plans are executed rather than merely
+    /// constructed.
+    #[cfg(test)]
+    pub(super) prefill_forward_lengths: Vec<usize>,
 
     /// Issue #908 prototype gate, read once from `MLXCEL_MIXED_STEP` at
     /// construction so the tick loop never touches the environment. False (the
@@ -628,6 +635,10 @@ pub struct BatchScheduler {
     /// entered.
     speculative_drafter_slot: super::speculative_burst::WorkerDrafterSlot,
 
+    /// Whether the prompt-lookup verify widths have been warmed up on this
+    /// scheduler (#2255, [`Self::warm_up_prompt_lookup_widths`]).
+    prompt_lookup_widths_warmed: bool,
+
     /// Adaptive MTP enable/decline policy (issue #333). `Some` only when the
     /// dispatch is [`crate::server::SpeculativeDispatch::Mtp`] and the adaptive
     /// path is enabled (`MLXCEL_MTP_ADAPTIVE` not set to an off value); built
@@ -726,6 +737,11 @@ pub struct BatchScheduler {
     /// never engages the lookahead pipeline and every decode tick runs
     /// synchronously, so the sync path stays available for A/B equivalence.
     lookahead_force_sync: bool,
+
+    /// Decode forwards submitted by this scheduler, for tests that pin the
+    /// B=1 terminal lookahead cost to one forward per post-prefill token.
+    #[cfg(test)]
+    pub(super) decode_forward_calls: usize,
 }
 
 /// One prebuilt decode step held across ticks by the lookahead pipeline.
@@ -743,24 +759,6 @@ struct DecodeLookahead {
     /// `[B]` device token-id array (uint32), one per `ids` entry, already
     /// scheduled with `async_eval`.
     tokens: UniquePtr<mlxcel_core::MlxArray>,
-}
-
-/// Copy a `[B]` device token-id array to host as `Vec<i32>`. `fused_sample`
-/// returns a row-contiguous `uint32` array; the raw bytes are reinterpreted as
-/// `i32`, exact for any token id in `0..vocab_size`.
-///
-/// Uses [`mlxcel_core::array_evaluated_bytes`] (surgical per-array `eval`, no
-/// `contiguous()` op) rather than `array_to_raw_bytes`: the steady pipeline has
-/// already scheduled the next forward on the same stream before this read, and
-/// `array_to_raw_bytes`' `contiguous()` would enqueue a fresh op behind that
-/// forward, making the read block on it and collapsing the overlap. This reader
-/// waits only on the token array's own completion event.
-fn lookahead_tokens_to_host(tokens: &mlxcel_core::MlxArray) -> Vec<i32> {
-    let bytes = mlxcel_core::array_evaluated_bytes(tokens);
-    bytes
-        .chunks_exact(4)
-        .map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
 }
 
 /// Pure decision: may the lookahead pipeline stay engaged for the next tick?
@@ -966,10 +964,12 @@ mod paged_layout;
 mod planned_prefill;
 mod prefill;
 mod prompt_cache;
+pub(crate) mod prompt_lookup;
 mod queued_adoption;
 mod run_loop;
 mod shared_budget;
 mod speculative_finalize;
+pub(crate) mod step_rows;
 
 #[cfg(test)]
 mod structure_tests;
@@ -1018,6 +1018,10 @@ mod scheduler_prompt_cache_plan_tests;
 mod scheduler_whole_prompt_hit_tests;
 
 #[cfg(test)]
+#[path = "../scheduler_prompt_lookup_tests.rs"]
+mod scheduler_prompt_lookup_tests;
+
+#[cfg(test)]
 #[path = "../scheduler_completion_snapshot_tests.rs"]
 mod scheduler_completion_snapshot_tests;
 
@@ -1028,6 +1032,14 @@ mod scheduler_model_owned_pad_trim_tests;
 #[cfg(test)]
 #[path = "../scheduler_model_owned_lookahead_tests.rs"]
 mod scheduler_model_owned_lookahead_tests;
+
+#[cfg(test)]
+#[path = "../scheduler_lookahead_read_failure_tests.rs"]
+mod scheduler_lookahead_read_failure_tests;
+
+#[cfg(test)]
+#[path = "../scheduler_real_batch_parity_tests.rs"]
+mod scheduler_real_batch_parity_tests;
 
 /// Resolve a request's context-retention values against the server policy
 /// (#1472), pure so the arithmetic is unit-testable without a scheduler.

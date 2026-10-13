@@ -14,9 +14,9 @@
 
 //! The server side of the shared post-sample finish step (#2168).
 //!
-//! Every `BatchScheduler` decode site (per-row batched decode, fused batched
-//! decode, single-step decode, prefill completion and the speculative burst
-//! stream) runs [`mlxcel_core::finish_step`] through [`run_finish_step`]. The
+//! Classic decode and prefill completion run [`mlxcel_core::finish_step`]
+//! inside the engine step (#2172) over [`SequenceFinishHooks`], and the
+//! speculative burst stream runs it through [`run_finish_step`]. The
 //! [`FinishHooks`] here stream the token's text through the request's stop
 //! matcher, read the b10621 generation bounds (#1477) and apply the context
 //! bound (#1472). [`apply_finish_cause`] then maps the [`FinishCause`] onto the
@@ -63,13 +63,40 @@ impl ContextBound {
                 .max_kv_size
                 .is_some_and(|max| prompt_len + generated_len + 1 >= max)
     }
+
+    /// The most proposals a verify round may forward for a still-decoding
+    /// sequence before [`Self::stop_due`] would end it, or `None` when no
+    /// stop bound applies (#2255).
+    ///
+    /// The round's state holds `prompt + generated - 1` positions and the
+    /// forward appends `k + 1`, emitting tokens `generated + 1` through
+    /// `generated + k + 1`. The bound stops the row at the first emitted
+    /// token with `prompt + generated' + 1 >= bound`, so with
+    /// `k <= bound - (prompt + generated + 2)` the last position is at most
+    /// that finishing token: no position is forwarded only to be discarded,
+    /// and the forward never holds more positions than the plain step that
+    /// emits the finishing token (`bound - 2`).
+    pub(crate) fn verify_room(
+        self,
+        prompt_len: usize,
+        generated_len: usize,
+        is_vlm: bool,
+    ) -> Option<usize> {
+        if self.context_shift || is_vlm {
+            return None;
+        }
+        let max = self.max_kv_size?;
+        Some(max.saturating_sub(prompt_len + generated_len + 2))
+    }
 }
 
 /// Where a finish step reads its EOS set, budget and history from.
+///
+/// Classic decode and prefill finish inside the engine step since #2172
+/// (`mlxcel_core::engine::finish_row` reads the sequence's merged EOS,
+/// `max_tokens` and its token history when the sampler reads one); this is
+/// what the speculative burst stream, which keeps its own limits, passes.
 pub(crate) enum StepLimits<'a> {
-    /// Classic decode and prefill: the sequence's merged EOS, `max_tokens`,
-    /// and its token history when the sampler reads one.
-    Sequence,
     /// The speculative burst stream: the stream's merged EOS set and its
     /// emission budget (`max_tokens.max(1)`). The burst keeps no history.
     Burst { eos: &'a [i32], max_tokens: usize },
@@ -78,16 +105,16 @@ pub(crate) enum StepLimits<'a> {
 /// [`FinishHooks`] over the disjoint `SequenceInfo` fields the stop matcher,
 /// the generation bounds and the context bound need, so the finish step can
 /// hold `generated_tokens` mutably at the same time.
-struct SequenceFinishHooks<'s> {
-    decode_state: &'s mut StreamingDecodeState,
-    stop_matcher: &'s mut StopMatcher,
-    bounds: &'s mut GenerationBounds,
-    response_tx: &'s mpsc::Sender<GenerateEvent>,
-    tokenizer: &'s MlxcelTokenizer,
-    logprobs: Option<TokenLogprobData>,
-    prompt_len: usize,
-    is_vlm: bool,
-    context: ContextBound,
+pub(crate) struct SequenceFinishHooks<'s> {
+    pub(crate) decode_state: &'s mut StreamingDecodeState,
+    pub(crate) stop_matcher: &'s mut StopMatcher,
+    pub(crate) bounds: &'s mut GenerationBounds,
+    pub(crate) response_tx: &'s mpsc::Sender<GenerateEvent>,
+    pub(crate) tokenizer: &'s MlxcelTokenizer,
+    pub(crate) logprobs: Option<TokenLogprobData>,
+    pub(crate) prompt_len: usize,
+    pub(crate) is_vlm: bool,
+    pub(crate) context: ContextBound,
 }
 
 impl FinishHooks for SequenceFinishHooks<'_> {
@@ -140,20 +167,12 @@ pub(crate) fn run_finish_step(
         bounds,
         response_tx,
         generated_tokens,
-        token_history,
-        merged_eos,
         sampling,
-        max_tokens,
         prompt_tokens,
         vlm_embeddings,
         ..
     } = seq;
     let (eos, max_tokens, history): (&[i32], usize, Option<&mut Vec<i32>>) = match limits {
-        StepLimits::Sequence => (
-            merged_eos.as_slice(),
-            *max_tokens,
-            sampling.needs_token_history().then_some(token_history),
-        ),
         StepLimits::Burst { eos, max_tokens } => (eos, max_tokens, None),
     };
     let mut hooks = SequenceFinishHooks {
@@ -215,8 +234,11 @@ pub(crate) fn apply_finish_cause(seq: &mut SequenceInfo, cause: FinishCause) {
     }
 }
 
-/// The classic decode and prefill finish: run the shared finish step on the
-/// sequence's own limits and, when it fires, finish the sequence.
+/// The classic decode and prefill finish as the tests pin it: the engine's
+/// finish step over the sequence's own limits and hooks, then the sequence
+/// finished when it fires. Production runs this inside the engine step
+/// (`BatchScheduler::run_engine_step`, `finish_prefill`).
+#[cfg(test)]
 pub(crate) fn finish_decode_token(
     seq: &mut SequenceInfo,
     tokenizer: &MlxcelTokenizer,
@@ -225,17 +247,12 @@ pub(crate) fn finish_decode_token(
     structured_stopped: bool,
     context: ContextBound,
 ) -> Option<FinishCause> {
-    let cause = run_finish_step(
-        seq,
-        tokenizer,
-        token,
-        logprobs,
-        structured_stopped,
-        context,
-        StepLimits::Sequence,
-    );
-    if let Some(cause) = cause {
+    let outcome = {
+        let mut row = super::scheduler::step_rows::step_row(seq, tokenizer, context, false);
+        mlxcel_core::engine::finish_row(&mut row, token, token, logprobs, structured_stopped)
+    };
+    if let Some(cause) = outcome.finish {
         apply_finish_cause(seq, cause);
     }
-    cause
+    outcome.finish
 }

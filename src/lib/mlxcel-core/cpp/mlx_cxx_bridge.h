@@ -12,6 +12,16 @@
 
 namespace mlx_cxx {
 
+// A copy of the pinned MLX KeySequence retains only its lazy key array.
+// Its public copy/assignment operations let failed fused submits restore the
+// calling thread's RNG without evaluating a graph or adding a GPU schedule.
+struct MlxRngSnapshot {
+    mlx::core::random::KeySequence inner;
+    MlxRngSnapshot() : inner(mlx::core::random::KeySequence::default_()) {}
+};
+std::unique_ptr<MlxRngSnapshot> rng_snapshot();
+void restore_rng_snapshot(const MlxRngSnapshot& snapshot);
+
 // Opaque wrapper struct to hold mlx::core::array
 // This allows cxx to manage the lifetime without exposing the complex internals
 struct MlxArray {
@@ -50,7 +60,7 @@ struct MlxStream {
 // across threads gives every thread its own dedicated MLX stream
 // without any explicit coordination between them. Used by
 // `mlxcel-core` to back the generation stream of `BatchScheduler`,
-// `CxxGenerator`, and `SpeculativeGenerator` (upstream MLX commit `728fab1` in mlx-vlm PR #1050).
+// the engine's raw-completion client, and `SpeculativeGenerator` (upstream MLX commit `728fab1` in mlx-vlm PR #1050).
 struct MlxThreadLocalStream {
     mlx::core::ThreadLocalStream inner;
 
@@ -238,6 +248,10 @@ rust::Vec<uint8_t> try_array_to_raw_bytes(const MlxArray& arr);
 // if the array is not row-contiguous it falls back to the safe
 // `array_to_raw_bytes` contiguous copy rather than reading past the allocation.
 rust::Vec<uint8_t> array_evaluated_bytes(const MlxArray& arr);
+
+// Test-only. Return an evaluated uint32 array whose signalled event carries a
+// synthetic backend error. The error outlives the returned event.
+std::unique_ptr<MlxArray> array_with_failed_event_for_test();
 
 // Evaluation.
 void eval(const MlxArray& arr);
@@ -1126,29 +1140,6 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_causal(
     float scale
 );
 
-// Decode-only paged attention over dense compatibility KV caches.
-std::unique_ptr<MlxArray> paged_decode_attention_dense_compat(
-    const MlxArray& q,
-    rust::Slice<const MlxArray* const> cache_keys,
-    rust::Slice<const MlxArray* const> cache_values,
-    rust::Slice<const int32_t> kv_lens,
-    rust::Slice<const int32_t> block_tables,
-    rust::Slice<const int32_t> block_table_offsets,
-    int32_t block_size,
-    float scale
-);
-
-// Decode-only paged attention over rotating ring-buffer KV caches.
-std::unique_ptr<MlxArray> paged_decode_attention_rotating_compat(
-    const MlxArray& q,
-    rust::Slice<const MlxArray* const> cache_keys,
-    rust::Slice<const MlxArray* const> cache_values,
-    rust::Slice<const int32_t> kv_lens,
-    rust::Slice<const int32_t> logical_starts,
-    int32_t block_size,
-    float scale
-);
-
 // Upstream MLX SDPA capability helpers for Metal/NAX instrumentation.
 bool sdpa_supports_fast_path(
     const MlxArray& q,
@@ -1381,6 +1372,10 @@ uint64_t count_astype_nodes_pair(const MlxArray& a, const MlxArray& b);
 // Human-readable AsType breakdown (counts + per src->dst dtype pair) for a pair.
 rust::String astype_breakdown_pair(const MlxArray& a, const MlxArray& b);
 
+// Sorted flags of every GatherMM / GatherQMM node below `out`, three bytes per
+// node in depth-first discovery order: quantized, left_sorted, right_sorted.
+rust::Vec<uint8_t> gather_sorted_flags_raw(const MlxArray& out);
+
 // Set default stream for subsequent operations
 void set_default_stream(const MlxStream& stream);
 
@@ -1419,6 +1414,12 @@ int32_t gpu_backend_kind();
 // width `port_for` sees (0 restores the hardware value).
 bool rocm_port_allowed(bool any_wave_size, int32_t warp_size);
 int32_t rocm_device_warp_size();
+
+// Counters of the ROCm QuantizedMatmul dequantized-weight cache
+// (lablup/mlxcel#2151), as `mlx::core::rocm::dequant_cache_stats()` returns
+// them: hits, misses, inserts, evictions, bypasses, entries, bytes, in that
+// order. Seven zeros off ROCm.
+rust::Vec<uint64_t> rocm_dequant_cache_stats();
 void set_rocm_port_warp_size_for_tests(int32_t warp_size);
 
 // Test-only (lablup/mlxcel#1804): a lazy array whose evaluation fails on the
@@ -1629,6 +1630,10 @@ bool sampling_rejection_routes(
     float top_p,
     float min_p
 );
+
+// The vocabulary ceiling `sampling_rejection_routes` applies to top-k and
+// top-p together on this build (`REJECTION_JOINT_VOCAB_MAX`, #2157).
+int32_t sampling_rejection_joint_vocab_max();
 
 // Threads per threadgroup the rejection kernel launches with.
 int32_t sampling_rejection_threadgroup_size();

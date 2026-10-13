@@ -197,6 +197,8 @@ pub struct ServerStartupConfig {
     /// "use the per-kind default" — `4` for MTP, `16` for DFlash. See
     /// [`crate::cli::speculative_args::default_block_size_for_kind`].
     pub draft_block_size: Option<u32>,
+    /// `--prompt-lookup-max-batch` (#2255).
+    pub prompt_lookup_max_batch: usize,
 
     // Chat template
     pub chat_template: Option<String>,
@@ -274,8 +276,10 @@ pub struct ServerStartupConfig {
     /// `--rerank-batch-size`. Forwarded to
     /// [`super::config::ServerConfig::rerank_batch_size`].
     pub rerank_batch_size: usize,
-    /// Prefill chunk size in tokens (0 = disabled).
+    /// Prefill chunk size when no other sequence is decoding (0 = disabled).
     pub prefill_chunk_size: usize,
+    /// Prefill chunk size while at least one other sequence is decoding.
+    pub prefill_chunk_size_contended: usize,
     /// Set when `--batch-size` and `--prefill-chunk-size` conflict; triggers a startup warning.
     pub batch_size_conflict: bool,
     /// Set when `--ubatch-size` was provided; triggers a startup info notice.
@@ -635,6 +639,9 @@ pub struct ServerStartupConfig {
 
 impl Default for ServerStartupConfig {
     fn default() -> Self {
+        let prefill_chunk_policy = mlxcel_core::prefill_plan::PrefillChunkPolicy::resolve(
+            mlxcel_core::prefill_plan::prefill_chunk_override(),
+        );
         Self {
             reasoning_format: crate::server::ReasoningFormat::default(),
             reasoning_alias_field: crate::server::ReasoningAliasField::default(),
@@ -683,6 +690,8 @@ impl Default for ServerStartupConfig {
             // has been resolved".
             draft_kind: None,
             draft_block_size: None,
+            prompt_lookup_max_batch:
+                crate::server::speculative_dispatch::DEFAULT_PROMPT_LOOKUP_MAX_BATCH,
             max_batch_size: None,
             max_queue_depth: 32,
             audio_queue_depth: crate::server::config::DEFAULT_AUDIO_QUEUE_DEPTH,
@@ -695,7 +704,8 @@ impl Default for ServerStartupConfig {
                 crate::server::config::DEFAULT_EMBEDDING_REQUEST_TIMEOUT_SECS,
             reranker_model_path: None,
             rerank_batch_size: crate::server::config::DEFAULT_RERANK_BATCH_SIZE,
-            prefill_chunk_size: mlxcel_core::prefill_plan::prefill_chunk_len(),
+            prefill_chunk_size: prefill_chunk_policy.alone,
+            prefill_chunk_size_contended: prefill_chunk_policy.contended,
             batch_size_conflict: false,
             ubatch_size_provided: false,
             enable_preemption: false,
@@ -1537,6 +1547,49 @@ pub(super) fn resolve_chat_template(
     Ok(ChatTemplateProcessor::from_model_path(model_path)?.unwrap_or_default())
 }
 
+/// Load the tokenizer and the chat template the way `start_server` does,
+/// including the `enable_thinking` default for checkpoints whose tokenizer
+/// recognizes a think marker pair. Shared with the in-process server
+/// ([`crate::server::in_process`]) so `mlxcel run` renders prompts exactly as
+/// `/v1/chat/completions` does (issue #2173).
+pub(crate) fn load_chat_front(
+    startup: &ServerStartupConfig,
+) -> Result<(crate::tokenizer::MlxcelTokenizer, ChatTemplateProcessor)> {
+    let mut chat_template = resolve_chat_template(
+        startup.chat_template.as_deref(),
+        startup.chat_template_file.as_deref(),
+        &startup.model_path,
+    )?;
+    let tokenizer = crate::tokenizer::load_tokenizer(&startup.model_path)?;
+
+    // The one `enable_thinking` default every front applies
+    // (`server::chat_front`, #2176): on when the tokenizer recognizes a think
+    // marker pair, except for a template that wants thinking off (issue
+    // #686). Per-request kwargs and `--chat-template-kwargs` still win via
+    // `merge_server_and_request`.
+    if crate::server::chat_front::apply_thinking_default(&mut chat_template, &tokenizer) {
+        let thinking_markers = tokenizer.infer_thinking_markers();
+        tracing::info!(
+            think_start = ?thinking_markers.think_start,
+            think_end = ?thinking_markers.think_end,
+            think_start_tokens_len = thinking_markers
+                .think_start_tokens
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or(0),
+            think_end_tokens_len = thinking_markers
+                .think_end_tokens
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or(0),
+            "Tokenizer recognizes a think marker pair; defaulting \
+             chat_template kwarg `enable_thinking=true` (\
+             upstream PR #1114)"
+        );
+    }
+    Ok((tokenizer, chat_template))
+}
+
 /// Parse a preemption policy string from CLI into the enum.
 ///
 /// Accepts "longest-first" (default) and "lowest-priority" (case-insensitive).
@@ -1692,12 +1745,12 @@ pub(super) fn build_server_config(
         num_draft_tokens: startup.draft_max,
         // forward the speculative-decoding selector flags
         // verbatim. Reconciliation against the drafter `config.json`
-        // and dispatch into `MtpGenerator` / `DFlashGenerator` / the
-        // classic `SpeculativeGenerator` happens later inside the
-        // continuous-batching worker, when both the drafter path and
-        // the resolved kind are known.
+        // and dispatch into `MtpGenerator` / `DFlashGenerator` / plain
+        // decode happens later inside the continuous-batching worker,
+        // when both the drafter path and the resolved kind are known.
         draft_kind: startup.draft_kind.clone(),
         draft_block_size: startup.draft_block_size,
+        prompt_lookup_max_batch: startup.prompt_lookup_max_batch,
         max_batch_size,
         max_queue_depth: startup.max_queue_depth,
         audio_queue_depth: startup.audio_queue_depth,
@@ -1710,6 +1763,7 @@ pub(super) fn build_server_config(
         reranker_model_path: startup.reranker_model_path.clone(),
         rerank_batch_size: startup.rerank_batch_size,
         prefill_chunk_size: startup.prefill_chunk_size,
+        prefill_chunk_size_contended: startup.prefill_chunk_size_contended,
         // #1011: pass the explicit --prefill-grant-interval through untouched
         // (the scheduler resolves env / shipped default when this is None).
         prefill_grant_interval: startup.prefill_grant_interval,
@@ -1909,7 +1963,48 @@ fn initialize_server_logging(startup: &ServerStartupConfig) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn warmup_model(model_provider: &ModelProvider) -> Result<()> {
+/// Why the startup text warmup does not run for a model of `model_type`, or
+/// `None` when it runs. Shared by `start_server` and the in-process server
+/// (issue #2173) so both skip the same families.
+pub(crate) fn startup_warmup_skip_reason(
+    model_type: Option<crate::models::ModelType>,
+) -> Option<&'static str> {
+    use crate::models::ModelType;
+    match model_type? {
+        // Nemotron VoiceChat (issues #1374, #1376) has no chat worker to warm;
+        // its `/v1/realtime` engine thread warms EAR-TTS when a session opens.
+        ModelType::NemotronVoiceChat => {
+            Some("Skipping text warmup for Nemotron VoiceChat (served on /v1/realtime)")
+        }
+        // Florence-2 (issue #1073) and Nemotron-Parse (issue #1369) run on
+        // their seq2seq workers, which reject anything but a task marker with
+        // exactly one image, so the text literal "Hello" would only log a
+        // spurious failure. They warm on their first real request instead.
+        ModelType::Florence2VLM | ModelType::NemotronParseVLM => {
+            Some("Skipping text warmup for image-task seq2seq model (Florence-2 / Nemotron-Parse)")
+        }
+        _ => None,
+    }
+}
+
+/// Run the startup one-token warmup for the chat model at `model_path`,
+/// unless [`startup_warmup_skip_reason`] says its family cannot take it. A
+/// failed warmup is logged and never fatal: the first real request pays the
+/// cost instead.
+pub(crate) fn run_startup_warmup(model_path: &Path, model_provider: &ModelProvider) {
+    let model_type = crate::models::get_model_type(model_path).ok();
+    if let Some(reason) = startup_warmup_skip_reason(model_type) {
+        tracing::info!("{reason}");
+        return;
+    }
+    tracing::info!("Warming up model...");
+    match warmup_model(model_provider) {
+        Ok(()) => tracing::info!("Warmup complete"),
+        Err(err) => tracing::warn!("Warmup failed (non-fatal): {}", err),
+    }
+}
+
+pub(crate) fn warmup_model(model_provider: &ModelProvider) -> Result<()> {
     model_provider.generate(
         "Hello".to_string(),
         ServerGenerateOptions {
@@ -2891,19 +2986,6 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         Ok(crate::models::ModelType::NemotronVoiceChat)
     );
 
-    // Florence-2 (issue #1073): the encoder-decoder (seq2seq) family is
-    // served on its dedicated worker loop (`server/florence2_worker.rs`),
-    // which the model worker thread branches into after loading the
-    // checkpoint, before any decoder-only scheduler starts. The #856-era
-    // startup refusal is gone; the flag below only gates the text-only
-    // warmup, which cannot run against an image-task model.
-    // Nemotron-Parse (issue #1369) is an image-only seq2seq model served on
-    // its own worker too; a text warmup cannot run against it either.
-    let is_image_seq2seq = matches!(
-        crate::models::get_model_type(&startup.model_path),
-        Ok(crate::models::ModelType::Florence2VLM | crate::models::ModelType::NemotronParseVLM)
-    );
-
     // Issue #688 (M1/M2 hardening): disable CUDA graph capture for hazard-family
     // models (Gemma 4) here, on the main startup thread, before any generation or
     // pipeline worker is spawned and before the first GPU eval latches MLX's
@@ -3006,6 +3088,7 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
             kv_unified = startup.kv_unified,
             n_parallel = startup.n_parallel,
             prefill_chunk_size = startup.prefill_chunk_size,
+            prefill_chunk_size_contended = startup.prefill_chunk_size_contended,
             max_kv_size = ?startup.max_kv_size,
             "resolved context and batch geometry (0 = the checkpoint's own trained context)"
         );
@@ -3166,12 +3249,7 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     if let Some(service_config) = distributed.remote_stage_service {
         return serve_remote_pipeline_stage(service_config).await;
     }
-    let mut chat_template = resolve_chat_template(
-        startup.chat_template.as_deref(),
-        startup.chat_template_file.as_deref(),
-        &startup.model_path,
-    )?;
-    let tokenizer = crate::tokenizer::load_tokenizer(&startup.model_path)?;
+    let (tokenizer, chat_template) = load_chat_front(&startup)?;
 
     // `--dry-sequence-breaker` carries b10621's string value domain since
     // #1485; the effective set (default set, replacement values, or the
@@ -3184,44 +3262,6 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
             breakers = ?config.default_dry_sequence_breakers,
             "DRY sequence breakers active (b10621 semantics: breaker token data derived from the vocabulary per request)"
         );
-    }
-
-    // align the chat-template `enable_thinking` Jinja kwarg
-    // default with upstream `TokenizerWrapper.apply_chat_template`'s
-    // `enable_thinking=self.has_thinking` behavior. When the underlying
-    // tokenizer recognizes a think marker pair (single-token `<think>` /
-    // `</think>`, single-token `<longcat_think>` variants, or multi-token
-    // `<|channel>thought` / `<channel|>` for Gemma 4 and friends), the
-    // server-side default flips to `true` so a request that does not set
-    // `chat_template_kwargs.enable_thinking` still sees thinking enabled
-    // by default. Per-request kwargs and the existing CLI/env defaults
-    // (`--chat-template-kwargs`, `LLAMA_ARG_CHAT_TEMPLATE_KWARGS`)
-    // continue to win on conflict via `merge_server_and_request`.
-    let thinking_markers = tokenizer.infer_thinking_markers();
-    // Issue #686: the Gemma-4 thinking-channel template's thinking-OFF branch
-    // is the correct interactive default (a CLOSED `<|channel>thought\n<channel|>`
-    // priming scaffold matching transformers' no-`enable_thinking` render), so
-    // the `has_thinking` heuristic below must not flip it on; forcing thinking
-    // there produces a bare `<|turn>model\n` that greedy-collapses to `<pad>`.
-    if thinking_markers.has_thinking() && !chat_template.wants_thinking_default_off() {
-        tracing::info!(
-            think_start = ?thinking_markers.think_start,
-            think_end = ?thinking_markers.think_end,
-            think_start_tokens_len = thinking_markers
-                .think_start_tokens
-                .as_ref()
-                .map(Vec::len)
-                .unwrap_or(0),
-            think_end_tokens_len = thinking_markers
-                .think_end_tokens
-                .as_ref()
-                .map(Vec::len)
-                .unwrap_or(0),
-            "Tokenizer recognizes a think marker pair; defaulting \
-             chat_template kwarg `enable_thinking=true` (\
-             upstream PR #1114)"
-        );
-        chat_template.set_default_enable_thinking(true);
     }
 
     // If the serving role is "router", start the lightweight HTTP router front-end
@@ -3293,24 +3333,8 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         batch_observability.clone(),
     )?);
 
-    if startup.warmup && is_voicechat {
-        // No chat worker exists to warm, and the engine thread warms EAR-TTS
-        // itself when a session opens.
-        tracing::info!("Skipping text warmup for Nemotron VoiceChat (served on /v1/realtime)");
-    } else if startup.warmup && is_image_seq2seq {
-        // The warmup prompt is the text literal "Hello"; the Florence-2
-        // seq2seq worker rejects any request that is not a task marker with
-        // exactly one image, so a warmup attempt would only log a spurious
-        // failure. The worker warms on its first real request instead.
-        tracing::info!(
-            "Skipping text warmup for image-task seq2seq model (Florence-2 / Nemotron-Parse)"
-        );
-    } else if startup.warmup {
-        tracing::info!("Warming up model...");
-        match warmup_model(model_provider.as_ref()) {
-            Ok(()) => tracing::info!("Warmup complete"),
-            Err(err) => tracing::warn!("Warmup failed (non-fatal): {}", err),
-        }
+    if startup.warmup {
+        run_startup_warmup(&startup.model_path, model_provider.as_ref());
     }
 
     // Warn if operator requested a distinct /metrics port — not yet wired.
