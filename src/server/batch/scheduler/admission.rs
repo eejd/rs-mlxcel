@@ -362,7 +362,12 @@ impl BatchScheduler {
         // lands in a different digest bucket. Multimodal requests with sharing
         // off keep the legacy cold-prefill path (their pre-injection token
         // stream is not self-describing).
-        let ctx_ref = if is_multimodal && !vlm_sharing_ok {
+        // A guarded request must not restore/copy a warm snapshot while a
+        // preceding request is running. Keep retained snapshots in the measured
+        // resident baseline and run this request cold after final admission.
+        let ctx_ref = if (is_multimodal && !vlm_sharing_ok)
+            || (!is_multimodal && self.request_memory_policy_enabled())
+        {
             None
         } else {
             options.prompt_cache_ctx.as_ref()
@@ -504,7 +509,8 @@ impl BatchScheduler {
         // empty and the donate-back short-circuits. Multimodal requests are
         // stored only when VLM sharing is enabled (#124 step c); otherwise
         // they keep opting out of the cache entirely.
-        if self.prompt_cache_active()
+        if !self.request_memory_policy_enabled()
+            && self.prompt_cache_active()
             && (!is_multimodal || vlm_sharing_ok)
             && let Some(mut ctx) = options.prompt_cache_ctx.clone()
         {
