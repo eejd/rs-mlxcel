@@ -65,15 +65,8 @@ they are reproduced below:
     SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 
-mlx (Metal overlay and expm1f device routine)
-----------------------------------------------
-
-The whole-file Metal gated-delta overlay at
-src/lib/mlxcelverse/overlays/metal/mlx/backend/metal/kernels/gated_delta_update_nax.h
-is derived from MLX's gated_delta_update_nax.h
-(https://github.com/ml-explore/mlx/blob/main/mlx/backend/metal/kernels/gated_delta_update_nax.h),
-Copyright © 2026 Apple Inc. It starts from MLX revision 59d600b5e and carries
-an mlxcel compatibility patch for Xcode 27.
+mlx (expm1f device routine)
+----------------------------
 
 The fused xIELU Metal kernel in
 src/lib/mlxcel-core/cpp/mlx_cxx_kernels.cpp reproduces the device-side

@@ -1,7 +1,7 @@
 # PR #2138: Size Metal `gather_qmm_rhs` by the broadcast x rows
 
 **Date**: 2026-10-15
-**Status**: The current-main integration passes focused Metal and portability tests plus a fresh exact-release real-model A/B on M1 Ultra; exact source head `44045522` passes the complete candidate Metal nightly
+**Status**: Integrated with main `9bfabbab` after #2304; the remaining delta is attribution and reports, with production source identical to validated main
 **Risk**: Low (no-op for every production caller; changes behavior only for an x that `gather_qmm_rhs` has to broadcast)
 
 ## Summary
@@ -51,3 +51,11 @@ The normal merge of current main moved the Xcode 27 NAX compatibility file into 
 ## 5. Follow-up
 
 Report the call to ml-explore/mlx, and drop the hunk when a pin bump carries an upstream fix. Merge the separate rustls security prerequisite rather than suppressing its advisory gate. Keep #1599 open through merge and close it only after a green post-merge Metal nightly.
+
+## 6. Final integration after #2304
+
+Main `9bfabbab` already carries this PR's `B * M` correction and portable split-MTP tests through #2304. Resolve the CMake and Metal quantized-file conflicts by retaining those main versions. Upstream MLX `243bdf09` includes the Xcode 27 correction from ml-explore/mlx#4594, so remove the obsolete whole-file NAX overlay and its registration instead of restoring the old `59d600b5e` source. Remove only the obsolete overlay-specific NOTICE wording; retain the expanded MIT terms and the expm1f attribution.
+
+The resulting production tree is identical to main. Its exact pre-squash source `4befdbc7` passed Metal nightly [38583586205](https://github.com/lablup/mlxcel/actions/runs/38583586205): formatting, Clippy, 12,315 workspace tests (390 ignored), and 51 FFmpeg video tests. The earlier release-model evidence above remains attributed to its original source and is not a fresh run on the new pin. #2304 also already upgraded rustls to 0.23.46, resolving the security prerequisite described above.
+
+Keep #1599 open until a post-merge main Metal nightly succeeds. M5-specific execution remains unverified.

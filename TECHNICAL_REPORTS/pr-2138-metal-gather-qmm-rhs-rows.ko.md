@@ -1,7 +1,7 @@
 # PR #2138: Metal `gather_qmm_rhs`의 행 수를 broadcast된 x 기준으로 지정
 
 **작성일**: 2026-10-15
-**상태**: 현재 main 통합본은 M1 Ultra에서 집중 Metal·이식성 테스트와 새 exact-release 실제 모델 A/B를 통과. 정확한 소스 head `44045522`는 전체 후보 Metal nightly를 통과
+**상태**: #2304 이후 main `9bfabbab`과 통합. 남은 변경은 출처 표시와 보고서이며 프로덕션 소스는 검증된 main과 동일
 **위험도**: 낮음 (모든 프로덕션 호출에서 no-op이며, `gather_qmm_rhs`가 x를 broadcast해야 하는 경우에만 동작이 바뀜)
 
 ## 요약
@@ -51,3 +51,11 @@ mxfp 테스트는 2026-09-30 #2071 (2cee9cf4)과 함께 추가되었으므로, �
 ## 5. 후속 작업
 
 ml-explore/mlx에 이 호출을 보고하고, upstream 수정이 포함된 pin bump 때 이 hunk를 제거한다. rustls 권고 gate를 억제하지 말고 별도 보안 선행 PR을 merge한다. #1599는 merge 후에도 열어 두고 post-merge Metal nightly가 통과한 뒤에만 닫는다.
+
+## 6. #2304 이후 최종 통합
+
+Main `9bfabbab`에는 #2304를 통해 이 PR의 `B * M` 수정과 split-MTP 이식성 테스트가 이미 포함됐다. CMake와 Metal quantized 파일의 충돌은 해당 main 버전을 유지해 해결했다. Upstream MLX `243bdf09`에는 ml-explore/mlx#4594의 Xcode 27 수정이 있으므로, 오래된 `59d600b5e` 전체 파일을 복원하지 않고 중복 NAX overlay와 등록을 제거했다. NOTICE에서는 제거된 overlay 설명만 삭제하고 확장된 MIT 조건과 expm1f 출처 표시는 유지했다.
+
+결과 프로덕션 트리는 main과 동일하다. 정확한 squash 이전 소스 `4befdbc7`의 Metal nightly [38583586205](https://github.com/lablup/mlxcel/actions/runs/38583586205)는 formatting, Clippy, workspace 테스트 12,315개(390개 ignored), FFmpeg video 테스트 51개를 통과했다. 위 release 모델 검증은 원래 소스에 대한 증거이며 새 pin에서 재실행한 결과가 아니다. #2304가 rustls도 0.23.46으로 올렸으므로 위 보안 선행 조건은 해결됐다.
+
+#1599는 merge 후 main Metal nightly가 통과할 때까지 열어 둔다. M5 전용 실행은 아직 검증하지 못했다.
