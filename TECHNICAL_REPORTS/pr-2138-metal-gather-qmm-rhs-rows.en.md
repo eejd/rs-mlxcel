@@ -1,7 +1,7 @@
 # PR #2138: Size Metal `gather_qmm_rhs` by the broadcast x rows
 
-**Date**: 2026-10-14
-**Status**: The kernel fix passed focused Metal and model-smoke validation on M1 Ultra at exact head `25202198`; the refreshed #1599 change passes Linux build, focused tests, contracts, and independent review and the refreshed candidate Metal nightly
+**Date**: 2026-10-15
+**Status**: The current-main integration passes focused Metal and portability tests plus a fresh exact-release real-model A/B on M1 Ultra; exact source head `44045522` passes the complete candidate Metal nightly
 **Risk**: Low (no-op for every production caller; changes behavior only for an x that `gather_qmm_rhs` has to broadcast)
 
 ## Summary
@@ -34,16 +34,20 @@ The mxfp tests arrived with #2071 (2cee9cf4) on 2026-09-30, so the last signatur
 
 The split-MTP test for `.` and `..` outputs now compares the staging parent with the canonical temporary-directory path, matching the resolver's intentional behavior on macOS where `/var` resolves to `/private/var`. The non-UTF-8 test first probes the temporary filesystem: filesystems that accept the byte name retain the successful round trip, while rejecting filesystems must return the same I/O error and leave no output or staging entry.
 
+The normal merge of current main moved the Xcode 27 NAX compatibility file into `src/lib/mlxcelverse/overlays/metal/`. Because that overlay is a whole-file derivative of MLX, its preserved Apple header now has the required MLX source URL, MIT-license statement, and top-level `NOTICE` pointer. `NOTICE` covers the whole overlay and carries MLX's copyright and MIT terms, while the README acknowledgment identifies the licensed reuse.
+
 ## 4. Validation
 
 - Historical exact-head Metal gate: Apple M1 Ultra (128 GB), macOS 27.0 (26A428), full Xcode 27 RC, PR head `25202198` on base `b34d517b`. All five `models::switch_layers::mxfp_tests` passed with the Metal overlay rebuilt, and the release build passed.
 - Historical exact-head model smoke: Qwen3-30B-A3B-4bit, greedy 64 tokens, produced byte-identical text on base, repeated base, and PR; SHA-256 `d2f40b2d5831c3d7790d467fb51123f0d1f615fb7300aa2f92d86a9d8831a0de`.
 - CUDA (GB10): the original PR branch built and all 32 `models::switch_layers` tests passed. This does not validate Metal.
-- Refreshed #1599 Linux candidate: the exact `mlxcel` plus `mlxcel-surgery` CUDA test graph compiled successfully in 25m54s. Both focused portability tests pass (2/2), repository contracts pass (123 Python tests and 49 WebUI fixtures), and formatting and diff checks pass.
-- Independent review found no source, security, or documentation issue in the three-source-file change, canonical source SHA-256 `2e36ccb93dfe3fa49206f5741249ebb45c49d3e9e19195f94f6d1282e55155a5`.
-- Main `398f9ba8`, containing the independently tested Kimi Linear chunked-prefill fix, was merged afterward without overlap. The #1599 native graph was not rebuilt for that unrelated sync; PR CI and the final integrated gate cover it.
-- Candidate Metal nightly [38418557399](https://github.com/lablup/mlxcel/actions/runs/38418557399) passed at source head `2dbffe6d` on `lablup-macmini01`: formatting, Clippy, 12,283 tests (390 ignored), and 51 video tests. No current-head model smoke is claimed; the historical exact-head checkpoint evidence remains separate.
+- Current-main integration: main `59974283` was merged normally into the existing PR branch at `44045522`. The sole merge conflict was the NAX overlay's move from `src/lib/mlx-cpp` to `src/lib/mlxcelverse`; the quantized-kernel hunk, split-MTP tests, and overlay registration merged without semantic conflict. The five focused `models::switch_layers::mxfp_tests` pass under `--profile test-fast --features metal,accelerate`, and both focused split-MTP portability tests pass. Formatting, diff, license-header, MLX-pin parser, and cross-repository-reference checks pass.
+- Fresh release real-model A/B: the compatibility baseline was built from `44045522` with only `quantized.cpp` restored from main `59974283`, excluding the `B * M` change while holding the Xcode 27 NAX compatibility overlay and all other source equal. It is explicitly not a pristine-main artifact. Its SHA-256 is `d76febfc9adb23ca6bc627310994c108cc4e721c26341ef7f49ab092a89db651`; the exact `44045522` candidate SHA-256 is `ee83df3db3cea7159579487718419d4329c7fbeb147655cb1847a6867b13a872`.
+- Both release artifacts ran twice on Qwen3-30B-A3B-4bit with `MLXCEL_FUSED_MOE=0`, greedy decoding, no chat template, a 96-token repeated-word prompt, and 64 generated tokens. Qwen3 routes each token to 8 of 128 experts, so prefill covers about 768 expert-route slots per MoE layer, comfortably above the 64-slot boundary. All four generated texts are byte-identical: 962 bytes, SHA-256 `cbf1670d0b554a35c029ec4104ae3ecfc8a46e07296d7e33a5f3b2c214a5fa8f`. Timings varied and are not used for a performance claim.
+- The exact-source candidate Metal nightly [38582194425](https://github.com/lablup/mlxcel/actions/runs/38582194425) passed at `44045522` on `lablup-macmini01`: formatting, Clippy, 12,316 general tests (390 ignored), and 51 video tests, with zero failures.
+- Review found no remaining functional or security issue in the #1599 implementation. It identified a high-severity attribution gap in the whole-file MLX NAX overlay; the header, `NOTICE`, and README changes described above fix it, and the attribution patch passed follow-up review and the repository license-header check.
+- PR CI's `cargo-deny` job exposed four rustls 0.23.45 advisories published on 2026-10-14. Exact main `59974283` locks the same version, so this is a base-wide prerequisite rather than a regression from #1599. It is not waived: issue #2312 and lock-only PR #2313 update rustls to 0.23.46 separately.
 
 ## 5. Follow-up
 
-Report the call to ml-explore/mlx, and drop the hunk when a pin bump carries an upstream fix. Keep #1599 open through merge and close it only after a green post-merge Metal nightly.
+Report the call to ml-explore/mlx, and drop the hunk when a pin bump carries an upstream fix. Merge the separate rustls security prerequisite rather than suppressing its advisory gate. Keep #1599 open through merge and close it only after a green post-merge Metal nightly.

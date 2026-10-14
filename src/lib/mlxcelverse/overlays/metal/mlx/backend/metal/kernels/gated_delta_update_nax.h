@@ -1,9 +1,13 @@
 // Copyright © 2026 Apple Inc.
 //
-// Modified from upstream MLX 59d600b5e mlx/backend/metal/kernels/gated_delta_update_nax.h
-// Patched by mlxcel for Xcode 27: strip local `thread` address-space
-// qualifiers before forming MPP destination cooperative tensors. This
-// matches MLX's existing steel NAX helpers and ml-explore/mlx#4594.
+// This file is derived from MLX
+// (https://github.com/ml-explore/mlx/blob/main/mlx/backend/metal/kernels/gated_delta_update_nax.h),
+// Copyright © 2026 Apple Inc., licensed under the MIT License. See the
+// top-level NOTICE file for the attribution carried forward under the MIT License.
+//
+// The overlay starts from MLX commit 59d600b5e and strips local `thread`
+// address-space qualifiers before forming MPP destination cooperative tensors
+// for Xcode 27. This matches MLX's existing steel NAX helpers and ml-explore/mlx#4594.
 #pragma once
 
 #include <metal_stdlib>
