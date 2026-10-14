@@ -33,7 +33,7 @@ The source passed independent implementation review. The root and surgery CUDA `
 
 ## Dependency refresh
 
-The validation above was recorded before the branch merged main commit `4b0c4519` from PR #2298. The merge commit `4cc9b87d` brings in the new MLX pin and CUDA/Metal overlay bases without changing the reviewed model files: `afmoe.rs` remains SHA-256 `7f00690db48937f9e5a2810f9c26307e50dd1d5b14ea1810cd216f75d1d3466c`, and `afmoe_tests.rs` remains `844cbce7258e750cface1aa24b7f64a925b2c8c79524159a411c53de25d71a12`. Focused runtime revalidation on the new pin is pending and is not claimed by this report.
+The validation above was recorded before the branch merged main commit `4b0c4519` from PR #2298. The merge commit `4cc9b87d` brings in the new MLX pin and CUDA/Metal overlay bases without changing the reviewed model files: `afmoe.rs` remains SHA-256 `7f00690db48937f9e5a2810f9c26307e50dd1d5b14ea1810cd216f75d1d3466c`, and `afmoe_tests.rs` remains `844cbce7258e750cface1aa24b7f64a925b2c8c79524159a411c53de25d71a12`. Fresh runtime validation after the final pin integration is recorded below.
 
 ## Memory tradeoff
 
@@ -42,3 +42,7 @@ The validation above was recorded before the branch merged main commit `4b0c4519
 ## Scope
 
 The change preserves independent-prompt reset behavior, stable-ID server state, cache modes, quantization loading, padded-prefill policy, and snapshot behavior. It changes only the chunking capability and adds lifecycle coverage.
+
+## Final integration validation
+
+Integrated main `a2698835`, including MLX `243bdf09`, mlxcelverse, and preceding model fixes, without source conflicts. The rebuilt CUDA `test-fast` binary passes all 29 `models::afmoe` tests, including loaded mixed sliding/full-attention cache lifecycle and snapshot coverage. No-ID prompts reset all six caches, while stable-ID chunks advance every cache continuously. Formatting and diff checks pass. This is loaded synthetic-weight validation, not an external-checkpoint run.

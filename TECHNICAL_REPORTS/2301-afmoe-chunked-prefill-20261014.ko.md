@@ -33,7 +33,7 @@ DirectEngine은 이미 prefill 조각 전체에 같은 sequence ID를 전달하�
 
 ## 의존성 갱신
 
-위 검증 결과는 브랜치가 PR #2298의 main commit `4b0c4519`를 병합하기 전에 기록했습니다. Merge commit `4cc9b87d`는 새 MLX pin과 CUDA/Metal overlay base를 가져오지만 검토한 model file을 바꾸지 않았습니다. `afmoe.rs`의 SHA-256은 `7f00690db48937f9e5a2810f9c26307e50dd1d5b14ea1810cd216f75d1d3466c`, `afmoe_tests.rs`는 `844cbce7258e750cface1aa24b7f64a925b2c8c79524159a411c53de25d71a12`로 유지됩니다. 새 pin의 focused runtime 재검증은 대기 중이며 이 보고서는 해당 결과를 주장하지 않습니다.
+위 검증 결과는 브랜치가 PR #2298의 main commit `4b0c4519`를 병합하기 전에 기록했습니다. Merge commit `4cc9b87d`는 새 MLX pin과 CUDA/Metal overlay base를 가져오지만 검토한 model file을 바꾸지 않았습니다. `afmoe.rs`의 SHA-256은 `7f00690db48937f9e5a2810f9c26307e50dd1d5b14ea1810cd216f75d1d3466c`, `afmoe_tests.rs`는 `844cbce7258e750cface1aa24b7f64a925b2c8c79524159a411c53de25d71a12`로 유지됩니다. 최종 pin 통합 후 새 focused runtime 검증 결과는 아래에 기록합니다.
 
 ## 메모리 트레이드오프
 
@@ -42,3 +42,7 @@ DirectEngine은 이미 prefill 조각 전체에 같은 sequence ID를 전달하�
 ## 범위
 
 이 변경은 독립 프롬프트 초기화, stable-ID server state, cache mode, quantization loading, padded-prefill 정책, snapshot 동작을 유지합니다. Chunking capability만 바꾸고 lifecycle coverage를 추가합니다.
+
+## 최종 통합 검증
+
+MLX `243bdf09`, mlxcelverse, 앞서 머지한 모델 수정을 포함한 main `a2698835`를 소스 충돌 없이 통합했다. 다시 빌드한 CUDA `test-fast` binary에서 `models::afmoe` 테스트 29개가 모두 통과했다. 가중치를 적재한 sliding/full attention 혼합 캐시 lifecycle과 snapshot 검증을 포함한다. ID 없는 prompt는 6개 캐시를 모두 초기화하고, 같은 ID의 청크는 모든 캐시를 연속해서 전진시킨다. Formatting과 diff 검사도 통과했다. 합성 가중치 적재 검증이며 외부 체크포인트 실행을 주장하지 않는다.
