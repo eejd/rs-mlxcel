@@ -32,3 +32,7 @@ Capability는 sequence ID 유무에 따른 지원 여부를 표현할 수 없습
 ## 변경 요약
 
 모델에 capability override 하나를 추가하고 기존의 0이 아닌 결정적 fixture fill을 helper로 분리하며 새 의존성 없이 loaded-model state-contract 회귀 테스트 하나를 추가합니다.
+
+## 최종 통합 검증
+
+MLX `243bdf09`, mlxcelverse, 앞서 머지한 추론 수정을 포함한 main `b159c89d`를 소스 충돌 없이 통합했다. 다시 빌드한 CUDA `test-fast` binary에서 `models::bailing_moe_linear` 테스트 36개가 모두 통과했다. 가중치를 적재한 6-layer 요청 상태 회귀 테스트를 포함하며, 최종 pin에서 ID 없는 prompt의 초기화와 같은 ID의 연속 처리를 새로 검증했다. Formatting과 diff 검사도 통과했다. 합성 가중치를 적재한 모델을 사용했으며 외부 체크포인트 추론을 주장하지 않는다.

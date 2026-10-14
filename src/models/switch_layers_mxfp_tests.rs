@@ -35,7 +35,7 @@
 //!
 //! # Which ROCm branches this reaches
 //!
-//! `GatherQMM::eval_gpu` in `patches-rocm/mlx/backend/rocm/quantized/qmm.hip`
+//! `GatherQMM::eval_gpu` in `overlays/rocm/mlx/backend/rocm/quantized/qmm.hip`
 //! gates every specialised path (grouped WMMA prefill, expert-batched, tiled,
 //! wide, idot and the warp-shared fast kernel) on `mode_ == Affine`, so a
 //! non-affine mode reaches exactly one launch: the
@@ -503,6 +503,22 @@ fn mxfp8_gather_qmm_matches_host_reference() {
 fn mxfp4_gather_qmm_matches_host_reference() {
     let _device = lock_default_device();
     check_gather(Mode::Mxfp4, OUT_FEATURES, &GATHER_CASES, &ACTIVATIONS);
+}
+
+/// Unlike the 320-wide tail cases, this width admits CUDA's sorted RHS GEMM.
+/// gather_sort expands 32 tokens x 4 experts into 128 physical rows, also
+/// exercising the consumer Blackwell 128-row CTA policy.
+#[test]
+fn mxfp_sorted_prefill_aligned_width_matches_host_reference() {
+    let _device = lock_default_device();
+    for mode in [Mode::Mxfp4, Mode::Mxfp8] {
+        check_gather(
+            mode,
+            384,
+            &[GatherCase::PrefillSorted],
+            &[ACTIVATIONS[0], ACTIVATIONS[1]],
+        );
+    }
 }
 
 #[test]

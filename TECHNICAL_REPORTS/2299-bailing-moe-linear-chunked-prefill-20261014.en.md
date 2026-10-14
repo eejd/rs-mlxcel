@@ -32,3 +32,7 @@ The capability cannot express support conditional on a sequence ID. Every honori
 ## Change summary
 
 The model adds one capability override, factors the existing deterministic nonzero fixture fill into a helper, and adds one loaded-model state-contract regression without new dependencies.
+
+## Final integration validation
+
+Integrated main `b159c89d`, including MLX `243bdf09`, mlxcelverse, and the preceding inference fixes, without source conflicts. The rebuilt CUDA `test-fast` binary passes all 36 `models::bailing_moe_linear` tests, including the loaded six-layer request-state regression. This freshly checks no-ID prompt reset and stable-ID continuation on the final pin. Formatting and diff checks pass. The model uses synthetic loaded weights; no external-checkpoint inference result is claimed.

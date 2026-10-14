@@ -256,19 +256,30 @@ debug: build ## Alias for build (debug mode)
 # the host: CUDA on Linux, Metal on macOS.
 
 IREE_CUDA_SCRIPT := scripts/iree/setup-cuda.sh
+IREE_ROCM_SCRIPT := scripts/iree/setup-rocm.sh
 IREE_MACOS_SCRIPT := scripts/iree/setup-macos.sh
 
 .PHONY: iree
-iree: ## Set up the IREE backend toolchain for this host (CUDA/Linux, Metal/macOS)
+iree: ## Set up the IREE backend toolchain for this host (CUDA or ROCm on Linux, Metal on macOS)
 ifeq ($(UNAME_S),Darwin)
 	@$(MAKE) --no-print-directory iree-metal
 else
-	@$(MAKE) --no-print-directory iree-cuda
+	@if command -v nvcc >/dev/null 2>&1 || [ -d /usr/local/cuda ]; then \
+		$(MAKE) --no-print-directory iree-cuda; \
+	elif [ -x /opt/rocm/bin/rocminfo ] || [ -e /dev/kfd ]; then \
+		$(MAKE) --no-print-directory iree-rocm; \
+	else \
+		$(MAKE) --no-print-directory iree-cuda; \
+	fi
 endif
 
 .PHONY: iree-cuda
 iree-cuda: ## Set up the IREE CUDA toolchain (Linux/NVIDIA)
 	@$(IREE_CUDA_SCRIPT)
+
+.PHONY: iree-rocm
+iree-rocm: ## Set up the IREE ROCm/HIP toolchain (Linux/AMD)
+	@$(IREE_ROCM_SCRIPT)
 
 .PHONY: iree-metal
 iree-metal: ## Set up the IREE Metal toolchain (macOS/Apple Silicon)
@@ -279,7 +290,13 @@ iree-env: ## Print the resolved IREE toolchain paths + pinned version
 ifeq ($(UNAME_S),Darwin)
 	@$(IREE_MACOS_SCRIPT) --info
 else
-	@$(IREE_CUDA_SCRIPT) --info
+	@if command -v nvcc >/dev/null 2>&1 || [ -d /usr/local/cuda ]; then \
+		$(IREE_CUDA_SCRIPT) --info; \
+	elif [ -x /opt/rocm/bin/rocminfo ] || [ -e /dev/kfd ]; then \
+		$(IREE_ROCM_SCRIPT) --info; \
+	else \
+		$(IREE_CUDA_SCRIPT) --info; \
+	fi
 endif
 
 # ============================================================================
@@ -859,7 +876,7 @@ verify-python-tooling: ## Run the tests/ Python suites (bench, GPU guard, qualit
 	@python3 -m unittest discover -s tests -p 'test_*.py'
 
 # Offline half of the mlxcelverse ROCm overlay checks (issue #1813). It reads
-# only files in this repository: patches-rocm/UPSTREAM must name the build's MLX
+# only files in this repository: overlays/rocm/UPSTREAM must name the build's MLX
 # pin (so a pin bump that skips the ROCm retarget fails here, on any host, not
 # first on an AMD machine), the README counts must be the real ones,
 # LOCAL_FIXES.md must be numbered without gaps, and CORE_RESIDUAL.diff must have
@@ -874,6 +891,7 @@ verify-rocm-overlay: ## Assert the ROCm overlay records agree with the MLX pin a
 	@echo "$(CYAN)[verify] ROCm overlay records...$(RESET)"
 	@python3 scripts/mlxcelverse/rocm_overlay.py records
 	@bash scripts/mlxcelverse/rocm_overlay_test.sh
+	@bash scripts/mlxcelverse/allocator_ownership_test.sh
 
 .PHONY: verify-binary-assets
 verify-binary-assets: ## Assert every tracked binary file is declared with a size budget
