@@ -8,7 +8,7 @@ The dependency advances from `59d600b5e64c238427d0f8d897ab7c682ef4d3d2` to `243b
 
 The original 32 files comprise 30 upstream-backed overlays and two local extracted helpers. Thirteen upstream-backed files changed relative to their declared bases; eleven were rebased and two were retired. The other seventeen upstream-backed files have zero path-specific commits between their declared base and the target, so their original provenance remains valid. The helpers have no upstream path to replace. There are 30 files after retirement.
 
-Paths below are relative to `patches/mlx/backend/`, except `dtype.cpp`, `fast.cpp` and `ops.cpp` under `patches-cuda/`.
+Paths below use upstream backend-relative names. After the #2305 layout migration, `<backend>/<path>` maps to `src/lib/mlxcelverse/overlays/<backend>/mlx/backend/<backend>/<path>`; `dtype.cpp`, `fast.cpp` and `ops.cpp` live under `src/lib/mlxcelverse/overlays/cuda/mlx/`.
 
 | Path | Previous base | Disposition | Retained behavior / evidence |
 | --- | --- | --- | --- |
@@ -59,7 +59,7 @@ The same PR's two filesystem-portability test corrections are retained for candi
 
 The upstream allocator returns move-only `allocator::Data`, and array donation requires allocator-owned storage. CUDA column-reduction intermediates now consume Data directly; upstream's removed free callback is not reintroduced. The remaining CPU/CUDA/Metal allocations already pass allocator results directly into arrays, preserving the owner and encoder temporary lifetime. The custom C++ bridge's `from_bytes_nocopy` uses the unchanged public raw-pointer/deleter constructor, which upstream now marks non-owned; `kv_inplace_write` uses `copy_shared_buffer`, preserving shared lifetime. `fused_rope_append` delegates allocation to upstream CustomKernel and has no raw allocation handoff to migrate.
 
-ROCm requires an explicit owned-data friend because the public Data constructor with a deleter intentionally represents borrowed storage. Its retarget and backend compatibility changes are recorded in `patches-rocm/LOCAL_FIXES.md` and `CORE_RESIDUAL.diff`. The fork remains `75915908dfe5028335d318b10340313744fd3a8d`. The host allocator regression uses the actual overlay header and wrapper; it tests moved ownership, borrowed custom release, empty allocations, pending shared ownership and exception cleanup. It does not execute HIP or prove GPU completion ordering.
+ROCm requires an explicit owned-data friend because the public Data constructor with a deleter intentionally represents borrowed storage. Its retarget and backend compatibility changes are recorded in `src/lib/mlxcelverse/overlays/rocm/LOCAL_FIXES.md` and `CORE_RESIDUAL.diff`. The fork remains `75915908dfe5028335d318b10340313744fd3a8d`. The host allocator regression uses the actual overlay header and wrapper; it tests moved ownership, borrowed custom release, empty allocations, pending shared ownership and exception cleanup. It does not execute HIP or prove GPU completion ordering.
 
 The upstream version moves from 0.32.3 to 0.32.4, giving default CUDA PTX caches a new namespace. Validation uses a fresh cache when an explicit `MLX_PTX_CACHE_DIR` override is supplied.
 

@@ -16,7 +16,7 @@
 # Exercise the move-only ROCm allocation boundary with a host mock, without HIP.
 set -euo pipefail
 repo_root=$(cd "$(dirname "$0")/../.." && pwd)
-overlay="$repo_root/src/lib/mlx-cpp/patches-rocm"
+overlay="$repo_root/src/lib/mlxcelverse/overlays/rocm"
 test_dir=$(mktemp -d "${TMPDIR:-/tmp}/rocm-ownership.XXXXXX")
 trap 'rm -rf "$test_dir"' EXIT
 mkdir -p "$test_dir/mlx"
