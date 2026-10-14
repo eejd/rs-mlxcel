@@ -786,6 +786,17 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                         .file_name()
                         .map(|name| name.to_string_lossy().into_owned()),
                 );
+                scheduler.set_request_memory_worker_path(
+                    crate::server::model_provider::request_memory_worker_path_supported(
+                        sched_config.pipeline_parallel_runtime.is_some(),
+                        sched_config.tensor_parallel.tp_size,
+                        sched_config.serving_mode,
+                        !matches!(
+                            sched_config.speculative_dispatch,
+                            crate::server::SpeculativeDispatch::Disabled
+                        ),
+                    ),
+                );
 
                 // The request that woke this worker from idle sleep is prefilled by
                 // the scheduler it just rebuilt, not answered separately (#1440):
@@ -1338,6 +1349,14 @@ pub(crate) fn spawn_legacy_model_worker(
             ))
             .with_xtc_newline_token_ids(xtc_newline_token_ids)
             .with_reasoning_budget(reasoning_budget, thinking_ids);
+            scheduler.set_request_memory_worker_path(
+                crate::server::model_provider::request_memory_worker_path_supported(
+                    false,
+                    tensor_parallel.tp_size,
+                    crate::distributed::disaggregated::ServingMode::Hybrid,
+                    false,
+                ),
+            );
             scheduler.serve();
         })
     })

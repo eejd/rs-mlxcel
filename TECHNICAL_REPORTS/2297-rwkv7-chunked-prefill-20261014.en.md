@@ -32,7 +32,7 @@ The broader contract gate also passed across a controlled retry. The initial run
 
 ## Dependency refresh
 
-The validation above was recorded before the branch merged main commit `4b0c4519` from PR #2298. The merge commit `9b05507b` brings in the new MLX pin and CUDA/Metal overlay bases without changing `src/models/rwkv7.rs`; its SHA-256 remains `fa18e8e5e33f4af42fe7c7c8574e55db8578f90724d3a70d0cad4a7cf10adea7`. Focused runtime revalidation on the new pin is pending and is not claimed by this report.
+The validation above was recorded before the branch merged main commit `4b0c4519` from PR #2298. The merge commit `9b05507b` brings in the new MLX pin and CUDA/Metal overlay bases without changing `src/models/rwkv7.rs`; its SHA-256 remains `fa18e8e5e33f4af42fe7c7c8574e55db8578f90724d3a70d0cad4a7cf10adea7`. Fresh runtime validation after the final pin integration is recorded below.
 
 ## Tradeoff
 
@@ -41,3 +41,9 @@ Every caller that honors the model capability, including DirectEngine and cache-
 ## Change summary
 
 One Rust model file changes. Production changes include the capability override and one recurrent output-axis correction. The regression adds one loaded-model contract test without new dependencies.
+
+## Final integration validation
+
+Merged main `d3cf28ac`, including MLX `243bdf09`, the mlxcelverse migration, and the Kimi inference fix, without source conflicts. The rebuilt CUDA `test-fast` unit binary passes all five `models::rwkv7` tests, including the loaded nonzero-weight contract regression. This revalidates output shape, no-ID prompt reset, and stable-ID split continuation on the final pin. Formatting and diff checks pass. The fixture result is not an external checkpoint inference claim.
+
+The refreshed Clippy gate also found a test-fixture style warning in the parity calculation. Replace `% 2 == 0` with `is_multiple_of(2)` without changing generated weights.

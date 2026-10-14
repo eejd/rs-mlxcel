@@ -1149,7 +1149,7 @@ mod tests {
         let values: Vec<f32> = (0..len)
             .map(|index| {
                 let magnitude = ((index + seed) % 17 + 1) as f32 * 0.005;
-                if (index + seed) % 2 == 0 {
+                if (index + seed).is_multiple_of(2) {
                     magnitude
                 } else {
                     -magnitude

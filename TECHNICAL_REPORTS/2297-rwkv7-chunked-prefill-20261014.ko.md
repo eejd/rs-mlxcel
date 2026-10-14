@@ -32,7 +32,7 @@ Focused GPU 검증 중 실제 one-layer fixture가 `(2,4)`와 `(1,1,2,4,1)` shap
 
 ## 의존성 갱신
 
-위 검증 결과는 브랜치가 PR #2298의 main commit `4b0c4519`를 병합하기 전에 기록했습니다. Merge commit `9b05507b`는 새 MLX pin과 CUDA/Metal overlay base를 가져오지만 `src/models/rwkv7.rs`를 바꾸지 않았고, 해당 파일의 SHA-256은 `fa18e8e5e33f4af42fe7c7c8574e55db8578f90724d3a70d0cad4a7cf10adea7`로 유지됩니다. 새 pin의 focused runtime 재검증은 대기 중이며 이 보고서는 해당 결과를 주장하지 않습니다.
+위 검증 결과는 브랜치가 PR #2298의 main commit `4b0c4519`를 병합하기 전에 기록했습니다. Merge commit `9b05507b`는 새 MLX pin과 CUDA/Metal overlay base를 가져오지만 `src/models/rwkv7.rs`를 바꾸지 않았고, 해당 파일의 SHA-256은 `fa18e8e5e33f4af42fe7c7c8574e55db8578f90724d3a70d0cad4a7cf10adea7`로 유지됩니다. 최종 pin 통합 후 새 focused runtime 검증 결과는 아래에 기록합니다.
 
 ## 트레이드오프
 
@@ -41,3 +41,9 @@ Focused GPU 검증 중 실제 one-layer fixture가 `(2,4)`와 `(1,1,2,4,1)` shap
 ## 변경 요약
 
 Rust 모델 파일 하나를 변경합니다. Production 변경은 capability override와 recurrent 출력 축 수정 하나이며, 새 의존성 없이 실제 loaded-model contract test 하나를 추가합니다.
+
+## 최종 통합 검증
+
+MLX `243bdf09`, mlxcelverse 경로 변경, Kimi 추론 수정을 포함한 main `d3cf28ac`을 소스 충돌 없이 통합했다. 다시 빌드한 CUDA `test-fast` unit binary에서 `models::rwkv7` 테스트 5개가 모두 통과했다. 비영 가중치를 적재한 계약 회귀 테스트를 포함하며, 최종 pin에서 출력 형태, ID 없는 prompt의 상태 초기화, 같은 ID를 사용하는 분할 연속 처리를 재검증했다. 위에서 대기로 기록한 pin 갱신 후 검증은 이 실행으로 완료됐다. Formatting과 diff 검사도 통과했다. 외부 체크포인트 추론 결과를 주장하지 않는다.
+
+갱신된 Clippy 검사에서 테스트 fixture의 짝수 판정 표기 경고도 발견했다. `% 2 == 0`을 `is_multiple_of(2)`로 바꿨으며 생성되는 가중치는 동일하다.
