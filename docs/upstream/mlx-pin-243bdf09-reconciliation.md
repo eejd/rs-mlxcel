@@ -6,7 +6,7 @@ The dependency advances from `59d600b5e64c238427d0f8d897ab7c682ef4d3d2` to `243b
 
 ## CPU, CUDA and Metal inventory
 
-The original 32 files comprise 30 upstream-backed overlays and two local extracted helpers. Thirteen upstream-backed files changed relative to their declared bases; twelve were rebased and one was retired. The other seventeen upstream-backed files have zero path-specific commits between their declared base and the target, so their original provenance remains valid. The helpers have no upstream path to replace. There are 31 files after retirement.
+The original 32 files comprise 30 upstream-backed overlays and two local extracted helpers. Thirteen upstream-backed files changed relative to their declared bases; eleven were rebased and two were retired. The other seventeen upstream-backed files have zero path-specific commits between their declared base and the target, so their original provenance remains valid. The helpers have no upstream path to replace. There are 30 files after retirement.
 
 Paths below are relative to `patches/mlx/backend/`, except `dtype.cpp`, `fast.cpp` and `ops.cpp` under `patches-cuda/`.
 
@@ -18,7 +18,7 @@ Paths below are relative to `patches/mlx/backend/`, except `dtype.cpp`, `fast.cp
 | `cuda/device/binary_ops.cuh` | `81ba1c6a` | Unchanged; zero drift | Mixed-type operators in runtime-compiled graphs. |
 | `cuda/device/gemm_sm70.cuh` | `9a795735` | Unchanged; zero drift | Volta tensor-core MMA path. |
 | `cuda/device/qmm_naive.cuh` | `59d600b5e` | Unchanged; zero drift | Volta MMA dispatch parameterization. |
-| `cuda/device/qmm_sm80.cuh` | `b7c3dd6d` | Rebased | Drain cp.async and synchronize before the aliased shared-memory epilogue (#910). |
+| `cuda/device/qmm_sm80.cuh` | `b7c3dd6d` | Retired | Upstream #4554 drains cp.async and synchronizes before the aliased shared-memory epilogue (#910). |
 | `cuda/gemms/grouped_gemm.h` | `b98831ad` | Unchanged; zero drift | Local grouped GEMM dispatch declarations. |
 | `cuda/gemms/grouped_gemm_arch.h` | `9a795735` | Local helper | Local extracted architecture selector with host-test coverage (#1544). |
 | `cuda/gemms/grouped_gemm_unaligned.cu` | `c9aa5605` | Unchanged; zero drift | Grouped GEMM architecture selection and local kernel dispatch. |
@@ -48,6 +48,8 @@ Paths below are relative to `patches/mlx/backend/`, except `dtype.cpp`, `fast.cp
 Three-way conflict review retained the local normalization compute dtype together with upstream's explicit stream argument. CUDA `GatherQMM` preserves the new `fp_gather_qmv` selection while feeding its index/output chunks through the existing batch limiter. The new expert-grouped `gather_qmm_rhs_sm80` route remains upstream's implementation.
 
 Upstream [#4514](https://github.com/ml-explore/mlx/pull/4514), `9eb3e3ab6fceb4031994f70dfe023872643ed634`, supplies nonthrowing CUDA handle destruction and associated stream/lifetime fixes. The removed overlay had no unrelated local delta; its GLOB registration disappears with the file. The overlapping #4531 was closed unmerged in favor of #4514.
+
+Upstream [#4554](https://github.com/ml-explore/mlx/pull/4554), `5c89fa11e0beb8b22b79d8aeffccb4c935ff1208`, adds `cp_async_wait<0>()` and `__syncthreads()` immediately before the epilogue writes the C tile into shared storage previously used by A/B. The former local #910 barrier appeared before the preceding register-only accumulator conversion; no shared-memory access or additional asynchronous copy occurs between those positions. The upstream pair therefore preserves both async-copy completion and cross-thread read/write ordering for the ordinary and new gathered RHS kernels. Removing the overlay leaves the device header byte-identical to pristine upstream; its only other delta was explanatory provenance. The existing `qmm_sm80_r2` module name remains to preserve the earlier cache boundary.
 
 Upstream [#4594](https://github.com/ml-explore/mlx/pull/4594), `91c83d19b`, provides the Xcode 27 cooperative-tensor workaround. No older `gated_delta_update_nax.h` whole-file overlay is imported from PR #2138. Target `quantized.cpp` still passes the pre-broadcast `x.size() / K` to both gathered matrix routes, so the #1599 correction from #2138 (`7d5459811f16c36d1b05c2a45455f8cb05b99883`) remains necessary and is applied to both as `B * M`. Existing shared-activation MXFP regressions exercise `GatherQMM`; the new NVFP4 matrix route needs appropriate Apple hardware coverage.
 
