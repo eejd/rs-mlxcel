@@ -106,6 +106,7 @@ impl BatchScheduler {
             batch_metrics,
             batch_observability,
             config_eos,
+            request_memory_worker_path: true,
             prefill_chunk_policy: mlxcel_core::prefill_plan::PrefillChunkPolicy::resolve(Some(
                 prefill_chunk_size,
             )),
@@ -114,6 +115,8 @@ impl BatchScheduler {
             chunked_prefill_seq: None,
             #[cfg(test)]
             prefill_forward_lengths: Vec::new(),
+            #[cfg(test)]
+            request_memory_test_inputs: None,
             // A one-wide decode batch has nothing to mix a prefill into, and
             // that is also exactly b10621's `--no-cont-batching` gate:
             // upstream adds pending prompts to the batch only when

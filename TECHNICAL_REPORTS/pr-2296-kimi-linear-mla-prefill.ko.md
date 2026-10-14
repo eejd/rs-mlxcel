@@ -59,3 +59,11 @@ KDA RMS 정규화는 의도적으로 바꾸지 않았습니다. 최신 upstream�
 ## 범위
 
 이 PR은 Kimi Linear MLA masking을 복구하고 #2292를 닫습니다. PR #2293은 Kimi Linear의 model-owned recurrent state가 chunk 사이에서 안전하게 재시작할 수 없어 no-ID chunked prefill을 별도로 비활성화합니다. 최종 브랜치는 두 변경을 모두 포함하지만 테스트와 전후 증거는 원인을 분리해 기록합니다.
+
+## mlxcelverse 및 최신 MLX pin과의 최종 통합
+
+#2304의 MLX `243bdf09` pin, mlxcelverse 경로, rustls 0.23.46을 포함한 main `adf0e589`를 소스 충돌 없이 통합했다. 실제 추론 검증의 staged source tree는 `2e4f5211f42b21973d097a00ed60a7768d7f05ba`이며 CLI SHA-256은 `45753012854036e8b44d1adc622a6eba8bc9d15b601e098d340769581cb1a064`다. 통합 이전 결과를 재사용하지 않고 최종 결합 소스를 새로 빌드했다.
+
+NVIDIA GB10에서 revision `919175d75427f1c10cfc17e7254b53295edddf72`의 `mlx-community/Kimi-Linear-48B-A3B-Instruct-4bit`가 정답 비교 5건을 모두 통과했다. 짧은 prompt는 `4`를 반환했고, 3,411-token 긴 prompt는 기본 prefill, 명시적 단일 청크 prefill, 일반 SDPA에서 모두 `AMBER-RAVEN-7429`를 회수했다. 짧은 prompt도 일반 SDPA에서 통과했다. 별도의 일반 SDPA 자연어 검증에서는 낮의 Rayleigh 산란과 일몰의 긴 대기 경로를 설명하는 일관된 두 문장, 58 token을 생성했다. token 0 반복 현상은 없었다. 이 정확성 실행으로 성능을 주장하지 않는다.
+
+최종 소스로 다시 빌드한 `models::kimi_linear` CUDA 테스트 10개가 모두 통과했다. Additive mask, 마지막 query 행의 유한값, 가중치를 적재한 모델의 청크 지원 계약 회귀 테스트를 포함한다. Formatting과 diff 검사도 통과했다.

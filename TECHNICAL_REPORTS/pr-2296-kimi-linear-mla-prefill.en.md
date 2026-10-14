@@ -59,3 +59,11 @@ The final branch merged main commit `398f9ba8`, which contains PR #2293, at head
 ## Scope
 
 This PR repairs Kimi Linear MLA masking and closes #2292. PR #2293 separately disables no-ID chunked prefill for Kimi Linear because its model-owned recurrent state cannot safely restart between chunks. The final branch contains both changes, while the tests and before/after evidence keep their causes distinct.
+
+## Final integration with mlxcelverse and the updated MLX pin
+
+Integrated main `adf0e589`, including #2304's MLX `243bdf09` pin, mlxcelverse layout, and rustls 0.23.46, without source conflicts. The actual-inference validation used staged source tree `2e4f5211f42b21973d097a00ed60a7768d7f05ba` and CLI SHA-256 `45753012854036e8b44d1adc622a6eba8bc9d15b601e098d340769581cb1a064`. This is a fresh build of the final combined source, not a reused pre-integration model result.
+
+On NVIDIA GB10, `mlx-community/Kimi-Linear-48B-A3B-Instruct-4bit` at revision `919175d75427f1c10cfc17e7254b53295edddf72` passes all five exact-answer controls: the short prompt returns `4`, and the 3,411-token long prompt returns `AMBER-RAVEN-7429` with default prefill, explicit single-chunk prefill, and ordinary SDPA. The short prompt also passes ordinary SDPA. A separate ordinary-SDPA natural-language smoke produces 58 tokens in two coherent sentences explaining daytime Rayleigh scattering and the longer atmospheric path at sunset. There is no repeated token-0 collapse. No performance claim is made from these correctness runs.
+
+All ten `models::kimi_linear` CUDA tests pass on the rebuilt final source, including the additive-mask, finite-last-query-row, and loaded-model chunk-capability regressions. Formatting and the diff check pass.
