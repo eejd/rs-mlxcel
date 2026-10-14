@@ -10,7 +10,7 @@
 //   - Modified add, subtract, multiply, divide, maximum, minimum to use the
 //     helper, avoiding copy_v kernel insertion for bf16/fp32 mixed operations.
 //
-// Everything else is byte-identical to upstream 81ba1c6a.
+// Everything else is byte-identical to the upstream target declared above.
 //
 // This patch is CUDA-only -- applied via the overlay system in CMakeLists.txt
 // only when MLX_BUILD_CUDA is set. Metal builds use the unmodified upstream file.
