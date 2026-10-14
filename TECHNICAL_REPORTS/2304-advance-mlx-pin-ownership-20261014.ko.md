@@ -90,3 +90,9 @@ CUDA reduction 중간 버퍼는 이제 `allocator::Data`를 직접 전달합니�
 ## 부록: 증거 범위
 
 이 보고서는 PR #2304가 열린 초안 상태에서 확보된 증거를 기록합니다. 병합 권한을 부여하지 않으며 PR #2304가 #1599, #2158, #1986을 종결한다고 주장하지 않습니다. 또한 명시된 소스 동등성 범위를 넘어서 이전 핀 Kimi 결과, 호스트 전용 ROCm 소유권 테스트, 다른 소스 리비전의 Metal 결과를 현재 헤드 검증으로 간주하지 않습니다.
+
+## 검증 이후 최신 main 동기화
+
+#2305의 mlxcelverse 디렉터리 이동 및 이후 ROCm·MoE·요청 메모리 변경을 포함한 main `59974283`까지 병합했다. 폐기한 CUDA 오버레이 두 파일은 삭제를 유지하고 `mlx/allocator.h`는 `src/lib/mlxcelverse/overlays/rocm/`으로 이동했다. 호스트 소유권 검사 경로, 로컬 수정 번호 중복(최종 48개), 오버레이 문서 경로·개수를 수정했다. main의 HIP 그리드 제한, SDPA 최적화, dequant 캐시 기본값 및 MoE 변경은 보존했다.
+
+병합 후 CUDA 테스트 빌드, 포맷, pin/parser 27개, 오버레이 provenance, ROCm residual·도구 검사 29개, 호스트 소유권 회귀, 계약 게이트 및 Python 123개가 통과했다. GPU 잠금 아래 요청 메모리 25개, Switch 38개, Inkling MoE 3개, DeepSeek V4 45개, 강제 RHS 1개가 통과했다(정렬 사례 재실행을 포함한 112회). 새 RHS PTX 네 개로 f16/bf16 × MXFP4/MXFP8 경로 실행을 확인했다. 로그와 정확한 소스 트리·바이너리 해시는 `/tmp/mlx-2304-merge-runtime.json`에 있다. 이전 Metal·실제 Kimi 검증은 기록된 소스에 대한 결과이며 이번 동기화에서 재실행하지 않았다.

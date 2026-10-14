@@ -90,3 +90,9 @@ Commit `6424eb916e2bdfe7c576cba9f8991d9b614ae9d9` passes `encoder.device()` to t
 ## Appendix: Evidence Boundaries
 
 This report records evidence available while PR #2304 is open and draft. It does not authorize merging, does not claim that PR #2304 closes #1599, #2158, or #1986, and does not treat old-pin Kimi results, host-only ROCm ownership tests, or Metal results from another source revision as current-head coverage beyond the stated source-equivalence boundary.
+
+## Main synchronization after validation
+
+Merged main through `59974283`, including the #2305 mlxcelverse directory migration and subsequent ROCm, MoE, and request-memory updates. Keep both retired CUDA overlays deleted; relocate `mlx/allocator.h` into `src/lib/mlxcelverse/overlays/rocm/`; fix the host ownership script path, duplicate local-fix numbering (48 entries), and overlay documentation paths/counts. Main's HIP grid limits, SDPA optimization, dequant-cache default, and MoE changes remain intact.
+
+Post-merge validation passes: CUDA test compilation, formatting, 27 pin/parser tests, overlay provenance, ROCm residual and 29 tooling checks, host ownership regression, contract gates, and 123 Python tests. Final GPU-serialized execution passes 25 request-memory tests, 38 switch-layer tests, three Inkling MoE tests, 45 DeepSeek V4 tests, and one forced RHS test (112 executions, including the repeated aligned case). Four fresh RHS PTX artifacts prove f16/bf16 × MXFP4/MXFP8 route execution. Logs and exact tree/binary hashes are in `/tmp/mlx-2304-merge-runtime.json`. Prior Metal and actual Kimi evidence remains attributed to its recorded source; those runs were not repeated for this synchronization.
