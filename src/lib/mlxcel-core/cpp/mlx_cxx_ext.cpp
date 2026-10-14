@@ -9,6 +9,7 @@
 #include "paged_attention_v2.h"     // paged decode v2 + merge kernels (#898).
 #include "fused_norm.h"             // fused residual-add + RMSNorm kernel (#905).
 #include "fused_rope_append.h"      // fused q/k RoPE + KV-append layout (#905).
+#include "kv_inplace_write.h"       // in-place decode KV row write (#1959).
 
 namespace mlx_cxx {
 
@@ -106,7 +107,7 @@ std::unique_ptr<MlxArray> fused_metal4_attention(
 }
 
 // Fused Sparse-V SDPA Metal kernel launcher. Implementation in
-// `src/lib/mlx-cpp/turbo/sparse_v_sdpa.cpp`; we forward the call here so the
+// `src/lib/mlxcelverse/kernels/sparse_v_sdpa.cpp`; we forward the call here so the
 // new symbol shows up in the cxx-bridge ABI without bloating the bridge .cpp.
 std::unique_ptr<MlxArray> turbo_sparse_v_weighted_sum(
     const MlxArray& attn_weights,
@@ -128,7 +129,7 @@ std::unique_ptr<MlxArray> turbo_sparse_v_weighted_sum(
 }
 
 // Fused Turbo4Delegated cold-V weighted-sum kernel launcher.
-// Implementation in `src/lib/mlx-cpp/turbo/turbo4_delegated_sdpa.cpp`; we
+// Implementation in `src/lib/mlxcelverse/kernels/turbo4_delegated_sdpa.cpp`; we
 // forward the call here so the new symbol shows up in the cxx-bridge ABI
 // without bloating the bridge .cpp. The unrotated cold weighted sum returned
 // here is paired with a host-side hot V matmul; the dequantised cold V never
@@ -166,7 +167,7 @@ std::unique_ptr<MlxArray> turbo4_delegated_bulk_dequant_rotated(
 }
 
 // Steel-attention-envelope fused Turbo4Delegated SDPA bridge.
-// Wraps the launcher in `src/lib/mlx-cpp/turbo/turbo4_delegated_sdpa.cpp` and
+// Wraps the launcher in `src/lib/mlxcelverse/kernels/turbo4_delegated_sdpa.cpp` and
 // repackages the std::vector<mlx::core::array> return into the `cxx`-friendly
 // `Turbo4DelegatedSteelOutputs` struct (cxx does not directly model multiple
 // return values, but it does model unique_ptr<struct>).
@@ -199,7 +200,7 @@ std::unique_ptr<Turbo4DelegatedSteelOutputs> turbo4_delegated_steel_sdpa(
 }
 
 // Fused paged-attention decode kernel launcher (epic #116 Phase 6, #123).
-// Implementation in `src/lib/mlx-cpp/turbo/paged_attention.cpp`; forwarded here
+// Implementation in `src/lib/mlxcelverse/kernels/paged_attention.cpp`; forwarded here
 // so the new symbol shows up in the cxx-bridge ABI. Reads scattered KV blocks
 // out of the global pool via the block table with no separate gather copy.
 std::unique_ptr<MlxArray> paged_attention_decode(
@@ -231,7 +232,7 @@ int32_t paged_attention_num_splits_cap(int32_t dim) {
 }
 
 // Paged-attention decode v2 (issue #898). Implementation in
-// `src/lib/mlx-cpp/turbo/paged_attention_v2.cpp` (partial kernel) and
+// `src/lib/mlxcelverse/kernels/paged_attention_v2.cpp` (partial kernel) and
 // `paged_attention_v2_merge.cpp` (merge kernel); forwarded here so the symbols
 // show up in the cxx-bridge ABI. Two outputs each, so both use out-params.
 void paged_attention_decode_v2_partial(
@@ -276,6 +277,25 @@ void paged_attention_merge_states(
     lse_out = std::make_unique<MlxArray>(std::move(outs[1]));
 }
 
+bool paged_attention_kernels_available() {
+    return mlxcel::turbo::paged_attention_decode_available() &&
+        mlxcel::turbo::paged_attention_v2_partial_available() &&
+        mlxcel::turbo::paged_attention_merge_states_available();
+}
+
+bool paged_attention_merge_available() {
+    return mlxcel::turbo::paged_attention_merge_states_available();
+}
+
+bool paged_attention_decode_available() {
+    return mlxcel::turbo::paged_attention_decode_available();
+}
+
+bool paged_attention_v2_available() {
+    return mlxcel::turbo::paged_attention_v2_partial_available() &&
+        mlxcel::turbo::paged_attention_merge_states_available();
+}
+
 int32_t paged_attention_v2_q_heads_per_cta(int32_t dim, int32_t n_rep) {
     return static_cast<int32_t>(mlxcel::turbo::paged_attention_v2_q_heads_per_cta(
         static_cast<int>(dim), static_cast<int>(n_rep)));
@@ -287,7 +307,7 @@ int32_t paged_attention_v2_num_warps(int32_t dim, int32_t q_heads_per_cta) {
 }
 
 // Fused residual-add + RMSNorm kernel launcher (issue #905). Implementation in
-// `src/lib/mlx-cpp/turbo/fused_norm.cpp`; forwarded here so the symbol shows up
+// `src/lib/mlxcelverse/kernels/fused_norm.cpp`; forwarded here so the symbol shows up
 // in the cxx-bridge ABI. Two outputs because MLX arrays are immutable from the
 // graph's perspective, so the in-place residual update has to be expressed as a
 // value rather than a mutation.
@@ -310,7 +330,7 @@ bool fused_add_rms_norm_available() {
 }
 
 // Fused q/k RoPE + KV-append-layout kernel launcher (issue #905).
-// Implementation in `src/lib/mlx-cpp/turbo/fused_rope_append.cpp`.
+// Implementation in `src/lib/mlxcelverse/kernels/fused_rope_append.cpp`.
 void fused_rope_qk_append(
     const MlxArray& qkv,
     int32_t num_heads,
@@ -343,6 +363,25 @@ void fused_rope_qk_append(
 
 bool fused_rope_qk_append_available() {
     return mlxcel::turbo::fused_rope_qk_append_available();
+}
+
+std::unique_ptr<MlxArray> array_handle_clone(const MlxArray& a) {
+    return std::make_unique<MlxArray>(a.inner);
+}
+
+bool array_same_handle(const MlxArray& a, const MlxArray& b) {
+    return a.inner.id() == b.inner.id();
+}
+
+// In-place KV row write (#1959). Implementation in
+// `src/lib/mlxcelverse/kernels/kv_inplace_write.cpp`.
+std::unique_ptr<MlxArray> inplace_slice_write(
+    const MlxArray& dst,
+    const MlxArray& rows,
+    rust::Slice<const int32_t> start) {
+    std::vector<int> s(start.begin(), start.end());
+    return std::make_unique<MlxArray>(
+        mlxcel::turbo::inplace_slice_write(dst.inner, rows.inner, s));
 }
 
 std::unique_ptr<MlxLoadedWeights> mlx_load_safetensors(rust::Str path) {

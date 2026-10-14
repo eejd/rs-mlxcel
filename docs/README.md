@@ -18,7 +18,7 @@ Current GitHub-facing docs:
 2. `environment-variables.md` - `MLXCEL_*` runtime, build, downloader, cache, and diagnostic knobs.
 3. `benchmarks.md` - benchmark methodology and the requirements for future raw result tables.
 4. `supported-models.md` - maintained architecture/checkpoint support matrix.
-5. `architecture.md` - runtime architecture and major components, including mlxcelverse (the per-backend MLX overlays and mlxcel kernels under `src/lib/mlx-cpp/`).
+5. `architecture.md` - runtime architecture and major components, including mlxcelverse (the per-backend MLX overlays and mlxcel kernels under `src/lib/mlxcelverse/`).
 6. `distributed.md` - tensor/pipeline parallel setup and limitations.
 7. `turbo-kv-cache.md` - TurboQuant modes, the unified paged KV cache, quality/performance trade-offs, and flags.
 8. `CONTINUOUS_BATCHING.md` - continuous-batching scheduler, paged decode, and disaggregated prefill/decode/router serving.
@@ -37,6 +37,10 @@ Current GitHub-facing docs:
 21. `code-guidelines.md` - the file-size and module-split thresholds, including when to extract a `<name>_helpers.rs` and when inline tests move to a sibling `_tests.rs`, the `// Used by:` annotation convention for shared functions, the JIT kernel rule that every varying input dtype must appear in `template_args` because CUDA keys the compiled-module cache on it, and the `HashMap` iteration-order rule covering what counts as an order-sensitive consumer, why a stable sort on a non-total key does not pin the result, the fresh-map-per-iteration testing requirement, and why no static check enforces it.
 22. `embeddings.md` - the `/v1/embeddings` and `/v1/rerank` endpoints plus `mlxcel embed` and `mlxcel rerank`: embedding and reranker detection, pooling and scoring, multimodal and late-interaction inputs, request/response schemas, server flags, error codes, and family-registration guidance.
 23. `llama-server-compat.md` - the verified llama-server b10621 compatibility boundary: how to read the machine-readable manifest under `compat/llama-server/b10621/`, the compatibility-policy states, the area sharding used by epic #1431, the CI gates, and the deterministic regeneration procedure.
+
+## mlxcelverse maintenance
+
+`mlxcelverse/rocm-overlay.md` is the procedure for keeping the ROCm overlay in step with the MLX pin and with the NripeshN/mlx fork it is vendored from, including the `scripts/mlxcelverse/` tools and the `make verify-rocm-overlay` gate. `mlxcelverse/upstream/` holds fork-side fix packages kept as historical reference, not submitted: fixes to the fork stay in the overlay and no PRs go to NripeshN/mlx; its README is the index.
 
 ## Architecture Decision Records
 

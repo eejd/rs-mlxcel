@@ -137,17 +137,17 @@ Remote Pipeline Parallel Example (TCP):
          examples/distributed/generated_pipeline_remote_2node_tcp.toml
 
   2. Start stage-1 on machine B:
-       mlxcel-server -m models/llama-3.2-1b-4bit \\
+       mlxcel-server -m models/llama-3.2-1b-instruct-4bit \\
          --distributed-config examples/distributed/generated_pipeline_remote_2node_tcp.toml \\
          --node-id stage-1 --host 0.0.0.0 --port 18081 --no-warmup
 
   3. Start stage-0 on machine A:
-       mlxcel-server -m models/llama-3.2-1b-4bit \\
+       mlxcel-server -m models/llama-3.2-1b-instruct-4bit \\
          --distributed-config examples/distributed/generated_pipeline_remote_2node_tcp.toml \\
          --node-id stage-0 --host 0.0.0.0 --port 18081 --no-warmup
 
   4. Start the coordinator on machine A:
-       mlxcel-server -m models/llama-3.2-1b-4bit --alias llama-remote-pp \\
+       mlxcel-server -m models/llama-3.2-1b-instruct-4bit --alias llama-remote-pp \\
          --distributed-config examples/distributed/generated_pipeline_remote_2node_tcp.toml \\
          --node-id coordinator --host 0.0.0.0 --port 18080 \\
          --parallel 2 --max-batch-size 2 --pp-micro-batch-size 2 \\
@@ -173,10 +173,20 @@ struct Cli {
     /// `--usage`, and clap's built-in help argument cannot carry an alias
     /// through the derive. Declared first so it lands before any
     /// `next_help_heading` group (#1448).
+    //
+    // `disable_help_flag` propagates to subcommands in clap 4.6, but this
+    // hand-declared arg does not automatically follow, so without
+    // `global = true` below `download` had no help flag of its own
+    // (`mlxcel-server download --help` failed with "unexpected argument").
+    // `global = true` makes this same arg reachable as
+    // `mlxcel-server download --help`/`-h`/`--usage` too (#2025). This is a
+    // plain `//` comment, not `///`, specifically so it does not change the
+    // rendered `--help` text for this argument.
     #[arg(
         short = 'h',
         long = "help",
         visible_alias = "usage",
+        global = true,
         action = clap::ArgAction::Help
     )]
     help: Option<bool>,
@@ -213,7 +223,14 @@ fn parse_unit_interval(s: &str) -> Result<f32, String> {
 /// compatibility with existing scripts and llama-server drop-in usage.
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Download a HuggingFace model repository snapshot
+    /// Download a HuggingFace model repository snapshot.
+    ///
+    /// Fetches an `owner/name` repo-id into the global mlxcel store (or a
+    /// custom destination via `--local-dir`/`--models-dir`), reusing an
+    /// existing HuggingFace cache copy when one is already present instead
+    /// of re-fetching it. See the Examples section below for revision,
+    /// token, and file-filtering invocations.
+    #[command(verbatim_doc_comment)]
     Download(DownloadArgs),
 }
 
@@ -677,6 +694,16 @@ struct ServerArgs {
     )]
     draft: usize,
 
+    /// Largest active decode batch at which a prompt-lookup sequence runs
+    /// its own verify round (`--draft-kind prompt-lookup`). Each proposing
+    /// row costs one verify forward on top of the batched step, so on ticks
+    /// with more concurrent rows every row takes the plain batched step and
+    /// the drafter keeps observing the emitted tokens until the batch
+    /// shrinks. Must be at least 1. Defaults to 2, the largest batch at which
+    /// the GB10 concurrency measurement showed no aggregate loss.
+    #[arg(long, value_name = "N", default_value_t = mlxcel::server::speculative_dispatch::DEFAULT_PROMPT_LOOKUP_MAX_BATCH)]
+    prompt_lookup_max_batch: usize,
+
     /// Maximum concurrent decode sequences; explicit value keeps split --ctx-size windows
     #[arg(long = "max-batch-size", value_name = "N")]
     max_batch_size: Option<usize>,
@@ -800,9 +827,12 @@ struct ServerArgs {
     )]
     rerank_batch_size: usize,
 
-    /// Prefill chunk size in tokens (0 = disabled, default: 512)
-    #[arg(long = "prefill-chunk-size", default_value_t = 512)]
-    prefill_chunk_size: usize,
+    /// Prefill chunk size in tokens (0 = disabled).
+    ///
+    /// [default: 2048 when no other sequence is decoding, 512 when one is;
+    /// MLXCEL_PREFILL_CHUNK overrides]
+    #[arg(long = "prefill-chunk-size")]
+    prefill_chunk_size: Option<usize>,
 
     /// Decode ticks a parked chunked prefill yields before it is granted one
     /// (#1011).
@@ -822,7 +852,7 @@ struct ServerArgs {
     #[arg(long = "prefill-grant-interval", value_name = "N")]
     prefill_grant_interval: Option<usize>,
 
-    /// Prefill batch size [llama-server alias for --prefill-chunk-size] [default: 512]
+    /// Prefill batch size [llama-server alias for --prefill-chunk-size]
     #[arg(
         short = 'b',
         long = "batch-size",
@@ -911,7 +941,7 @@ struct ServerArgs {
     /// mask, an O(B*L^2) transient. This caps the drained window by total
     /// padded tokens (rows * L): rows past the budget spill to the next tick
     /// and prefill via the chunked single-sequence path. Unset derives the
-    /// default `2 * max_batch_prefill * prefill_chunk_size` (2 * 4 * 512 = 4096).
+    /// default `2 * max_batch_prefill * min(prefill_chunk_size, 512)` (2 * 4 * 512 = 4096).
     /// `0` disables the cap (uncapped). Env: `MLXCEL_MAX_BATCH_PREFILL_TOKENS`
     /// overrides both.
     #[arg(long = "max-batch-prefill-tokens")]
@@ -958,6 +988,27 @@ struct ServerArgs {
         value_parser = parse_kv_cache_budget
     )]
     kv_cache_budget: Option<mlxcel::memory_estimate::PagedBudgetDirective>,
+
+    /// Fraction of the paged KV block budget a prefill admission keeps free
+    /// for running rows to keep decoding (issue #2088), in `0.0..=0.5`.
+    ///
+    /// Under a tight `--kv-cache-budget`, admitting a request into exactly the
+    /// free blocks leaves the decoding rows no room to grow, so the next decode
+    /// ticks preempt them and they re-prefill from scratch. With a watermark,
+    /// admission waits until the free blocks cover the request plus this share
+    /// of the budget, evicting cold prompt-cache prefixes (and, for a
+    /// higher-priority request, preempting strictly lower-priority rows) to
+    /// make that room. It applies only
+    /// while rows are decoding, so a request that fits the budget is never
+    /// refused. `0` disables it. Ignored without a block budget. Defaults to
+    /// 0.01. Also reads `MLXCEL_KV_ADMISSION_WATERMARK`.
+    #[arg(
+        long = "kv-admission-watermark",
+        env = "MLXCEL_KV_ADMISSION_WATERMARK",
+        value_name = "FRACTION",
+        value_parser = mlxcel::server::parse_kv_admission_watermark
+    )]
+    kv_admission_watermark: Option<f64>,
 
     /// Maximum number of responses persisted by the OpenAI
     /// `/v1/responses` store (in-memory). `0` disables persistence
@@ -2279,6 +2330,16 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         );
         args.model_draft = None;
     }
+    // `none` disables prompt lookup as well (#2255): it needs no draft model,
+    // so the draft-model drop above does not reach it.
+    if spec_type.disable_speculation
+        && args.speculative.draft_kind.as_deref() == Some("prompt-lookup")
+    {
+        tracing::warn!(
+            "--spec-type none disables speculative decoding (b10621 semantics); ignoring --draft-kind prompt-lookup"
+        );
+        args.speculative.draft_kind = None;
+    }
     if let Some(kind) = spec_type.draft_kind {
         match args.speculative.draft_kind.as_deref() {
             None => args.speculative.draft_kind = Some(kind.to_string()),
@@ -2311,8 +2372,9 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
     args.ui_compat
         .apply_env_bindings()
         .map_err(|(var, raw)| anyhow::anyhow!("{var} has an invalid boolean value {raw:?}"))?;
-    args.ui_compat
-        .ensure_inert()
+    let webui_enabled = args
+        .ui_compat
+        .webui_enabled()
         .map_err(|rejection| anyhow::anyhow!("{rejection}"))?;
     let image_token_bounds = args
         .multimodal_compat
@@ -2376,11 +2438,16 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
     set_offline_mode(args.offline);
     // b10621 router mode (#1438): `--models-dir` with no model argument
     // serves the router surface and never resolves a checkpoint here.
-    let router_mode = args.models_dir.is_some()
-        && args.model.is_none()
-        && args.hf_repo.is_none()
-        && args.model_url.is_none()
-        && args.docker_repo.is_none();
+    let has_model_source = args.model.is_some()
+        || args.hf_repo.is_some()
+        || args.model_url.is_some()
+        || args.docker_repo.is_some()
+        || args.hf_file.is_some();
+    let router_mode = (args.models_dir.is_some() || args.models_preset.is_some() || webui_enabled)
+        && !has_model_source;
+    if webui_enabled && router_mode {
+        args.models_autoload = false;
+    }
     // The #1438 migration guard, raised BEFORE model resolution so the old
     // store-root combination fails in milliseconds instead of after a
     // multi-gigabyte download. `into_startup_config` re-checks it for
@@ -2502,6 +2569,7 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         decode_timeout_was_set: long_cli_flag_was_set("decode-timeout")
             || std::env::var_os("MLXCEL_DECODE_TIMEOUT").is_some(),
         api_prefix: args.api_prefix,
+        webui_enabled,
         sse_ping_interval: args.sse_ping_interval,
         threads_http: args.threads_http,
         reuse_port: args.reuse_port,
@@ -2519,6 +2587,7 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         // typed `DrafterKind` happens later, at the dispatch site.
         draft_kind: args.speculative.draft_kind,
         draft_block_size: args.speculative.draft_block_size,
+        prompt_lookup_max_batch: args.prompt_lookup_max_batch,
         max_batch_size: args.max_batch_size,
         no_batch: args.no_batch,
         max_queue_depth: args.max_queue_depth,
@@ -2683,6 +2752,8 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         // paged KV pool block-budget directive (#122 b3); clap parses it into
         // a `PagedBudgetDirective`, resolved to a block count on the worker.
         kv_cache_budget: args.kv_cache_budget,
+        // paged KV admission watermark (#2088).
+        kv_admission_watermark: args.kv_admission_watermark,
         // experimental VLM prompt-prefix cache toggle (#124 step c).
         enable_vlm_prefix_cache: args.enable_vlm_prefix_cache,
         // CORS allow-list origins (#244); validated in into_startup_config.
@@ -3658,5 +3729,24 @@ mod tests {
         let err = Cli::try_parse_from(["mlxcel-server", "download", "-1"])
             .expect_err("`download -1` has no numeric option to bind to");
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn the_download_subcommand_accepts_all_three_help_spellings() {
+        // The hand-declared `-h`/`--help`/`--usage` arg on `Cli` (b10621's
+        // spelling, #1448) did not carry `global = true`, so
+        // `disable_help_flag` left `download` with no help flag of its own:
+        // `mlxcel-server download --help` failed with `UnknownArgument`
+        // instead of printing help (#2025).
+        for flag in ["--help", "-h", "--usage"] {
+            let err = Cli::try_parse_from(["mlxcel-server", "download", flag])
+                .expect_err("a help flag must short-circuit parsing, not succeed");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayHelp,
+                "`download {flag}` must trigger DisplayHelp, got {:?}",
+                err.kind()
+            );
+        }
     }
 }

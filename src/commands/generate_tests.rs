@@ -19,10 +19,11 @@ use super::{
     apply_user_chat_template, apply_vlm_chat_template, build_cli_sampling_config_with_flags,
     cli_pipeline_requested, cli_video_content_part_count, estimate_delta_label_and_bytes,
     generated_suffix, generation_stats_from_duration, memory_preflight_ctx_len,
-    reject_dflash_drafter_offline, resolve_cli_pipeline_assignments, resolve_cli_prompt,
-    should_route_offline_mtp, strip_trailing_eos, validate_muse_glimmer_cli_unsupported_options,
-    validate_pipeline_parallel_args, validate_tensor_parallel_args,
-    validate_xla_cli_image_cardinality, validate_xla_output_audio,
+    reject_dflash_drafter_offline, repl_drafter, resolve_cli_pipeline_assignments,
+    resolve_cli_prompt, should_route_offline_mtp, strip_trailing_eos,
+    validate_muse_glimmer_cli_unsupported_options, validate_pipeline_parallel_args,
+    validate_prompt_lookup_args, validate_tensor_parallel_args, validate_xla_cli_image_cardinality,
+    validate_xla_output_audio,
 };
 use mlxcel::server::chat_template::{ChatMessage, ChatTemplateProcessor, flatten_template_text};
 use mlxcel_core::cache::KVCacheMode;
@@ -596,6 +597,9 @@ fn sample_generate_args(model_path: PathBuf) -> crate::GenerateArgs {
             video_max_frames: mlxcel::video::DEFAULT_FALLBACK_MAX_FRAMES,
             output_audio: None,
             speaker: "ethan".to_string(),
+            extra_decoding_seconds: 3.0,
+            stream: false,
+            max_streaming_seconds: None,
             max_tokens: 16,
             profile: false,
             no_chat_template: false,
@@ -613,6 +617,7 @@ fn sample_generate_args(model_path: PathBuf) -> crate::GenerateArgs {
             min_p: 0.0,
             top_n_sigma: 0.0,
             typical_p: 1.0,
+            p_less: false,
             repetition_penalty: 1.0,
             dry_multiplier: 0.0,
             dry_base: 1.75,
@@ -634,6 +639,7 @@ fn sample_generate_args(model_path: PathBuf) -> crate::GenerateArgs {
         },
         lang_bias: mlxcel::lang_bias::LangBiasCliArgs::default(),
         speculative: mlxcel::cli::speculative_args::SpeculativeArgs::default(),
+        prompt_lookup: crate::PromptLookupOptions::default(),
         // Default to None so existing tests stay on
         // the bit-exact baseline load path; tests that need surgery
         // override this field explicitly.
@@ -960,6 +966,9 @@ fn validate_pipeline_parallel_args_rejects_incompatible_modes() {
     args.model.draft_model = Some(PathBuf::from("draft"));
     assert!(validate_pipeline_parallel_args(&args).is_err());
     args.model.draft_model = None;
+    args.prompt_lookup.prompt_lookup = true;
+    assert!(validate_pipeline_parallel_args(&args).is_err());
+    args.prompt_lookup.prompt_lookup = false;
 
     // Tensor parallelism + PP is now accepted (2D PP × TP composition landed). Positive coverage for the 2D path lives in
     // `validate_pipeline_parallel_args_accepts_2d_pp_tp` below.
@@ -1059,7 +1068,7 @@ fn gemma3_vlm_config() -> serde_json::Value {
 
 #[test]
 fn cli_video_fallback_declines_native_and_text_only_checkpoints() {
-    // A native video family keeps its clip so `compute_vlm_embeddings` routes
+    // A native video family keeps its clip so `prepare_local_vlm_embeddings` routes
     // it to the family's own temporal path, and a checkpoint with no vision
     // tower has nowhere to send frames. Neither reaches ffmpeg, which is why
     // this test needs none.
@@ -1164,7 +1173,7 @@ fn cli_video_fallback_appends_frame_images_and_clears_video() {
     let first = clip_frames.frame_paths[0].clone();
 
     // What `run_generate_once` then does with it: the frames join `--image` and
-    // the video list empties, so `compute_vlm_embeddings` never sees a video.
+    // the video list empties, so `prepare_local_vlm_embeddings` never sees a video.
     let mut images: Vec<PathBuf> = vec![PathBuf::from("user-own.png")];
     let mut videos: Vec<PathBuf> = vec![clip.clone()];
     let (groups, frame_dir) = expansion.splice_into(&mut images, &mut videos);
@@ -1412,4 +1421,67 @@ fn cli_video_frames_are_private_and_removed_with_the_run() {
         assert!(!frame.exists(), "{} outlived the run", frame.display());
     }
     assert!(!dir.exists(), "the frame directory outlived the run");
+}
+
+#[test]
+fn validate_prompt_lookup_args_is_a_no_op_without_the_flag() {
+    let mut args = sample_generate_args(temp_model_dir("pl-disabled"));
+    args.generation.image = vec![PathBuf::from("page.png")];
+    args.prompt_lookup.prompt_lookup_ngram_min = 0;
+    assert!(validate_prompt_lookup_args(&args).is_ok());
+    fs::remove_dir_all(args.model.model).unwrap();
+}
+
+#[test]
+fn validate_prompt_lookup_args_refuses_before_the_model_loads() {
+    let mut args = sample_generate_args(temp_model_dir("pl-refusals"));
+    args.prompt_lookup.prompt_lookup = true;
+    assert!(validate_prompt_lookup_args(&args).is_ok());
+
+    args.prompt_lookup.prompt_lookup_ngram_min = 0;
+    let err = validate_prompt_lookup_args(&args).unwrap_err().to_string();
+    assert!(err.contains("ngram-min"), "{err}");
+    args.prompt_lookup.prompt_lookup_ngram_min = 2;
+
+    args.prompt_lookup.prompt_lookup_ngram_max =
+        mlxcel_core::speculative::prompt_lookup::NGRAM_MAX_LIMIT + 1;
+    let err = validate_prompt_lookup_args(&args).unwrap_err().to_string();
+    assert!(err.contains("at most"), "{err}");
+    args.prompt_lookup.prompt_lookup_ngram_max = 3;
+
+    for media in ["image", "audio", "video"] {
+        let mut args = sample_generate_args(args.model.model.clone());
+        args.prompt_lookup.prompt_lookup = true;
+        match media {
+            "image" => args.generation.image = vec![PathBuf::from("page.png")],
+            "audio" => args.generation.audio = Some(PathBuf::from("clip.wav")),
+            _ => args.generation.video = vec![PathBuf::from("clip.mp4")],
+        }
+        let err = validate_prompt_lookup_args(&args).unwrap_err().to_string();
+        assert!(err.contains("text-only"), "{media}: {err}");
+    }
+    fs::remove_dir_all(args.model.model).unwrap();
+}
+
+#[test]
+fn the_repl_uses_a_drafter_only_with_an_explicit_server_kind() {
+    // issue #2173 review: on `generate`, `--draft-model` alone is a classic
+    // draft model, which the in-process server does not run, so the REPL
+    // passes a drafter only for `--draft-kind dflash|mtp`.
+    let mut args = sample_generate_args(PathBuf::from("/m"));
+    assert_eq!(repl_drafter(&args), None, "no drafter");
+    args.model.draft_model = Some(PathBuf::from("/d"));
+    assert_eq!(repl_drafter(&args), None, "classic draft model");
+    for kind in ["dflash", "mtp"] {
+        args.speculative.draft_kind = Some(kind.to_string());
+        assert_eq!(
+            repl_drafter(&args),
+            Some((PathBuf::from("/d"), kind.to_string()))
+        );
+    }
+    args.speculative.draft_kind = Some("internal-mtp".to_string());
+    assert_eq!(repl_drafter(&args), None, "not a server drafter kind");
+    args.model.draft_model = None;
+    args.speculative.draft_kind = Some("mtp".to_string());
+    assert_eq!(repl_drafter(&args), None, "a kind without a drafter");
 }

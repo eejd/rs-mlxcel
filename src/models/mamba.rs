@@ -354,8 +354,66 @@ impl MambaBlock {
             .and_then(|c| c.ssm_state.as_ref())
             .and_then(|s| s.as_ref());
 
-        // For single-token decode (t=1), avoid copy + stack overhead
-        let (y, current_state) = if t == 1 {
+        // Fused selective scan (issue #2007): project the whole sequence once,
+        // then one kernel walks every timestep with the state in float32
+        // registers, for prefill and decode alike (Metal, and ROCm since issue
+        // #2069). The per-step graph scan below remains for CUDA and
+        // `MLXCEL_MAMBA1_SCAN_KERNEL=0`. CUDA's graph-exact port (issue #1981)
+        // is not used here yet: it reproduces the rounding of Jamba's
+        // whole-sequence graph scan, but this graph path projects one timestep
+        // at a time, so switching would change CUDA output and needs its own
+        // validation. The predicate reads the float32-state variant's port
+        // table, so it answers for exactly the backends that have that variant;
+        // `mamba1_scan_kernel_accepts` then checks the inputs themselves (one
+        // lane per state column, so a state wider than 32 takes the graph scan,
+        // and the GPU stream), as Jamba's gate does.
+        let fused_inputs = if mlxcel_core::mamba1_scan_float_state_kernel_available() {
+            let delta_bc = self.x_proj.forward(&x_conv);
+            let rank = self.time_step_rank as i32;
+            let n = self.state_size as i32;
+            let delta_raw = slice_axis(&delta_bc, -1, 0, rank);
+            let b_raw = slice_axis(&delta_bc, -1, rank, rank + n);
+            let c_raw = slice_axis(&delta_bc, -1, rank + n, -1);
+            let delta = mlxcel_core::softplus(&self.dt_proj.forward(&self.mixer_norm(&delta_raw)));
+            let b = self.mixer_norm(&b_raw);
+            let c = self.mixer_norm(&c_raw);
+            mlxcel_core::mamba1_scan_kernel_accepts(&x_conv, &delta, &b, &c, &a, &self.d_param)
+                .then_some((delta, b, c))
+        } else {
+            None
+        };
+        let (y, current_state) = if let Some((delta, b, c)) = fused_inputs {
+            let n = self.state_size as i32;
+            let zeros;
+            let state_in = match state_cache {
+                Some(s) => s,
+                None => {
+                    zeros = mlxcel_core::zeros(
+                        &[shape[0], self.intermediate_size as i32, n],
+                        mlxcel_core::dtype::FLOAT32,
+                    );
+                    zeros.as_ref().unwrap()
+                }
+            };
+            let mut y = UniquePtr::null();
+            let mut state_out = UniquePtr::null();
+            mlxcel_core::mamba1_selective_scan(
+                &x_conv,
+                &delta,
+                &b,
+                &c,
+                &a,
+                &self.d_param,
+                state_in,
+                &mut y,
+                &mut state_out,
+            )
+            .expect(
+                "mamba1_scan_kernel_accepts() checked the port, so the launcher must not refuse",
+            );
+            (y, Some(state_out))
+        } else if t == 1 {
+            // For single-token decode (t=1), avoid copy + stack overhead
             let x_t = mlxcel_core::squeeze_axis(&x_conv, 1);
             let state_ref = state_cache;
             let (y_t, new_state) = self.ssm_step(&x_t, &a, state_ref);
@@ -456,29 +514,31 @@ impl MambaModel {
         let path = Path::new(model_path);
 
         // Load config
-        println!("[Mamba] Loading config...");
+        tracing::info!("[Mamba] Loading config...");
         let config_path = path.join("config.json");
         let config_str = std::fs::read_to_string(&config_path)?;
         let config_str = super::sanitize_config_json(&config_str);
         let mut config: MambaConfig = serde_json::from_str(&config_str)?;
         config.compute_time_step_rank();
-        println!(
+        tracing::info!(
             "[Mamba] Config loaded: {} layers, hidden_size={}, state_size={}",
-            config.num_hidden_layers, config.hidden_size, config.state_size
+            config.num_hidden_layers,
+            config.hidden_size,
+            config.state_size
         );
 
         // Load weights
-        println!("[Mamba] Loading weights from safetensors...");
+        tracing::info!("[Mamba] Loading weights from safetensors...");
         let weights = crate::models::load_text_weights(path, None)?;
 
         // Process weights (handle conv1d weight transpose)
         let weights = Self::sanitize_weights(weights, &config);
 
         // Build model
-        println!("[Mamba] Building model...");
+        tracing::info!("[Mamba] Building model...");
         let model = Self::from_weights(config.clone(), weights)?;
 
-        println!("[Mamba] Model loaded successfully");
+        tracing::info!("[Mamba] Model loaded successfully");
         Ok((model, config))
     }
 

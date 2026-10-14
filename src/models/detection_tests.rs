@@ -21,14 +21,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
 fn has_vision_config_detects_vlm_configs() {
-    assert!(has_vision_config(&json!({ "vision_config": {} })));
+    assert!(has_vision_config(
+        &json!({ "vision_config": { "hidden_size": 1024 } })
+    ));
+    assert!(!has_vision_config(&json!({ "vision_config": {} })));
     assert!(!has_vision_config(&json!({ "text_config": {} })));
 }
 
 #[test]
 fn detect_text_or_vlm_prefers_vlm_when_vision_config_exists() {
     let vlm = detect_text_or_vlm(
-        &json!({ "vision_config": {} }),
+        &json!({ "vision_config": { "hidden_size": 1024 } }),
         ModelType::Gemma3,
         ModelType::Gemma3VLM,
     );
@@ -160,6 +163,62 @@ fn whisper_model_type_is_detected() {
 
     let detected = super::detection::get_model_type(&model_dir).unwrap();
     assert_eq!(detected, ModelType::Whisper);
+
+    fs::remove_dir_all(model_dir).unwrap();
+}
+
+/// Nemotron-Parse keeps its geometry under `encoder` / `decoder` sub-configs
+/// and ships an empty `vision_config`; detection keys off the top-level
+/// `model_type` alone (issue #1369).
+#[test]
+fn nemotron_parse_model_type_is_detected() {
+    let model_dir = temp_path("nemotron_parse_vlm");
+    fs::create_dir_all(&model_dir).unwrap();
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+            "model_type": "nemotron_parse",
+            "architectures": ["NemotronParseForConditionalGeneration"],
+            "is_encoder_decoder": true,
+            "image_size": [2048, 1664],
+            "decoder": {"model_type": "nemotron_parse_text", "d_model": 1024},
+            "encoder": {"patch_size": 16, "max_resolution": 2048},
+            "vision_config": {}
+        }"#,
+    )
+    .unwrap();
+
+    let detected = super::detection::get_model_type(&model_dir).unwrap();
+    assert_eq!(detected, ModelType::NemotronParseVLM);
+
+    fs::remove_dir_all(model_dir).unwrap();
+}
+
+#[test]
+fn nemotron_voicechat_model_type_is_detected() {
+    // The VoiceChat checkpoint nests a `nemotron_h` text_config; detection
+    // must route on the top-level `nemotron_voicechat` value (issue #1374).
+    let model_dir = temp_path("nemotron_voicechat");
+    fs::create_dir_all(&model_dir).unwrap();
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+            "model_type": "nemotron_voicechat",
+            "architectures": ["NemotronVoiceChatForConditionalGeneration"],
+            "text_config": {
+                "model_type": "nemotron_h",
+                "hidden_size": 4480,
+                "hybrid_override_pattern": "M-M*"
+            },
+            "audio_config": {"output_dim": 4480},
+            "tts_config": {"hidden_size": 1152},
+            "codec_config": {"sample_rate": 22050}
+        }"#,
+    )
+    .unwrap();
+
+    let detected = super::detection::get_model_type(&model_dir).unwrap();
+    assert_eq!(detected, ModelType::NemotronVoiceChat);
 
     fs::remove_dir_all(model_dir).unwrap();
 }
@@ -1766,6 +1825,37 @@ fn llmjpvl_model_type_is_detected_for_both_released_backbones() {
 }
 
 #[test]
+fn mage_vl_model_type_is_detected_with_and_without_vision() {
+    // Mage-VL (#1365) keeps `MageVLM` even for a vision-stripped config: its
+    // decoder is nested under `text_config` with `language_model.*` keys,
+    // which the flat `qwen3` text route cannot read, so the loader (not the
+    // detector) drops the tower, as the Qwen2-VL family does (#1367).
+    for (name, vision) in [
+        (
+            "mage_vl_full",
+            json!({"model_type": "mage_vl_vision", "hidden_size": 1024}),
+        ),
+        ("mage_vl_stripped", json!({})),
+    ] {
+        let model_dir = temp_path(name);
+        fs::create_dir_all(&model_dir).unwrap();
+        let config = json!({
+            "architectures": ["MageVLForConditionalGeneration"],
+            "model_type": "mage_vl",
+            "image_token_id": 151655,
+            "text_config": {"model_type": "qwen3", "hidden_size": 2560, "num_hidden_layers": 36},
+            "vision_config": vision,
+        });
+        fs::write(model_dir.join("config.json"), config.to_string()).unwrap();
+
+        let detected = super::detection::get_model_type(&model_dir).unwrap();
+        assert_eq!(detected, ModelType::MageVLM, "{name}");
+
+        fs::remove_dir_all(model_dir).unwrap();
+    }
+}
+
+#[test]
 fn got_model_type_is_detected_for_both_released_layouts() {
     // GOT-OCR 2.0 writes its `model_type` in upper case (`"GOT"`), so this
     // depends on the lowercase normalization the detector applies before
@@ -1975,4 +2065,32 @@ fn iquestcoder_architecture_is_untouched_by_the_loop_guard() {
         detect_iquest_coder("iquestcoder_as_llama", config).unwrap(),
         ModelType::IQuestCoder
     );
+}
+
+#[test]
+fn nanochat_model_type_is_detected() {
+    // nanochat declares `NanoChatForCausalLM` and a Llama-like config
+    // (`num_key_value_heads`, `rope_theta`), so detection must key off
+    // `model_type` alone. Both MLX conversions and the transformers export use it.
+    let model_dir = temp_path("nanochat_text");
+    fs::create_dir_all(&model_dir).unwrap();
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+            "model_type": "nanochat",
+            "architectures": ["NanoChatForCausalLM"],
+            "hidden_size": 1280,
+            "num_attention_heads": 10,
+            "num_hidden_layers": 20,
+            "intermediate_size": 5120,
+            "vocab_size": 65536,
+            "logits_soft_cap": 15.0
+        }"#,
+    )
+    .unwrap();
+
+    let detected = super::detection::get_model_type(&model_dir).unwrap();
+    assert_eq!(detected, ModelType::NanoChat);
+
+    fs::remove_dir_all(model_dir).unwrap();
 }

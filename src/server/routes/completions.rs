@@ -447,6 +447,9 @@ async fn stream_completion(
     let tokenizer = state.tokenizer.clone();
 
     // Spawn a blocking task to handle generation
+    let admission =
+        crate::server::model_provider::AdmissionWaiter::arm(&mut options, cancelled.clone());
+
     tokio::task::spawn_blocking(move || {
         // Unregister the completion-control entry when this task exits, on
         // every path (#1444).
@@ -545,6 +548,10 @@ async fn stream_completion(
         finish_events.done();
     });
 
+    if let Err(error) = admission.wait().await {
+        return generation_error_to_response(error).into_response();
+    }
+
     sse_response(stream, keepalive)
 }
 
@@ -587,6 +594,16 @@ mod tests {
             validate_top_n_sigma(request.params.top_n_sigma),
             Err("top_n_sigma must be >= 0.0")
         );
+    }
+
+    #[test]
+    fn completions_accepts_p_less_bool() {
+        let request: CompletionRequest =
+            serde_json::from_str(r#"{"model":"m","prompt":"hi","p_less":true}"#).unwrap();
+        assert_eq!(request.params.p_less, Some(true));
+        let request: CompletionRequest =
+            serde_json::from_str(r#"{"model":"m","prompt":"hi"}"#).unwrap();
+        assert_eq!(request.params.p_less, None);
     }
 
     #[test]

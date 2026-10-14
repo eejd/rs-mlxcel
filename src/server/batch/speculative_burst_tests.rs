@@ -95,6 +95,117 @@ use super::speculative_burst::{
 // Test helpers
 // =============================================================================
 
+fn measured_row_wise_window() -> super::speculative_burst::RowWiseBatchedWindow {
+    // The issue #2190 GB10 measurement: B=2, ~190-token prompts, 200 tokens,
+    // K=4, the 31B's 1024-token sliding window.
+    super::speculative_burst::RowWiseBatchedWindow {
+        batch_size: 2,
+        max_prompt_len: 192,
+        max_tokens: 200,
+        block_size: 4,
+        sliding_window: 1024,
+        dense_fp16_caches: true,
+        measured_backend: true,
+    }
+}
+
+#[test]
+fn row_wise_batched_window_serves_the_measured_configuration() {
+    assert_eq!(measured_row_wise_window().decline_reason(), None);
+    let no_window = super::speculative_burst::RowWiseBatchedWindow {
+        sliding_window: 0,
+        max_tokens: 100_000,
+        ..measured_row_wise_window()
+    };
+    assert_eq!(no_window.decline_reason(), None);
+}
+
+#[test]
+fn row_wise_batched_window_declines_outside_its_exact_limits() {
+    let base = measured_row_wise_window();
+    let cases = [
+        super::speculative_burst::RowWiseBatchedWindow {
+            batch_size: super::speculative_burst::ROW_WISE_MTP_MAX_BATCH + 1,
+            ..base
+        },
+        super::speculative_burst::RowWiseBatchedWindow {
+            dense_fp16_caches: false,
+            ..base
+        },
+        super::speculative_burst::RowWiseBatchedWindow {
+            measured_backend: false,
+            ..base
+        },
+        super::speculative_burst::RowWiseBatchedWindow {
+            max_prompt_len: 1025,
+            max_tokens: 1,
+            ..base
+        },
+        // 192 + 4 * 301 = 1396 passes 1024 + 32: a finished row's advances
+        // could make the shared ring compact under a lagging live row.
+        super::speculative_burst::RowWiseBatchedWindow {
+            max_tokens: 300,
+            ..base
+        },
+    ];
+    for window in cases {
+        assert!(window.decline_reason().is_some(), "{window:?} must decline");
+    }
+    // The ceiling itself is inclusive: 192 + 4 * 216 = 1056.
+    let at_ceiling = super::speculative_burst::RowWiseBatchedWindow {
+        max_tokens: 215,
+        ..base
+    };
+    assert_eq!(at_ceiling.decline_reason(), None);
+}
+
+#[test]
+fn gemma31b_batched_mtp_declines_before_drafter_io_and_preserves_requests() {
+    let _runtime = crate::initialize_runtime();
+    let wrapper = crate::models::gemma4_tests::build_synthetic_wrapper_for_linear_mtp_only();
+    assert!(wrapper.mtp_requires_linear_singleton());
+    let model = crate::LoadedModel::Gemma4(wrapper);
+    let mut dispatch = make_mtp_dispatch();
+    if let crate::server::SpeculativeDispatch::Mtp {
+        draft_model_path, ..
+    } = &mut dispatch
+    {
+        *draft_model_path = std::path::PathBuf::from(
+            "/nonexistent/mlxcel-1983-dispatch-test/must-not-load-drafter",
+        );
+    }
+    let mut slot = WorkerDrafterSlot::from_dispatch(&dispatch);
+    let tokenizer = crate::tokenizer::MlxcelTokenizer::stub();
+    let (first, first_events) = make_test_sequence();
+    let (mut second, second_events) = make_test_sequence();
+    second.seq_id = SequenceId::from_raw(43);
+    let expected_prompts = [first.prompt_tokens.clone(), second.prompt_tokens.clone()];
+    let ctx = super::speculative_burst::BurstContext {
+        model: &model,
+        tokenizer: &tokenizer,
+        drafter_slot: &mut slot,
+        dispatch: &dispatch,
+        profile_probe_rounds: 0,
+        prefill_chunk_size: 512,
+        prefill_boundary: None,
+        context_bound: Default::default(),
+        prefill_boundaries: Vec::new(),
+    };
+    let requests = match super::speculative_burst::try_run_burst_batched(ctx, vec![first, second]) {
+        Err(requests) => requests,
+        Ok(_) => panic!("unsupported exactness layout must return requests for classic decode"),
+    };
+    assert_eq!(requests.len(), 2);
+    for (request, expected_prompt) in requests.iter().zip(expected_prompts) {
+        assert!(matches!(request.state, SequenceState::Queued));
+        assert_eq!(request.prompt_tokens, expected_prompt);
+        assert!(request.prefill_start.is_none());
+        assert!(request.generated_tokens.is_empty());
+    }
+    assert!(first_events.try_recv().is_err());
+    assert!(second_events.try_recv().is_err());
+}
+
 /// Build a minimal [`SequenceInfo`] in the `Queued` state with default
 /// sampling. Callers tweak individual fields before passing to
 /// [`should_burst_for_sequence`].
@@ -126,13 +237,15 @@ fn make_test_sequence() -> (SequenceInfo, mpsc::Receiver<GenerateEvent>) {
         prefill_offset: 0,
         prefill_start_offset: 0,
         already_cached_tokens: 0,
+        eos_terminated: false,
         response_tx: tx,
         cancelled: Arc::new(AtomicBool::new(false)),
         created_at: Instant::now(),
         prefill_start: None,
         first_token_time: None,
+        prompt_lookup: None,
         token_history: Vec::new(),
-        sampler_state: None,
+        sampler: Default::default(),
         merged_eos: Vec::new(),
         thinking: ThinkingState::disabled(),
         structured: None,
@@ -148,6 +261,7 @@ fn make_mtp_dispatch() -> crate::server::SpeculativeDispatch {
     crate::server::SpeculativeDispatch::Mtp {
         draft_model_path: std::path::PathBuf::from("/tmp/test-mtp-drafter"),
         block_size: 4,
+        block_size_source: crate::cli::draft_block_policy::BlockSizeSource::Override,
         user_requested_explicit_kind: true,
     }
 }
@@ -159,6 +273,7 @@ fn make_dflash_dispatch() -> crate::server::SpeculativeDispatch {
     crate::server::SpeculativeDispatch::DFlash {
         draft_model_path: std::path::PathBuf::from("/tmp/test-dflash-drafter"),
         block_size: 16,
+        block_size_source: crate::cli::draft_block_policy::BlockSizeSource::Override,
         user_requested_explicit_kind: true,
     }
 }
@@ -1915,6 +2030,11 @@ const SRC_OFFLINE_GENERATE: &str = include_str!("../../commands/generate.rs");
 /// Qwen 3.5 MTP is B = 1 only (#1165).
 const MTP_DISPATCH_SITES: &[(&str, &str, &str)] = &[
     (
+        "mtp_target_family_supported (decline-message family check)",
+        SRC_SPECULATIVE_BURST,
+        "fn mtp_target_family_supported(",
+    ),
+    (
         "run_mtp_burst (variant gate + adapter selection)",
         SRC_SPECULATIVE_BURST,
         "fn run_mtp_burst(",
@@ -2225,4 +2345,21 @@ fn classic_mark_first_token_stamps_the_decode_state_and_on_token_does_not_restam
         "the gap between the mark and on_token belongs to generation, got {}",
         result.generation_only_ms
     );
+}
+
+#[test]
+fn sampling_config_eq_distinguishes_p_less() {
+    let a = SamplingConfig::with_temperature(0.7);
+    let b = SamplingConfig {
+        p_less: true,
+        ..a.clone()
+    };
+    assert!(!super::speculative_burst::sampling_config_eq(&a, &b));
+    // Greedy rows differing only in an inert p_less still share a window.
+    let g = SamplingConfig::greedy();
+    let gp = SamplingConfig {
+        p_less: true,
+        ..g.clone()
+    };
+    assert!(super::speculative_burst::sampling_config_eq(&g, &gp));
 }

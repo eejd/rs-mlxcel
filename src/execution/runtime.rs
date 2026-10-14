@@ -20,6 +20,13 @@
 
 use std::fmt;
 
+static APPLIED_WIRED_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The cap actually configured at runtime, unlike get_wired_limit (device recommendation).
+pub(crate) fn applied_wired_limit() -> u64 {
+    APPLIED_WIRED_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 const RUNTIME_DEVICE_ENV: &str = "MLXCEL_DEVICE";
 const WIRED_LIMIT_ENV: &str = "MLXCEL_WIRED_LIMIT";
 /// Issue #55: optional soft cap on the MLX allocator. When set, the
@@ -35,9 +42,28 @@ const MEMORY_LIMIT_ENV: &str = "MLXCEL_MEMORY_LIMIT";
 /// memory pool stays bounded without the per-decode `clear_memory_cache`
 /// churn that defeats CUDA-graph reuse (ml-explore/mlx#2358). Accepts the
 /// shared size grammar of [`parse_memory_size`]: plain bytes, `NK`/`NKB`,
-/// `NM`/`NMB` or `NG`/`NGB`. Unset means "do not override MLX's default
-/// cache behavior".
+/// `NM`/`NMB` or `NG`/`NGB`; `0` or `none` disables the bound. Unset means
+/// [`DEFAULT_CACHE_LIMIT_BYTES`]: none on Metal and CUDA, a fixed bound on
+/// ROCm (issue #2062).
 const CACHE_LIMIT_ENV: &str = "MLXCEL_CACHE_LIMIT";
+
+/// Buffer-cache bound applied when `MLXCEL_CACHE_LIMIT` is unset (issue
+/// #2062): 2 GiB on ROCm builds, where the MLX ROCm allocator's own default
+/// lets freed buffers accumulate up to its memory limit (80% of the larger of
+/// device memory and host RAM, 76.8 GiB on the 96 GiB gfx1151 carve-out) and
+/// its cache only reuses a buffer of exactly the requested size, so on a UMA
+/// host freed memory the model will not ask for again is held from the OS and
+/// every other GPU tenant. Measured on gfx1151, decode throughput did not
+/// move between 128 MiB and no bound, while prefill lost 16% at 128 MiB on
+/// Llama-3.1-8B-4bit (its f16 weight copies no longer survive in the cache)
+/// and nothing measurable from 512 MiB up; 2 GiB is four times that smallest
+/// free value, for the larger weight copies of bigger models. See
+/// `docs/benchmark_results/rocm-memory-gfx1151-2026-09-30.md`. Metal and CUDA
+/// keep MLX's own default (`None`).
+#[cfg(feature = "rocm")]
+const DEFAULT_CACHE_LIMIT_BYTES: Option<u64> = Some(2 * 1024 * 1024 * 1024);
+#[cfg(not(feature = "rocm"))]
+const DEFAULT_CACHE_LIMIT_BYTES: Option<u64> = None;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeDevice {
@@ -89,21 +115,24 @@ pub struct RuntimeSetup {
     /// (issue #55). `None` when the env var was unset or invalid and
     /// MLX's default limit is in effect.
     pub memory_limit_bytes: Option<usize>,
-    /// Buffer-cache bound applied via `MLXCEL_CACHE_LIMIT` (issue #627).
-    /// `None` when the env var was unset/invalid and MLX's default cache
-    /// behavior is in effect.
+    /// Buffer-cache bound applied at startup: `MLXCEL_CACHE_LIMIT` (issue
+    /// #627) or, when that is unset, the backend default (2 GiB on ROCm,
+    /// issue #2062). `None` when no bound was applied and MLX's default
+    /// cache behavior is in effect.
     pub cache_limit_bytes: Option<usize>,
     pub invalid_device_override: Option<String>,
 }
 
-/// Initialize the runtime, refusing to start when this binary's compiled CUDA
-/// architectures do not cover the GPU in this host (issue #1537).
+/// Initialize the runtime, refusing to start when this binary's compiled GPU
+/// architectures do not cover the GPU in this host (issues #1537, #1805).
 ///
 /// This is the entry point every binary-facing caller uses. The check runs
 /// before any device state is touched, so an incompatible build reports which
 /// architectures it carries and which one it found, instead of continuing to
-/// the first kernel launch and dying there on a CUDA load error that names
-/// neither. It is inert on Metal, on CPU-only builds, and on any CUDA build
+/// the first kernel launch and dying there on a load error that names neither.
+/// Both backends are checked: CUDA compute capabilities (#1537) and HIP `gfx`
+/// targets (#1805). Each check is inert unless its backend is the live one, so
+/// it is inert on Metal, on CPU-only builds, and on any CUDA or ROCm build
 /// whose architecture list does cover the device, which is every supported
 /// configuration.
 ///
@@ -114,19 +143,57 @@ pub struct RuntimeSetup {
 /// Tests and other in-process callers that do not own the process exit path
 /// keep using [`initialize_runtime`], which performs the same setup without the
 /// refusal.
-pub fn initialize_runtime_checked() -> Result<RuntimeSetup, mlxcel_core::hardware::CudaArchMismatch>
-{
+pub fn initialize_runtime_checked() -> Result<RuntimeSetup, GpuArchMismatch> {
     // Trace before the refusal, so `MLXCEL_TRACE_ARCH` still explains an
     // incompatible build rather than going quiet on the one path where the
-    // architecture picture matters most.
+    // architecture picture matters most. Both traces run: each is a no-op
+    // unless its own backend is the live one.
     mlxcel_core::hardware::trace_arch_once();
+    mlxcel_core::rocm_arch::trace_rocm_arch_once();
     let (requested_device, _) =
         resolve_runtime_device(std::env::var(RUNTIME_DEVICE_ENV).ok().as_deref());
     if requested_device.uses_gpu() {
         mlxcel_core::hardware::enforce_cuda_arch_compatibility()?;
+        mlxcel_core::rocm_arch::enforce_rocm_arch_compatibility()?;
     }
     Ok(initialize_runtime())
 }
+
+/// The running GPU is not covered by the architectures this binary carries.
+///
+/// One variant per backend rather than one shared type, because the two
+/// coverage rules are different: CUDA's is an ordering over compute
+/// capabilities with a PTX JIT fallback, HIP's is set membership over `gfx`
+/// targets with no fallback at all (issue #1805). Only one variant is
+/// reachable in a given process, since only one GPU backend resolves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpuArchMismatch {
+    Cuda(mlxcel_core::hardware::CudaArchMismatch),
+    Rocm(mlxcel_core::rocm_arch::RocmArchMismatch),
+}
+
+impl From<mlxcel_core::hardware::CudaArchMismatch> for GpuArchMismatch {
+    fn from(inner: mlxcel_core::hardware::CudaArchMismatch) -> Self {
+        Self::Cuda(inner)
+    }
+}
+
+impl From<mlxcel_core::rocm_arch::RocmArchMismatch> for GpuArchMismatch {
+    fn from(inner: mlxcel_core::rocm_arch::RocmArchMismatch) -> Self {
+        Self::Rocm(inner)
+    }
+}
+
+impl std::fmt::Display for GpuArchMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cuda(inner) => inner.fmt(f),
+            Self::Rocm(inner) => inner.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for GpuArchMismatch {}
 
 pub fn initialize_runtime() -> RuntimeSetup {
     // Device init is the once-per-process point where the architecture trace
@@ -196,15 +263,21 @@ pub fn initialize_runtime() -> RuntimeSetup {
         None
     };
 
+    APPLIED_WIRED_LIMIT.store(
+        wired_limit_bytes.unwrap_or(0) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
     // Issue #55: apply optional soft allocator cap regardless of device.
     // The MLX no-gpu CPU allocator also honours `set_memory_limit()`, so
     // the preflight (#56) can use this on Linux/CI just as on Apple
     // Silicon.
     let memory_limit_bytes = resolve_memory_limit();
 
-    // Issue #627: apply optional buffer-cache bound. Meaningful mainly on
-    // CUDA, where the periodic decode-loop clear is disabled by default and
-    // this cap is the intended mechanism for bounding cache growth instead.
+    // Issue #627: apply the buffer-cache bound. On CUDA it is opt-in and
+    // replaces the periodic decode-loop clear that CUDA disables by default;
+    // on ROCm it has a default (issue #2062) because the allocator's own
+    // default holds freed memory up to its 76.8 GiB limit on a UMA host.
     let cache_limit_bytes = resolve_cache_limit();
 
     RuntimeSetup {
@@ -300,23 +373,46 @@ fn resolve_memory_limit() -> Option<usize> {
     Some(clamp_to_usize(bytes))
 }
 
-/// Resolve the MLX buffer-cache bound from MLXCEL_CACHE_LIMIT (issue #627).
+/// Resolve and apply the MLX buffer-cache bound (issues #627, #2062).
 ///
-/// Returns the limit applied, or `None` when unset/disabled. On CUDA this is
-/// the intended replacement for the periodic decode-loop `clear_memory_cache`
-/// (disabled by default there): it keeps the memory pool bounded without the
-/// per-step churn that defeats CUDA-graph reuse (ml-explore/mlx#2358).
+/// Returns the limit applied, or `None` when none was. On CUDA an explicit
+/// `MLXCEL_CACHE_LIMIT` is the intended replacement for the periodic
+/// decode-loop `clear_memory_cache` (disabled by default there): it keeps the
+/// memory pool bounded without the per-step churn that defeats CUDA-graph
+/// reuse (ml-explore/mlx#2358). On ROCm an unset variable applies
+/// [`DEFAULT_CACHE_LIMIT_BYTES`]; see [`cache_limit_bytes`] for the rules.
 fn resolve_cache_limit() -> Option<usize> {
-    let raw = std::env::var(CACHE_LIMIT_ENV).ok();
-    let bytes = match raw.as_deref() {
-        Some("0") | Some("none") | Some("NONE") | None | Some("") => return None,
-        Some(s) => parse_memory_size(s)?,
-    };
-    if bytes == 0 {
-        return None;
-    }
+    let bytes = cache_limit_bytes(
+        std::env::var(CACHE_LIMIT_ENV).ok().as_deref(),
+        DEFAULT_CACHE_LIMIT_BYTES,
+    )?;
     mlxcel_core::memory::set_cache_limit(bytes);
     Some(clamp_to_usize(bytes))
+}
+
+/// The cache bound for a raw `MLXCEL_CACHE_LIMIT` value and a backend
+/// default. Pure, so every case is unit-tested on every backend.
+///
+/// - unset or empty: `default`
+/// - `0` or `none` (any case): `None`, the operator's way to turn off a
+///   default bound
+/// - a size in the [`parse_memory_size`] grammar: that size (`0B`-style
+///   spellings that parse to zero also disable)
+/// - anything unparseable: `default`, so a typo cannot silently remove the
+///   ROCm bound
+fn cache_limit_bytes(raw: Option<&str>, default: Option<u64>) -> Option<u64> {
+    let s = match raw.map(str::trim) {
+        None | Some("") => return default,
+        Some(s) => s,
+    };
+    if s == "0" || s.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    match parse_memory_size(s) {
+        Some(0) => None,
+        Some(bytes) => Some(bytes),
+        None => default,
+    }
 }
 
 /// The one size grammar behind every size-valued mlxcel environment variable

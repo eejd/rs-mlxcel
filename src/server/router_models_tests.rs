@@ -22,12 +22,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
-    RouterModelSource, RouterModelStatus, RouterPool, RouterPoolError, RouterSources,
-    discover_models,
+    ModelActionEvictionTarget, RouterModelSource, RouterModelStatus, RouterPool, RouterPoolError,
+    RouterSources, discover_models,
 };
 use crate::downloader::DownloadHooks;
 use crate::server::ServerStartupConfig;
 use crate::server::router_cache::{CacheSource, RouterDownloader};
+use crate::server::router_lifecycle::ModelLifecycleState;
 use crate::server::router_presets::{PresetCliOverrides, parse_preset_text};
 
 fn temp_models_dir(tag: &str) -> PathBuf {
@@ -47,6 +48,19 @@ fn add_fake_model(root: &std::path::Path, name: &str) {
     let dir = root.join(name);
     std::fs::create_dir_all(&dir).expect("model dir");
     std::fs::write(dir.join("config.json"), "{}").expect("config.json");
+}
+
+#[test]
+fn cache_source_list_does_not_create_absent_store_root() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let absent = temp.path().join("missing-store");
+    let cache = CacheSource::new(absent.clone(), FakeDownloader::ok());
+
+    assert!(cache.list().is_empty());
+    assert!(
+        !absent.exists(),
+        "catalog construction/listing must not create cache or staging directories"
+    );
 }
 
 /// A downloader that materializes a fake snapshot locally, driving the same
@@ -85,13 +99,14 @@ impl FakeDownloader {
 }
 
 impl RouterDownloader for FakeDownloader {
-    fn validate(&self, _repo_id: &str) -> anyhow::Result<()> {
+    fn validate(&self, _repo_id: &str, _revision: Option<&str>) -> anyhow::Result<()> {
         Ok(())
     }
 
     fn download(
         &self,
         repo_id: &str,
+        _revision: Option<&str>,
         dest_root: &Path,
         hooks: DownloadHooks,
     ) -> anyhow::Result<()> {
@@ -120,6 +135,190 @@ impl RouterDownloader for FakeDownloader {
         if let Some(progress) = &hooks.progress {
             progress(&url, 2, 2);
         }
+        Ok(())
+    }
+}
+
+struct PublishingDownloader {
+    entered_publish: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
+impl PublishingDownloader {
+    fn new(sender: std::sync::mpsc::Sender<()>) -> Arc<Self> {
+        Arc::new(Self {
+            entered_publish: std::sync::Mutex::new(Some(sender)),
+        })
+    }
+}
+
+impl RouterDownloader for PublishingDownloader {
+    fn validate(&self, _repo_id: &str, _revision: Option<&str>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn download(
+        &self,
+        repo_id: &str,
+        _revision: Option<&str>,
+        dest_root: &Path,
+        hooks: DownloadHooks,
+    ) -> anyhow::Result<()> {
+        let url = format!("https://example.invalid/{repo_id}/config.json");
+        if let Some(progress) = &hooks.progress {
+            progress(&url, 1, 1);
+        }
+        if let Some(begin_publish) = &hooks.begin_publish
+            && !begin_publish()
+        {
+            return Err(anyhow::Error::new(crate::downloader::DownloadCancelled));
+        }
+        if let Some(sender) = self
+            .entered_publish
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+        {
+            let _ = sender.send(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let dest = dest_root.join(repo_id);
+        std::fs::create_dir_all(&dest)?;
+        std::fs::write(dest.join("config.json"), "{}")?;
+        Ok(())
+    }
+}
+
+struct ResolvingHangingDownloader {
+    plan_sent: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    resolved_revision: String,
+}
+
+impl ResolvingHangingDownloader {
+    fn new(sender: std::sync::mpsc::Sender<()>, resolved_revision: &str) -> Arc<Self> {
+        Arc::new(Self {
+            plan_sent: std::sync::Mutex::new(Some(sender)),
+            resolved_revision: resolved_revision.to_string(),
+        })
+    }
+}
+
+impl RouterDownloader for ResolvingHangingDownloader {
+    fn validate(&self, _repo_id: &str, _revision: Option<&str>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn download(
+        &self,
+        repo_id: &str,
+        revision: Option<&str>,
+        _dest_root: &Path,
+        hooks: DownloadHooks,
+    ) -> anyhow::Result<()> {
+        if let Some(plan) = &hooks.plan {
+            plan(crate::downloader::DownloadPlan {
+                repo_id: repo_id.to_string(),
+                requested_revision: revision.unwrap_or("main").to_string(),
+                resolved_revision: self.resolved_revision.clone(),
+                destination: PathBuf::from("/redacted/cache"),
+                selected_files: 2,
+                total_bytes: Some(100),
+            });
+        }
+        if let Some(sender) = self
+            .plan_sent
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+        {
+            let _ = sender.send(());
+        }
+        let cancel = hooks.cancel.clone().expect("cancel flag");
+        while !cancel.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Err(anyhow::Error::new(crate::downloader::DownloadCancelled))
+    }
+}
+
+struct BurstProgressDownloader;
+
+impl RouterDownloader for BurstProgressDownloader {
+    fn validate(&self, _repo_id: &str, _revision: Option<&str>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn download(
+        &self,
+        repo_id: &str,
+        revision: Option<&str>,
+        dest_root: &Path,
+        hooks: DownloadHooks,
+    ) -> anyhow::Result<()> {
+        if let Some(plan) = &hooks.plan {
+            plan(crate::downloader::DownloadPlan {
+                repo_id: repo_id.to_string(),
+                requested_revision: revision.unwrap_or("main").to_string(),
+                resolved_revision: "abc123".to_string(),
+                destination: dest_root.join(repo_id),
+                selected_files: 2,
+                total_bytes: Some(100),
+            });
+        }
+        let url = format!("https://example.invalid/{repo_id}/model.safetensors");
+        if let Some(progress) = &hooks.progress {
+            for done in 1..20 {
+                progress(&url, done, 20);
+            }
+            progress(&url, 20, 20);
+        }
+        let dest = dest_root.join(repo_id);
+        std::fs::create_dir_all(&dest)?;
+        std::fs::write(dest.join("config.json"), "{}")?;
+        Ok(())
+    }
+}
+
+struct FailOnceDownloader {
+    attempts: AtomicUsize,
+}
+
+impl FailOnceDownloader {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            attempts: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl RouterDownloader for FailOnceDownloader {
+    fn validate(&self, _repo_id: &str, _revision: Option<&str>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn download(
+        &self,
+        repo_id: &str,
+        revision: Option<&str>,
+        dest_root: &Path,
+        hooks: DownloadHooks,
+    ) -> anyhow::Result<()> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            anyhow::bail!("simulated first download failure");
+        }
+        if let Some(plan) = &hooks.plan {
+            plan(crate::downloader::DownloadPlan {
+                repo_id: repo_id.to_string(),
+                requested_revision: revision.unwrap_or("main").to_string(),
+                resolved_revision: "retry-sha".to_string(),
+                destination: dest_root.join(repo_id),
+                selected_files: 2,
+                total_bytes: Some(2),
+            });
+        }
+        let dest = dest_root.join(repo_id);
+        std::fs::create_dir_all(&dest)?;
+        std::fs::write(dest.join("config.json"), "{}")?;
+        std::fs::write(dest.join("model.safetensors"), b"ok")?;
         Ok(())
     }
 }
@@ -392,6 +591,417 @@ async fn a_download_emits_the_b10621_event_sequence_and_lands_in_the_cache() {
         "snapshot landed in the cache"
     );
     assert_eq!(downloader.downloads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn duplicate_download_with_same_idempotency_key_replays_active_operation() {
+    let cache = tempfile::tempdir().unwrap();
+    let downloader = FakeDownloader::hanging();
+    let pool = Arc::new(pool_from(
+        RouterSources {
+            cache: Some(CacheSource::new(
+                cache.path().to_path_buf(),
+                downloader.clone(),
+            )),
+            ..RouterSources::default()
+        },
+        2,
+        false,
+    ));
+    let mut events = pool.subscribe();
+    let first = pool
+        .submit_download(
+            "mlx-community/replay-model",
+            None,
+            Some("idem_download_replay"),
+        )
+        .expect("first download");
+    let second = pool
+        .submit_download(
+            "mlx-community/replay-model",
+            None,
+            Some("idem_download_replay"),
+        )
+        .expect("replay download");
+    assert_eq!(second.operation_id, first.operation_id);
+    assert!(second.idempotent_replay);
+    wait_for_operation_state(
+        &pool,
+        &first.operation_id,
+        &[crate::server::router_lifecycle::OperationState::Running],
+    )
+    .await;
+    pool.lifecycle_coordinator()
+        .cancel_operation(&first.operation_id)
+        .expect("cancel replayed op");
+    wait_for_event(&mut events, "download_failed").await;
+    assert_eq!(downloader.downloads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn duplicate_download_idempotency_key_rejects_different_payload_before_alias_replay() {
+    let cache = tempfile::tempdir().unwrap();
+    let downloader = FakeDownloader::hanging();
+    let pool = Arc::new(pool_from(
+        RouterSources {
+            cache: Some(CacheSource::new(cache.path().to_path_buf(), downloader)),
+            ..RouterSources::default()
+        },
+        2,
+        false,
+    ));
+    let mut events = pool.subscribe();
+    let first = pool
+        .submit_download(
+            "mlx-community/idempotency-conflict",
+            Some("main"),
+            Some("idem_download_conflict"),
+        )
+        .expect("first download");
+
+    let err = pool
+        .submit_download(
+            "mlx-community/idempotency-conflict",
+            Some("dev"),
+            Some("idem_download_conflict"),
+        )
+        .expect_err("same idempotency key with different payload must fail");
+    match err {
+        RouterPoolError::OperationRejected(error) => {
+            assert_eq!(error.code, "conflict");
+            assert_eq!(
+                error.operation_id.as_deref(),
+                Some(first.operation_id.as_str())
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    pool.lifecycle_coordinator()
+        .cancel_operation(&first.operation_id)
+        .expect("cancel first op");
+    wait_for_event(&mut events, "download_failed").await;
+}
+
+#[tokio::test]
+async fn active_download_replays_resolved_revision_alias() {
+    let cache = tempfile::tempdir().unwrap();
+    let (plan_tx, plan_rx) = std::sync::mpsc::channel();
+    let downloader = ResolvingHangingDownloader::new(plan_tx, "abc123");
+    let pool = Arc::new(pool_from(
+        RouterSources {
+            cache: Some(CacheSource::new(cache.path().to_path_buf(), downloader)),
+            ..RouterSources::default()
+        },
+        2,
+        false,
+    ));
+    let mut events = pool.subscribe();
+    let first = pool
+        .submit_download(
+            "mlx-community/revision-alias",
+            Some("main"),
+            Some("idem_revision_alias_main"),
+        )
+        .expect("first download");
+    tokio::task::spawn_blocking(move || {
+        plan_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("plan hook")
+    })
+    .await
+    .expect("plan waiter");
+
+    let second = pool
+        .submit_download(
+            "mlx-community/revision-alias",
+            Some("abc123"),
+            Some("idem_revision_alias_sha"),
+        )
+        .expect("resolved revision replay");
+    assert_eq!(second.operation_id, first.operation_id);
+    assert!(second.idempotent_replay);
+
+    pool.lifecycle_coordinator()
+        .cancel_operation(&first.operation_id)
+        .expect("cancel first op");
+    wait_for_event(&mut events, "download_failed").await;
+}
+
+#[tokio::test]
+async fn download_progress_keeps_plan_total_and_throttles_coordinator_events() {
+    let cache = tempfile::tempdir().unwrap();
+    let pool = Arc::new(pool_from(
+        RouterSources {
+            cache: Some(CacheSource::new(
+                cache.path().to_path_buf(),
+                Arc::new(BurstProgressDownloader),
+            )),
+            ..RouterSources::default()
+        },
+        2,
+        false,
+    ));
+    let mut lifecycle_events = pool.lifecycle_coordinator().subscribe();
+    let accepted = pool
+        .submit_download(
+            "mlx-community/progress-total",
+            None,
+            Some("idem_progress_total"),
+        )
+        .expect("download accepted");
+    wait_for_operation_state(
+        &pool,
+        &accepted.operation_id,
+        &[crate::server::router_lifecycle::OperationState::Succeeded],
+    )
+    .await;
+
+    let mut progress_events = Vec::new();
+    while let Ok(event) = lifecycle_events.try_recv() {
+        if let crate::server::router_lifecycle::UiEventPayload::DownloadProgress(payload) =
+            event.payload
+            && payload.operation_id == accepted.operation_id
+        {
+            progress_events.push(payload.progress);
+        }
+    }
+    assert!(
+        progress_events.len() <= 2,
+        "coordinator progress should be coalesced, got {progress_events:?}"
+    );
+    assert!(
+        progress_events
+            .iter()
+            .all(|progress| progress.total_bytes == Some(100)),
+        "known plan total must not regress to per-file totals: {progress_events:?}"
+    );
+}
+
+#[tokio::test]
+async fn failed_download_can_retry_same_repo_with_new_idempotency_key() {
+    let cache = tempfile::tempdir().unwrap();
+    let downloader = FailOnceDownloader::new();
+    let pool = Arc::new(pool_from(
+        RouterSources {
+            cache: Some(CacheSource::new(
+                cache.path().to_path_buf(),
+                downloader.clone(),
+            )),
+            ..RouterSources::default()
+        },
+        2,
+        false,
+    ));
+    let mut events = pool.subscribe();
+    let first = pool
+        .submit_download(
+            "mlx-community/retry-once",
+            None,
+            Some("idem_retry_once_first"),
+        )
+        .expect("first download accepted");
+    let failed = wait_for_operation_state(
+        &pool,
+        &first.operation_id,
+        &[crate::server::router_lifecycle::OperationState::Failed],
+    )
+    .await;
+    assert_eq!(
+        failed.state,
+        crate::server::router_lifecycle::OperationState::Failed
+    );
+    wait_for_event(&mut events, "download_failed").await;
+    assert!(
+        pool.get("mlx-community/retry-once").is_none(),
+        "failed transient entry must be dropped before retry"
+    );
+    assert!(
+        !cache.path().join("mlx-community/retry-once").exists(),
+        "failed fake transfer must leave no cache snapshot"
+    );
+
+    let second = pool
+        .submit_download(
+            "mlx-community/retry-once",
+            None,
+            Some("idem_retry_once_second"),
+        )
+        .expect("retry download accepted");
+    assert_ne!(
+        first.operation_id, second.operation_id,
+        "new idempotency key should create a distinct terminal operation"
+    );
+    let succeeded = wait_for_operation_state(
+        &pool,
+        &second.operation_id,
+        &[crate::server::router_lifecycle::OperationState::Succeeded],
+    )
+    .await;
+    assert_eq!(
+        succeeded.state,
+        crate::server::router_lifecycle::OperationState::Succeeded
+    );
+    wait_for_event(&mut events, "download_finished").await;
+
+    assert_eq!(downloader.attempts.load(Ordering::SeqCst), 2);
+    assert!(
+        !cache.path().join(".mlxcel-staging").exists(),
+        "retry fake transfer must not leave staging debris"
+    );
+    let cache_entries = pool
+        .catalog_snapshot()
+        .into_iter()
+        .filter(|model| {
+            model.name == "mlx-community/retry-once" && model.source == RouterModelSource::Cache
+        })
+        .count();
+    assert_eq!(cache_entries, 1, "retry should publish exactly one entry");
+}
+
+#[tokio::test]
+async fn download_rejects_case_only_cache_alias() {
+    let cache = tempfile::tempdir().unwrap();
+    let downloader = FakeDownloader::hanging();
+    let pool = Arc::new(pool_from(
+        RouterSources {
+            cache: Some(CacheSource::new(cache.path().to_path_buf(), downloader)),
+            ..RouterSources::default()
+        },
+        2,
+        false,
+    ));
+    let mut events = pool.subscribe();
+    let first = pool
+        .submit_download("mlx-community/CaseModel", None, Some("idem_case_one"))
+        .expect("first download");
+    assert_eq!(
+        pool.submit_download("mlx-community/casemodel", None, Some("idem_case_two")),
+        Err(RouterPoolError::AlreadyExists(
+            "mlx-community/casemodel".to_string()
+        ))
+    );
+    pool.lifecycle_coordinator()
+        .cancel_operation(&first.operation_id)
+        .expect("cancel first op");
+    wait_for_event(&mut events, "download_failed").await;
+}
+
+#[tokio::test]
+async fn download_admission_rejects_queue_saturation_before_worker_network() {
+    let cache = tempfile::tempdir().unwrap();
+    let downloader = FakeDownloader::hanging();
+    let pool = Arc::new(pool_from(
+        RouterSources {
+            cache: Some(CacheSource::new(
+                cache.path().to_path_buf(),
+                downloader.clone(),
+            )),
+            ..RouterSources::default()
+        },
+        8,
+        false,
+    ));
+    let mut events = pool.subscribe();
+    let mut accepted = Vec::new();
+    for idx in 0..crate::server::router_lifecycle::MAX_ACTIVE_DOWNLOAD_OPERATIONS {
+        accepted.push(
+            pool.submit_download(
+                &format!("mlx-community/saturated-{idx}"),
+                None,
+                Some(&format!("idem_saturation_{idx}")),
+            )
+            .expect("download admission"),
+        );
+    }
+
+    let err = pool
+        .submit_download(
+            "mlx-community/saturated-extra",
+            None,
+            Some("idem_saturation_extra"),
+        )
+        .expect_err("fifth active download must be rejected before network");
+    match err {
+        RouterPoolError::OperationRejected(error) => {
+            assert_eq!(error.code, "rate_limited");
+            assert!(
+                downloader.downloads.load(Ordering::SeqCst) <= accepted.len(),
+                "rejected request must not start an extra worker"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    for op in &accepted {
+        pool.lifecycle_coordinator()
+            .cancel_operation(&op.operation_id)
+            .expect("cancel accepted op");
+    }
+    let mut failed = 0usize;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while failed < accepted.len() {
+            let event = events.recv().await.expect("events open");
+            if event["event"] == "download_failed" {
+                failed += 1;
+            }
+        }
+    })
+    .await
+    .expect("all accepted downloads should cancel");
+}
+
+#[tokio::test]
+async fn cancel_after_publish_linearization_is_refused_and_download_completes() {
+    let cache = tempfile::tempdir().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let pool = Arc::new(pool_from(
+        RouterSources {
+            cache: Some(CacheSource::new(
+                cache.path().to_path_buf(),
+                PublishingDownloader::new(tx),
+            )),
+            ..RouterSources::default()
+        },
+        2,
+        false,
+    ));
+    let mut events = pool.subscribe();
+    let accepted = pool
+        .submit_download(
+            "mlx-community/publish-race",
+            None,
+            Some("idem_publish_race"),
+        )
+        .expect("download accepted");
+
+    tokio::task::spawn_blocking(move || {
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("publish linearization")
+    })
+    .await
+    .expect("publish waiter");
+
+    assert!(matches!(
+        pool.lifecycle_coordinator()
+            .cancel_operation(&accepted.operation_id),
+        Err(crate::server::router_lifecycle::CancelError::Unsupported { .. })
+    ));
+    wait_for_event(&mut events, "download_finished").await;
+    let operation = pool
+        .lifecycle_coordinator()
+        .get_operation(&accepted.operation_id)
+        .expect("operation");
+    assert_eq!(
+        operation.state,
+        crate::server::router_lifecycle::OperationState::Succeeded
+    );
+    assert!(
+        cache
+            .path()
+            .join("mlx-community/publish-race/config.json")
+            .is_file()
+    );
 }
 
 #[tokio::test]
@@ -805,6 +1415,46 @@ async fn ui_load_requires_explicit_eviction_when_capacity_is_reserved() {
 }
 
 #[tokio::test]
+async fn ui_load_rejects_stale_eviction_target_revision_before_unload() {
+    let root = temp_models_dir("ui-stale-eviction-target");
+    add_fake_model(&root, "resident");
+    add_fake_model(&root, "candidate");
+    let pool = Arc::new(pool(root, 1, true));
+    let resident = pool.get("resident").expect("resident");
+    resident.lifecycle.mark_ready();
+    let target_id = resident.ui_model_id.clone();
+    let stale_target_revision = resident.lifecycle_revision();
+    resident.lifecycle.mark_loading();
+    resident.lifecycle.mark_ready();
+    assert_ne!(resident.lifecycle_revision(), stale_target_revision);
+    let candidate = pool.get("candidate").expect("candidate");
+
+    let err = pool
+        .submit_model_action(
+            &candidate.ui_model_id,
+            super::RouterModelAction::Load,
+            candidate.lifecycle_revision(),
+            "stale-victim-0001",
+            Some(ModelActionEvictionTarget::new(
+                &target_id,
+                stale_target_revision,
+            )),
+        )
+        .expect_err("stale eviction target revision must be rejected");
+    let error = match err {
+        RouterPoolError::OperationRejected(error) => error,
+        other => panic!("unexpected error: {other:?}"),
+    };
+    assert_eq!(error.code, "stale_revision");
+    let field_errors = error.field_errors.expect("field error");
+    let field = &field_errors[0];
+    assert_eq!(field.field, "eviction_target_expected_revision");
+    assert_eq!(field.code, "stale");
+    assert_eq!(resident.lifecycle.state(), ModelLifecycleState::Ready);
+    assert_eq!(resident.ui_model_id, target_id);
+}
+
+#[tokio::test]
 async fn rescan_and_remove_preserve_reserved_entries_until_release() {
     let cache_root = temp_models_dir("reserved-cache");
     add_fake_model(&cache_root.join("mlx-community"), "reserved");
@@ -829,6 +1479,326 @@ async fn rescan_and_remove_preserve_reserved_entries_until_release() {
         pool.remove("mlx-community/reserved").await,
         Err(RouterPoolError::NotLoaded),
         "cache deletion must not remove a lifecycle-reserved entry without an observed unload"
+    );
+}
+
+#[test]
+fn rescan_preserves_webui_removal_busy_entry_until_operation_finishes() {
+    let cache_root = temp_models_dir("removal-busy-rescan");
+    add_fake_model(&cache_root.join("mlx-community"), "remove-busy");
+    let pool = pool_from(
+        RouterSources {
+            models_dir: None,
+            cache: Some(CacheSource::new(cache_root.clone(), FakeDownloader::ok())),
+            presets: Default::default(),
+        },
+        4,
+        true,
+    );
+    let entry = pool.get("mlx-community/remove-busy").expect("entry");
+    entry.lifecycle.mark_operation_busy();
+    std::fs::remove_dir_all(cache_root.join("mlx-community/remove-busy")).unwrap();
+
+    pool.rescan().expect("rescan");
+
+    let current = pool
+        .get("mlx-community/remove-busy")
+        .expect("entry after rescan");
+    assert!(
+        Arc::ptr_eq(&entry, &current),
+        "rescan must not rebuild an entry while WebUI removal owns its busy reservation"
+    );
+    assert!(current.lifecycle_snapshot().busy);
+    entry.lifecycle.mark_operation_idle();
+}
+
+#[tokio::test]
+async fn webui_cache_removal_deletes_managed_snapshot_and_drops_entry() {
+    let cache_root = temp_models_dir("webui-remove-ok");
+    add_fake_model(&cache_root.join("mlx-community"), "remove-me");
+    let pool = Arc::new(pool_from(
+        RouterSources {
+            models_dir: None,
+            cache: Some(CacheSource::new(cache_root.clone(), FakeDownloader::ok())),
+            presets: Default::default(),
+        },
+        4,
+        true,
+    ));
+    let mut events = pool.subscribe();
+    let entry = pool.get("mlx-community/remove-me").expect("entry");
+    let accepted = pool
+        .submit_cache_removal_by_model_id(
+            &entry.ui_model_id,
+            entry.lifecycle_revision(),
+            "idem_remove_model",
+        )
+        .expect("remove accepted");
+
+    let terminal = wait_for_operation_state(
+        &pool,
+        &accepted.operation_id,
+        &[crate::server::router_lifecycle::OperationState::Succeeded],
+    )
+    .await;
+    assert_eq!(
+        terminal.kind,
+        crate::server::router_lifecycle::OperationKind::ModelRemoval
+    );
+    wait_for_event(&mut events, "model_remove").await;
+    assert!(!cache_root.join("mlx-community/remove-me").exists());
+    assert!(pool.get("mlx-community/remove-me").is_none());
+}
+
+#[tokio::test]
+async fn webui_cache_removal_rejects_when_operation_guard_is_held() {
+    let cache_root = temp_models_dir("webui-remove-guard-held");
+    add_fake_model(&cache_root.join("mlx-community"), "guarded");
+    let pool = Arc::new(pool_from(
+        RouterSources {
+            models_dir: None,
+            cache: Some(CacheSource::new(cache_root.clone(), FakeDownloader::ok())),
+            presets: Default::default(),
+        },
+        4,
+        true,
+    ));
+    let entry = pool.get("mlx-community/guarded").expect("entry");
+    let _guard = entry.lifecycle.operation_guard().await;
+    let err = pool
+        .submit_cache_removal_by_model_id(
+            &entry.ui_model_id,
+            entry.lifecycle_revision(),
+            "idem_remove_guarded",
+        )
+        .expect_err("held operation guard must reject removal");
+    match err {
+        RouterPoolError::OperationRejected(error) => assert_eq!(error.code, "conflict"),
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert!(cache_root.join("mlx-community/guarded").exists());
+}
+
+#[tokio::test]
+async fn webui_cache_removal_rejects_models_dir_physical_overlap() {
+    let cache_root = temp_models_dir("webui-remove-models-dir-overlap");
+    add_fake_model(&cache_root.join("mlx-community"), "shared");
+    let pool = Arc::new(pool_from(
+        RouterSources {
+            models_dir: Some(cache_root.join("mlx-community")),
+            cache: Some(CacheSource::new(cache_root.clone(), FakeDownloader::ok())),
+            presets: Default::default(),
+        },
+        4,
+        true,
+    ));
+    let entry = pool.get("mlx-community/shared").expect("cache entry");
+    let err = pool
+        .submit_cache_removal_by_model_id(
+            &entry.ui_model_id,
+            entry.lifecycle_revision(),
+            "idem_remove_models_dir_overlap",
+        )
+        .expect_err("models-dir alias must block cache removal");
+    match err {
+        RouterPoolError::OperationRejected(error) => assert_eq!(error.code, "unsupported"),
+        other => panic!("unexpected error: {other:?}"),
+    }
+    let catalog = pool.catalog_snapshot();
+    let cache_entry = catalog
+        .iter()
+        .find(|model| model.name == "mlx-community/shared")
+        .expect("catalog cache entry");
+    assert!(cache_entry.removal_blocked_reason.is_some());
+    assert!(
+        cache_root
+            .join("mlx-community/shared/config.json")
+            .is_file()
+    );
+}
+
+#[tokio::test]
+async fn webui_cache_removal_rejects_descendant_models_dir_overlap() {
+    let cache_root = temp_models_dir("webui-remove-models-dir-descendant");
+    add_fake_model(&cache_root.join("mlx-community"), "parent");
+    let nested_models_dir = cache_root.join("mlx-community/parent/nested-models");
+    add_fake_model(&nested_models_dir, "user-owned");
+    let pool = Arc::new(pool_from(
+        RouterSources {
+            models_dir: Some(nested_models_dir.clone()),
+            cache: Some(CacheSource::new(cache_root.clone(), FakeDownloader::ok())),
+            presets: Default::default(),
+        },
+        4,
+        true,
+    ));
+    assert!(
+        pool.get("user-owned").is_some(),
+        "descendant models-dir entry should be discovered"
+    );
+    let entry = pool.get("mlx-community/parent").expect("cache entry");
+    let err = pool
+        .submit_cache_removal_by_model_id(
+            &entry.ui_model_id,
+            entry.lifecycle_revision(),
+            "idem_remove_models_dir_descendant",
+        )
+        .expect_err("descendant models-dir root must block parent cache removal");
+    match err {
+        RouterPoolError::OperationRejected(error) => assert_eq!(error.code, "unsupported"),
+        other => panic!("unexpected error: {other:?}"),
+    }
+    let catalog = pool.catalog_snapshot();
+    let cache_entry = catalog
+        .iter()
+        .find(|model| model.name == "mlx-community/parent")
+        .expect("catalog cache entry");
+    assert!(cache_entry.removal_blocked_reason.is_some());
+    assert!(
+        cache_root
+            .join("mlx-community/parent/config.json")
+            .is_file(),
+        "managed parent snapshot must remain after rejected removal"
+    );
+    assert!(
+        nested_models_dir.join("user-owned/config.json").is_file(),
+        "nested user-owned models-dir files must remain after rejected removal"
+    );
+}
+
+#[tokio::test]
+async fn webui_cache_removal_rejects_active_preset_physical_alias_without_hidden_cache_row() {
+    let cache_root = temp_models_dir("webui-remove-active-preset-overlap");
+    add_fake_model(&cache_root.join("mlx-community"), "active-twin");
+    let ini = "[served-active]
+hf-repo = mlx-community/active-twin
+";
+    let presets = parse_preset_text(ini).expect("parse presets");
+    let pool = Arc::new(pool_from(
+        RouterSources {
+            models_dir: None,
+            cache: Some(CacheSource::new(cache_root.clone(), FakeDownloader::ok())),
+            presets,
+        },
+        4,
+        true,
+    ));
+    let cache_entry = pool.get("mlx-community/active-twin").expect("cache entry");
+    assert!(!cache_entry.hidden);
+    let served = pool.get("served-active").expect("preset alias");
+    served.lifecycle.mark_ready();
+
+    let err = pool
+        .submit_cache_removal_by_model_id(
+            &cache_entry.ui_model_id,
+            cache_entry.lifecycle_revision(),
+            "idem_remove_active_preset_overlap",
+        )
+        .expect_err("active preset alias must block cache removal");
+    match err {
+        RouterPoolError::OperationRejected(error) => assert_eq!(error.code, "unsupported"),
+        other => panic!("unexpected error: {other:?}"),
+    }
+    let catalog = pool.catalog_snapshot();
+    let cache_catalog = catalog
+        .iter()
+        .find(|model| model.name == "mlx-community/active-twin")
+        .expect("catalog cache entry");
+    assert!(cache_catalog.removal_blocked_reason.is_some());
+    assert!(
+        cache_root
+            .join("mlx-community/active-twin/config.json")
+            .is_file()
+    );
+}
+
+#[tokio::test]
+async fn webui_cache_removal_rejects_preset_physical_alias_even_when_hidden() {
+    let cache_root = temp_models_dir("webui-remove-preset-overlap");
+    add_fake_model(&cache_root.join("mlx-community"), "twin");
+    let ini = "[served]\nhf-repo = mlx-community/twin\ndedup-cache-models = 1\n";
+    let presets = parse_preset_text(ini).expect("parse presets");
+    let pool = Arc::new(pool_from(
+        RouterSources {
+            models_dir: None,
+            cache: Some(CacheSource::new(cache_root.clone(), FakeDownloader::ok())),
+            presets,
+        },
+        4,
+        true,
+    ));
+    let cache_entry = pool.get("mlx-community/twin").expect("hidden cache entry");
+    assert!(cache_entry.hidden);
+    let served = pool.get("served").expect("preset entry");
+    served.lifecycle.mark_ready();
+
+    let err = pool
+        .submit_cache_removal_by_model_id(
+            &cache_entry.ui_model_id,
+            cache_entry.lifecycle_revision(),
+            "idem_remove_hidden_preset_overlap",
+        )
+        .expect_err("preset alias must block cache removal");
+    match err {
+        RouterPoolError::OperationRejected(error) => assert_eq!(error.code, "unsupported"),
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert!(cache_root.join("mlx-community/twin/config.json").is_file());
+}
+
+#[tokio::test]
+async fn webui_cache_removal_rejects_loaded_preset_descendant_overlap() {
+    let cache_root = temp_models_dir("webui-remove-preset-descendant");
+    add_fake_model(&cache_root.join("mlx-community"), "parent");
+    let preset_dir = cache_root.join("mlx-community/parent/preset-owned");
+    std::fs::create_dir_all(&preset_dir).expect("preset dir");
+    std::fs::write(preset_dir.join("config.json"), "{}").expect("preset config");
+    let ini = format!("[served-descendant]\nmodel = {}\n", preset_dir.display());
+    let presets = parse_preset_text(&ini).expect("parse presets");
+    let pool = Arc::new(pool_from(
+        RouterSources {
+            models_dir: None,
+            cache: Some(CacheSource::new(cache_root.clone(), FakeDownloader::ok())),
+            presets,
+        },
+        4,
+        true,
+    ));
+    let cache_entry = pool.get("mlx-community/parent").expect("cache entry");
+    let served = pool.get("served-descendant").expect("preset entry");
+    assert_eq!(served.source, RouterModelSource::Preset);
+    served.lifecycle.mark_ready();
+
+    let err = pool
+        .submit_cache_removal_by_model_id(
+            &cache_entry.ui_model_id,
+            cache_entry.lifecycle_revision(),
+            "idem_remove_preset_descendant",
+        )
+        .expect_err("loaded descendant preset must block parent cache removal");
+    match err {
+        RouterPoolError::OperationRejected(error) => assert_eq!(error.code, "unsupported"),
+        other => panic!("unexpected error: {other:?}"),
+    }
+    let catalog = pool.catalog_snapshot();
+    let cache_catalog = catalog
+        .iter()
+        .find(|model| model.name == "mlx-community/parent")
+        .expect("catalog cache entry");
+    assert!(cache_catalog.removal_blocked_reason.is_some());
+    assert!(
+        cache_root
+            .join("mlx-community/parent/config.json")
+            .is_file(),
+        "managed parent snapshot must remain after rejected removal"
+    );
+    assert!(
+        preset_dir.join("config.json").is_file(),
+        "nested preset snapshot must remain after rejected removal"
+    );
+    assert_eq!(
+        served.lifecycle.state(),
+        crate::server::router_lifecycle::ModelLifecycleState::Ready
     );
 }
 
@@ -1049,9 +2019,15 @@ async fn queued_ui_action_rejects_same_id_recreated_before_execution() {
         &[crate::server::router_lifecycle::OperationState::Failed],
     )
     .await;
+    let error = terminal.error.as_ref().expect("operation error");
+    assert_eq!(error.code, "stale_revision");
     assert_eq!(
-        terminal.error.as_ref().map(|error| error.code.as_str()),
-        Some("stale_revision")
+        error
+            .field_errors
+            .as_ref()
+            .and_then(|fields| fields.first())
+            .map(|field| field.field.as_str()),
+        Some("expected_revision")
     );
     pool.set_model_action_before_execute_hook(None);
 }
@@ -1095,7 +2071,7 @@ async fn queued_ui_load_rejects_same_id_recreated_eviction_target_before_executi
             super::RouterModelAction::Load,
             candidate_revision,
             "queued-target-same-id-0001",
-            Some(&target_id),
+            Some(ModelActionEvictionTarget::new(&target_id, target_revision)),
         )
         .expect("accepted");
     entered_rx.recv().expect("background reached hook");
@@ -1116,11 +2092,133 @@ async fn queued_ui_load_rejects_same_id_recreated_eviction_target_before_executi
         &[crate::server::router_lifecycle::OperationState::Failed],
     )
     .await;
+    let error = terminal.error.as_ref().expect("operation error");
+    assert_eq!(error.code, "stale_revision");
     assert_eq!(
-        terminal.error.as_ref().map(|error| error.code.as_str()),
-        Some("stale_revision")
+        error
+            .field_errors
+            .as_ref()
+            .and_then(|fields| fields.first())
+            .map(|field| field.field.as_str()),
+        Some("expected_revision")
     );
     pool.set_model_action_before_execute_hook(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_ui_load_rejects_advanced_eviction_target_revision_before_execution() {
+    let cache_root = temp_models_dir("queued-target-revision-advanced");
+    add_fake_model(&cache_root.join("mlx-community"), "resident");
+    add_fake_model(&cache_root.join("mlx-community"), "candidate");
+    let pool = Arc::new(pool_from(
+        RouterSources {
+            models_dir: None,
+            cache: Some(CacheSource::new(cache_root.clone(), FakeDownloader::ok())),
+            presets: Default::default(),
+        },
+        1,
+        true,
+    ));
+    let resident = pool.get("mlx-community/resident").expect("resident");
+    resident.lifecycle.mark_ready();
+    let target_id = resident.ui_model_id.clone();
+    let target_revision = resident.lifecycle_revision();
+    let candidate = pool.get("mlx-community/candidate").expect("candidate");
+    let candidate_id = candidate.ui_model_id.clone();
+    let candidate_revision = candidate.lifecycle_revision();
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+    pool.set_model_action_before_execute_hook(Some(Arc::new(move || {
+        let _ = entered_tx.send(());
+        release_rx
+            .lock()
+            .expect("release receiver mutex")
+            .recv()
+            .expect("release queued action");
+    })));
+
+    let accepted = pool
+        .submit_model_action(
+            &candidate_id,
+            super::RouterModelAction::Load,
+            candidate_revision,
+            "queued-target-revision-advanced-0001",
+            Some(ModelActionEvictionTarget::new(&target_id, target_revision)),
+        )
+        .expect("accepted");
+    entered_rx.recv().expect("background reached hook");
+    let current_candidate = pool
+        .get("mlx-community/candidate")
+        .expect("candidate current");
+    assert!(
+        Arc::ptr_eq(&current_candidate, &candidate),
+        "test must keep the primary candidate registry entry current"
+    );
+    assert_eq!(
+        candidate.lifecycle_revision(),
+        candidate_revision,
+        "test must not advance the primary candidate revision"
+    );
+    resident.lifecycle.mark_loading();
+    resident.lifecycle.mark_ready();
+    assert_ne!(resident.lifecycle_revision(), target_revision);
+    let current_candidate = pool
+        .get("mlx-community/candidate")
+        .expect("candidate current");
+    assert!(Arc::ptr_eq(&current_candidate, &candidate));
+    assert_eq!(candidate.lifecycle_revision(), candidate_revision);
+    release_tx.send(()).expect("release hook");
+
+    let terminal = wait_for_operation_state(
+        &pool,
+        &accepted.operation_id,
+        &[crate::server::router_lifecycle::OperationState::Failed],
+    )
+    .await;
+    let error = terminal.error.as_ref().expect("operation error");
+    assert_eq!(error.code, "stale_revision");
+    assert_eq!(
+        error
+            .field_errors
+            .as_ref()
+            .and_then(|fields| fields.first())
+            .map(|field| field.field.as_str()),
+        Some("eviction_target_expected_revision")
+    );
+    pool.set_model_action_before_execute_hook(None);
+}
+
+#[test]
+fn explicit_eviction_error_retarget_preserves_operation_rejection() {
+    let err = RouterPoolError::OperationRejected(crate::server::router_lifecycle::ErrorBody {
+        code: "stale_revision".to_string(),
+        message: "catalog entry changed; refresh before retrying".to_string(),
+        retryable: true,
+        field_errors: Some(vec![crate::server::router_lifecycle::FieldError {
+            field: "expected_revision".to_string(),
+            code: "stale".to_string(),
+            message: "expected 1 but current revision is 2".to_string(),
+        }]),
+        operation_id: Some("op_model_load_000001".to_string()),
+    });
+
+    let RouterPoolError::OperationRejected(error) =
+        super::retarget_router_error_field(err, "eviction_target_expected_revision")
+    else {
+        panic!("operation rejection must remain an operation rejection");
+    };
+    assert_eq!(error.code, "stale_revision");
+    assert_eq!(error.operation_id.as_deref(), Some("op_model_load_000001"));
+    assert_eq!(
+        error
+            .field_errors
+            .as_ref()
+            .and_then(|fields| fields.first())
+            .map(|field| field.field.as_str()),
+        Some("eviction_target_expected_revision")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1144,6 +2242,7 @@ async fn queued_ui_load_rejects_different_id_eviction_target_same_name_before_ex
     let resident = pool.get("resident").expect("resident");
     assert_eq!(resident.source, RouterModelSource::Cache);
     let target_id = resident.ui_model_id.clone();
+    let target_revision = resident.lifecycle_revision();
 
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -1163,7 +2262,7 @@ async fn queued_ui_load_rejects_different_id_eviction_target_same_name_before_ex
             super::RouterModelAction::Load,
             candidate_revision,
             "queued-target-different-id-0001",
-            Some(&target_id),
+            Some(ModelActionEvictionTarget::new(&target_id, target_revision)),
         )
         .expect("accepted");
     entered_rx.recv().expect("background reached hook");

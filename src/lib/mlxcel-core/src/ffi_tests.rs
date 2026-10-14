@@ -343,117 +343,68 @@ fn test_fast_rope_batched_non_contiguous_t1_symmetric() {
     );
 }
 
-#[test]
-fn test_paged_decode_attention_dense_compat_matches_fallback() {
-    let q = from_slice_f32(&[1.0, 0.5, 0.25, 1.25], &[2, 1, 1, 2]);
-
-    let cache_k_0 = from_slice_f32(&[1.0, 0.0, 0.0, 1.0, 1.0, 1.0], &[1, 1, 3, 2]);
-    let cache_v_0 = from_slice_f32(&[0.5, 0.0, 0.0, 0.5, 1.0, 1.0], &[1, 1, 3, 2]);
-    let cache_k_1 = from_slice_f32(
-        &[1.0, 0.0, 0.0, 1.0, 0.5, 0.5, 1.0, 1.0, 0.25, 1.25],
-        &[1, 1, 5, 2],
-    );
-    let cache_v_1 = from_slice_f32(
-        &[0.2, 0.8, 0.8, 0.2, 0.5, 0.5, 1.2, 0.4, 0.3, 1.3],
-        &[1, 1, 5, 2],
-    );
-
-    let cache_keys = vec![
-        cache_k_0.as_ref().unwrap() as *const MlxArray,
-        cache_k_1.as_ref().unwrap() as *const MlxArray,
-    ];
-    let cache_values = vec![
-        cache_v_0.as_ref().unwrap() as *const MlxArray,
-        cache_v_1.as_ref().unwrap() as *const MlxArray,
-    ];
-    let metadata = crate::cache::PagedDecodeMetadata {
-        block_size: 2,
-        kv_lens: vec![3, 5],
-        block_table_offsets: vec![0, 2, 5],
-        block_tables: vec![0, 1, 0, 1, 2],
-    };
-
-    let fallback = crate::layers::paged_decode_attention_dense_fallback(
-        &q,
-        &cache_keys,
-        &cache_values,
-        &metadata,
-        1.0,
-    )
-    .unwrap();
-    let native = crate::layers::paged_decode_attention_dense_compat(
-        &q,
-        &cache_keys,
-        &cache_values,
-        &metadata,
-        1.0,
-    )
-    .unwrap();
-
-    eval(&fallback);
-    eval(&native);
-    let close = allclose(&fallback, &native, 1e-5, 1e-5);
-    eval(&close);
-    assert!(item_bool(&close));
-}
-
-#[test]
-fn test_paged_decode_attention_rotating_compat_matches_fallback_after_wrap() {
-    let q = from_slice_f32(&[0.5, 1.0, 1.5, 2.0], &[2, 1, 1, 2]);
-
-    // Sequence 0 ring buffer physically stores logical tokens [2, 3, 4] as [4, 2, 3].
-    let cache_k_0 = from_slice_f32(&[4.0, 0.0, 2.0, 0.0, 3.0, 0.0], &[1, 1, 3, 2]);
-    let cache_v_0 = from_slice_f32(&[0.4, 0.0, 0.2, 0.0, 0.3, 0.0], &[1, 1, 3, 2]);
-    // Sequence 1 ring buffer physically stores logical tokens [8, 9, 10, 11] as [10, 11, 8, 9].
-    let cache_k_1 = from_slice_f32(&[10.0, 1.0, 11.0, 1.1, 8.0, 0.8, 9.0, 0.9], &[1, 1, 4, 2]);
-    let cache_v_1 = from_slice_f32(&[1.0, 0.1, 1.1, 0.11, 0.8, 0.08, 0.9, 0.09], &[1, 1, 4, 2]);
-
-    let cache_keys = vec![
-        cache_k_0.as_ref().unwrap() as *const MlxArray,
-        cache_k_1.as_ref().unwrap() as *const MlxArray,
-    ];
-    let cache_values = vec![
-        cache_v_0.as_ref().unwrap() as *const MlxArray,
-        cache_v_1.as_ref().unwrap() as *const MlxArray,
-    ];
-    let metadata =
-        crate::cache::RotatingPagedDecodeMetadata::from_parts(&[3, 4], &[1, 2], 2).unwrap();
-
-    let fallback = crate::layers::paged_decode_attention_rotating_fallback(
-        &q,
-        &cache_keys,
-        &cache_values,
-        &metadata,
-        1.0,
-    )
-    .unwrap();
-    let native = crate::layers::paged_decode_attention_rotating_compat(
-        &q,
-        &cache_keys,
-        &cache_values,
-        &metadata,
-        1.0,
-    )
-    .unwrap();
-
-    eval(&fallback);
-    eval(&native);
-    let close = allclose(&fallback, &native, 1e-5, 1e-5);
-    eval(&close);
-    assert!(item_bool(&close));
-}
-
 // ---------------------------------------------------------------------------
-// Pooled paged decode (#119): parity vs the dense fallback baseline.
+// Pooled paged decode (#119): parity vs a dense attention reference.
 //
 // `paged_decode_attention_pooled_fallback` gathers each sequence's visible K/V
 // from a `PagedBlockPool` (real, possibly fragmented physical block tables),
-// whereas `paged_decode_attention_dense_fallback` slices contiguous dense
-// buffers with identity metadata. Both feed the same fused SDPA, so for
-// identical K/V/q values the two outputs must match tightly. FP32 K/V/q is used
-// so the gather (pure take/reshape/slice/transpose) and the dense slice/concat
-// stay bit-exact and the only residual delta is SDPA float ordering.
+// while the test-only oracle below evaluates softmax(q k^T * scale) v over the
+// contiguous K/V tensors the tests build in parallel. FP32 K/V/q keeps the
+// comparison focused on the pooled gather and attention computation.
 // ---------------------------------------------------------------------------
+
+fn dense_reference_decode_attention(
+    q: &MlxArray,
+    keys: &[&MlxArray],
+    values: &[&MlxArray],
+    scale: f32,
+) -> UniquePtr<MlxArray> {
+    let q_shape = array_shape(q);
+    assert_eq!(q_shape.len(), 4, "reference q must have rank 4");
+    assert_eq!(q_shape[2], 1, "reference q must be a decode token");
+    assert_eq!(keys.len(), values.len(), "reference K/V batch mismatch");
+    assert_eq!(
+        q_shape[0] as usize,
+        keys.len(),
+        "reference q/K batch mismatch"
+    );
+
+    let q_heads = q_shape[1];
+    let mut rows = Vec::with_capacity(keys.len());
+    for (batch_idx, (&key, &value)) in keys.iter().zip(values).enumerate() {
+        let key_shape = array_shape(key);
+        assert_eq!(key_shape.len(), 4, "reference K must have rank 4");
+        assert_eq!(
+            array_shape(value),
+            key_shape,
+            "reference K/V shape mismatch"
+        );
+        let kv_heads = key_shape[1];
+        assert_eq!(q_heads % kv_heads, 0, "query heads must divide by KV heads");
+
+        let row = batch_idx as i32;
+        let q_row = slice(q, &[row, 0, 0, 0], &[row + 1, q_heads, 1, q_shape[3]]);
+        let q_f32 = astype(&q_row, dtype::FLOAT32);
+        let mut key_f32 = astype(key, dtype::FLOAT32);
+        let mut value_f32 = astype(value, dtype::FLOAT32);
+        if q_heads != kv_heads {
+            let repeats = q_heads / kv_heads;
+            key_f32 = repeat(&key_f32, repeats, 1);
+            value_f32 = repeat(&value_f32, repeats, 1);
+        }
+
+        let key_t = transpose_axes(&key_f32, &[0, 1, 3, 2]);
+        let scores = multiply_scalar(&matmul(&q_f32, &key_t), scale);
+        rows.push(matmul(&softmax(&scores, -1), &value_f32));
+    }
+
+    let mut rows = rows.into_iter();
+    let mut result = rows.next().expect("reference batch must be non-empty");
+    for row in rows {
+        result = concatenate(&result, &row, 0);
+    }
+    result
+}
 
 /// Deterministic, seed-varying FP32 values in roughly `[-1, 1]`. Avoids an RNG
 /// dependency while giving every decode step a fresh, non-degenerate q/k/v.
@@ -487,6 +438,26 @@ fn pooled_rms(a: &[f32], b: &[f32]) -> f32 {
     (sum_sq / a.len() as f64).sqrt() as f32
 }
 
+/// RMS error normalized by the dense reference's RMS.
+///
+/// The pooled-vs-dense oracle needs a relative bound: an absolute `5e-3`
+/// bound can accept a one-percent rescaling when the attention output itself
+/// has RMS below 0.5.
+fn pooled_normalized_rms(a: &[f32], b: &[f32]) -> f32 {
+    let diff_rms = pooled_rms(a, b);
+    let ref_rms = (b
+        .iter()
+        .map(|x| {
+            let x = f64::from(*x);
+            x * x
+        })
+        .sum::<f64>()
+        / b.len() as f64)
+        .sqrt()
+        .max(1e-20) as f32;
+    diff_rms / ref_rms
+}
+
 /// A `PagedKvLayout` whose per-block byte budget is a positive placeholder; the
 /// real geometry is inferred from the first written block.
 fn pooled_layout(
@@ -510,7 +481,8 @@ fn pooled_layout(
 /// NON-CONTIGUOUS physical rows by interleaving a spacer sequence's block
 /// writes between the target's. Each step appends one fresh token's K/V to both
 /// stores, picks a fresh pseudo-random `q [1, H, 1, D]`, runs the pooled and
-/// dense fallbacks, and asserts the RMS of their outputs stays < 5e-3.
+/// dense fallbacks, and asserts both absolute and normalized RMS stay below
+/// `5e-3`.
 #[test]
 fn test_pooled_paged_decode_matches_dense_over_200_steps() {
     use crate::cache::{PagedBlockPool, PagedSequenceState};
@@ -534,6 +506,7 @@ fn test_pooled_paged_decode_matches_dense_over_200_steps() {
     let mut dense_v: Option<UniquePtr<MlxArray>> = None;
 
     let mut max_rms = 0.0f32;
+    let mut max_normalized_rms = 0.0f32;
     let mut prev_blocks = 0usize;
 
     for step in 0..STEPS {
@@ -612,31 +585,23 @@ fn test_pooled_paged_decode_matches_dense_over_200_steps() {
         )
         .unwrap();
 
-        // --- dense fallback (identity block table) ---
-        let metadata = crate::cache::PagedDecodeMetadata::from_visible_lengths(
-            &[visible_len],
-            block_size as i32,
-        )
-        .unwrap();
-        let cache_keys = vec![dk.as_ref().unwrap() as *const MlxArray];
-        let cache_values = vec![dv.as_ref().unwrap() as *const MlxArray];
-        let dense_out = crate::layers::paged_decode_attention_dense_fallback(
-            &q,
-            &cache_keys,
-            &cache_values,
-            &metadata,
-            scale,
-        )
-        .unwrap();
+        // --- independent dense attention reference ---
+        let dense_out = dense_reference_decode_attention(&q, &[dk], &[dv], scale);
 
         let p = flatten_f32_local(&pooled_out);
         let d = flatten_f32_local(&dense_out);
         let rms = pooled_rms(&p, &d);
+        let normalized_rms = pooled_normalized_rms(&p, &d);
         assert!(
             rms < 5e-3,
             "step {step}: pooled vs dense RMS {rms} exceeded 5e-3"
         );
+        assert!(
+            normalized_rms < 5e-3,
+            "step {step}: pooled vs dense normalized RMS {normalized_rms} exceeded 5e-3"
+        );
         max_rms = max_rms.max(rms);
+        max_normalized_rms = max_normalized_rms.max(normalized_rms);
     }
 
     // The target eventually spans ceil(200/4) = 50 blocks; assert its block ids
@@ -654,12 +619,18 @@ fn test_pooled_paged_decode_matches_dense_over_200_steps() {
     );
 
     // Sanity: the run actually exercised a meaningful number of steps and the
-    // worst-case RMS is reported for the implementation summary.
+    // worst-case errors are reported for the implementation summary.
     assert!(
         max_rms < 5e-3,
         "max RMS {max_rms} over 200 steps exceeded 5e-3"
     );
-    println!("test_pooled_paged_decode_matches_dense_over_200_steps: max RMS = {max_rms:e}");
+    assert!(
+        max_normalized_rms < 5e-3,
+        "max normalized RMS {max_normalized_rms} over 200 steps exceeded 5e-3"
+    );
+    println!(
+        "test_pooled_paged_decode_matches_dense_over_200_steps: max RMS = {max_rms:e}, max normalized RMS = {max_normalized_rms:e}"
+    );
 }
 
 /// #123 fused-kernel parity: the native fused paged-attention decode kernel
@@ -671,6 +642,7 @@ fn test_pooled_paged_decode_matches_dense_over_200_steps() {
 /// exercises its block-table indexing rather than a contiguous run.
 #[test]
 fn test_fused_paged_decode_matches_gather_over_200_steps() {
+    crate::test_support::kernel_ports::require_paged_decode_port!();
     use crate::cache::{PagedBlockPool, PagedSequenceState};
 
     const STEPS: usize = 200;
@@ -809,10 +781,14 @@ fn test_fused_paged_decode_matches_gather_over_200_steps() {
 fn test_fused_paged_decode_gqa_and_batched() {
     use crate::cache::{PagedBlockPool, PagedSequenceState};
 
-    // The fused paged-decode kernel dispatches a Metal JIT body on Apple and a
-    // CUDA JIT body on NVIDIA (#634); on a CPU-only build neither backend can
-    // launch it, so skip there rather than aborting the process.
-    if !crate::metal_is_available() && !crate::cuda_is_available() {
+    // The fused paged-decode kernel has a Metal JIT body and a CUDA JIT body
+    // (#634) and no HIP port yet (#1814). ROCm skips visibly through the shared
+    // helper, which reads the kernel's port table, so a HIP port runs this
+    // test. A build with no GPU backend cannot launch it and skips here; on
+    // Metal and CUDA the test always runs, so a wrongly false predicate there
+    // fails it instead of passing.
+    crate::test_support::kernel_ports::require_paged_decode_port!();
+    if crate::hardware::gpu_backend_kind() == crate::hardware::GpuBackendKind::None {
         return;
     }
 
@@ -916,9 +892,10 @@ fn test_fused_paged_decode_gqa_and_batched() {
 fn test_fused_paged_decode_native_vs_fallback_matrix() {
     use crate::cache::{PagedBlockPool, PagedSequenceState};
 
-    if !crate::metal_is_available() && !crate::cuda_is_available() {
-        // No GPU backend can launch the fused kernel; the CPU build has no
-        // native path to compare (it always gathers). Nothing to verify.
+    crate::test_support::kernel_ports::require_paged_decode_port!();
+    if crate::hardware::gpu_backend_kind() == crate::hardware::GpuBackendKind::None {
+        // No GPU backend (a CPU-only build): the native path cannot run, so
+        // there is nothing to compare.
         return;
     }
 
@@ -1124,8 +1101,8 @@ fn test_pooled_paged_decode_sliding_window_via_logical_start() {
         crate::layers::paged_decode_attention_pooled_fallback(&q, &pool, &states, layer_idx, scale)
             .unwrap();
 
-    // Dense reference: slice the full dense buffer to the visible window and run
-    // the dense fallback over just those 7 tokens with identity metadata.
+    // Dense reference: slice the full dense buffer to the visible window and
+    // evaluate attention over just those 7 tokens.
     let dk = dense_k.as_ref().unwrap();
     let dv = dense_v.as_ref().unwrap();
     let window_k = slice(
@@ -1138,28 +1115,19 @@ fn test_pooled_paged_decode_sliding_window_via_logical_start() {
         &[0, 0, window_start, 0],
         &[1, n_kv_heads, total, head_dim],
     );
-    let visible_len = total - window_start;
-    let metadata =
-        crate::cache::PagedDecodeMetadata::from_visible_lengths(&[visible_len], block_size as i32)
-            .unwrap();
-    let cache_keys = vec![window_k.as_ref().unwrap() as *const MlxArray];
-    let cache_values = vec![window_v.as_ref().unwrap() as *const MlxArray];
-    let dense_out = crate::layers::paged_decode_attention_dense_fallback(
-        &q,
-        &cache_keys,
-        &cache_values,
-        &metadata,
-        scale,
-    )
-    .unwrap();
+    let dense_out = dense_reference_decode_attention(&q, &[&window_k], &[&window_v], scale);
 
-    let rms = pooled_rms(
-        &flatten_f32_local(&pooled_out),
-        &flatten_f32_local(&dense_out),
-    );
+    let pooled = flatten_f32_local(&pooled_out);
+    let dense = flatten_f32_local(&dense_out);
+    let rms = pooled_rms(&pooled, &dense);
+    let normalized_rms = pooled_normalized_rms(&pooled, &dense);
     assert!(
         rms < 5e-3,
         "sliding-window pooled vs dense RMS {rms} exceeded 5e-3"
+    );
+    assert!(
+        normalized_rms < 5e-3,
+        "sliding-window pooled vs dense normalized RMS {normalized_rms} exceeded 5e-3"
     );
 }
 
@@ -1231,33 +1199,22 @@ fn test_pooled_paged_decode_batch_of_two() {
             .unwrap();
     assert_eq!(array_shape(&pooled_out), vec![2, n_kv_heads, 1, head_dim]);
 
-    // Dense fallback over the two dense buffers with identity metadata.
-    let metadata =
-        crate::cache::PagedDecodeMetadata::from_visible_lengths(&lens, block_size as i32).unwrap();
-    let cache_keys = vec![
-        dense_ks[0].as_ref().unwrap() as *const MlxArray,
-        dense_ks[1].as_ref().unwrap() as *const MlxArray,
-    ];
-    let cache_values = vec![
-        dense_vs[0].as_ref().unwrap() as *const MlxArray,
-        dense_vs[1].as_ref().unwrap() as *const MlxArray,
-    ];
-    let dense_out = crate::layers::paged_decode_attention_dense_fallback(
-        &q,
-        &cache_keys,
-        &cache_values,
-        &metadata,
-        scale,
-    )
-    .unwrap();
+    // Independent dense attention over both rows, whose visible lengths differ.
+    let dense_keys: Vec<&MlxArray> = dense_ks.iter().map(|key| &**key).collect();
+    let dense_values: Vec<&MlxArray> = dense_vs.iter().map(|value| &**value).collect();
+    let dense_out = dense_reference_decode_attention(&q, &dense_keys, &dense_values, scale);
 
-    let rms = pooled_rms(
-        &flatten_f32_local(&pooled_out),
-        &flatten_f32_local(&dense_out),
-    );
+    let pooled = flatten_f32_local(&pooled_out);
+    let dense = flatten_f32_local(&dense_out);
+    let rms = pooled_rms(&pooled, &dense);
+    let normalized_rms = pooled_normalized_rms(&pooled, &dense);
     assert!(
         rms < 5e-3,
         "batch-of-two pooled vs dense RMS {rms} exceeded 5e-3"
+    );
+    assert!(
+        normalized_rms < 5e-3,
+        "batch-of-two pooled vs dense normalized RMS {normalized_rms} exceeded 5e-3"
     );
 }
 
@@ -1351,6 +1308,7 @@ fn test_pooled_prefill_then_decode_matches_dense() {
     assert_eq!(target.layer(layer_idx).unwrap().block_ids.len(), 4);
 
     let mut max_rms = 0.0f32;
+    let mut max_normalized_rms = 0.0f32;
 
     for step in 0..STEPS {
         let t = PROMPT + step as i32; // absolute token index being appended
@@ -1397,34 +1355,27 @@ fn test_pooled_prefill_then_decode_matches_dense() {
         )
         .unwrap();
 
-        let metadata = crate::cache::PagedDecodeMetadata::from_visible_lengths(
-            &[visible_len],
-            block_size as i32,
-        )
-        .unwrap();
-        let cache_keys = vec![dk.as_ref().unwrap() as *const MlxArray];
-        let cache_values = vec![dv.as_ref().unwrap() as *const MlxArray];
-        let dense_out = crate::layers::paged_decode_attention_dense_fallback(
-            &q,
-            &cache_keys,
-            &cache_values,
-            &metadata,
-            scale,
-        )
-        .unwrap();
+        let dense_out = dense_reference_decode_attention(&q, &[dk], &[dv], scale);
 
-        let rms = pooled_rms(
-            &flatten_f32_local(&pooled_out),
-            &flatten_f32_local(&dense_out),
-        );
+        let pooled = flatten_f32_local(&pooled_out);
+        let dense = flatten_f32_local(&dense_out);
+        let rms = pooled_rms(&pooled, &dense);
+        let normalized_rms = pooled_normalized_rms(&pooled, &dense);
         assert!(
             rms < 5e-3,
             "prefill->decode step {step} (abs token {t}): pooled vs dense RMS {rms} exceeded 5e-3"
         );
+        assert!(
+            normalized_rms < 5e-3,
+            "prefill->decode step {step} (abs token {t}): pooled vs dense normalized RMS {normalized_rms} exceeded 5e-3"
+        );
         max_rms = max_rms.max(rms);
+        max_normalized_rms = max_normalized_rms.max(normalized_rms);
     }
 
-    println!("test_pooled_prefill_then_decode_matches_dense: max RMS = {max_rms:e}");
+    println!(
+        "test_pooled_prefill_then_decode_matches_dense: max RMS = {max_rms:e}, max normalized RMS = {max_normalized_rms:e}"
+    );
 }
 
 /// Flatten any tensor to a row-major `Vec<f32>` (after an FP32 cast). Local to
@@ -1487,7 +1438,7 @@ fn test_rms_norm() {
 
 /// Verify that rms_norm with bf16 input preserves bf16 output dtype.
 ///
-/// The CUDA patch in `patches/mlx/fast.cpp` selects `compute_type = bfloat16`
+/// The CUDA patch in `overlays/cuda/mlx/fast.cpp` selects `compute_type = bfloat16`
 /// when `out_type == bfloat16`, avoiding unnecessary fp32 promotion and
 /// copy_v kernels.  This test confirms the invariant holds at the Rust FFI
 /// boundary.
@@ -1535,7 +1486,7 @@ fn test_rms_norm_bf16_dtype_preserved() {
 /// Verify that layer_norm with bf16 input preserves bf16 output dtype.
 ///
 /// Mirrors the rms_norm bf16 test but exercises the layer_norm fallback path
-/// patched in `patches/mlx/fast.cpp`.
+/// patched in `overlays/cuda/mlx/fast.cpp`.
 #[test]
 fn test_layer_norm_bf16_dtype_preserved() {
     let x_f32 = from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4]);
@@ -2234,8 +2185,9 @@ fn compiled_qgelu_mlp_forward_8bit_decode_matches_reference() {
 
 #[test]
 fn compiled_qgelu_mlp_forward_8bit_multi_token_takes_fallback_and_matches_reference() {
-    // Same group_size=64/bits=8 weights, but a `[1, 3, H]` multi-token input:
-    // `is_single_token` is false and this is not the legacy 4-bit shape, so
+    // Same group_size=64/bits=8 weights, but a `[1, 16, H]` multi-token input:
+    // `is_single_token` is false, this is not the legacy 4-bit shape, and 16
+    // rows is past the CUDA verify-block window (#2160), so
     // `compiled_gelu_approx_mlp_forward` must take the op-at-a-time fallback
     // (prefill stays off the new 8-bit fusion, per the #680 gating). Assert
     // the fallback output still matches the reference, proving the compiled
@@ -2250,7 +2202,7 @@ fn compiled_qgelu_mlp_forward_8bit_multi_token_takes_fallback_and_matches_refere
     let (up_w, up_s, up_b) = random_quantized_weight(intermediate, hidden, group_size, bits);
     let (down_w, down_s, down_b) = random_quantized_weight(hidden, intermediate, group_size, bits);
 
-    let x = unsafe { random_normal(&[1, 3, hidden], dtype::FLOAT32, std::ptr::null()) };
+    let x = unsafe { random_normal(&[1, 16, hidden], dtype::FLOAT32, std::ptr::null()) };
 
     let fallback_out = unsafe {
         compiled_gelu_approx_mlp_forward(
@@ -2276,7 +2228,7 @@ fn compiled_qgelu_mlp_forward_8bit_multi_token_takes_fallback_and_matches_refere
 
     eval(&fallback_out);
     eval(&reference);
-    assert_eq!(array_shape(&fallback_out), vec![1, 3, hidden]);
+    assert_eq!(array_shape(&fallback_out), vec![1, 16, hidden]);
     assert_eq!(array_shape(&fallback_out), array_shape(&reference));
 
     let close = allclose(&fallback_out, &reference, 1e-5, 1e-5);
@@ -2384,12 +2336,40 @@ fn random_block_float_weight(
     (quantized_weights_w(&q), quantized_weights_scales(&q))
 }
 
+/// Whether the running backend has native NVFP4 kernels, per the capability
+/// table (issue #1806). The native-NVFP4 tests below run group-16 `nvfp4`
+/// through FFI calls that return no `Result`, so on a backend without the
+/// kernel (ROCm) MLX's dispatch throw would terminate the whole test binary and
+/// hide every later test. They skip there with the reason printed instead; the
+/// load path converts NVFP4 to affine on that backend, so native NVFP4 is never
+/// reached in production either.
+fn backend_runs_native_nvfp4(test: &str) -> bool {
+    use crate::hardware::{QuantMode, QuantModeSupport, gpu_backend_kind};
+    let backend = gpu_backend_kind();
+    match backend.quant_mode_support(QuantMode::Nvfp4) {
+        QuantModeSupport::Native => true,
+        support => {
+            eprintln!(
+                "skipping {test}: the {} backend has no native NVFP4 kernel ({support:?} in the \
+                 quantization capability table)",
+                backend.display_name()
+            );
+            false
+        }
+    }
+}
+
 /// `quantized_linear_forward_global_scale` is the UnifiedLinear fast path for
 /// native-NVFP4 sidecars: qmm, `apply_global_scale`, and the optional dense
 /// linear bias are issued through one FFI call while preserving the exact
 /// op-at-a-time semantics.
 #[test]
 fn quantized_linear_forward_global_scale_matches_manual_sidecar_path() {
+    if !backend_runs_native_nvfp4(
+        "quantized_linear_forward_global_scale_matches_manual_sidecar_path",
+    ) {
+        return;
+    }
     random_seed(7051);
     let (group_size, bits, mode) = (16, 4, "nvfp4");
     let hidden = 128;
@@ -2978,6 +2958,11 @@ fn compiled_qgelu_mlp_global_scale_non_nvfp4_multi_token_fallback_matches_refere
 /// the op-at-a-time sidecar reference.
 #[test]
 fn compiled_qgelu_mlp_global_scale_native_nvfp4_prefill_matches_reference() {
+    if !backend_runs_native_nvfp4(
+        "compiled_qgelu_mlp_global_scale_native_nvfp4_prefill_matches_reference",
+    ) {
+        return;
+    }
     random_seed(705);
     let (group_size, bits, mode) = (16, 4, "nvfp4");
     let hidden = 128;
@@ -4218,35 +4203,14 @@ fn test_batch_quantized_kv_cache_make_mask_no_padding_multi_token() {
     );
 }
 
-/// Issue #195: the paged-decode attention fallbacks must reject an empty
-/// batch with a clean `Err` instead of panicking in `drain(..1)`.
+/// Issue #195: the pooled paged-decode fallback must reject an empty batch
+/// with a clean `Err` instead of panicking while assembling row outputs.
 #[test]
-fn paged_decode_fallbacks_reject_an_empty_batch() {
-    use crate::cache::{
-        PagedBlockPool, PagedDecodeMetadata, PagedKvLayout, PagedSequenceState,
-        RotatingPagedDecodeMetadata,
-    };
+fn paged_decode_pooled_fallback_rejects_an_empty_batch() {
+    use crate::cache::{PagedBlockPool, PagedKvLayout, PagedSequenceState};
 
     // A valid 4-D decode query shape with batch == 0.
     let q = zeros(&[0, 1, 1, 2], crate::dtype::FLOAT32);
-
-    let dense_meta = PagedDecodeMetadata::from_visible_lengths(&[], 2).unwrap();
-    let dense =
-        crate::layers::paged_decode_attention_dense_fallback(&q, &[], &[], &dense_meta, 1.0);
-    assert!(
-        dense.as_ref().is_err_and(|e| e.contains("empty batch")),
-        "dense fallback must reject batch == 0, got error {:?}",
-        dense.as_ref().err()
-    );
-
-    let rot_meta = RotatingPagedDecodeMetadata::from_parts(&[], &[], 2).unwrap();
-    let rotating =
-        crate::layers::paged_decode_attention_rotating_fallback(&q, &[], &[], &rot_meta, 1.0);
-    assert!(
-        rotating.as_ref().is_err_and(|e| e.contains("empty batch")),
-        "rotating fallback must reject batch == 0, got error {:?}",
-        rotating.as_ref().err()
-    );
 
     let layout = PagedKvLayout::uniform(1, 2, 32).unwrap();
     let pool = PagedBlockPool::new(layout);
@@ -4518,6 +4482,114 @@ fn qmv_multirow_matches_per_row_qmv_bitwise() {
                     &full_bytes[j as usize * row_nbytes..(j as usize + 1) * row_nbytes],
                     "row {j} of multirow [{rows}x{k}] {bits}-bit gs{group_size} \
                      diverged from per-row qmv"
+                );
+            }
+        }
+    }
+}
+
+/// [#2160] Multirow qmv parity at Gemma 4 12B MLP shapes, in the `[1, 4, K]`
+/// layout an MTP verify block hands the MLP. Gemma 4 12B MTP verify needs each
+/// verify row to be byte-equal to the single-token `[1, 1, K]` decode forward;
+/// the checkpoint mixes 8-bit (MLP) and 4-bit (attention) affine projections at
+/// group 64 over bf16 activations, so both widths are checked at the up
+/// (3840 -> 15360) and down (15360 -> 3840) shapes.
+#[cfg(feature = "cuda")]
+#[test]
+fn qmv_multirow_matches_per_row_qmv_bitwise_gemma4_12b_mlp_shapes() {
+    random_seed(2160);
+    const ROWS: i32 = 4;
+    for &bits in &[8, 4] {
+        for &(k, n) in &[(3840, 15360), (15360, 3840)] {
+            let group_size = 64;
+            let (w, s, b) = random_quantized_weight(n, k, group_size, bits);
+            let x_f32 = unsafe { random_normal(&[1, ROWS, k], dtype::FLOAT32, std::ptr::null()) };
+            let x = astype(&x_f32, dtype::BFLOAT16);
+            eval(&x);
+            let qmm = |input: &MlxArray| {
+                let out = unsafe {
+                    quantized_matmul(
+                        input,
+                        &w,
+                        &s,
+                        b.as_ref().unwrap() as *const MlxArray,
+                        true,
+                        group_size,
+                        bits,
+                        "affine",
+                    )
+                };
+                eval(&out);
+                out
+            };
+            let block = qmm(&x);
+            assert_eq!(array_shape(&block), vec![1, ROWS, n]);
+            for j in 0..ROWS {
+                let row = qmm(&slice(&x, &[0, j, 0], &[1, j + 1, k]));
+                let block_row = slice(&block, &[0, j, 0], &[1, j + 1, n]);
+                assert_eq!(
+                    array_to_raw_bytes(&row),
+                    array_to_raw_bytes(&block_row),
+                    "row {j} of [1, {ROWS}, {k}] -> {n} {bits}-bit gs{group_size} bf16 \
+                     diverged from the single-row qmv"
+                );
+            }
+        }
+    }
+}
+
+/// [#2160] A small multi-row block through the quantized GeGLU MLP must give
+/// each row the bytes the single-token decode call gives it. On CUDA the 8-bit
+/// multi-token call used to take the op-at-a-time activation while decode took
+/// the fused compiled one, and the two round differently, which failed Gemma 4
+/// 12B's MTP verify-vs-chain probe at the first MLP.
+#[cfg(feature = "cuda")]
+#[test]
+fn compiled_qgelu_mlp_small_block_rows_match_single_token_bitwise() {
+    random_seed(2161);
+    let group_size = 64;
+    let hidden = 256;
+    let intermediate = 512;
+    for &bits in &[8, 4] {
+        let (gate_w, gate_s, gate_b) =
+            random_quantized_weight(intermediate, hidden, group_size, bits);
+        let (up_w, up_s, up_b) = random_quantized_weight(intermediate, hidden, group_size, bits);
+        let (down_w, down_s, down_b) =
+            random_quantized_weight(hidden, intermediate, group_size, bits);
+        let mlp = |x: &MlxArray| {
+            let out = unsafe {
+                compiled_gelu_approx_mlp_forward(
+                    x,
+                    &gate_w,
+                    &gate_s,
+                    gate_b.as_ref().unwrap() as *const MlxArray,
+                    &up_w,
+                    &up_s,
+                    up_b.as_ref().unwrap() as *const MlxArray,
+                    &down_w,
+                    &down_s,
+                    down_b.as_ref().unwrap() as *const MlxArray,
+                    group_size,
+                    bits,
+                    "affine",
+                )
+            };
+            eval(&out);
+            out
+        };
+        // Inside CUDA's qmv window (`M * B < 8`); 8 rows take qmm.
+        for &rows in &[2i32, 4, 7] {
+            let x_f32 =
+                unsafe { random_normal(&[1, rows, hidden], dtype::FLOAT32, std::ptr::null()) };
+            let x = astype(&x_f32, dtype::BFLOAT16);
+            eval(&x);
+            let block = mlp(&x);
+            for j in 0..rows {
+                let row = mlp(&slice(&x, &[0, j, 0], &[1, j + 1, hidden]));
+                assert_eq!(
+                    array_to_raw_bytes(&row),
+                    array_to_raw_bytes(&slice(&block, &[0, j, 0], &[1, j + 1, hidden])),
+                    "{bits}-bit row {j} of a {rows}-row block diverged from single-token decode"
                 );
             }
         }
@@ -4822,5 +4894,73 @@ fn activation_helpers_return_the_input_dtype() {
                 array_dtype(&out)
             );
         }
+    }
+}
+
+/// `item_f32` must convert from the array's real dtype, not reinterpret it.
+///
+/// `array::item<T>()` is `*data<T>()`, so asking for `float` from a 2-byte
+/// dtype reads 4 bytes out of a 2-byte buffer: the low half is the real bit
+/// pattern and the high half is whatever follows in the allocation. Before the
+/// dispatch in `item_scalar`, a bfloat16 `10.3125` (bits `0x4125`) came back as
+/// `0x00004125` reinterpreted, or `2.337e-41`, and the same call returned a
+/// NaN under a different build profile because the layout put different bytes
+/// after the scalar.
+///
+/// Every value here is exactly representable in every dtype under test, so any
+/// difference is the read, never rounding.
+#[test]
+fn item_f32_converts_from_the_arrays_own_dtype() {
+    for (dtype, name) in [
+        (dtype::BFLOAT16, "bf16"),
+        (dtype::FLOAT16, "f16"),
+        (dtype::FLOAT32, "f32"),
+    ] {
+        for value in [10.3125_f32, 8.125, 11.25, -2.5, 0.0] {
+            let arr = full_f32(&[1], value, dtype);
+            eval(&arr);
+            let got = item_f32(&arr);
+            assert_eq!(
+                got, value,
+                "item_f32 on a {name} scalar holding {value} returned {got}; a reinterpret \
+                 rather than a conversion yields a denormal near 1e-41 or a NaN"
+            );
+            assert!(
+                got.is_finite(),
+                "item_f32 on a {name} scalar holding {value} returned a non-finite {got}"
+            );
+        }
+    }
+}
+
+/// The same defect class reaches the integer and bool readers, which share the
+/// raw-reinterpret implementation. `item_i32` on an `int64` array read the low
+/// word, and `item_bool` on any wider dtype read one byte of a larger element.
+#[test]
+fn item_readers_convert_across_widths() {
+    let i64_arr = astype(&full_f32(&[1], 7.0, dtype::FLOAT32), dtype::INT64);
+    eval(&i64_arr);
+    assert_eq!(item_i32(&i64_arr), 7, "item_i32 must convert from int64");
+
+    let i32_arr = astype(&full_f32(&[1], 9.0, dtype::FLOAT32), dtype::INT32);
+    eval(&i32_arr);
+    assert_eq!(item_i64(&i32_arr), 9, "item_i64 must convert from int32");
+
+    let bf16_arr = full_f32(&[1], 3.0, dtype::BFLOAT16);
+    eval(&bf16_arr);
+    assert_eq!(
+        item_i32(&bf16_arr),
+        3,
+        "item_i32 must convert from bfloat16"
+    );
+
+    for (value, expected) in [(0.0_f32, false), (1.0, true), (2.5, true)] {
+        let arr = full_f32(&[1], value, dtype::BFLOAT16);
+        eval(&arr);
+        assert_eq!(
+            item_bool(&arr),
+            expected,
+            "item_bool on a bfloat16 scalar holding {value}"
+        );
     }
 }

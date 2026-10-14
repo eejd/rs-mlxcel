@@ -4,13 +4,13 @@
 
 ## Scope and ownership
 
-Issue #1840 adds metadata-only catalog projections over the existing `RouterPool`, plus list, detail, and refresh adapters. It does not create a second model registry or start another provider. `create_router_app_with_authenticated_ui` exposes the adapters behind mandatory API-key authentication for integration tests and the future secure startup path. The ordinary `create_router_app` still leaves them unmounted. Production `--webui` startup and browser security integration belong to #1838 and #1837, respectively; these API paths are not a claim that the production flag is already available.
+Issue #1840 adds metadata-only catalog projections over the existing `RouterPool`, plus list, detail, and refresh adapters. It does not create a second model registry or start another provider. `create_router_app_with_authenticated_ui` exposes the adapters behind mandatory API-key authentication for integration tests, and #1838 mounts the same typed API in production `--webui` startup behind the WebUI security wrapper. The ordinary `create_router_app` still leaves the administrative UI routes unmounted when WebUI is off.
 
 Discovery remains owned by the router: managed cache, explicit `--models-dir`, and presets retain their existing collision precedence (cache < models directory < preset), aliases, and hidden-entry policy. Select the repository store explicitly with `--models-dir models/mlx`; catalog code does not invent a working-directory-dependent default or a filesystem picker. Listing projects discovered entries without downloading a checkpoint, opening a tokenizer, constructing a provider, or loading weights.
 
 ## Consuming the projection
 
-The adapter paths below are relative to the server's future validated API prefix. See [the API schema](api.yaml) and [generated TypeScript declarations](generated/ui-api.d.ts) for complete DTO definitions.
+The adapter paths below are relative to the server's validated API prefix. See [the API schema](api.yaml) and [generated TypeScript declarations](generated/ui-api.d.ts) for complete DTO definitions.
 
 | Request | Behavior |
 |---|---|
@@ -20,17 +20,19 @@ The adapter paths below are relative to the server's future validated API prefix
 
 The list accepts `limit` (default 50, maximum 200), the returned `cursor`, `q` (maximum 128 bytes), `source`, `task`, `lifecycle`, `support`, and `completeness`. Cursors are at most 512 bytes. Projection is bounded to 1,000 inventory entries. Pagination is deterministic for an unchanged inventory, not a transactional snapshot spanning concurrent refreshes: retain `server_instance_id` and `snapshot_sequence`, and follow the resnapshot rules in [architecture.md](architecture.md) when state changes.
 
-Use `identity.id` for catalog operations and selection; use `identity.inference_id` for inference requests. A display name is not either identity. Content fingerprints describe bounded filesystem metadata observed when metadata is first projected or explicitly refreshed; they are not cryptographic verification of weight contents and are not recomputed on every poll. Revision and lifecycle fields come from the pool rather than a browser-maintained state machine.
+Use `identity.id` for catalog operations and selection; use `identity.inference_id` for inference requests. `identity.display_name` is the inference id with no character rewriting (the directory name for a models-dir entry, the full `owner/name` for a cache entry, the full preset name for a preset entry, and the last `/`-separated segment of the served id in single-model mode), not a humanized form. It is still only a label: two sources can expose the same name, so operations and selection use `identity.id`. Content fingerprints describe bounded filesystem metadata observed when metadata is first projected or explicitly refreshed; they are not cryptographic verification of weight contents and are not recomputed on every poll. Revision and lifecycle fields come from the pool rather than a browser-maintained state machine.
 
 Do not collapse these separate facts into a single “works” badge:
 
 - `complete` describes the local checkpoint file layout; it is not a successful load or tensor-integrity check.
 - `metadata.support.architecturally_supported` comes from shared model detection and the architecture registry, not a vendor-heading match.
-- `runnable_on_backend` reflects registry support for the compiled backend, not a measured inference result.
+- `runnable_on_backend` reflects registry support for the GPU backend resolved at runtime (Metal, CUDA or ROCm), not a measured inference result. A process with no resolved GPU backend reports no architecture as runnable.
 - `tested_checkpoint` currently remains false with an explicit reason: the catalog has no per-checkpoint evidence database.
 - `lifecycle.state` reflects the current provider lifecycle; advertised pre-load capabilities do not imply `ready`.
 
 `metadata.model_type` is the raw bounded `config.json` string, preserving case and returning `null` with a reason when the value is missing, non-string, oversized, or unreadable. `metadata.declared_architectures` is the raw bounded `architectures` array under the same no-truncation rule. `metadata.architecture` is the resolved mlxcel registry identifier from the shared loader detection authority, not an unvalidated copy of either raw field. The catalog supplies restricted probes to that authority; if distinguishing a variant requires weight headers and no bounded sidecar evidence exists, the result remains unknown with a reason. This includes relevant Gemma 4, Inkling, and Kimi K3 distinctions rather than guessing a text variant.
+
+`metadata.dtype` is the declared weight dtype from `config.json`: `torch_dtype`, or `dtype` in newer exports, read at the top level and then under `text_config`. It is normalized to a short lowercase name (`bfloat16` becomes `bf16`, `float16` becomes `fp16`, `float32` becomes `fp32`, `float64` becomes `fp64`, and a `torch.` prefix is dropped); `float8_e4m3fn`, `float8_e4m3fnuz`, `float8_e5m2`, `float8_e5m2fnuz`, `int8` and `uint8` are reported as written. Any other value is `null`, with no separate reason, as it is when the key is absent, not a string or `auto`: the value is printed where a quantization would be, so a downloaded config must not be able to put an arbitrary word there. Quantized checkpoints also report it, naming the dtype of their unquantized tensors, so the library shows `metadata.quantization` when it is known and falls back to `metadata.dtype` for unquantized checkpoints.
 
 Capabilities carry a phase and an unavailable reason. Image input is confirmed from the existing provider after readiness; metadata alone does not enable image submission. Non-chat output tasks remain separate from chat. Unknown parameter counts and memory estimates remain `null` with reasons, never zero. Disk bytes describe files, not process RSS or allocator memory.
 
@@ -42,7 +44,7 @@ Metadata projection runs on blocking workers. Each router or single-model WebUI 
 
 Only one refresh owns execution per server instance while its operation is active. Concurrent requests replay that operation without starting another rescan; a later request after completion may start a new one. `changed_entries` compares entry signatures and includes additions, removals, and detected modifications even when the inventory count is unchanged. Client-facing refresh failures are redacted; diagnostic details stay in server logs.
 
-Removal eligibility is advisory, not permission to unlink a path: only managed cache entries can be eligible, and busy entries are unavailable. The actual removal workflow and operation-boundary checks belong to #1841. Single-model mode uses the cache-aware `single_model_entry_from_state_with_cache(&CatalogProjectionCache, &AppState)` handoff to describe the existing provider and its real inference ID, without registering another provider; it reports read-only removal reasons and projects fresh provider/lifecycle state over cached static metadata. Mounting that accessor in production belongs to #1838.
+Removal eligibility is advisory, not permission to unlink a path: only managed cache entries can be eligible, and busy entries are unavailable. The actual removal workflow and operation-boundary checks belong to #1841. Single-model mode uses the cache-aware `single_model_entry_from_state_with_cache(&CatalogProjectionCache, &AppState)` handoff to describe the existing provider and its real inference ID, without registering another provider; it reports read-only removal reasons and projects fresh provider/lifecycle state over cached static metadata. #1838 mounts that accessor in production through a per-app cache and blocking offload.
 
 ## Regression coverage
 
@@ -50,4 +52,4 @@ Focused tests cover full producer JSON against schema-validated fixtures, raw mo
 
 The final combined gate ran at `808994e353fdab5563966e751ca2c71515d08595`: catalog 32 library + 1 CLI, security 26 and discovery 2 passed; workspace all-target clippy, 40 contract fixtures, structural checks, fmt and diff checks passed. The shared detection/loader path remained unchanged. Both independent reviewers cleared the complete router and single-model cache boundaries at this revision.
 
-`single_model_entry_from_state_with_cache` is synchronous. The #1838 startup owner must retain one per-application `Arc<CatalogProjectionCache>` and invoke this helper inside `tokio::task::spawn_blocking`. Never create a cache per poll or call the uncached convenience accessor in an HTTP handler. Cached-helper/provider transitions are tested here; production single-model route offload and responsiveness are #1838 responsibilities. Router HTTP adapters already offload metadata acquisition.
+`single_model_entry_from_state_with_cache` is synchronous. Production single-model WebUI routes retain one per-application `Arc<CatalogProjectionCache>` and invoke this helper inside `tokio::task::spawn_blocking`; never create a cache per poll or call the uncached convenience accessor in an HTTP handler. Cached-helper/provider transitions are tested here, and #1838 adds mounted-route coverage for the production offload path. Router HTTP adapters already offload metadata acquisition.

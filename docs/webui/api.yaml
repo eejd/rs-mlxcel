@@ -294,6 +294,16 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Catalog refresh is unsupported in read-only single-model mode",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         }
       }
@@ -1444,7 +1454,8 @@
           "features",
           "actions",
           "roots",
-          "limits"
+          "limits",
+          "media_limits"
         ],
         "properties": {
           "schema_version": {
@@ -1476,6 +1487,9 @@
           },
           "limits": {
             "$ref": "#/components/schemas/LimitSummary"
+          },
+          "media_limits": {
+            "$ref": "#/components/schemas/MediaLimits"
           }
         }
       },
@@ -1504,7 +1518,8 @@
           "display_name": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 128
+            "maxLength": 256,
+            "description": "The model's inference id with no character rewriting: the full id for cache and preset entries (owner/name for a cache repo), the directory name for models_dir entries, and the last /-separated segment of the served id for single_model. A label only: select and operate on a model by id."
           },
           "source": {
             "$ref": "#/components/schemas/CatalogSourceKind"
@@ -1829,6 +1844,11 @@
           },
           "eviction_target_id": {
             "$ref": "#/components/schemas/ModelId"
+          },
+          "eviction_target_expected_revision": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Catalog revision of eviction_target_id observed when the user confirmed the eviction; required when eviction_target_id is present and forbidden otherwise."
           }
         }
       },
@@ -1934,6 +1954,13 @@
                 "type": "null"
               }
             ]
+          },
+          "eviction_target_expected_revision": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
           }
         }
       },
@@ -2388,7 +2415,8 @@
           "revision",
           "snapshot_sequence",
           "measurements",
-          "settings"
+          "settings",
+          "slots"
         ],
         "properties": {
           "schema_version": {
@@ -2417,6 +2445,9 @@
           "snapshot_sequence": {
             "$ref": "#/components/schemas/EventSequence",
             "description": "Single global event sequence after which this snapshot is authoritative."
+          },
+          "slots": {
+            "$ref": "#/components/schemas/RuntimeSlots"
           }
         }
       },
@@ -2670,6 +2701,7 @@
           "input_tasks",
           "output_tasks",
           "quantization",
+          "dtype",
           "format",
           "parameter_count",
           "disk_bytes",
@@ -2718,6 +2750,15 @@
               "null"
             ],
             "maxLength": 128
+          },
+          "dtype": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 32,
+            "pattern": "^[a-z0-9_]+$",
+            "description": "Declared weight dtype from config.json torch_dtype (or dtype), normalized to a short lowercase name such as bf16 or fp16; null when absent, auto, or not a recognized tensor dtype. Quantized checkpoints report the dtype of their unquantized tensors."
           },
           "format": {
             "type": [
@@ -2965,7 +3006,7 @@
             "items": {
               "$ref": "#/components/schemas/StringContract"
             },
-            "maxItems": 256
+            "maxItems": 1024
           }
         }
       },
@@ -3532,6 +3573,162 @@
             "maxLength": 512
           }
         }
+      },
+      "RuntimeSlot": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "processing",
+          "prompt_tokens",
+          "cached_prompt_tokens",
+          "decoded_tokens"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "processing": {
+            "type": "boolean"
+          },
+          "prompt_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "Current context occupancy from GET /slots n_prompt_tokens: includes processed prompt and accepted decoded tokens. Never add decoded_tokens again."
+          },
+          "cached_prompt_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "decoded_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          }
+        }
+      },
+      "RuntimeSlots": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "available",
+          "reason",
+          "measured_at",
+          "configured_parallelism",
+          "effective_parallelism",
+          "request_context_tokens",
+          "shared_pool_context_tokens",
+          "items"
+        ],
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 256
+          },
+          "measured_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "configured_parallelism": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "effective_parallelism": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "request_context_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "shared_pool_context_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "items": {
+            "type": "array",
+            "maxItems": 256,
+            "items": {
+              "$ref": "#/components/schemas/RuntimeSlot"
+            }
+          }
+        }
+      },
+      "MediaLimits": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "max_images",
+          "max_image_bytes",
+          "max_width",
+          "max_height",
+          "max_decoded_bytes",
+          "max_body_bytes"
+        ],
+        "properties": {
+          "max_images": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "max_image_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "max_width": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "max_height": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "max_decoded_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "max_body_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "description": "Resolved server image admission and WebUI JSON body limits; clients may impose additional lower local safety ceilings. JSON budget includes base64 encoding, transcript and request envelope."
       }
     }
   }

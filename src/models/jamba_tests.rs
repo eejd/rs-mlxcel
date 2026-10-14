@@ -440,3 +440,245 @@ fn jamba_rejects_a_declared_quantization_mode_its_loaders_cannot_honor() {
         Err(e) => panic!("an explicitly declared affine mode must load: {e}"),
     }
 }
+
+/// Seeded small-magnitude values, so positions differ and a non-causal
+/// attention would change the prefill rows.
+fn varied(shape: &[i32], seed: u64) -> mlxcel_core::UniquePtr<mlxcel_core::MlxArray> {
+    let len: usize = shape.iter().map(|d| *d as usize).product();
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+    let data: Vec<f32> = (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 40) as f32) / ((1u32 << 24) as f32) * 0.4 - 0.2
+        })
+        .collect();
+    mlxcel_core::from_slice_f32(&data, shape)
+}
+
+fn to_f32(arr: &mlxcel_core::MlxArray) -> Vec<f32> {
+    let arr = mlxcel_core::astype(arr, dtype::FLOAT32);
+    mlxcel_core::eval(&arr);
+    mlxcel_core::array_to_raw_bytes(&arr)
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Issue #1991: Jamba prefill passes no attention mask and the attention
+/// layer takes MLX's maskless causal SDPA. Each prefill row must match the
+/// same position decoded one token at a time, fresh and continued from an
+/// offset. Varied embeddings and projections make a non-causal pass differ.
+#[test]
+fn jamba_prefill_rows_match_token_by_token_decode() {
+    use mlxcel_core::cache::SequenceId;
+    use mlxcel_core::generate::LanguageModel;
+
+    let build = || {
+        let mut weights = dense_expert_weights();
+        weights.insert(
+            "model.embed_tokens.weight".into(),
+            varied(&[VOCAB, HIDDEN], 1),
+        );
+        for (i, proj) in ["q_proj", "k_proj", "v_proj", "o_proj"].iter().enumerate() {
+            weights.insert(
+                format!("model.layers.0.self_attn.{proj}.weight"),
+                varied(&[HIDDEN, HIDDEN], 10 + i as u64),
+            );
+        }
+        JambaModel::from_weights(moe_config(&quant_block(0, 0)), weights)
+            .expect("dense Jamba fixture must load")
+    };
+    let vocab = VOCAB as usize;
+    for (case, (warm, chunk)) in [(0usize, 6usize), (3, 5)].into_iter().enumerate() {
+        let tokens: Vec<i32> = (0..(warm + chunk) as i32)
+            .map(|i| (i * 5 + 1) % VOCAB)
+            .collect();
+
+        let reference = build();
+        let seq_ref = SequenceId::from_raw(1_991_000 + case as u64);
+        reference.prepare_sequence_state(seq_ref);
+        let want: Vec<Vec<f32>> = tokens
+            .iter()
+            .map(|&t| {
+                let x = mlxcel_core::from_slice_i32(&[t], &[1, 1]);
+                to_f32(&reference.forward_with_sequence_id(&x, Some(seq_ref), &mut [], None))
+            })
+            .collect();
+
+        let model = build();
+        let seq = SequenceId::from_raw(1_991_100 + case as u64);
+        model.prepare_sequence_state(seq);
+        if warm > 0 {
+            let x = mlxcel_core::from_slice_i32(&tokens[..warm], &[1, warm as i32]);
+            let _ = to_f32(&model.forward_with_sequence_id(&x, Some(seq), &mut [], None));
+        }
+        let x = mlxcel_core::from_slice_i32(&tokens[warm..], &[1, chunk as i32]);
+        let got = to_f32(&model.forward_with_sequence_id(&x, Some(seq), &mut [], None));
+        assert_eq!(got.len(), chunk * vocab, "case {case}: logits shape");
+        for row in 0..chunk {
+            let max = got[row * vocab..(row + 1) * vocab]
+                .iter()
+                .zip(&want[warm + row])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max < 1e-4,
+                "warm {warm} chunk {chunk} row {row}: max |diff| {max}"
+            );
+        }
+    }
+}
+
+/// One Mamba layer (`attn_layer_period` 2, offset 1 puts attention at layer 1,
+/// which a one-layer model never reaches) with a dense MoE feed-forward.
+fn mamba_config() -> JambaConfig {
+    serde_json::from_str(&format!(
+        r#"{{
+            "model_type": "jamba",
+            "hidden_size": {HIDDEN},
+            "intermediate_size": {INTERMEDIATE},
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "vocab_size": {VOCAB},
+            "attn_layer_period": 2,
+            "attn_layer_offset": 1,
+            "expert_layer_period": 1,
+            "expert_layer_offset": 0,
+            "num_experts": {EXPERTS},
+            "num_experts_per_tok": 2,
+            "mamba_d_state": 8,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+            "mamba_dt_rank": 8,
+            "mamba_conv_bias": true,
+            "tie_word_embeddings": true,
+            "quantization": {{"group_size": 0, "bits": 0}}
+        }}"#
+    ))
+    .expect("jamba Mamba test config")
+}
+
+fn mamba_weights() -> WeightMap {
+    let (h, i, n, r, k) = (HIDDEN, 2 * HIDDEN, 8, 8, 4);
+    let mut weights = dense_expert_weights();
+    weights.insert("model.embed_tokens.weight".into(), varied(&[VOCAB, h], 1));
+    let m = "model.layers.0.mamba";
+    for (name, shape, seed) in [
+        ("in_proj.weight", vec![2 * i, h], 21u64),
+        ("x_proj.weight", vec![r + 2 * n, i], 22),
+        ("dt_proj.weight", vec![i, r], 23),
+        ("dt_proj.bias", vec![i], 24),
+        ("conv1d.weight", vec![i, k, 1], 25),
+        ("conv1d.bias", vec![i], 26),
+        ("A_log", vec![i, n], 27),
+        ("D", vec![i], 28),
+        ("out_proj.weight", vec![h, i], 29),
+    ] {
+        weights.insert(format!("{m}.{name}"), varied(&shape, seed));
+    }
+    for (name, dim) in [("dt_layernorm", r), ("b_layernorm", n), ("c_layernorm", n)] {
+        put_f32(&mut weights, &format!("{m}.{name}.weight"), &[dim], 1.0);
+    }
+    weights
+}
+
+/// Issue #1999: the multi-token Mamba scan (the prefill branch of
+/// `JambaMambaMixer::ssm_step`) must give, row for row, what the single-token
+/// branch gives when the same tokens are decoded one at a time, both from an
+/// empty state and continuing from an existing conv and SSM state.
+#[test]
+fn jamba_mamba_prefill_rows_match_token_by_token_decode() {
+    use mlxcel_core::cache::SequenceId;
+    use mlxcel_core::generate::LanguageModel;
+
+    let build = || {
+        JambaModel::from_weights(mamba_config(), mamba_weights())
+            .expect("Mamba Jamba fixture must load")
+    };
+    let vocab = VOCAB as usize;
+    for (case, (warm, chunk)) in [(0usize, 7usize), (3, 6)].into_iter().enumerate() {
+        let tokens: Vec<i32> = (0..(warm + chunk) as i32)
+            .map(|i| (i * 7 + 3) % VOCAB)
+            .collect();
+
+        let reference = build();
+        let seq_ref = SequenceId::from_raw(1_999_000 + case as u64);
+        reference.prepare_sequence_state(seq_ref);
+        let want: Vec<Vec<f32>> = tokens
+            .iter()
+            .map(|&t| {
+                let x = mlxcel_core::from_slice_i32(&[t], &[1, 1]);
+                to_f32(&reference.forward_with_sequence_id(&x, Some(seq_ref), &mut [], None))
+            })
+            .collect();
+
+        let model = build();
+        let seq = SequenceId::from_raw(1_999_100 + case as u64);
+        model.prepare_sequence_state(seq);
+        if warm > 0 {
+            let x = mlxcel_core::from_slice_i32(&tokens[..warm], &[1, warm as i32]);
+            let _ = to_f32(&model.forward_with_sequence_id(&x, Some(seq), &mut [], None));
+        }
+        let x = mlxcel_core::from_slice_i32(&tokens[warm..], &[1, chunk as i32]);
+        let got = to_f32(&model.forward_with_sequence_id(&x, Some(seq), &mut [], None));
+        assert_eq!(got.len(), chunk * vocab, "case {case}: logits shape");
+        for row in 0..chunk {
+            let max = got[row * vocab..(row + 1) * vocab]
+                .iter()
+                .zip(&want[warm + row])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max < 1e-4,
+                "warm {warm} chunk {chunk} row {row}: max |diff| {max}"
+            );
+        }
+    }
+}
+
+/// Issue #1981: on a backend with a fused Mamba1 scan port (Metal, CUDA, and
+/// ROCm since #2069), a
+/// Jamba prefill must not walk the per-step graph scan. That loop issues
+/// several small ops per timestep per Mamba layer, and on CUDA it was about
+/// two thirds of a 3.3k-token prefill. Checked for f32 and bf16 weights (the
+/// published checkpoints are bf16), for a prefill and the decode step after it.
+#[test]
+fn jamba_mamba_prefill_takes_the_fused_scan_where_a_port_exists() {
+    use mlxcel_core::cache::SequenceId;
+    use mlxcel_core::generate::LanguageModel;
+    use mlxcel_core::hardware::{GpuBackendKind, gpu_backend_kind};
+
+    // Not skipped under `MLXCEL_MAMBA1_SCAN_KERNEL=0`: that setting brings the
+    // per-step loop back, which is exactly what this test must catch.
+    if !matches!(
+        gpu_backend_kind(),
+        GpuBackendKind::Metal | GpuBackendKind::Cuda | GpuBackendKind::Rocm
+    ) {
+        return;
+    }
+    for weight_dtype in [dtype::FLOAT32, dtype::BFLOAT16] {
+        let weights: WeightMap = mamba_weights()
+            .into_iter()
+            .map(|(k, v)| (k, mlxcel_core::astype(&v, weight_dtype)))
+            .collect();
+        let model = JambaModel::from_weights(mamba_config(), weights)
+            .expect("Mamba Jamba fixture must load");
+        let seq = SequenceId::from_raw(1_981_000 + weight_dtype as u64);
+        model.prepare_sequence_state(seq);
+
+        let before = super::GRAPH_SCAN_STEPS.with(|n| n.get());
+        let prompt: Vec<i32> = (0..48).map(|i| (i * 7 + 3) % VOCAB).collect();
+        let x = mlxcel_core::from_slice_i32(&prompt, &[1, prompt.len() as i32]);
+        let _ = to_f32(&model.forward_with_sequence_id(&x, Some(seq), &mut [], None));
+        let x = mlxcel_core::from_slice_i32(&[5], &[1, 1]);
+        let _ = to_f32(&model.forward_with_sequence_id(&x, Some(seq), &mut [], None));
+        let walked = super::GRAPH_SCAN_STEPS.with(|n| n.get()) - before;
+        assert_eq!(
+            walked, 0,
+            "dtype {weight_dtype}: prefill and decode walked {walked} graph-scan timesteps instead of the fused kernel"
+        );
+    }
+}

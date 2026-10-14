@@ -16,7 +16,7 @@ Apple Silicon is the primary target. Linux/CUDA is supported as a secondary targ
 
 The current `main` branch is v0.7.0 plus unreleased work. Install from source to use features that have not reached the latest tagged release; see the [changelog](CHANGELOG.md) for the release-by-release record.
 
-- **Experimental AMD GPU (ROCm) support.** `--features rocm` builds mlxcel on Linux against an MLX ROCm backend vendored into the source tree as the ROCm part of mlxcelverse, applied on the same pinned MLX commit as the Metal and CUDA builds. Affine, mxfp8, and mxfp4 checkpoints, including gpt-oss MoE experts, run on RDNA 3.5 (`gfx1151`); fused kernels fall back to MLX graphs and affine MoE models need `MLXCEL_FUSED_MOE=0` for now. See [Linux with AMD ROCm](docs/installation.md#linux-with-amd-rocm-experimental) for the build and the open gaps.
+- **Experimental AMD GPU (ROCm) support.** `--features rocm` builds mlxcel on Linux against an MLX ROCm backend vendored into the source tree as the ROCm part of mlxcelverse, applied on the same pinned MLX commit as the Metal and CUDA builds. Affine, mxfp8, and mxfp4 checkpoints, including gpt-oss MoE experts, run on RDNA 3.5 (`gfx1151`); the fused kernels with a HIP port (BitLinear, the samplers, the SSM update step, the Mamba1 scan, the decode-MoE kernels, xIELU, the add3 LayerNorm, and the fused add-RMSNorm and RoPE + append, which are on by default on ROCm) run natively and the rest fall back to MLX graphs. See [Linux with AMD ROCm](docs/installation.md#linux-with-amd-rocm-experimental) for the build and the open gaps.
 - **Verified `llama-server` compatibility.** A frozen b10621 manifest classifies all 376 pinned options, routes, and native request fields, with no deferred entries. Native completion, embedding, tokenization, template, infill, props, slots, metrics, resumable-stream, router, and LoRA surfaces are implemented or explicitly classified instead of being silently ignored.
 - **OpenAI, Anthropic, and Vertex-compatible serving.** Chat Completions, Completions, Responses, Embeddings, Reranking, Audio, and Anthropic Messages are available alongside the native `llama-server` routes. Optional Vertex AI custom-container routing is supported through the standard `AIP_*` variables.
 - **Multi-model routing and live adapters.** Router mode discovers checkpoints from the model store, a model directory, or INI presets; loads them on demand; and bounds the resident set with LRU eviction. Multiple LoRA adapters can remain unfused for per-request or live scale changes, or be fused for zero decode overhead.
@@ -38,7 +38,7 @@ See [Server features](docs/server-features.md) for the route and deployment map 
 - **Compatibility without overclaiming.** `mlxcel-server` accepts a broad `llama-server` flag and `LLAMA_ARG_*` environment surface, while the checked-in manifest records every supported, aliased, not-applicable, or intentional-difference case.
 - **Serving features enabled for real workloads.** Continuous batching, prompt-prefix caching, and automatic prefix caching are on by default. Speculative decoding, KV-cache compression, router mode, live LoRA, and distributed modes are available where the model and backend support them.
 - **Reproducible model surgery.** Default builds support YAML load-time weight edits through `--surgery` / `MLXCEL_SURGERY`, including `scale`, `add`, `prune`, `replace`, and `interpolate`.
-- **Broad architecture coverage.** Dense transformers, sparse MoE, hybrid SSM, VLM/OCR, block diffusion, embeddings, rerankers, ASR, and TTS are represented. Run `mlxcel arch` for the binary's architecture catalog and consult [Supported models](docs/supported-models.md) for checkpoint-level notes.
+- **Broad architecture coverage.** Dense transformers, sparse MoE, hybrid SSM, VLM/OCR, block diffusion, embeddings, rerankers, ASR, TTS, and full-duplex speech-to-speech (Nemotron VoiceChat) are represented. Run `mlxcel arch` for the binary's architecture catalog and consult [Supported models](docs/supported-models.md) for checkpoint-level notes.
 
 ## Quick start
 
@@ -48,7 +48,7 @@ The Homebrew formula installs the latest released `mlxcel` and `mlxcel-server` b
 
 ```bash
 brew tap lablup/tap
-brew install mlxcel
+brew install lablup/tap/mlxcel
 ```
 
 ### Run a model
@@ -70,6 +70,8 @@ mlxcel run
 
 Thinking-capable checkpoints may generate reasoning before the final answer. `run` and `generate` hide reasoning from terminal output by default; pass `--show-reasoning` to display it without the raw marker tokens.
 
+`run` and its chat REPL are clients of the server engine: they start the `mlxcel-server` model worker in-process (one slot, no HTTP listener) and send each turn through the same `/v1/chat/completions` request path, so `mlxcel run -p` and the server give the same output for the same request. Sampling flags map onto the server options of the same name (`--temp`, `--top-k`, `--repeat-last-n`, `--frequency-penalty`, `--dry-sequence-breaker`, `--stop`, ...); with none given, the base sampler stays greedy unless `generation_config.json` sets one. `--draft-model` (with `--draft-kind dflash|mtp` when the drafter does not say) runs speculative decoding through the server's DFlash and MTP paths. In the REPL, `/clear` starts a new conversation, `/image <path>` attaches an image to the next message, and Ctrl-C stops the reply being generated without leaving the chat (a second Ctrl-C quits). The whole conversation is re-sent every turn, so `/image` and `--image` refuse an image once the conversation would hold more than the server's per-request image cap (16 by default); `/clear` starts over.
+
 With no `-n/--max-tokens`, generation continues until EOS or the effective context limit. Pass `-n N` to set a cap.
 
 ```bash
@@ -85,7 +87,9 @@ mlxcel inspect --json -m Qwen3.5-0.8B-4bit --max-tokens 32768 | python3 -m json.
 mlxcel generate -m Qwen3.5-0.8B-4bit -p "Hello" -n 32768 --estimate-memory
 ```
 
-`mlxcel inspect --json` prints a single JSON object with byte-exact `weights_bytes`, `kv_bytes_total`, `activation_bytes`, `headroom_bytes`, `budget_bytes`, `total_bytes`, `fits`, input flags, and per-token FP16/INT8 KV rates when the model config exposes KV geometry. TurboQuant per-token sizing is reported as `null` until the estimator models those widths directly.
+`generate` is the raw-completion client of the same batch-native engine (`mlxcel_core::engine::DirectEngine`): no server worker or HTTP request path in between, the rendered prompt goes straight through the engine's prefill and decode, so it decodes with the same sampler, finish step and lookahead pipeline as the server's single-sequence row (`MLXCEL_FORCE_SYNC` turns the pipeline off). `--prompt-lookup` runs drafter-free speculative decoding on that engine for any model. The classic draft-model path (`--draft-model` without `--draft-kind mtp` or `dflash`) is deprecated and will be removed in v0.8.0.
+
+`mlxcel inspect --json` prints a single JSON object with byte-exact `weights_bytes`, `kv_bytes_total`, `activation_bytes`, `backend_inflight_bytes` (ROCm builds only, else 0), `headroom_bytes`, `budget_bytes`, `total_bytes`, `fits`, input flags, and per-token FP16/INT8 KV rates when the model config exposes KV geometry. TurboQuant per-token sizing is reported as `null` until the estimator models those widths directly.
 
 ### Start a server
 
@@ -161,6 +165,15 @@ curl http://localhost:8080/v1/audio/transcriptions \
 ```
 
 Kokoro-82M checkpoints serve `POST /v1/audio/speech`. See [Audio API](docs/audio-api.md) for model layout, request formats, limits, streaming, and current backend constraints.
+
+A Nemotron VoiceChat checkpoint serves the full-duplex `/v1/realtime` WebSocket (base64 PCM16 in at 16 kHz, text, transcript and 22.05 kHz speech events out, one session at a time). `examples/voicechat_file_client.rs` drives a WAV file through it and `examples/voicechat_microphone.rs` (feature `voicechat-mic`, headphones recommended) holds a live microphone/speaker exchange; the protocol is in [Nemotron VoiceChat](docs/nemotron-voicechat.md#realtime-websocket-v1realtime).
+
+```bash
+mlxcel-server -m models/NemotronLabs-VoiceChat-11B-4bit --port 8080
+cargo run --release --example voicechat_file_client -- \
+  ws://127.0.0.1:8080/v1/realtime question.wav answer.wav \
+  --system-prompt "Be concise and answer in one sentence."
+```
 
 ### Manage downloaded models
 
@@ -306,6 +319,7 @@ Install with `pip install ./python`. See [Python client](docs/python-client.md) 
 - [OpenAI Responses API](docs/responses-api.md)
 - [Embeddings and reranking](docs/embeddings.md)
 - [Audio API](docs/audio-api.md)
+- [Nemotron VoiceChat (full-duplex speech)](docs/nemotron-voicechat.md)
 - [TurboQuant KV cache](docs/turbo-kv-cache.md)
 - [Speculative-decoding acceptance](docs/speculative-acceptance.md)
 - [Adaptive MTP policy API](docs/mtp-policy-api.md)
@@ -327,11 +341,12 @@ Apache License 2.0 unless otherwise noted. See [LICENSE](LICENSE). Third-party a
 
 ## Acknowledgments
 
-- [MLX](https://github.com/ml-explore/mlx), Apple's machine learning framework.
+- [MLX](https://github.com/ml-explore/mlx), Copyright © 2023 Apple Inc., licensed under the MIT License, provides the runtime and source adapted for mlxcel's fused xIELU `expm1f` routine. See [NOTICE](NOTICE).
 - [NripeshN/mlx](https://github.com/NripeshN/mlx), whose `rocm-support` branch is the AMD GPU (ROCm/HIP) MLX backend vendored as the ROCm part of mlxcelverse, under the MIT License. See [NOTICE](NOTICE).
 - [mlx-lm](https://github.com/ml-explore/mlx-lm), [mlx-vlm](https://github.com/Blaizzy/mlx-vlm), and [mlx-audio](https://github.com/Blaizzy/mlx-audio), whose model coverage and behavior mlxcel ports and mirrors. See [NOTICE](NOTICE).
 - [MLX Community](https://huggingface.co/mlx-community), pre-converted MLX checkpoints.
 - [turboquant_plus](https://github.com/TheTom/turboquant_plus), whose TurboQuant KV-cache algorithms are ported under Apache-2.0. See [NOTICE](NOTICE).
+- [backend.ai-go](https://github.com/lablup/backend.ai-go), whose glass theme tokens the bundled WebUI's glass theme is derived from under Apache-2.0. See [NOTICE](NOTICE).
 - [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3), whose tiktoken pre-tokenization pattern and XTML chat grammar are reimplemented in Rust under the Kimi K3 License. See [NOTICE](NOTICE).
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer), whose paged-attention, split-KV, cascade state-merge, and sampling designs inform mlxcel's serving kernels.
 - [IREE](https://github.com/iree-org/iree) and [StableHLO](https://github.com/openxla/stablehlo), the runtime and graph format behind the alpha OpenXLA backend: mlxcel emits StableHLO, `iree-compile` lowers it, and the IREE runtime executes it under the opt-in `xla-iree` build. See [NOTICE](NOTICE).

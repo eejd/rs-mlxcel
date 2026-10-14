@@ -266,6 +266,86 @@ pub fn apply_token_bias(logits: &MlxArray, bias: &TokenBiasMap) -> UniquePtr<Mlx
     ffi::reshape(&biased, &shape)
 }
 
+/// Per-row [`apply_token_bias`] for a `[B, vocab]` batch, one [`TokenBiasMap`]
+/// per row.
+///
+/// The batched fused sampler dispatches `[B, vocab] -> [B]` from shared scalar
+/// parameters and has no per-row bias input, which is why a biased row used to
+/// leave the fused path (and with it the lookahead decode pipeline) entirely.
+/// Token bias does not read generated history, so it is a static additive edit
+/// that belongs on the logits instead: this applies every row's bias in one
+/// pass, in the chain position the per-row sampler uses (after the
+/// last-position slice, before [`apply_row_filters`]).
+///
+/// The work is sized by the union of biased ids across rows, never by the
+/// vocabulary, preserving the property `apply_token_bias` was rewritten for.
+/// Rows that do not bias an id in the union get an exact `0.0` delta, and
+/// `x + 0.0` is bitwise `x` for every finite logit and for `-inf`, so those
+/// rows come out unchanged. Returns the input pointer unchanged, adding no
+/// graph nodes, when every row's map is empty.
+///
+/// Panics when `biases` does not carry exactly one map per logit row: that
+/// means the caller's bias list and its forward batch disagree, and silently
+/// dropping a bias would let an `ignore_eos` request sample its EOS token.
+///
+/// Used by: `BatchScheduler::execute_batched_decode` (fused branch),
+/// `BatchScheduler::prime_lookahead_with_input` (lookahead pipeline)
+pub fn apply_token_bias_rows(
+    logits: UniquePtr<MlxArray>,
+    biases: &[&TokenBiasMap],
+) -> UniquePtr<MlxArray> {
+    if biases.iter().all(|bias| bias.is_empty()) {
+        return logits;
+    }
+    let shape = ffi::array_shape(&logits);
+    let Some(&vocab) = shape.last() else {
+        return logits;
+    };
+    let vocab_size = vocab as usize;
+    let rows: i32 = shape[..shape.len() - 1].iter().product();
+    assert_eq!(
+        rows as usize,
+        biases.len(),
+        "apply_token_bias_rows: one bias map per logit row required"
+    );
+
+    // One shared index vector over the union of biased ids keeps the update a
+    // single `[B, K]` matrix; per-row index sets would need either padding
+    // (which can overwrite a real bias when a pad id collides) or B separate
+    // scatters.
+    let mut ids: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+    for bias in biases {
+        for (&tok, _) in bias.iter() {
+            if tok >= 0 && (tok as usize) < vocab_size {
+                ids.insert(tok);
+            }
+        }
+    }
+    if ids.is_empty() {
+        return logits;
+    }
+    let idx: Vec<i32> = ids.into_iter().collect();
+    let k = idx.len() as i32;
+    let mut vals: Vec<f32> = Vec::with_capacity(biases.len() * idx.len());
+    for bias in biases {
+        // B9 — same applied counter the per-row stage increments, once per
+        // biased row per step.
+        if !bias.is_empty() {
+            LANG_BIAS_APPLIED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        vals.extend(idx.iter().map(|tok| bias.get(tok).copied().unwrap_or(0.0)));
+    }
+
+    let idx_row = ffi::from_slice_i32(&idx, &[1, k]);
+    let idx2d = ffi::broadcast_to(&idx_row, &[rows, k]);
+    let upd = ffi::from_slice_f32(&vals, &[rows, k]);
+    let flat = ffi::reshape(&logits, &[rows, vocab]);
+    let current = ffi::take_along_axis(&flat, &idx2d, -1);
+    let updated = ffi::add(&current, &upd);
+    let biased = ffi::put_along_axis(&flat, &idx2d, &updated, -1);
+    ffi::reshape(&biased, &shape)
+}
+
 /// Optimized sampling that returns arrays for pipelining.
 ///
 /// Returns `(token_array, logits_array)` without forcing evaluation so the
@@ -283,7 +363,7 @@ pub fn apply_token_bias(logits: &MlxArray, bias: &TokenBiasMap) -> UniquePtr<Mlx
 /// increments are skipped entirely when the map is empty, preserving the
 /// zero-overhead baseline path.
 ///
-/// Used by: `CxxGenerator`, `SpeculativeGenerator`, `BatchScheduler`
+/// Used by: the engine's per-row chain, `SpeculativeGenerator`, `BatchScheduler`
 pub fn sample_token_optimized(
     logits: &MlxArray,
     config: &SamplingConfig,
@@ -310,7 +390,9 @@ pub fn sample_token_optimized(
 /// Produces byte-identical logits to [`sample_token_optimized`] for the same
 /// history, so penalty-adjusted greedy sampling selects identical token ids.
 ///
-/// Used by: `BatchScheduler` decode steps, `CxxGenerator` decode loops
+/// Used by: [`crate::sampling_row_step::RowSampler`] (the CLI decode loops and
+/// the server's batched, single-step, and first-token sampling), and the
+/// prompt-lookup speculative loop
 pub fn sample_token_optimized_with_state(
     logits: &MlxArray,
     config: &SamplingConfig,
@@ -342,9 +424,23 @@ fn sample_token_optimized_core(
     state: Option<&mut SamplerState>,
 ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
     let (token, adjusted, _probs) =
-        sample_token_optimized_core_full(logits, config, token_history, state, false);
+        sample_token_optimized_core_full(logits, config, token_history, state, false)
+            .unwrap_or_else(|e| panic!("sampler host read failed: {e}"));
     (token, adjusted)
 }
+
+/// Sampled token, adjusted logits, and the post-chain probability distribution.
+pub type SampleWithDistribution = (
+    UniquePtr<MlxArray>,
+    UniquePtr<MlxArray>,
+    UniquePtr<MlxArray>,
+);
+
+type SampleWithOptionalDistribution = (
+    UniquePtr<MlxArray>,
+    UniquePtr<MlxArray>,
+    Option<UniquePtr<MlxArray>>,
+);
 
 /// Full-form core sampler shared by every entry point: samples one token and,
 /// when `want_distribution` is set, also returns the float32 `[1, vocab]`
@@ -367,11 +463,7 @@ fn sample_token_optimized_core_full(
     token_history: &[i32],
     mut state: Option<&mut SamplerState>,
     want_distribution: bool,
-) -> (
-    UniquePtr<MlxArray>,
-    UniquePtr<MlxArray>,
-    Option<UniquePtr<MlxArray>>,
-) {
+) -> Result<SampleWithOptionalDistribution, String> {
     if config.effective_mirostat() != 0 {
         return mirostat_sample_core(logits, config, state, want_distribution);
     }
@@ -382,14 +474,14 @@ fn sample_token_optimized_core_full(
         let gate = xtc_gate_draw(config);
         let filtered = apply_extended_chain(&adjusted, config, gate.as_deref());
         let (token, probs) = if config.effective_adaptive_target() >= 0.0 {
-            adaptive_p_sample(&filtered, config, state, want_distribution)
+            adaptive_p_sample(&filtered, config, state, want_distribution)?
         } else {
             let token = ffi::fused_sample(&filtered, 1.0, 0, 1.0, 0.0);
             let probs = want_distribution.then(|| ffi::softmax(&filtered, -1));
             (token, probs)
         };
         crate::sampling_dispatch::report_sampling_dispatch();
-        return (token, adjusted, probs);
+        return Ok((token, adjusted, probs));
     }
 
     let last_logits = preprocess_logits_for_sampling(logits, config, token_history, state);
@@ -401,7 +493,7 @@ fn sample_token_optimized_core_full(
     crate::sampling_dispatch::report_sampling_dispatch();
     let probs = want_distribution
         .then(|| fused_sample_probs_dispatch(&last_logits, config, gate.as_deref()));
-    (token, last_logits, probs)
+    Ok((token, last_logits, probs))
 }
 
 /// Stateful sampling with the post-chain distribution (#1485): the
@@ -411,7 +503,8 @@ fn sample_token_optimized_core_full(
 /// This is what the native `/completion` route's `post_sampling_probs` view
 /// reports.
 ///
-/// Used by: `BatchScheduler` decode steps for `post_sampling_probs` requests
+/// Used by: [`crate::sampling_row_step::RowSampler`] when a server request asks
+/// for `post_sampling_probs`
 pub fn sample_token_with_state_and_distribution(
     logits: &MlxArray,
     config: &SamplingConfig,
@@ -422,11 +515,35 @@ pub fn sample_token_with_state_and_distribution(
     UniquePtr<MlxArray>,
     UniquePtr<MlxArray>,
 ) {
+    try_sample_token_with_state_and_distribution(logits, config, token_history, state)
+        .unwrap_or_else(|e| panic!("sampler host read failed: {e}"))
+}
+
+/// Fallible stateful sampling with the post-chain distribution.
+pub fn try_sample_token_with_state_and_distribution(
+    logits: &MlxArray,
+    config: &SamplingConfig,
+    token_history: &[i32],
+    state: &mut Option<SamplerState>,
+) -> Result<SampleWithDistribution, String> {
     ensure_sampler_state(config, state);
     let (token, adjusted, probs) =
-        sample_token_optimized_core_full(logits, config, token_history, state.as_mut(), true);
+        sample_token_optimized_core_full(logits, config, token_history, state.as_mut(), true)?;
     let probs = probs.expect("want_distribution returns a distribution on every path");
-    (token, adjusted, probs)
+    Ok((token, adjusted, probs))
+}
+
+/// Fallible stateful sampling for the engine's per-row chain.
+pub fn try_sample_token_optimized_with_state(
+    logits: &MlxArray,
+    config: &SamplingConfig,
+    token_history: &[i32],
+    state: &mut Option<SamplerState>,
+) -> Result<(UniquePtr<MlxArray>, UniquePtr<MlxArray>), String> {
+    ensure_sampler_state(config, state);
+    let (token, adjusted, _) =
+        sample_token_optimized_core_full(logits, config, token_history, state.as_mut(), false)?;
+    Ok((token, adjusted))
 }
 
 /// Create the per-sequence [`SamplerState`] on first use when `config` needs
@@ -584,22 +701,9 @@ fn preprocess_logits_for_sampling(
 /// The token-bias stage shared by [`preprocess_penalty_stages`] and the
 /// mirostat bypass path (#1485): applies [`SamplingConfig::token_bias`] with
 /// the B9 observability counters, or returns the input unchanged (no new
-/// graph nodes) when the map is empty.
-/// Whether the B9 pre-bias suppression counters are collected.
-///
-/// Off by default: reading the pre-bias argmax id requires an `eval` plus a
-/// device-to-host read on every decode step, which breaks the async lookahead
-/// pipeline the decode loop depends on. `LANG_BIAS_APPLIED_TOTAL` is unaffected
-/// and stays always-on, since incrementing it costs nothing.
-fn lang_bias_counters_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("MLXCEL_LANG_BIAS_COUNTERS")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false)
-    })
-}
-
+/// graph nodes) when the map is empty. `LANG_BIAS_APPLIED_TOTAL` is always
+/// counted; the pre-bias suppression counters only behind
+/// [`crate::lang_bias_counters`].
 fn apply_token_bias_stage(
     last_logits: UniquePtr<MlxArray>,
     config: &SamplingConfig,
@@ -619,7 +723,7 @@ fn apply_token_bias_stage(
     // qwen3-30b-a3b-4bit and +78% on qwen3-0.6b-4bit, paid by every request
     // that sets `logit_bias` or `ignore_eos`. The counters stay available for
     // diagnosing suppression behaviour via MLXCEL_LANG_BIAS_COUNTERS=1.
-    if lang_bias_counters_enabled() {
+    if crate::lang_bias_counters::enabled() {
         let top_arr = ffi::argmax_last_axis(&last_logits);
         ffi::eval(&top_arr);
         let top_id = ffi::item_i32(&top_arr);
@@ -879,6 +983,9 @@ pub struct FusedSampleParams {
     /// RNG-free, so it stays fused-eligible: [`apply_row_filters`] applies it
     /// to the whole `[B, V]` batch before the single fused dispatch.
     pub top_n_sigma: f32,
+    /// p-less truncation (`false` disables). Row-wise, history-free and
+    /// RNG-free, applied by [`apply_row_filters`] after `top_n_sigma`.
+    pub p_less: bool,
     /// Locally typical sampling cutoff (`1.0` disables). Row-wise,
     /// history-free and RNG-free like `top_n_sigma`, and applied by the same
     /// [`apply_row_filters`] hook before the single fused dispatch.
@@ -900,6 +1007,7 @@ impl FusedSampleParams {
             top_p: config.top_p,
             min_p: config.min_p,
             top_n_sigma: config.effective_top_n_sigma(),
+            p_less: config.effective_p_less(),
             typical_p: config.effective_typical_p(),
         }
     }
@@ -915,6 +1023,7 @@ impl FusedSampleParams {
             && self.top_p.to_bits() == other.top_p.to_bits()
             && self.min_p.to_bits() == other.min_p.to_bits()
             && self.top_n_sigma.to_bits() == other.top_n_sigma.to_bits()
+            && self.p_less == other.p_less
             && self.typical_p.to_bits() == other.typical_p.to_bits()
     }
 }
@@ -940,15 +1049,33 @@ impl FusedSampleParams {
 ///
 /// Used by: `BatchScheduler::execute_batched_decode` fast-path gate
 pub fn config_supports_fused_batch(config: &SamplingConfig) -> bool {
-    !config.needs_token_history()
-        && config.token_bias.is_empty()
-        && config.xtc_probability <= 0.0
-        // #1485: mirostat carries per-sequence feedback state and replaces
-        // the chain; the extended chain (dynatemp / min_keep / adaptive-p)
-        // needs per-row Rust filter arithmetic the fused dispatch has no
-        // parameters for. Both must take the per-row sampler.
-        && config.effective_mirostat() == 0
-        && !config.needs_extended_chain()
+    config_supports_fused_batch_except_bias(config) && config.token_bias.is_empty()
+}
+
+/// [`config_supports_fused_batch`] without the token-bias requirement, for
+/// callers that apply the bias themselves before the fused dispatch.
+///
+/// Token bias is not per-row sampler state the way a penalty is: it does not
+/// read the tokens generated so far, so it is a static additive edit that
+/// [`apply_token_bias_rows`] can fold into the `[B, vocab]` logits ahead of the
+/// single dispatch. The strict predicate above stays the default because the
+/// callers that do NOT apply the bias ([`uniform_fused_batch_params`], and
+/// through it [`batched_sample`]) would otherwise drop it silently.
+///
+/// A caller that uses this predicate owes the batch an
+/// [`apply_token_bias_rows`] call in the same chain position the per-row
+/// sampler uses: after the last-position slice, before [`apply_row_filters`].
+///
+/// A thin delegate to [`crate::sampling_row_step::RowSampler::fused_eligible`]
+/// (#2169), which derives the answer from the per-row step's own stage list.
+/// That includes the B9 counters rule: while the pre-bias suppression
+/// counters are on, a biased config is not eligible, because only the per-row
+/// sampler reads the pre-bias argmax.
+///
+/// Used by: [`config_supports_fused_batch`],
+/// [`row_supports_fused_batch_except_bias`]
+pub fn config_supports_fused_batch_except_bias(config: &SamplingConfig) -> bool {
+    crate::sampling_row_step::RowSampler::fused_eligible(config)
 }
 
 /// Per-row eligibility for the batched fused fast path.
@@ -979,6 +1106,28 @@ pub fn row_supports_fused_batch(
         && !needs_per_token_payload
 }
 
+/// [`row_supports_fused_batch`] for callers that apply the row's token bias
+/// themselves (see [`config_supports_fused_batch_except_bias`]).
+///
+/// The sampler-stage half, including the opt-in `MLXCEL_LANG_BIAS_COUNTERS`
+/// rule (a biased row goes back to the per-row sampler while they are on), is
+/// [`crate::sampling_row_step::RowSampler::fused_eligible`]; this adds the
+/// per-row obligations that are not sampler stages.
+///
+/// Used by: [`crate::engine::shared_fused_params`] (the engine's fused branch
+/// and `BatchScheduler::batched_decode_fused_params`)
+pub fn row_supports_fused_batch_except_bias(
+    config: &SamplingConfig,
+    needs_logit_mask: bool,
+    needs_token_override: bool,
+    needs_per_token_payload: bool,
+) -> bool {
+    crate::sampling_row_step::RowSampler::fused_eligible(config)
+        && !needs_logit_mask
+        && !needs_token_override
+        && !needs_per_token_payload
+}
+
 /// Batched fused sampler: sample `[B]` token ids from `[B, vocab]` (or
 /// `[B, 1, vocab]`) logits with a single eval/sync point.
 ///
@@ -998,8 +1147,41 @@ pub fn row_supports_fused_batch(
 ///
 /// Used by: `BatchScheduler::execute_batched_decode` fast-path dispatch
 pub fn batched_fused_sample(logits: &MlxArray, params: &FusedSampleParams) -> Vec<i32> {
+    batched_fused_sample_with_bias(logits, params, &[])
+}
+
+/// [`batched_fused_sample`] with one [`TokenBiasMap`] per row folded into the
+/// logits first (see [`apply_token_bias_rows`]).
+///
+/// Pass an empty slice for an unbiased batch; the bias stage then adds no
+/// graph nodes and the dispatch is the one [`batched_fused_sample`] performs.
+///
+/// Used by: `BatchScheduler::execute_batched_decode` fast-path dispatch
+pub fn batched_fused_sample_with_bias(
+    logits: &MlxArray,
+    params: &FusedSampleParams,
+    biases: &[&TokenBiasMap],
+) -> Vec<i32> {
+    token_ids_to_host(&batched_fused_sample_tokens(logits, params, biases))
+}
+
+/// The device half of [`batched_fused_sample_with_bias`]: the lazy `[B]`
+/// `uint32` token ids, not yet evaluated, so a caller can schedule them
+/// (`async_eval`, the lookahead pipeline) or evaluate them through the
+/// fallible boundary before reading them back (#822).
+///
+/// Used by: [`batched_fused_sample_with_bias`], `Engine::step` (fused branch),
+/// `Engine::submit`
+pub fn batched_fused_sample_tokens(
+    logits: &MlxArray,
+    params: &FusedSampleParams,
+    biases: &[&TokenBiasMap],
+) -> UniquePtr<MlxArray> {
     // [B, 1, vocab] -> [B, vocab]; a 2-D input is returned unchanged.
     let last_logits = ffi::slice_last_logits(logits);
+    // Token bias before the filters, matching the per-row chain order in
+    // `preprocess_penalty_stages`.
+    let last_logits = apply_token_bias_rows(last_logits, biases);
     // Row filters (top-n-sigma) apply to the whole [B, vocab] batch before the
     // single fused dispatch; a no-op when every filter is disabled.
     let last_logits = apply_row_filters(last_logits, params);
@@ -1011,7 +1193,7 @@ pub fn batched_fused_sample(logits: &MlxArray, params: &FusedSampleParams) -> Ve
         params.min_p,
     );
     crate::sampling_dispatch::report_sampling_dispatch();
-    token_ids_to_host(&tokens)
+    tokens
 }
 
 /// Copy a 1-D `[B]` token-id array to host as `Vec<i32>` with a single
@@ -1032,6 +1214,15 @@ fn token_ids_to_host(tokens: &MlxArray) -> Vec<i32> {
         .collect()
 }
 
+fn try_token_ids_to_host(tokens: &MlxArray) -> Result<Vec<i32>, String> {
+    crate::eval_faults::check(crate::eval_faults::FaultPoint::SamplerRead)?;
+    let bytes = ffi::try_array_to_raw_bytes(tokens).map_err(|e| e.to_string())?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
 /// Batch-safe row-filter hook: apply the enabled RNG-free, history-free
 /// logit filters to a `[B, V]` (or `[V]`-broadcastable) logit tensor in the
 /// fixed order pinned by #1375:
@@ -1040,8 +1231,9 @@ fn token_ids_to_host(tokens: &MlxArray) -> Vec<i32> {
 /// top_n_sigma -> p_less (#1373) -> typical_p (#1377)
 /// ```
 ///
-/// (`p_less` lands in its own issue; its slot in this function fixes the
-/// order here so it cannot accidentally reorder the chain).
+/// `p_less` (#1373) reads `params.temperature` because it is defined on the
+/// tempered distribution; the fused chain still applies the temperature
+/// itself afterwards.
 ///
 /// Returns the input pointer unchanged, adding NO graph nodes, when every
 /// filter is disabled or when the config is greedy (`temperature == 0.0 ||
@@ -1069,7 +1261,9 @@ pub fn apply_row_filters(
     if params.top_n_sigma > 0.0 && params.top_n_sigma.is_finite() {
         logits = top_n_sigma_filter(&logits, params.top_n_sigma);
     }
-    // p_less (#1373) slot: runs here, after top_n_sigma, when it lands.
+    if params.p_less {
+        logits = p_less_filter(&logits, params.temperature);
+    }
     if params.typical_p.is_finite() && params.typical_p > 0.0 && params.typical_p < 1.0 {
         // b10621's default sampler chain is `... top_n_sigma; top_k; typ_p;
         // top_p; min_p ...`: typical sampling runs on the RENORMALIZED top-k
@@ -1121,6 +1315,9 @@ fn apply_extended_chain(
     let top_n_sigma = config.effective_top_n_sigma();
     if top_n_sigma > 0.0 {
         x = top_n_sigma_filter(&x, top_n_sigma);
+    }
+    if config.effective_p_less() {
+        x = p_less_filter(&x, config.temperature);
     }
     if config.top_k > 1 {
         let vocab = ffi::array_shape(&x).last().copied().unwrap_or(0);
@@ -1238,7 +1435,7 @@ fn adaptive_p_sample(
     config: &SamplingConfig,
     state: Option<&mut SamplerState>,
     want_distribution: bool,
-) -> (UniquePtr<MlxArray>, Option<UniquePtr<MlxArray>>) {
+) -> Result<(UniquePtr<MlxArray>, Option<UniquePtr<MlxArray>>), String> {
     let target = config.effective_adaptive_target();
     let decay = config.adaptive_decay.clamp(0.0, 0.99);
 
@@ -1280,15 +1477,16 @@ fn adaptive_p_sample(
     // Read back the selected token's ORIGINAL probability for the EMA.
     let idx = ffi::reshape(&ffi::astype(&token, dtype::INT32), &[1, 1]);
     let sel_p = ffi::take_along_axis(&p, &idx, -1);
-    ffi::eval(&sel_p);
+    crate::eval_faults::check(crate::eval_faults::FaultPoint::SamplerRead)?;
+    crate::try_eval(&sel_p).map_err(|e| e.to_string())?;
     let orig_p = ffi::item_f32(&sel_p);
-    let token_id = token_ids_to_host(&token)[0];
+    let token_id = try_token_ids_to_host(&token)?[0];
     if let Some(a) = adaptive {
         a.pending = Some((token_id, orig_p));
     }
 
     let probs = want_distribution.then(|| ffi::softmax(&transformed, -1));
-    (token, probs)
+    Ok((token, probs))
 }
 
 /// b10621's mirostat bypass path (#1485, upstream `common_sampler_init` with
@@ -1317,11 +1515,7 @@ fn mirostat_sample_core(
     config: &SamplingConfig,
     state: Option<&mut SamplerState>,
     want_distribution: bool,
-) -> (
-    UniquePtr<MlxArray>,
-    UniquePtr<MlxArray>,
-    Option<UniquePtr<MlxArray>>,
-) {
+) -> Result<SampleWithOptionalDistribution, String> {
     let version = config.effective_mirostat();
     let tau = config.mirostat_tau;
     let eta = config.mirostat_eta;
@@ -1338,7 +1532,8 @@ fn mirostat_sample_core(
         // The plain temperature stage collapses to the argmax; mirostat then
         // draws the single candidate with observed surprise 0.
         let token = ffi::fused_sample(&biased, 0.0, 0, 1.0, 0.0);
-        ffi::eval(&token);
+        crate::eval_faults::check(crate::eval_faults::FaultPoint::SamplerRead)?;
+        crate::try_eval(&token).map_err(|e| e.to_string())?;
         mu -= eta * (0.0 - tau);
         let probs = want_distribution.then(|| ffi::fused_sample_probs(&biased, 0.0, 0, 1.0, 0.0));
         (token, probs)
@@ -1365,8 +1560,11 @@ fn mirostat_sample_core(
             let m = 100.min(vocab);
             let p = ffi::exp(&logp);
             let top = ffi::topk(&p, m, -1);
-            ffi::eval(&top);
-            let bytes = ffi::array_to_raw_bytes(&ffi::astype(&top, dtype::FLOAT32));
+            crate::eval_faults::check(crate::eval_faults::FaultPoint::SamplerRead)?;
+            crate::try_eval(&top).map_err(|e| e.to_string())?;
+            crate::eval_faults::check(crate::eval_faults::FaultPoint::SamplerRead)?;
+            let bytes = ffi::try_array_to_raw_bytes(&ffi::astype(&top, dtype::FLOAT32))
+                .map_err(|e| e.to_string())?;
             let mut top_probs: Vec<f32> = bytes
                 .chunks_exact(4)
                 .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
@@ -1413,7 +1611,8 @@ fn mirostat_sample_core(
         // renormalized distribution.
         let idx = ffi::reshape(&ffi::astype(&token, dtype::INT32), &[1, 1]);
         let sel_lp = ffi::take_along_axis(&ffi::log_softmax(&masked, -1), &idx, -1);
-        ffi::eval(&sel_lp);
+        crate::eval_faults::check(crate::eval_faults::FaultPoint::SamplerRead)?;
+        crate::try_eval(&sel_lp).map_err(|e| e.to_string())?;
         let observed_surprise = -ffi::item_f32(&sel_lp) / LN_2;
         mu -= eta * (observed_surprise - tau);
 
@@ -1425,7 +1624,7 @@ fn mirostat_sample_core(
         m.mu = mu;
     }
     crate::sampling_dispatch::report_sampling_dispatch();
-    (token, biased, probs)
+    Ok((token, biased, probs))
 }
 
 /// Top-n-sigma logit filter: keep only the tokens whose logit lies within
@@ -1474,6 +1673,32 @@ pub(crate) fn top_n_sigma_filter(logits: &MlxArray, n_sigma: f32) -> UniquePtr<M
     // runs in and doubling the `[B, V]` tensor. Same masking convention as
     // `min_p_filter` / `top_k_filter` otherwise: kept entries pass through
     // from the original logits.
+    let neg_inf = ffi::full_f32(&[1], f32::NEG_INFINITY, ffi::array_dtype(logits));
+    ffi::where_cond(&keep, logits, &neg_inf)
+}
+
+/// p-less filter: keep every token whose probability under the
+/// temperature-scaled softmax is at least the row's collision probability
+/// `L = sum_v p(v)^2`, and mask the rest to `-inf`.
+///
+/// `L <= max_v p(v)` always holds, so the argmax survives; a sharply peaked
+/// row collapses to its argmax while a flat row keeps most of the
+/// vocabulary. `L > 0` for any row with a finite entry, so already-masked
+/// entries (probability exactly 0) stay masked. Statistics are computed in
+/// float32; the mask fill keeps the ORIGINAL logits dtype (same convention
+/// as [`top_n_sigma_filter`]). The filter takes the temperature explicitly
+/// because it is defined on the tempered distribution, while the fused chain
+/// applies the temperature again later (unchanged). Rows are independent.
+///
+/// Used by: [`apply_row_filters`], [`apply_extended_chain`], unit tests
+pub(crate) fn p_less_filter(logits: &MlxArray, temperature: f32) -> UniquePtr<MlxArray> {
+    let mut f = ffi::astype(logits, dtype::FLOAT32);
+    if temperature != 1.0 {
+        f = crate::ops::divide_scalar(&f, temperature);
+    }
+    let probs = ffi::softmax(&f, -1);
+    let l = ffi::sum_axis(&ffi::multiply(&probs, &probs), -1, true);
+    let keep = ffi::greater_equal(&probs, &l);
     let neg_inf = ffi::full_f32(&[1], f32::NEG_INFINITY, ffi::array_dtype(logits));
     ffi::where_cond(&keep, logits, &neg_inf)
 }
@@ -1625,7 +1850,75 @@ pub(crate) fn apply_repetition_penalty_sorted(
 /// Apply OpenAI-style frequency and presence penalties to logits.
 ///
 /// Used by: standard generation, speculative decoding
+fn apply_frequency_presence_sparse(
+    logits: &MlxArray,
+    idx: &[i32],
+    val: &[f32],
+) -> UniquePtr<MlxArray> {
+    debug_assert_eq!(idx.len(), val.len());
+
+    let shape = ffi::array_shape(logits);
+    let vocab_size = *shape.last().unwrap();
+    let rows: i32 = shape[..shape.len() - 1].iter().product();
+    if idx.is_empty() {
+        return ffi::copy(logits);
+    }
+
+    let k = idx.len() as i32;
+    let mut row_idx = Vec::with_capacity(rows as usize * idx.len());
+    let mut row_val = Vec::with_capacity(rows as usize * val.len());
+    for _ in 0..rows {
+        row_idx.extend_from_slice(idx);
+        row_val.extend_from_slice(val);
+    }
+
+    let indices = ffi::from_slice_i32(&row_idx, &[rows, k]);
+    let values = ffi::from_slice_f32(&row_val, &[rows, k]);
+    let flat = ffi::reshape(logits, &[rows, vocab_size]);
+    let selected = ffi::take_along_axis(&flat, &indices, -1);
+    let penalized = ffi::subtract(&selected, &values);
+    let scattered = ffi::put_along_axis(&flat, &indices, &penalized, -1);
+    ffi::reshape(&scattered, &shape)
+}
+
 pub(crate) fn apply_frequency_presence_penalty(
+    logits: &MlxArray,
+    token_history: &[i32],
+    frequency_penalty: f32,
+    presence_penalty: f32,
+) -> UniquePtr<MlxArray> {
+    let mut token_counts: HashMap<i32, usize> = HashMap::new();
+    for &tok in token_history {
+        *token_counts.entry(tok).or_insert(0) += 1;
+    }
+
+    if token_counts.is_empty() {
+        return ffi::copy(logits);
+    }
+
+    let shape = ffi::array_shape(logits);
+    let vocab_size = *shape.last().unwrap() as usize;
+    let mut idx = Vec::with_capacity(token_counts.len());
+    let mut val = Vec::with_capacity(token_counts.len());
+    for (&token_id, &count) in &token_counts {
+        if token_id >= 0 && (token_id as usize) < vocab_size {
+            idx.push(token_id);
+            val.push(frequency_penalty * count as f32 + presence_penalty);
+        }
+    }
+
+    // Reproduce the dense reference's mixed-dtype result before scattering.
+    // The CUDA MLX patch preserves bf16 for bf16/f32 binary arithmetic, while
+    // unpatched backends and f16 promote to f32. Subtracting a scalar +0.0
+    // follows that platform rule without allocating a vocabulary-sized host
+    // buffer and leaves every untouched value unchanged.
+    let zero = ffi::full_f32(&[1], 0.0, dtype::FLOAT32);
+    let promoted = ffi::subtract(logits, &zero);
+    apply_frequency_presence_sparse(&promoted, &idx, &val)
+}
+
+#[cfg(test)]
+fn apply_frequency_presence_penalty_reference(
     logits: &MlxArray,
     token_history: &[i32],
     frequency_penalty: f32,
@@ -1655,6 +1948,25 @@ pub(crate) fn apply_frequency_presence_penalty(
     ffi::subtract(logits, &penalty_broadcast)
 }
 
+#[cfg(test)]
+fn apply_frequency_presence_incremental_reference(
+    logits: &MlxArray,
+    idx: &[i32],
+    val: &[f32],
+) -> UniquePtr<MlxArray> {
+    if idx.is_empty() {
+        ffi::copy(logits)
+    } else {
+        let promoted = ffi::astype(logits, dtype::FLOAT32);
+        let k = idx.len() as i32;
+        let indices = ffi::from_slice_i32(idx, &[1, k]);
+        let selected = ffi::take_along_axis(&promoted, &indices, -1);
+        let values = ffi::from_slice_f32(val, &[1, k]);
+        let penalized = ffi::subtract(&selected, &values);
+        ffi::put_along_axis(&promoted, &indices, &penalized, -1)
+    }
+}
+
 /// Whether DRY matching breaks at `window[pos]` (#1485).
 ///
 /// Two breaker sources compose:
@@ -1668,6 +1980,7 @@ pub(crate) fn apply_frequency_presence_penalty(
 ///   only form). A head with a non-empty tail breaks only when the window
 ///   tokens after `pos` spell the tail out in full, which is how a
 ///   multi-character breaker split across token boundaries is recognized.
+#[cfg(test)]
 fn dry_breaks_at(config: &SamplingConfig, window: &[i32], pos: usize) -> bool {
     if config.dry_sequence_breakers.contains(&window[pos]) {
         return true;
@@ -1690,13 +2003,400 @@ fn dry_breaks_at(config: &SamplingConfig, window: &[i32], pos: usize) -> bool {
         })
 }
 
+#[derive(Default)]
+struct DryBreakerNode {
+    transitions: HashMap<i32, usize>,
+    failure: usize,
+    terminal: bool,
+}
+
+struct DryBreakerMatches {
+    positions: Vec<bool>,
+    #[cfg(test)]
+    build_steps: usize,
+    #[cfg(test)]
+    scan_steps: usize,
+}
+
+/// Find every DRY breaker start in `reversed_window` in additive
+/// `O(window + breaker-pattern tokens)` expected time.
+///
+/// Exact IDs are singleton patterns. A forward breaker `[head] + tail` is
+/// inserted as `reverse(tail) + [head]`, so an Aho-Corasick terminal reached
+/// at reversed index `r` always maps to original start `n - 1 - r`, regardless
+/// of pattern length. Failure-terminal propagation therefore marks a start
+/// once without enumerating every matching suffix pattern.
+fn dry_breaker_matches(reversed_window: &[i32], config: &SamplingConfig) -> DryBreakerMatches {
+    #[cfg(test)]
+    let mut build_steps = 0usize;
+    #[cfg(test)]
+    let mut scan_steps = 0usize;
+
+    if config.dry_sequence_breakers.is_empty() && config.dry_breaker_heads.is_empty() {
+        return DryBreakerMatches {
+            positions: vec![false; reversed_window.len()],
+            #[cfg(test)]
+            build_steps,
+            #[cfg(test)]
+            scan_steps,
+        };
+    }
+
+    let mut nodes = vec![DryBreakerNode::default()];
+
+    for &token in &config.dry_sequence_breakers {
+        #[cfg(test)]
+        {
+            build_steps += 1;
+        }
+        let next = nodes[0].transitions.get(&token).copied();
+        let state = match next {
+            Some(state) => state,
+            None => {
+                let state = nodes.len();
+                nodes.push(DryBreakerNode::default());
+                nodes[0].transitions.insert(token, state);
+                #[cfg(test)]
+                {
+                    build_steps += 1;
+                }
+                state
+            }
+        };
+        nodes[state].terminal = true;
+    }
+
+    for (&head, tails) in config.dry_breaker_heads.iter() {
+        for tail in tails {
+            let mut state = 0usize;
+            for token in tail.iter().rev().copied().chain(std::iter::once(head)) {
+                #[cfg(test)]
+                {
+                    build_steps += 1;
+                }
+                let next = nodes[state].transitions.get(&token).copied();
+                state = match next {
+                    Some(next) => next,
+                    None => {
+                        let next = nodes.len();
+                        nodes.push(DryBreakerNode::default());
+                        nodes[state].transitions.insert(token, next);
+                        #[cfg(test)]
+                        {
+                            build_steps += 1;
+                        }
+                        next
+                    }
+                };
+            }
+            nodes[state].terminal = true;
+        }
+    }
+
+    // Breadth-first failure-link construction. Root children fail to root;
+    // every deeper node inherits the terminal bit of its failure target. Across
+    // trie edges, failure hops telescope over failure depth, so construction is
+    // linear in the number of supplied pattern tokens in expected HashMap time.
+    let mut queue: Vec<usize> = nodes[0].transitions.values().copied().collect();
+    #[cfg(test)]
+    {
+        build_steps += queue.len();
+    }
+    let mut cursor = 0usize;
+    while cursor < queue.len() {
+        let state = queue[cursor];
+        cursor += 1;
+        let transitions: Vec<(i32, usize)> = nodes[state]
+            .transitions
+            .iter()
+            .map(|(&token, &next)| (token, next))
+            .collect();
+        #[cfg(test)]
+        {
+            build_steps += transitions.len();
+        }
+        for (token, next) in transitions {
+            let mut fallback = nodes[state].failure;
+            let failure = loop {
+                #[cfg(test)]
+                {
+                    build_steps += 1;
+                }
+                if let Some(&target) = nodes[fallback].transitions.get(&token) {
+                    break target;
+                }
+                if fallback == 0 {
+                    break 0;
+                }
+                fallback = nodes[fallback].failure;
+                #[cfg(test)]
+                {
+                    build_steps += 1;
+                }
+            };
+            nodes[next].failure = failure;
+            let failure_terminal = nodes[failure].terminal;
+            nodes[next].terminal |= failure_terminal;
+            queue.push(next);
+        }
+    }
+
+    let mut positions = vec![false; reversed_window.len()];
+    let mut state = 0usize;
+    for (reversed_pos, &token) in reversed_window.iter().enumerate() {
+        loop {
+            #[cfg(test)]
+            {
+                scan_steps += 1;
+            }
+            if let Some(&next) = nodes[state].transitions.get(&token) {
+                state = next;
+                break;
+            }
+            if state == 0 {
+                break;
+            }
+            state = nodes[state].failure;
+            #[cfg(test)]
+            {
+                scan_steps += 1;
+            }
+        }
+        if nodes[state].terminal {
+            positions[reversed_window.len() - 1 - reversed_pos] = true;
+        }
+    }
+
+    DryBreakerMatches {
+        positions,
+        #[cfg(test)]
+        build_steps,
+        #[cfg(test)]
+        scan_steps,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static DRY_STEP_COST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DRY_BREAKER_BUILD_COST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DRY_BREAKER_SCAN_COST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_dry_step_cost(cost: usize) {
+    DRY_STEP_COST.with(|counter| counter.set(cost));
+}
+
+#[cfg(test)]
+fn last_dry_step_cost() -> usize {
+    DRY_STEP_COST.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn record_dry_breaker_cost(build: usize, scan: usize) {
+    DRY_BREAKER_BUILD_COST.with(|counter| counter.set(build));
+    DRY_BREAKER_SCAN_COST.with(|counter| counter.set(scan));
+}
+
+#[cfg(test)]
+fn last_dry_breaker_cost() -> (usize, usize) {
+    let build = DRY_BREAKER_BUILD_COST.with(std::cell::Cell::get);
+    let scan = DRY_BREAKER_SCAN_COST.with(std::cell::Cell::get);
+    (build, scan)
+}
+
+/// Compute DRY penalties from a selected history window without MLX calls.
+///
+/// Reversing the window turns every suffix match against the current suffix
+/// into a prefix match, so one Z-function pass provides all match lengths.
+/// A reversed-token automaton marks breaker starts before one forward pass
+/// records the nearest breaker strictly before each candidate position. The
+/// per-step work is additive in the window and configured breaker-pattern
+/// tokens; it never multiplies the two request-controlled sizes.
+fn dry_penalty_map(window: &[i32], config: &SamplingConfig) -> Vec<(i32, f32)> {
+    #[cfg(test)]
+    let mut step_cost = 0usize;
+    #[cfg(test)]
+    record_dry_step_cost(0);
+    #[cfg(test)]
+    record_dry_breaker_cost(0, 0);
+
+    let window_len = window.len();
+    if window_len < 2 || config.dry_base < 1.0 {
+        return Vec::new();
+    }
+
+    let reversed: Vec<i32> = window.iter().rev().copied().collect();
+    let mut z = vec![0usize; window_len];
+    z[0] = window_len;
+    let mut left = 0usize;
+    let mut right = 0usize;
+    for i in 1..window_len {
+        if i <= right {
+            z[i] = (right - i + 1).min(z[i - left]);
+        }
+        while i + z[i] < window_len {
+            #[cfg(test)]
+            {
+                step_cost += 1;
+            }
+            if reversed[z[i]] != reversed[i + z[i]] {
+                break;
+            }
+            z[i] += 1;
+        }
+        if z[i] > 0 {
+            let candidate_right = i + z[i] - 1;
+            if candidate_right > right {
+                left = i;
+                right = candidate_right;
+            }
+        }
+    }
+
+    let breaker_matches = dry_breaker_matches(&reversed, config);
+    #[cfg(test)]
+    {
+        step_cost += breaker_matches.scan_steps;
+        record_dry_breaker_cost(breaker_matches.build_steps, breaker_matches.scan_steps);
+    }
+
+    let no_breaker = usize::MAX;
+    let mut breaker_before = vec![no_breaker; window_len];
+    let mut most_recent_breaker = no_breaker;
+    for (pos, slot) in breaker_before.iter_mut().enumerate() {
+        *slot = most_recent_breaker;
+        #[cfg(test)]
+        {
+            step_cost += 1;
+        }
+        if breaker_matches.positions[pos] {
+            most_recent_breaker = pos;
+        }
+    }
+
+    let last_pos = window_len - 1;
+    let last_token = window[last_pos];
+    let mut penalties: HashMap<i32, f32> = HashMap::new();
+    for (pos, &token) in window[..last_pos].iter().enumerate() {
+        #[cfg(test)]
+        {
+            step_cost += 1;
+        }
+        if token != last_token {
+            continue;
+        }
+
+        let suffix_match_len = z[last_pos - pos];
+        let breaker_limited_len = if breaker_before[pos] == no_breaker {
+            pos + 1
+        } else {
+            pos - breaker_before[pos]
+        };
+        let match_len = suffix_match_len.min(breaker_limited_len);
+
+        if match_len >= config.dry_allowed_length {
+            let next_token = window[pos + 1];
+            let mut exponent = (match_len - config.dry_allowed_length) as f32;
+            if config.dry_base > 1.0 {
+                let max_exponent = 88.722_84_f32 / config.dry_base.ln();
+                if exponent > max_exponent {
+                    exponent = max_exponent;
+                }
+            }
+            let penalty = config.dry_multiplier * config.dry_base.powf(exponent);
+            let entry = penalties.entry(next_token).or_insert(0.0);
+            if penalty > *entry {
+                *entry = penalty;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    record_dry_step_cost(step_cost);
+    penalties.into_iter().collect()
+}
+
+fn apply_dry_penalties_sparse(logits: &MlxArray, penalties: &[(i32, f32)]) -> UniquePtr<MlxArray> {
+    let shape = ffi::array_shape(logits);
+    let vocab_size = *shape.last().unwrap();
+    let rows: i32 = shape[..shape.len() - 1].iter().product();
+    let mut idx = Vec::with_capacity(penalties.len());
+    let mut val = Vec::with_capacity(penalties.len());
+    for &(token_id, penalty) in penalties {
+        if token_id >= 0 && token_id < vocab_size {
+            idx.push(token_id);
+            val.push(-penalty);
+        }
+    }
+
+    // Match the old dense `add(logits, f32_penalty_buffer)` result dtype on
+    // every backend. In particular, the CUDA MLX patch keeps bf16 here rather
+    // than promoting it to f32. A scalar +0.0 obtains the same binary-op dtype
+    // and untouched values without a vocabulary-sized host allocation.
+    let zero = ffi::full_f32(&[1], 0.0, dtype::FLOAT32);
+    let promoted = ffi::add(logits, &zero);
+    if idx.is_empty() {
+        return promoted;
+    }
+
+    let k = idx.len() as i32;
+    let mut row_idx = Vec::with_capacity(rows as usize * idx.len());
+    let mut row_val = Vec::with_capacity(rows as usize * val.len());
+    for _ in 0..rows {
+        row_idx.extend_from_slice(&idx);
+        row_val.extend_from_slice(&val);
+    }
+
+    let indices = ffi::from_slice_i32(&row_idx, &[rows, k]);
+    let values = ffi::from_slice_f32(&row_val, &[rows, k]);
+    let flat = ffi::reshape(&promoted, &[rows, vocab_size]);
+    let selected = ffi::take_along_axis(&flat, &indices, -1);
+    let penalized = ffi::add(&selected, &values);
+    let scattered = ffi::put_along_axis(&flat, &indices, &penalized, -1);
+    ffi::reshape(&scattered, &shape)
+}
+
 /// Apply DRY (Don't Repeat Yourself) penalty to logits.
 ///
-/// This runs on CPU as sequential pattern matching, which keeps the matching
-/// invariant explicit and mirrors the upstream llama.cpp style algorithm.
+/// The host matching pass is linear in the selected history window and the
+/// device update touches only token ids that receive a penalty.
 ///
 /// Used by: standard generation, speculative decoding
 pub(crate) fn apply_dry_penalty(
+    logits: &MlxArray,
+    token_history: &[i32],
+    config: &SamplingConfig,
+) -> UniquePtr<MlxArray> {
+    let history_len = token_history.len();
+    if history_len < 2 || config.dry_base < 1.0 {
+        return ffi::copy(logits);
+    }
+
+    let window = if config.dry_penalty_last_n == crate::generate::DRY_FULL_HISTORY {
+        token_history
+    } else if config.dry_penalty_last_n == 0 {
+        &token_history[history_len..]
+    } else {
+        let start = history_len.saturating_sub(config.dry_penalty_last_n);
+        &token_history[start..]
+    };
+
+    if window.len() < 2 {
+        return ffi::copy(logits);
+    }
+
+    let penalties = dry_penalty_map(window, config);
+    if penalties.is_empty() {
+        return ffi::copy(logits);
+    }
+    apply_dry_penalties_sparse(logits, &penalties)
+}
+
+/// Test-only copy of the pre-#2259 DRY implementation.
+#[cfg(test)]
+fn apply_dry_penalty_reference(
     logits: &MlxArray,
     token_history: &[i32],
     config: &SamplingConfig,
@@ -1931,10 +2631,19 @@ impl SamplerState {
     /// structures a penalty needs are maintained, so a repetition-only config
     /// never touches the count map and a frequency-only config never touches
     /// the sorted set.
+    ///
+    /// The aggregates serve only the full-history window
+    /// (`penalty_last_n < 0`): a positive window rebuilds over its slice and a
+    /// zero window disables the stage (see [`preprocess_penalty_stages`]), so
+    /// neither maintains them. `RowSampler` creates the state for every
+    /// history-reading config (#2169), and this keeps a windowed config from
+    /// absorbing a prompt and a history it never reads.
     pub fn for_config(config: &SamplingConfig) -> Self {
+        let full_history = config.penalty_last_n < 0;
         Self {
-            track_seen: config.repetition_penalty != 1.0,
-            track_counts: config.frequency_penalty != 0.0 || config.presence_penalty != 0.0,
+            track_seen: full_history && config.repetition_penalty != 1.0,
+            track_counts: full_history
+                && (config.frequency_penalty != 0.0 || config.presence_penalty != 0.0),
             ..Self::default()
         }
     }
@@ -1998,12 +2707,12 @@ impl SamplerState {
     /// Frequency/presence penalty using the reusable sparse scratch buffers
     /// (touched tokens only); never allocates a full-vocabulary vector.
     ///
-    /// Byte-identical to [`apply_frequency_presence_penalty`]: the rebuild path
-    /// computes `subtract(logits, penalty_f32)`, which promotes the whole array
-    /// to f32 (f16/bf16 -> f32 is lossless). This path promotes first, then
-    /// applies `logits[id] - penalty[id]` to exactly the touched ids via
-    /// take/put. Untouched ids keep their promoted value, which equals the
-    /// rebuild path's `logits[id] - 0.0` for every finite logit.
+    /// Preserves the pre-#2259 incremental semantics: promote the logits to
+    /// f32 first, then apply `logits[id] - penalty[id]` to exactly the touched
+    /// ids. This intentionally differs from the dense rebuild path on CUDA
+    /// bf16, where patched MLX keeps mixed bf16/f32 subtraction in bf16; the
+    /// two paths already had that dtype/rounding distinction before this
+    /// refactor. An all-out-of-range count map still returns an unchanged copy.
     fn apply_frequency_presence(
         &mut self,
         logits: &MlxArray,
@@ -2032,16 +2741,15 @@ impl SamplerState {
         }
 
         let result = if idx.is_empty() {
-            // No in-range tokens: matches the rebuild path's empty early return.
+            // Preserve the pre-#2259 incremental path: an all-out-of-range
+            // count map returns an unchanged copy without dtype promotion.
             ffi::copy(logits)
         } else {
+            // The incremental path explicitly promoted before its sparse
+            // scatter, including on CUDA bf16 where the dense rebuild path
+            // follows MLX's patched bf16/f32 binary-op rule instead.
             let promoted = ffi::astype(logits, dtype::FLOAT32);
-            let k = idx.len() as i32;
-            let indices = ffi::from_slice_i32(&idx, &[1, k]);
-            let selected = ffi::take_along_axis(&promoted, &indices, -1);
-            let values = ffi::from_slice_f32(&val, &[1, k]);
-            let penalized = ffi::subtract(&selected, &values);
-            ffi::put_along_axis(&promoted, &indices, &penalized, -1)
+            apply_frequency_presence_sparse(&promoted, &idx, &val)
         };
 
         self.sparse_idx = idx;
@@ -2064,6 +2772,16 @@ impl SamplerState {
         {
             a.weighted_sum = orig_p + a.decay * a.weighted_sum;
             a.total_weight = 1.0 + a.decay * a.total_weight;
+        }
+    }
+
+    /// Confirm the last draw as emitted unchanged: [`Self::accept_token`] with
+    /// the sampled token adaptive-p parked as `pending`, without the caller
+    /// reading that token on the host. A no-op when no pair is pending (every
+    /// other config).
+    pub fn accept_pending_token(&mut self) {
+        if let Some((token, _)) = self.adaptive.as_ref().and_then(|a| a.pending) {
+            self.accept_token(token);
         }
     }
 }
@@ -2316,6 +3034,9 @@ pub(crate) fn min_p_filter(logits: &MlxArray, min_p: f32) -> UniquePtr<MlxArray>
 /// mask that pins b10621's `top_k -> typ_p` chain position), unit tests
 /// (`fused_sample_probs_equals_softmax_of_filtered_over_t` in
 /// `sampling::tests`)
+///
+/// `k` must be in `1..vocab`: `argpartition` aborts the process on
+/// `k > vocab`, so every caller guards with `top_k < vocab` first (#2247).
 pub(crate) fn top_k_filter(logits: &MlxArray, k: i32) -> UniquePtr<MlxArray> {
     let neg_logits = ffi::negative(logits);
     let indices = ffi::argpartition(&neg_logits, k - 1, -1);
@@ -2637,6 +3358,16 @@ fn apply_xtc_step(logits: &MlxArray, config: &SamplingConfig) -> UniquePtr<MlxAr
 mod tests {
     use super::*;
 
+    /// Whole-array f32 readback, for the `[B, V]` assertions the per-row
+    /// `logit_at` helper below cannot express.
+    fn array_to_vec_f32(array: &MlxArray) -> Vec<f32> {
+        ffi::eval(array);
+        ffi::array_to_raw_bytes(array)
+            .chunks_exact(4)
+            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
     fn logit_at(logits: &MlxArray, token_id: i32) -> f32 {
         let index = ffi::from_slice_i32(&[token_id], &[1, 1]);
         let taken = ffi::take_along_axis(logits, &index, -1);
@@ -2679,6 +3410,454 @@ mod tests {
         assert_eq!(logit_at(&result, 0), 1.0);
         assert_eq!(logit_at(&result, 1), 1.0);
         assert_eq!(logit_at(&result, 2), -1.0);
+    }
+
+    fn assert_penalty_logits_equal(a: &MlxArray, b: &MlxArray, context: &str) {
+        assert_eq!(ffi::array_shape(a), ffi::array_shape(b), "{context}: shape");
+        assert_eq!(ffi::array_dtype(a), ffi::array_dtype(b), "{context}: dtype");
+        let a = ffi::astype(a, dtype::FLOAT32);
+        let b = ffi::astype(b, dtype::FLOAT32);
+        let a = array_to_vec_f32(&a);
+        let b = array_to_vec_f32(&b);
+        assert_eq!(a.len(), b.len(), "{context}: length");
+        for (index, (&actual, &expected)) in a.iter().zip(&b).enumerate() {
+            assert_eq!(
+                actual, expected,
+                "{context}: element {index}: {actual} != {expected}"
+            );
+        }
+    }
+
+    fn lcg_token_history(seed: u64, len: usize, vocab_size: usize) -> Vec<i32> {
+        let mut state = seed;
+        let mut history = Vec::with_capacity(len);
+        for _ in 0..len {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            history.push(((state >> 32) as usize % vocab_size) as i32);
+        }
+        history
+    }
+
+    #[test]
+    fn dry_reverse_z_matches_reference_lcg_cases() {
+        const CASES: usize = 512;
+        const LENGTHS: [usize; 10] = [0, 1, 2, 3, 7, 17, 64, 257, 1024, 2048];
+        const WINDOWS: [usize; 6] = [crate::generate::DRY_FULL_HISTORY, 0, 1, 2, 17, 64];
+
+        for case in 0..CASES {
+            let vocab_size = [8usize, 64][(case / 19) % 2];
+            let history_len = LENGTHS[(case / 23) % LENGTHS.len()];
+            let periodic = (case / 7) % 2 == 0;
+            let history = if periodic {
+                (0..history_len)
+                    .map(|index| ((index + case) % 3) as i32)
+                    .collect()
+            } else {
+                lcg_token_history(
+                    0x2259_0000_u64.wrapping_add(case as u64),
+                    history_len,
+                    vocab_size,
+                )
+            };
+            let batch = [1usize, 2][(case / 3) % 2];
+            let raw_logits = lcg_logits(
+                0xD4A0_0000_u64.wrapping_add(case as u64),
+                batch * vocab_size,
+            );
+            let f32_logits = ffi::from_slice_f32(&raw_logits, &[batch as i32, vocab_size as i32]);
+            let input_dtype = [dtype::FLOAT32, dtype::BFLOAT16][(case / 5) % 2];
+            let logits = if input_dtype == dtype::FLOAT32 {
+                f32_logits
+            } else {
+                ffi::astype(&f32_logits, input_dtype)
+            };
+
+            let mut config = SamplingConfig {
+                dry_multiplier: 0.75,
+                dry_base: [1.0, 1.75][(case / 13) % 2],
+                dry_allowed_length: 1 + (case / 11) % 4,
+                dry_penalty_last_n: WINDOWS[(case / 29) % WINDOWS.len()],
+                ..Default::default()
+            };
+            let breaker = ((case * 5 + 1) % vocab_size) as i32;
+            match (case / 17) % 4 {
+                1 => config.dry_sequence_breakers = vec![breaker],
+                2 => {
+                    config.dry_breaker_heads =
+                        std::sync::Arc::new(HashMap::from([(breaker, vec![Vec::new()])]));
+                }
+                3 => {
+                    let tail = (breaker + 1) % vocab_size as i32;
+                    config.dry_breaker_heads =
+                        std::sync::Arc::new(HashMap::from([(breaker, vec![vec![tail]])]));
+                }
+                _ => {}
+            }
+
+            let window = if config.dry_penalty_last_n == crate::generate::DRY_FULL_HISTORY {
+                history.as_slice()
+            } else if config.dry_penalty_last_n == 0 {
+                &history[history.len()..]
+            } else {
+                let start = history.len().saturating_sub(config.dry_penalty_last_n);
+                &history[start..]
+            };
+            let breaker_matches = breaker_positions(window, &config);
+            for (pos, matched) in breaker_matches.iter().copied().enumerate() {
+                assert_eq!(
+                    matched,
+                    dry_breaks_at(&config, window, pos),
+                    "breaker mismatch at case={case} pos={pos} window={window:?}"
+                );
+            }
+
+            let reference = apply_dry_penalty_reference(&logits, &history, &config);
+            let linear = apply_dry_penalty(&logits, &history, &config);
+            assert_penalty_logits_equal(
+                &linear,
+                &reference,
+                &format!(
+                    "case={case} vocab={vocab_size} history={history_len} periodic={periodic} batch={batch} dtype={input_dtype} window={} allowed={} base={}",
+                    config.dry_penalty_last_n, config.dry_allowed_length, config.dry_base
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn dry_reverse_z_preserves_breaker_boundaries() {
+        let mut config = SamplingConfig {
+            dry_multiplier: 0.75,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_penalty_last_n: crate::generate::DRY_FULL_HISTORY,
+            dry_sequence_breakers: vec![2],
+            ..Default::default()
+        };
+        let history = [1, 2, 9, 1, 2];
+        let map = dry_penalty_map(&history, &config);
+        assert!(
+            map.iter().any(|&(token, _)| token == 9),
+            "a breaker at the occurrence itself must not cut the preceding match"
+        );
+
+        config.dry_sequence_breakers.clear();
+        config.dry_breaker_heads = std::sync::Arc::new(HashMap::from([(2, vec![vec![7, 8]])]));
+        let reference = apply_dry_penalty_reference(
+            &ffi::from_slice_f32(&[0.0; 12], &[1, 12]),
+            &history,
+            &config,
+        );
+        let linear = apply_dry_penalty(
+            &ffi::from_slice_f32(&[0.0; 12], &[1, 12]),
+            &history,
+            &config,
+        );
+        assert_penalty_logits_equal(
+            &linear,
+            &reference,
+            "a breaker tail running past the window end must not break",
+        );
+    }
+
+    fn breaker_positions(window: &[i32], config: &SamplingConfig) -> Vec<bool> {
+        let reversed: Vec<i32> = window.iter().rev().copied().collect();
+        dry_breaker_matches(&reversed, config).positions
+    }
+
+    #[test]
+    fn dry_breaker_automaton_preserves_overlap_and_boundary_semantics() {
+        let config = SamplingConfig {
+            dry_multiplier: 0.75,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_penalty_last_n: crate::generate::DRY_FULL_HISTORY,
+            dry_sequence_breakers: vec![-7, 2, 2],
+            dry_breaker_heads: std::sync::Arc::new(HashMap::from([
+                (2, vec![Vec::new(), Vec::new(), vec![3, 4]]),
+                (4, vec![vec![5, 6, 8]]),
+                (5, vec![vec![6], vec![6, 7], vec![7]]),
+                (9, vec![vec![10, 11]]),
+            ])),
+            ..Default::default()
+        };
+
+        let window = [-7, 2, 3, 4, 5, 6, 7, 5, 7, 9, 10, 11];
+        let positions = breaker_positions(&window, &config);
+        for (pos, matched) in positions.iter().copied().enumerate() {
+            assert_eq!(
+                matched,
+                dry_breaks_at(&config, &window, pos),
+                "overlap breaker mismatch at position {pos}"
+            );
+        }
+        for expected in [0usize, 1, 4, 7, 9] {
+            assert!(positions[expected], "missing breaker at {expected}");
+        }
+        assert_eq!(
+            positions.iter().filter(|&&is_breaker| is_breaker).count(),
+            5,
+            "duplicates and overlapping tails must mark each start once"
+        );
+
+        assert_eq!(
+            breaker_positions(&[9, 10, 11], &config),
+            vec![true, false, false],
+            "a tail ending exactly at the window end must match"
+        );
+        assert_eq!(
+            breaker_positions(&[9, 10], &config),
+            vec![false, false],
+            "a tail running past the window end must not match"
+        );
+        assert_eq!(
+            breaker_positions(&[5, 6, 8], &config),
+            vec![true, false, false],
+            "a terminal failure suffix must mark the same original start"
+        );
+
+        let logits = ffi::from_slice_f32(&[0.0; 16], &[1, 16]);
+        for history in [
+            vec![9, 10, 11, 4, 9, 10, 11],
+            vec![9, 10, 4, 9, 10],
+            vec![1, -7, 2, 4, 1, -7, 2],
+            vec![5, 6, 8, 4, 5, 6, 8],
+        ] {
+            let reference = apply_dry_penalty_reference(&logits, &history, &config);
+            let automaton = apply_dry_penalty(&logits, &history, &config);
+            assert_penalty_logits_equal(
+                &automaton,
+                &reference,
+                &format!("breaker automaton history {history:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn dry_breaker_automaton_large_exact_list_is_additive() {
+        const WINDOW: usize = 4096;
+        const EXACT: usize = 2048;
+        let mut exact: Vec<i32> = (10_000..10_000 + EXACT as i32).collect();
+        exact.extend([-7, 0, 1, 2]);
+        let config = SamplingConfig {
+            dry_multiplier: 0.75,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_penalty_last_n: crate::generate::DRY_FULL_HISTORY,
+            dry_sequence_breakers: exact,
+            ..Default::default()
+        };
+        let mut history: Vec<i32> = (0..WINDOW - 1).map(|index| (index % 3) as i32).collect();
+        history.push(63);
+
+        let _ = dry_penalty_map(&history, &config);
+        let (build_steps, scan_steps) = last_dry_breaker_cost();
+        assert!(
+            build_steps <= 4 * config.dry_sequence_breakers.len() + 16,
+            "exact-list build took {build_steps} steps for {} tokens",
+            config.dry_sequence_breakers.len()
+        );
+        assert!(
+            scan_steps <= 3 * WINDOW + 16,
+            "exact-list scan took {scan_steps} steps for window {WINDOW}"
+        );
+        assert!(
+            last_dry_step_cost() <= 8 * WINDOW,
+            "window work must stay linear independently of the exact-list size"
+        );
+
+        let logits = ffi::from_slice_f32(&[0.0; 64], &[1, 64]);
+        let reference = apply_dry_penalty_reference(&logits, &history, &config);
+        let automaton = apply_dry_penalty(&logits, &history, &config);
+        assert_penalty_logits_equal(
+            &automaton,
+            &reference,
+            "large exact list with a rare last token",
+        );
+    }
+
+    #[test]
+    fn dry_breaker_automaton_long_shared_tails_are_additive() {
+        const WINDOW: usize = 4096;
+        const MAX_TAIL: usize = 128;
+        let mut breaker_heads = HashMap::new();
+        let mut inserted_tokens = 0usize;
+        for len in 1..=MAX_TAIL {
+            let tail = vec![1; len];
+            inserted_tokens += tail.len() + 1;
+            breaker_heads.insert(10_000 + len as i32, vec![tail]);
+        }
+        let config = SamplingConfig {
+            dry_multiplier: 0.75,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_penalty_last_n: crate::generate::DRY_FULL_HISTORY,
+            dry_breaker_heads: std::sync::Arc::new(breaker_heads),
+            ..Default::default()
+        };
+        let mut history = vec![1; WINDOW - 1];
+        history.push(63);
+
+        let _ = dry_penalty_map(&history, &config);
+        let (build_steps, scan_steps) = last_dry_breaker_cost();
+        assert!(
+            build_steps <= 8 * inserted_tokens + 32,
+            "shared-tail build took {build_steps} steps for {inserted_tokens} inserted tokens"
+        );
+        assert!(
+            scan_steps <= 3 * WINDOW + 16,
+            "shared-tail scan took {scan_steps} steps for window {WINDOW}"
+        );
+        assert!(
+            last_dry_step_cost() <= 8 * WINDOW,
+            "window work must not multiply by the shared-tail family"
+        );
+
+        let logits = ffi::from_slice_f32(&[0.0; 64], &[1, 64]);
+        let reference = apply_dry_penalty_reference(&logits, &history, &config);
+        let automaton = apply_dry_penalty(&logits, &history, &config);
+        assert_penalty_logits_equal(
+            &automaton,
+            &reference,
+            "long shared tails with a rare last token",
+        );
+    }
+
+    #[test]
+    fn dry_reverse_z_step_cost_is_linear() {
+        let config = SamplingConfig {
+            dry_multiplier: 0.75,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_penalty_last_n: crate::generate::DRY_FULL_HISTORY,
+            ..Default::default()
+        };
+        let history_4096: Vec<i32> = (0..4096).map(|index| index % 3).collect();
+        let _ = dry_penalty_map(&history_4096, &config);
+        let cost_4096 = last_dry_step_cost();
+        assert!(
+            cost_4096 <= 8 * 4096,
+            "period-3 window 4096 cost {cost_4096}, expected <= {}",
+            8 * 4096
+        );
+
+        let history_8192: Vec<i32> = (0..8192).map(|index| index % 3).collect();
+        let _ = dry_penalty_map(&history_8192, &config);
+        let cost_8192 = last_dry_step_cost();
+        assert!(
+            cost_8192 <= 2 * cost_4096 + 16,
+            "doubling the window changed cost from {cost_4096} to {cost_8192}"
+        );
+    }
+
+    #[test]
+    fn frequency_presence_sparse_matches_vocab_reference() {
+        let vocab_size = 64usize;
+        let history = lcg_token_history(0xF2E9_2259, 96, vocab_size);
+        for penalty_last_n in [1, 64] {
+            let window = penalty_window(&history, penalty_last_n);
+            for batch in [1usize, 2] {
+                let raw = lcg_logits(0xF2E9_0000 + batch as u64, batch * vocab_size);
+                let f32_logits = ffi::from_slice_f32(&raw, &[batch as i32, vocab_size as i32]);
+                for input_dtype in [dtype::FLOAT32, dtype::FLOAT16, dtype::BFLOAT16] {
+                    let logits = if input_dtype == dtype::FLOAT32 {
+                        ffi::copy(&f32_logits)
+                    } else {
+                        ffi::astype(&f32_logits, input_dtype)
+                    };
+                    let reference =
+                        apply_frequency_presence_penalty_reference(&logits, window, 0.625, 0.375);
+                    let sparse = apply_frequency_presence_penalty(&logits, window, 0.625, 0.375);
+                    assert_penalty_logits_equal(
+                        &sparse,
+                        &reference,
+                        &format!(
+                            "penalty_last_n={penalty_last_n} batch={batch} dtype={input_dtype}"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sampler_state_frequency_presence_preserves_bf16_reference() {
+        let (frequency_penalty, presence_penalty) = (0.625, 0.375);
+        let config = SamplingConfig {
+            frequency_penalty,
+            presence_penalty,
+            ..Default::default()
+        };
+        let raw = lcg_logits(0x1AC0_2259, 64);
+        let bf16_logits = ffi::astype(&ffi::from_slice_f32(&raw, &[1, 64]), dtype::BFLOAT16);
+
+        let mut state = SamplerState::for_config(&config);
+        state.sync(&[1, 1, 2, 5, 8, 13, 13]);
+        let mut idx = Vec::new();
+        let mut val = Vec::new();
+        for (&token_id, &count) in &state.counts {
+            idx.push(token_id);
+            val.push(frequency_penalty * count as f32 + presence_penalty);
+        }
+        let reference = apply_frequency_presence_incremental_reference(&bf16_logits, &idx, &val);
+        let sparse =
+            state.apply_frequency_presence(&bf16_logits, frequency_penalty, presence_penalty);
+        assert_penalty_logits_equal(
+            &sparse,
+            &reference,
+            "incremental bf16 path must retain its explicit f32 promotion",
+        );
+        assert_eq!(ffi::array_dtype(&sparse), dtype::FLOAT32);
+
+        let mut out_of_range = SamplerState::for_config(&config);
+        out_of_range.sync(&[-3, 64, 100]);
+        let untouched = out_of_range.apply_frequency_presence(
+            &bf16_logits,
+            frequency_penalty,
+            presence_penalty,
+        );
+        assert_eq!(ffi::array_dtype(&untouched), dtype::BFLOAT16);
+        assert_penalty_logits_equal(
+            &untouched,
+            &bf16_logits,
+            "all-out-of-range incremental counts must keep the copy early return",
+        );
+    }
+
+    #[test]
+    #[ignore = "manual timing evidence for issue #2259"]
+    fn dry_step_cost_report() {
+        let config = SamplingConfig {
+            dry_multiplier: 0.75,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_penalty_last_n: crate::generate::DRY_FULL_HISTORY,
+            ..Default::default()
+        };
+        let logits = ffi::from_slice_f32(&[0.0; 4], &[1, 4]);
+        for window_len in [1024usize, 4096, 16384] {
+            let history: Vec<i32> = (0..window_len).map(|index| (index % 3) as i32).collect();
+            let reference_steps = if window_len == 16384 { 1 } else { 3 };
+            let reference_start = std::time::Instant::now();
+            for _ in 0..reference_steps {
+                std::hint::black_box(apply_dry_penalty_reference(&logits, &history, &config));
+            }
+            let reference_us =
+                reference_start.elapsed().as_secs_f64() * 1_000_000.0 / reference_steps as f64;
+
+            let linear_steps = 20;
+            let linear_start = std::time::Instant::now();
+            for _ in 0..linear_steps {
+                std::hint::black_box(apply_dry_penalty(&logits, &history, &config));
+            }
+            let linear_us =
+                linear_start.elapsed().as_secs_f64() * 1_000_000.0 / linear_steps as f64;
+            println!(
+                "dry_step_cost window={window_len} reference_us_per_step={reference_us:.3} linear_us_per_step={linear_us:.3}"
+            );
+        }
     }
 
     #[test]
@@ -2819,13 +3998,137 @@ mod tests {
 
     #[test]
     fn config_supports_fused_batch_false_for_token_bias() {
+        // Pin the opt-in suppression counters off so an exported
+        // MLXCEL_LANG_BIAS_COUNTERS does not change the answer below.
+        let counters_off = crate::lang_bias_counters::scoped_override(false);
         let mut bias = TokenBiasMap::new();
         bias.insert(7, -1.0);
         let cfg = SamplingConfig {
             token_bias: bias,
             ..Default::default()
         };
+        // The strict predicate keeps rejecting bias, because its callers
+        // (`uniform_fused_batch_params` / `batched_sample`) do not apply one.
         assert!(!config_supports_fused_batch(&cfg));
+        // The caller-applies-it variant admits the same config, and still
+        // rejects everything the strict one rejects for other reasons.
+        assert!(config_supports_fused_batch_except_bias(&cfg));
+        assert!(row_supports_fused_batch_except_bias(
+            &cfg, false, false, false
+        ));
+        assert!(!row_supports_fused_batch_except_bias(
+            &cfg, true, false, false
+        ));
+        // With the counters on, a biased row needs the per-row sampler's
+        // pre-bias argmax read, so it leaves the fused path (#2187).
+        {
+            let _on = crate::lang_bias_counters::scoped_override(true);
+            assert!(!row_supports_fused_batch_except_bias(
+                &cfg, false, false, false
+            ));
+        }
+        assert!(row_supports_fused_batch_except_bias(
+            &cfg, false, false, false
+        ));
+        drop(counters_off);
+
+        let penalised = SamplingConfig {
+            repetition_penalty: 1.1,
+            token_bias: {
+                let mut bias = TokenBiasMap::new();
+                bias.insert(7, -1.0);
+                bias
+            },
+            ..Default::default()
+        };
+        assert!(!config_supports_fused_batch_except_bias(&penalised));
+    }
+
+    #[test]
+    fn uniform_fused_batch_params_still_rejects_token_bias() {
+        // `batched_sample` reaches the fused dispatch through this helper and
+        // never applies a bias, so a biased row must keep falling back to the
+        // per-row sampler there even though the scheduler now admits one.
+        let mut bias = TokenBiasMap::new();
+        bias.insert(2, f32::NEG_INFINITY);
+        let biased = SamplingConfig {
+            token_bias: bias,
+            ..Default::default()
+        };
+        let plain = SamplingConfig::default();
+        assert!(uniform_fused_batch_params(&[&biased]).is_none());
+        assert!(uniform_fused_batch_params(&[&plain, &biased]).is_none());
+        assert!(uniform_fused_batch_params(&[&plain, &plain]).is_some());
+    }
+
+    #[test]
+    fn apply_token_bias_rows_matches_single_row_helper() {
+        // One row through the batched helper must be bitwise what the per-row
+        // stage produces, since that is what the fused fast path replaces.
+        let logits = ffi::from_slice_f32(&[0.5, 1.5, 0.3, -2.0], &[1, 4]);
+        let mut bias = TokenBiasMap::new();
+        bias.insert(1, -0.75);
+        bias.insert(3, 2.0);
+        let rows = apply_token_bias_rows(ffi::copy(&logits), &[&bias]);
+        let single = apply_token_bias(&logits, &bias);
+        assert_eq!(array_to_vec_f32(&rows), array_to_vec_f32(&single));
+        assert_eq!(array_to_vec_f32(&rows), vec![0.5, 0.75, 0.3, 0.0]);
+    }
+
+    #[test]
+    fn apply_token_bias_rows_biases_each_row_independently() {
+        // Row 0 bans id 2, row 1 is unbiased, row 2 boosts id 0. The unbiased
+        // row must come out untouched even though the shared index vector
+        // covers every id any row biases.
+        let logits = ffi::from_slice_f32(&[0.0, 1.0, 5.0, 0.0, 1.0, 5.0, 0.0, 1.0, 5.0], &[3, 3]);
+        let mut ban = TokenBiasMap::new();
+        ban.insert(2, f32::NEG_INFINITY);
+        let empty = TokenBiasMap::new();
+        let mut boost = TokenBiasMap::new();
+        boost.insert(0, 10.0);
+        let biased = apply_token_bias_rows(ffi::copy(&logits), &[&ban, &empty, &boost]);
+        let values = array_to_vec_f32(&biased);
+        assert_eq!(values[0..2], [0.0, 1.0]);
+        assert!(values[2].is_infinite() && values[2].is_sign_negative());
+        assert_eq!(values[3..6], [0.0, 1.0, 5.0]);
+        assert_eq!(values[6..9], [10.0, 1.0, 5.0]);
+
+        let greedy = FusedSampleParams::from_config(&SamplingConfig::greedy());
+        let tokens = batched_fused_sample_with_bias(&logits, &greedy, &[&ban, &empty, &boost]);
+        assert_eq!(tokens, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn apply_token_bias_rows_is_a_noop_without_bias() {
+        let logits = ffi::from_slice_f32(&[0.5, 1.5], &[1, 2]);
+        let empty = TokenBiasMap::new();
+        let untouched = apply_token_bias_rows(ffi::copy(&logits), &[&empty]);
+        assert_eq!(array_to_vec_f32(&untouched), vec![0.5, 1.5]);
+        // An empty list is the unbiased batch the fused dispatch passes.
+        let none = apply_token_bias_rows(ffi::copy(&logits), &[]);
+        assert_eq!(array_to_vec_f32(&none), vec![0.5, 1.5]);
+    }
+
+    #[test]
+    fn apply_token_bias_rows_ignores_out_of_range_ids() {
+        // Same contract as `apply_token_bias`: an id outside the vocabulary is
+        // dropped rather than gathered out of bounds.
+        let logits = ffi::from_slice_f32(&[0.5, 1.5], &[1, 2]);
+        let mut bias = TokenBiasMap::new();
+        bias.insert(9, -1.0);
+        bias.insert(-3, -1.0);
+        let result = apply_token_bias_rows(ffi::copy(&logits), &[&bias]);
+        assert_eq!(array_to_vec_f32(&result), vec![0.5, 1.5]);
+    }
+
+    #[test]
+    #[should_panic(expected = "one bias map per logit row")]
+    fn apply_token_bias_rows_rejects_a_row_count_mismatch() {
+        // Dropping a bias here would let an `ignore_eos` request sample EOS.
+        let logits = ffi::from_slice_f32(&[0.5, 1.5, 0.3, 0.1], &[2, 2]);
+        let mut bias = TokenBiasMap::new();
+        bias.insert(0, -1.0);
+        let _ = apply_token_bias_rows(ffi::copy(&logits), &[&bias]);
     }
 
     #[test]
@@ -3528,6 +4831,28 @@ mod tests {
     }
 
     #[test]
+    fn sampler_state_skips_aggregates_outside_the_full_history_window() {
+        // A positive or zero penalty window never reads the incremental
+        // aggregates (#1436), so a state created for such a config (the
+        // per-row step creates one for every history-reading config, #2169)
+        // must not absorb the history into them.
+        for penalty_last_n in [8, 0] {
+            let cfg = SamplingConfig {
+                repetition_penalty: 1.2,
+                frequency_penalty: 0.5,
+                presence_penalty: 0.1,
+                penalty_last_n,
+                ..Default::default()
+            };
+            let mut s = SamplerState::for_config(&cfg);
+            s.sync(&[1, 2, 2, 3]);
+            assert_eq!(s.absorbed_len, 4, "window {penalty_last_n}");
+            assert!(s.seen_sorted.is_empty(), "window {penalty_last_n}");
+            assert!(s.counts.is_empty(), "window {penalty_last_n}");
+        }
+    }
+
+    #[test]
     fn sample_token_optimized_with_state_greedy_parity_over_sequence() {
         // Greedy sampling with every history-based penalty active (repetition +
         // DRY + frequency + presence). The state-backed path must select the
@@ -4019,7 +5344,8 @@ mod tests {
     /// decision boundary the sampler observes, and that has shown up
     /// intermittently in nightly `make verify-test` runs. The routed kernel
     /// cases therefore hold the exact support and keep every positive
-    /// probability within one f32 ULP of the saved row. The non-routed stock
+    /// probability within two f32 ULPs of the saved row (one until gfx1151
+    /// ran them, see the assertion). The non-routed stock
     /// chain case uses the same support-preserving snapshot helper with a
     /// two-ULP ceiling because local CPU validation observed a two-ULP drift
     /// on one low-probability entry while preserving the same filtered
@@ -4101,7 +5427,14 @@ mod tests {
                 .collect();
             let ctx = format!("T=1.0 fused_sample_probs drifted for top_k={top_k} top_p={top_p}");
             if routed {
-                assert_probs_match_snapshot_within_ulp(&got, &expected, 1, &ctx);
+                // 2, not 1. These rows are the graph's softmax over the
+                // kernel's support (`fused_sample_probs` never launches the
+                // kernel), and they first ran on ROCm when the rejection
+                // kernel got its HIP port (#2064): gfx1151 lands 2 ulp from
+                // the Metal capture at token 26 of the (40, 0.9) row, with the
+                // support unchanged. The same reassociation drift the stock
+                // case below allows for.
+                assert_probs_match_snapshot_within_ulp(&got, &expected, 2, &ctx);
             } else {
                 // 4, not 2. The bound is a drift tripwire on the fused softmax,
                 // not the correctness gate: the support set is asserted just
@@ -4505,6 +5838,166 @@ mod tests {
         };
         assert!(!base.matches(&diff));
         assert!(diff.matches(&diff));
+    }
+
+    // ---- p_less (#1373) ----
+
+    /// Deterministic pseudo-random N(0, 1)-ish source (sum of uniforms), so
+    /// the tests need no RNG dependency.
+    struct TestRng(u64);
+    impl TestRng {
+        fn next_unit(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
+        }
+        fn normal(&mut self) -> f64 {
+            (0..12).map(|_| self.next_unit()).sum::<f64>() - 6.0
+        }
+    }
+
+    fn host_probs(row: &[f32], t: f32) -> Vec<f64> {
+        let scaled: Vec<f64> = row.iter().map(|x| *x as f64 / t as f64).collect();
+        let m = scaled.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let exps: Vec<f64> = scaled.iter().map(|x| (x - m).exp()).collect();
+        let z: f64 = exps.iter().sum();
+        exps.iter().map(|e| e / z).collect()
+    }
+
+    fn p_less_row(row: &[f32], t: f32) -> Vec<f32> {
+        let logits = ffi::from_slice_f32(row, &[1, row.len() as i32]);
+        to_vec_f32(&p_less_filter(&logits, t))
+    }
+
+    #[test]
+    fn p_less_filter_matches_host_reference() {
+        let mut rng = TestRng(7);
+        let temps = [0.5f32, 0.7, 1.0, 1.3, 2.0];
+        for i in 0..40 {
+            let v = 8 + ((rng.next_unit() * 192.0) as usize);
+            let t = temps[i % temps.len()];
+            let row: Vec<f32> = (0..v).map(|_| (rng.normal() * 3.0) as f32).collect();
+            let out = p_less_row(&row, t);
+            let p = host_probs(&row, t);
+            let l: f64 = p.iter().map(|x| x * x).sum();
+            for (j, pj) in p.iter().enumerate() {
+                if (pj - l).abs() > 1e-5 {
+                    assert_eq!(
+                        out[j].is_finite(),
+                        *pj >= l,
+                        "row {i} token {j} p={pj} L={l}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn p_less_filter_argmax_always_survives() {
+        let mut rng = TestRng(11);
+        for i in 0..50 {
+            let v = 4 + ((rng.next_unit() * 100.0) as usize);
+            let t = 0.3 + rng.next_unit() as f32 * 3.0;
+            let row: Vec<f32> = (0..v).map(|_| (rng.normal() * 2.0) as f32).collect();
+            let am = row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .unwrap()
+                .0;
+            let out = p_less_row(&row, t);
+            assert!(out[am].is_finite(), "row {i}: argmax was masked");
+            assert_eq!(out[am], row[am]);
+        }
+    }
+
+    #[test]
+    fn p_less_filter_peaked_keeps_top_only() {
+        let out = p_less_row(&[10.0, 0.0, 0.0, 0.0, 0.0], 1.0);
+        assert_eq!(kept_indices(&out), vec![0]);
+    }
+
+    #[test]
+    fn p_less_filter_higher_temp_keeps_more() {
+        let row = [4.0f32, 2.0, 1.0, 0.5, 0.0, -1.0];
+        let counts: Vec<usize> = [0.5f32, 1.0, 2.0, 5.0]
+            .iter()
+            .map(|t| kept_indices(&p_less_row(&row, *t)).len())
+            .collect();
+        assert!(counts.windows(2).all(|w| w[0] <= w[1]), "{counts:?}");
+    }
+
+    #[test]
+    fn p_less_filter_rows_independent() {
+        let logits = ffi::from_slice_f32(
+            &[10.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.9, 0.8, 0.7, 0.6],
+            &[2, 5],
+        );
+        let v = to_vec_f32(&p_less_filter(&logits, 1.0));
+        assert_eq!(kept_indices(&v[..5]), vec![0]);
+        assert!(kept_indices(&v[5..]).len() > 1);
+    }
+
+    #[test]
+    fn p_less_filter_ignores_neg_inf_entries() {
+        let base = p_less_row(&[4.0, 2.0, 1.0, 0.5, 0.0], 1.0);
+        let padded = p_less_row(
+            &[
+                4.0,
+                2.0,
+                1.0,
+                0.5,
+                0.0,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+            ],
+            1.0,
+        );
+        assert_eq!(kept_indices(&base), kept_indices(&padded[..5]));
+        assert_eq!(padded[5], f32::NEG_INFINITY);
+        assert_eq!(padded[6], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn p_less_skipped_on_greedy_and_disabled_returns_input_pointer() {
+        let logits = ffi::from_slice_f32(&[10.0, 0.0, 0.0, 0.0, 0.0], &[1, 5]);
+        let ptr = &*logits as *const MlxArray;
+        let mut cfg = SamplingConfig::with_temperature(0.7);
+        let out = apply_row_filters(logits, &FusedSampleParams::from_config(&cfg));
+        assert_eq!(&*out as *const MlxArray, ptr);
+        cfg.p_less = true;
+        cfg.temperature = 0.0;
+        assert!(!FusedSampleParams::from_config(&cfg).p_less);
+    }
+
+    #[test]
+    fn fused_sample_params_matches_compares_p_less() {
+        let base = FusedSampleParams::from_config(&SamplingConfig::with_temperature(0.7));
+        let diff = FusedSampleParams {
+            p_less: true,
+            ..base
+        };
+        assert!(!base.matches(&diff));
+        assert!(diff.matches(&diff));
+    }
+
+    #[test]
+    fn batched_fused_sample_honors_p_less() {
+        const B: usize = 128;
+        let mut flat = Vec::with_capacity(B * 5);
+        for _ in 0..B {
+            flat.extend_from_slice(&[10.0f32, 0.0, 0.0, 0.0, 0.0]);
+        }
+        let logits = ffi::from_slice_f32(&flat, &[B as i32, 1, 5]);
+        let cfg = SamplingConfig {
+            temperature: 1.0,
+            p_less: true,
+            ..Default::default()
+        };
+        let tokens = batched_fused_sample(&logits, &FusedSampleParams::from_config(&cfg));
+        assert!(tokens.iter().all(|t| *t == 0), "{tokens:?}");
     }
 
     #[test]

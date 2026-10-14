@@ -125,11 +125,12 @@ fn a_diverging_probe_declines_unless_the_override_is_set() {
 /// The control flow is what this pins, not the kernel selection. On a build
 /// without the Metal backend the switch is inert, so the second call sees the
 /// same hardware as the first; the stateful closure stands in for the change
-/// the switch makes on hardware that has it. Both builds must reach the probe
-/// exactly twice and engage.
+/// the switch makes on hardware that has it. An unpinned process must reach
+/// the probe exactly twice and engage; an ambient operator pin skips retry.
 #[test]
 fn a_probe_that_only_diverges_under_qmv_wide_engages_after_the_retry() {
     let k = key(9005);
+    let initial_switch = super::qmv_wide_switch_get();
     let mut calls = 0;
     let decision = mtp_exactness_gate(k, || {
         calls += 1;
@@ -143,11 +144,21 @@ fn a_probe_that_only_diverges_under_qmv_wide_engages_after_the_retry() {
             BlockChainExactness::Equal
         }
     });
-    assert!(
-        decision,
-        "an exact retry without qmv_wide must engage MTP, not decline"
-    );
-    assert_eq!(calls, 2, "the gate must re-probe exactly once");
+    if super::qmv_wide_pinned_by_operator() {
+        assert_eq!(calls, 1, "an operator pin must skip the retry");
+        assert_eq!(decision, super::allow_inexact());
+        assert_eq!(super::qmv_wide_switch_get(), initial_switch);
+    } else {
+        assert!(
+            decision,
+            "an exact retry without qmv_wide must engage MTP, not decline"
+        );
+        assert_eq!(calls, 2, "the gate must re-probe exactly once");
+        assert!(
+            !super::qmv_wide_switch_get(),
+            "an exact retry keeps narrow selected"
+        );
+    }
 }
 
 /// The retry must not fire when the operator pinned the kernel themselves.
@@ -179,6 +190,52 @@ fn a_pinned_qmv_wide_skips_the_retry() {
     } else {
         assert_eq!(calls, 2, "an unpinned build must re-probe");
         assert!(decision);
+    }
+}
+
+/// Without the Metal backend `qmv_wide` does not exist, so there is nothing
+/// to retry: the gate must decline on the first verdict instead of paying a
+/// second probe and logging a lever it never had (GB10 / CUDA, Gemma 4 31B).
+#[test]
+fn a_backend_without_qmv_wide_skips_the_retry() {
+    // Restore on drop so a failing assertion cannot leak the toggle into a
+    // later test on this thread (`--test-threads=1` shares one).
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::TEST_QMV_WIDE_APPLICABLE.with(|c| c.set(true));
+        }
+    }
+    let _restore = Restore;
+    super::TEST_QMV_WIDE_APPLICABLE.with(|c| c.set(false));
+    let k = key(9007);
+    let mut calls = 0;
+    let decision = mtp_exactness_gate(k, || {
+        calls += 1;
+        if calls == 1 {
+            BlockChainExactness::Diverges {
+                position: 0,
+                differing_bytes: 226_171,
+                total_bytes: 524_288,
+            }
+        } else {
+            BlockChainExactness::Equal
+        }
+    });
+    assert_eq!(calls, 1, "no qmv_wide lever means no re-probe");
+    assert_eq!(decision, super::allow_inexact());
+    let reason = super::decline_reason(9007);
+    if !super::allow_inexact() {
+        let reason = reason.expect("a decline records its reason");
+        assert!(
+            !reason.contains("Retry with qmv_wide disabled:"),
+            "the reason must not report a narrow measurement that never ran: {reason}"
+        );
+        if super::qmv_wide_pinned_by_operator() {
+            assert!(reason.contains("retry was skipped"), "{reason}");
+        } else {
+            assert!(!reason.contains("qmv_wide"), "{reason}");
+        }
     }
 }
 
@@ -227,11 +284,135 @@ fn a_decline_records_its_reason_and_a_pass_does_not() {
         reason.contains("differs from the single-token chain"),
         "{reason}"
     );
-    assert!(
-        reason.contains("Disabling qmv_wide did not make it exact either"),
-        "the retry outcome is part of the story: {reason}"
-    );
+    if super::qmv_wide_pinned_by_operator() {
+        assert!(reason.contains("retry was skipped"), "{reason}");
+    } else {
+        assert!(
+            reason.contains("Retry with qmv_wide disabled:"),
+            "the retry outcome is part of the story: {reason}"
+        );
+    }
 
     assert!(mtp_exactness_gate(key(9106), || BlockChainExactness::Equal));
     assert_eq!(super::decline_reason(9106), None);
+}
+
+#[test]
+fn localized_divergence_is_preserved_in_decline_reason() {
+    let k = key(9199);
+    let decision = mtp_exactness_gate(k, || BlockChainExactness::Localized {
+        verdict: Box::new(BlockChainExactness::Diverges {
+            position: 0,
+            differing_bytes: 4,
+            total_bytes: 16,
+        }),
+        location: "first divergence: layer 5 (full_attention) attention output at position 0"
+            .to_owned(),
+    });
+    if !decision {
+        assert!(
+            super::decline_reason(9199)
+                .unwrap()
+                .contains("layer 5 (full_attention) attention output")
+        );
+    }
+}
+
+#[test]
+fn failed_retry_preserves_both_locations_and_restores_the_switch() {
+    let initial = BlockChainExactness::Localized {
+        verdict: Box::new(BlockChainExactness::Diverges {
+            position: 0,
+            differing_bytes: 240460,
+            total_bytes: 524288,
+        }),
+        location: "first divergence: layer 0 sliding_attention".to_owned(),
+    };
+    let narrow = BlockChainExactness::Localized {
+        verdict: Box::new(BlockChainExactness::Diverges {
+            position: 2,
+            differing_bytes: 17,
+            total_bytes: 524288,
+        }),
+        location: "first divergence: layer 5 full_attention".to_owned(),
+    };
+    let k = key(9201);
+    super::TEST_QMV_WIDE.with(|flag| flag.set(true));
+    let mut calls = 0;
+    let decision = mtp_exactness_gate(k, || {
+        calls += 1;
+        if calls == 1 {
+            assert!(super::qmv_wide_switch_get());
+            initial.clone()
+        } else {
+            assert!(!super::qmv_wide_switch_get());
+            narrow.clone()
+        }
+    });
+    assert_eq!(decision, super::allow_inexact());
+    assert!(super::qmv_wide_switch_get(), "failed retry restores wide");
+    if super::qmv_wide_pinned_by_operator() {
+        assert_eq!(calls, 1);
+        return;
+    }
+    assert_eq!(calls, 2);
+    let expected = super::failed_probe_reason(&initial, Some(&narrow), false);
+    for part in [
+        "Initial probe:",
+        "240460",
+        "layer 0",
+        "Retry with qmv_wide disabled:",
+        "17 of 524288",
+        "layer 5",
+    ] {
+        assert!(expected.contains(part), "{expected}");
+    }
+    if !decision {
+        assert_eq!(
+            super::decline_reason(k.block_size).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+    assert_eq!(
+        mtp_exactness_gate(k, || panic!("memo must avoid another probe")),
+        decision
+    );
+}
+
+#[test]
+fn an_unrunnable_retry_keeps_its_reason_and_restores_wide() {
+    let initial = BlockChainExactness::Diverges {
+        position: 0,
+        differing_bytes: 3,
+        total_bytes: 64,
+    };
+    super::TEST_QMV_WIDE.with(|flag| flag.set(true));
+    let retry = super::retry_without_qmv_wide(
+        key(9202),
+        &mut || BlockChainExactness::NotRun("rotating verify buffer unavailable"),
+        &initial,
+    );
+    assert!(super::qmv_wide_switch_get());
+    if !super::qmv_wide_pinned_by_operator() {
+        assert_eq!(
+            retry,
+            Some(BlockChainExactness::NotRun(
+                "rotating verify buffer unavailable"
+            ))
+        );
+        let reason = super::failed_probe_reason(&initial, retry.as_ref(), false);
+        assert!(reason.contains("Retry with qmv_wide disabled: exactness probe did not run: rotating verify buffer unavailable"));
+    }
+}
+
+#[test]
+fn skipped_retry_diagnostics_do_not_invent_a_narrow_measurement() {
+    let first = BlockChainExactness::NotRun("unavailable backend");
+    assert_eq!(
+        super::failed_probe_reason(&first, None, false),
+        format!("{}.", first.reason())
+    );
+    let reason = super::failed_probe_reason(&first, None, true);
+    assert!(reason.contains("retry was skipped"));
+    assert!(!reason.contains("Retry with qmv_wide disabled:"));
 }

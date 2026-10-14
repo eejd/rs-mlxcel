@@ -32,6 +32,11 @@
 //! * `SequenceInfo::prefill_start_offset` / `already_cached_tokens` transport
 //!   the hit metadata to the prefill path without forcing the rest of the
 //!   sequence struct to mutate.
+//!
+//! The cache-hit versus cache-miss equality of issue #2170 (a hit from a plan
+//! split point decodes what the miss decoded) drives the real scheduler over
+//! the model-owned fixture and lives next to it, in
+//! `scheduler_prompt_cache_plan_tests.rs` under the `scheduler` module.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -573,13 +578,15 @@ fn sequence_info_fields_transport_cache_hit_metadata() {
         prefill_offset: 0,
         prefill_start_offset: 73,
         already_cached_tokens: 73,
+        eos_terminated: false,
         response_tx: tx,
         cancelled: Arc::new(AtomicBool::new(false)),
         created_at: Instant::now(),
         prefill_start: None,
         first_token_time: None,
+        prompt_lookup: None,
         token_history: Vec::new(),
-        sampler_state: None,
+        sampler: Default::default(),
         merged_eos: Vec::new(),
         thinking: crate::server::thinking_budget::ThinkingState::disabled(),
         structured: None,
@@ -1470,4 +1477,37 @@ fn evicting_cold_prefix_restores_paged_block_budget() {
         free_before + 2,
         "evicting the cold prefix reclaimed its 2 blocks into the budget"
     );
+}
+
+#[test]
+fn adopted_prefix_is_charged_only_for_its_suffix() {
+    // Issue #2088: admission used to charge an adopted request for its whole
+    // prompt while the adopted blocks already counted as live, so a prefix
+    // larger than half the budget could never be admitted, even into an empty
+    // batch (the GB10 run at a 0.15 watermark wedged on one). Budget 8 blocks
+    // (1 layer, block 4): a 20-token adopted prefix holds 5 blocks and leaves 3
+    // free. The 24-token prompt mints 1 block, not the 6 the whole prompt
+    // would, so it fits.
+    let model = PagedStub {
+        layout: PagedKvLayout::uniform(1, 4, 128).unwrap(),
+    };
+    let mut pool = CachePool::new(4);
+    pool.set_paged_block_budget(Some(8));
+    let (set, _blocks) = mint_paged_set(&mut pool, &model, 20);
+    let DetachedKvSet::Paged(paged) = set else {
+        panic!("paged set");
+    };
+    let adopted = pool.adopt_paged(&model, paged).expect("adopt");
+    let free = pool.free_paged_block_budget().expect("budgeted");
+    assert_eq!(free, 3);
+
+    let whole_prompt = 24usize.div_ceil(4);
+    assert!(whole_prompt > free, "the old charge could never fit");
+    assert_eq!(pool.paged_blocks_to_reach(adopted, 24), Some(1));
+    pool.append_paged_tokens(adopted, 0, 4)
+        .expect("the suffix fits the free blocks");
+
+    // No paged state: callers fall back to the whole-prompt estimate.
+    let dense = SequenceId::from_raw(u64::MAX);
+    assert_eq!(pool.paged_blocks_to_reach(dense, 24), None);
 }

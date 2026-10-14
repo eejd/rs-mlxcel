@@ -17,6 +17,11 @@
 //! This crate provides direct bindings to MLX C++ API, bypassing the mlx-c wrapper
 //! for improved performance.
 
+// Compile build-policy tests in the workspace gate without invoking build.rs.
+#[cfg(test)]
+#[path = "../build_support/metal_backend.rs"]
+mod metal_backend_build_policy;
+
 #[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
 #[cxx::bridge(namespace = "mlx_cxx")]
 mod ffi {
@@ -26,6 +31,9 @@ mod ffi {
 
         /// Opaque wrapper for mlx::core::array
         type MlxArray;
+        type MlxRngSnapshot;
+        fn rng_snapshot() -> Result<UniquePtr<MlxRngSnapshot>>;
+        fn restore_rng_snapshot(snapshot: &MlxRngSnapshot);
 
         /// Opaque wrapper for one MLX quantize() result triple.
         type MlxQuantizedWeights;
@@ -56,6 +64,13 @@ mod ffi {
         /// thread gets its own `MlxStream` on first resolution.
         fn new_thread_local_stream_gpu() -> UniquePtr<MlxThreadLocalStream>;
 
+        /// Process-wide GPU thread-local stream handle, created once and
+        /// shared by every caller; each thread still resolves its own stream.
+        fn shared_thread_local_stream_gpu() -> UniquePtr<MlxThreadLocalStream>;
+
+        /// Index of the MLX stream behind `stream`.
+        fn stream_index(stream: &MlxStream) -> i32;
+
         /// Resolve the calling thread's `MlxStream` from a TLS handle.
         fn stream_from_thread_local_stream(tls: &MlxThreadLocalStream) -> UniquePtr<MlxStream>;
 
@@ -79,6 +94,18 @@ mod ffi {
         /// [`crate::hardware::cuda_compute_capability`], which caches the
         /// value and unpacks it into `(major, minor)`.
         fn gpu_compute_capability(index: i32) -> i32;
+
+        /// Device name MLX publishes for GPU `index` ("AMD Radeon Graphics",
+        /// "NVIDIA GB10"), or "" when the backend does not publish one.
+        fn gpu_device_name(index: i32) -> String;
+
+        /// ROCm `gfx` target of GPU `index` ("gfx1151"), or "" on a backend
+        /// that publishes no architecture string (Metal, CUDA, CPU-only).
+        fn gpu_architecture(index: i32) -> String;
+
+        /// Total device memory of GPU `index` in bytes, or 0 when the backend
+        /// does not publish it.
+        fn gpu_total_memory(index: i32) -> usize;
 
         /// Create a new stream pinned to GPU `index` (0-based, unvalidated).
         fn new_stream_on_gpu_index(index: i32) -> UniquePtr<MlxStream>;
@@ -191,7 +218,12 @@ mod ffi {
         /// `fused_sample` output); a non-contiguous array falls back to the safe
         /// `array_to_raw_bytes` copy rather than reading past the allocation.
         /// Used by: the #632 lookahead decode pipeline.
-        fn array_evaluated_bytes(arr: &MlxArray) -> Vec<u8>;
+        fn array_evaluated_bytes(arr: &MlxArray) -> Result<Vec<u8>>;
+
+        /// Test-only. Build an evaluated uint32 array whose real, signalled
+        /// event carries a synthetic backend error. Each call owns an
+        /// independent error so tests can exercise consuming read boundaries.
+        fn array_with_failed_event_for_test() -> UniquePtr<MlxArray>;
 
         /// Fallible counterpart of [`array_to_raw_bytes`].
         ///
@@ -524,6 +556,37 @@ mod ffi {
             stops: &[i32],
         ) -> UniquePtr<MlxArray>;
 
+        /// Reduce slice update: `src[starts:stops] = op(src[starts:stops], update)`
+        /// with `reduce` 0 = Sum, 1 = Prod, 2 = Max, 3 = Min (MLX's
+        /// `slice_update_add`, `slice_update_prod`, `slice_update_max`,
+        /// `slice_update_min`). Any other `reduce` value is an `Err` naming the
+        /// valid range. Test-only entry point: no model path uses the reduce
+        /// variants; `tests/rocm_slice_update_reduce.rs` drives the ROCm
+        /// `SliceUpdate` reduce kernel through it.
+        fn slice_update_reduce(
+            src: &MlxArray,
+            update: &MlxArray,
+            starts: &[i32],
+            stops: &[i32],
+            reduce: i32,
+        ) -> Result<UniquePtr<MlxArray>>;
+
+        /// Dynamic-start slice update: `src` with `update` written at the
+        /// offsets held in the int array `start`, one per entry of `axes`
+        /// (MLX's `slice_update(src, update, start, axes)`, which builds the
+        /// `DynamicSliceUpdate` primitive). Each offset is clamped to where
+        /// the update fits, since the GPU writes at it unchecked; an axis out
+        /// of range or a `start` length other than `axes.len()` is an `Err`.
+        /// Test-only entry point: no model
+        /// path uses it; `tests/rocm_slice_update_source.rs` drives the ROCm
+        /// `DynamicSliceUpdate::eval_gpu` through it.
+        fn slice_update_dynamic(
+            src: &MlxArray,
+            update: &MlxArray,
+            start: &MlxArray,
+            axes: &[i32],
+        ) -> Result<UniquePtr<MlxArray>>;
+
         /// Argmax along axis
         fn argmax(a: &MlxArray, axis: i32, keepdims: bool) -> UniquePtr<MlxArray>;
 
@@ -552,6 +615,17 @@ mod ffi {
         /// Whether `qmv_wide` is currently enabled. `true` on a build
         /// without the Metal backend.
         fn qmv_wide_enabled() -> bool;
+
+        /// Override MLX's per-command-buffer input budget
+        /// (`MLX_MAX_MB_PER_BUFFER`, an element count >> 20) for work encoded
+        /// from now on; `0` restores the device default. Process-wide and
+        /// immediate. Use [`crate::DecodeCommandBufferBudget`] rather than
+        /// calling this directly. Inert on a build without the Metal backend.
+        fn set_metal_mb_per_buffer_override(mb: i32);
+
+        /// Current override set by [`set_metal_mb_per_buffer_override`], `0`
+        /// when none is active (always `0` without the Metal backend).
+        fn metal_mb_per_buffer_override() -> i32;
 
         /// Random categorical sampling
         fn random_categorical(logits: &MlxArray, axis: i32) -> UniquePtr<MlxArray>;
@@ -627,6 +701,34 @@ mod ffi {
         /// Uses mlx::core::compile(shapeless=true) like Python's @mx.compile
         /// output = silu(gate) * x
         fn compiled_swiglu_activation(gate: &MlxArray, x: &MlxArray) -> UniquePtr<MlxArray>;
+
+        /// True when this backend has a port of [`fused_add3_layer_norm`],
+        /// that is Metal or ROCm (issue #2069). Read from the kernel's port
+        /// table, the one the launcher dispatches through.
+        fn fused_add3_layer_norm_available() -> bool;
+
+        /// Residual add fused with the next LayerNorm in one kernel launch:
+        /// `x_out = (a + b) + x`, `h_out = layer_norm(x_out, weight, bias)`.
+        /// Byte-identical to `compiled_add3` + `fast_layer_norm` on the same
+        /// backend. Metal and ROCm, last dimension <= 6656; call it through
+        /// [`crate::layers::residual_add3_layer_norm`], which checks both.
+        /// Used by: Cohere2
+        unsafe fn fused_add3_layer_norm(
+            a: &MlxArray,
+            b: &MlxArray,
+            x: &MlxArray,
+            weight: &MlxArray,
+            bias: *const MlxArray,
+            eps: f32,
+            x_out: &mut UniquePtr<MlxArray>,
+            h_out: &mut UniquePtr<MlxArray>,
+        ) -> Result<()>;
+
+        /// Compiled three-way add `(a + b) + c` as one fused kernel.
+        /// Byte-identical to two chained `add` calls (same association order);
+        /// saves one dispatch and one barrier level per call.
+        /// Used by: Cohere2
+        fn compiled_add3(a: &MlxArray, b: &MlxArray, c: &MlxArray) -> UniquePtr<MlxArray>;
 
         /// Compiled GptOss SwiGLU activation with kernel fusion
         /// Matches mlx-lm gpt_oss.swiglu: clipped gate/up + sigmoid(1.702*gate).
@@ -893,6 +995,10 @@ mod ffi {
 
         /// Create range of i32 values
         fn arange_i32(start: i32, stop: i32, step: i32) -> UniquePtr<MlxArray>;
+
+        /// `[0, stop)` as uint32 in one node, the dtype MLX's gather ops use
+        /// for indices (so passing it adds no cast node).
+        fn arange_u32(stop: i32) -> UniquePtr<MlxArray>;
 
         // Logical operations.
         /// Element-wise logical NOT
@@ -1290,36 +1396,6 @@ mod ffi {
             scale: f32,
         ) -> UniquePtr<MlxArray>;
 
-        /// Decode-only paged attention over dense compatibility KV caches.
-        ///
-        /// `q` is `[B, Hq, 1, D]`. `cache_keys[i]` / `cache_values[i]` are
-        /// per-sequence dense KV buffers, while `kv_lens`, `block_tables`, and
-        /// `block_table_offsets` describe the logical paged layout.
-        unsafe fn paged_decode_attention_dense_compat(
-            q: &MlxArray,
-            cache_keys: &[*const MlxArray],
-            cache_values: &[*const MlxArray],
-            kv_lens: &[i32],
-            block_tables: &[i32],
-            block_table_offsets: &[i32],
-            block_size: i32,
-            scale: f32,
-        ) -> UniquePtr<MlxArray>;
-
-        /// Decode-only paged attention over rotating ring-buffer KV caches.
-        ///
-        /// `logical_starts[i]` identifies the physical start of the logical
-        /// visible window within `cache_keys[i]` / `cache_values[i]`.
-        unsafe fn paged_decode_attention_rotating_compat(
-            q: &MlxArray,
-            cache_keys: &[*const MlxArray],
-            cache_values: &[*const MlxArray],
-            kv_lens: &[i32],
-            logical_starts: &[i32],
-            block_size: i32,
-            scale: f32,
-        ) -> UniquePtr<MlxArray>;
-
         /// Fused paged-attention decode Metal kernel (epic #116 Phase 6, #123).
         ///
         /// Reads scattered KV blocks directly out of the global pool via the
@@ -1341,8 +1417,9 @@ mod ffi {
         /// Returns `Err` instead of ending the process when the GPU backend has
         /// no custom kernel port (issue #1803): the C++ launcher throws and cxx
         /// turns that into an `Err` here, which a `noexcept` extern could not
-        /// do. mlxcel's own callers gate on `custom_kernels_available()` and
-        /// never reach it.
+        /// do. mlxcel's own callers gate on
+        /// [`paged_attention_decode_available`] (or the all-kernels
+        /// [`paged_attention_kernels_available`]) and never reach it.
         fn paged_attention_decode(
             q: &MlxArray,
             k_pool: &MlxArray,
@@ -1404,8 +1481,8 @@ mod ffi {
         /// Returns `Err` instead of ending the process when the GPU backend has
         /// no custom kernel port (issue #1803): the C++ launcher throws and cxx
         /// turns that into an `Err` here, which a `noexcept` extern could not
-        /// do. mlxcel's own callers gate on `custom_kernels_available()` and
-        /// never reach it.
+        /// do. mlxcel's own callers gate on [`paged_attention_merge_available`]
+        /// or [`paged_attention_kernels_available`] and never reach it.
         fn paged_attention_merge_states(
             v_in: &MlxArray,
             lse_in: &MlxArray,
@@ -1413,6 +1490,31 @@ mod ffi {
             v_out: &mut UniquePtr<MlxArray>,
             lse_out: &mut UniquePtr<MlxArray>,
         ) -> Result<()>;
+
+        /// True when the resolved GPU backend has ports of all three
+        /// paged-attention kernels: the v1 decode kernel, the v2 partial kernel
+        /// and the merge kernel. Answered from the kernels' own `KernelPorts`
+        /// tables (`has_kernel_port`), the ones their launchers dispatch
+        /// through, so this cannot say yes to a launch that would refuse.
+        /// True on Metal, CUDA and ROCm (the HIP ports, #2068).
+        fn paged_attention_kernels_available() -> bool;
+
+        /// True when the resolved GPU backend has a port of the merge kernel
+        /// ([`paged_attention_merge_states`]), which MLA split-KV uses on its
+        /// own. Same source of truth as [`paged_attention_kernels_available`].
+        fn paged_attention_merge_available() -> bool;
+
+        /// True when the resolved GPU backend has a port of the v1 paged
+        /// decode kernel ([`paged_attention_decode`]). Same source of truth as
+        /// [`paged_attention_kernels_available`].
+        fn paged_attention_decode_available() -> bool;
+
+        /// True when the resolved GPU backend has ports of both v2 kernels,
+        /// the partial kernel ([`paged_attention_decode_v2_partial`]) and the
+        /// merge kernel, which the flat, cascade and sparse v2 launches use
+        /// together. Same source of truth as
+        /// [`paged_attention_kernels_available`].
+        fn paged_attention_v2_available() -> bool;
 
         /// Query heads one v2 CTA processes together (issue #898). Always
         /// divides `n_rep`, so the plan's CTA count and the launcher's grid
@@ -1447,10 +1549,12 @@ mod ffi {
             weight_bias: f32,
             normed_out: &mut UniquePtr<MlxArray>,
             new_residual_out: &mut UniquePtr<MlxArray>,
-        );
+        ) -> Result<()>;
 
-        /// Whether the current backend has a fused-add-RMSNorm kernel at all
-        /// (issue #905). False on a CPU-only build, where the custom-kernel JIT
+        /// Whether the fused-add-RMSNorm kernel can run (issue #905): the
+        /// backend has a port in `fused_norm_ports()` (Metal, CUDA, and ROCm
+        /// since #2063) and the default device is the GPU. False on a CPU-only
+        /// build and on the CPU device of a GPU build, where a custom kernel
         /// throws.
         fn fused_add_rms_norm_available() -> bool;
 
@@ -1480,11 +1584,31 @@ mod ffi {
             q_out: &mut UniquePtr<MlxArray>,
             k_out: &mut UniquePtr<MlxArray>,
             v_out: &mut UniquePtr<MlxArray>,
-        );
+        ) -> Result<()>;
 
-        /// Whether the current backend has a fused RoPE + append kernel at all
-        /// (issue #905). False on a CPU-only build.
+        /// Whether the fused RoPE + append kernel can run (issue #905): the
+        /// backend has a port in `fused_rope_ports()` (Metal, CUDA, and ROCm
+        /// since #2063) and the default device is the GPU. False on a CPU-only
+        /// build and on the CPU device of a GPU build.
         fn fused_rope_qk_append_available() -> bool;
+
+        /// A second handle to the same MLX array node: same id, same
+        /// buffer, nothing copied or evaluated.
+        fn array_handle_clone(a: &MlxArray) -> UniquePtr<MlxArray>;
+
+        /// Whether two handles refer to the same MLX array node.
+        fn array_same_handle(a: &MlxArray, b: &MlxArray) -> bool;
+
+        /// `dst` with `rows` written at `start`, sharing `dst`'s buffer
+        /// instead of copying it (#1959). Sound only when no reader of `dst`
+        /// needs the written region's old contents and the caller owns the
+        /// buffer alone; see `src/lib/mlxcelverse/kernels/kv_inplace_write.h`. GPU
+        /// only.
+        fn inplace_slice_write(
+            dst: &MlxArray,
+            rows: &MlxArray,
+            start: &[i32],
+        ) -> UniquePtr<MlxArray>;
 
         fn sdpa_supports_fast_path(
             q: &MlxArray,
@@ -1703,15 +1827,19 @@ mod ffi {
             norm_topk_prob: bool,
             group_size: i32,
             bits: i32,
-        ) -> UniquePtr<MlxArray>;
+        ) -> Result<UniquePtr<MlxArray>>;
 
-        // SSM (Mamba2) fused Metal kernel.
-        /// Check if SSM Metal kernel is available
+        // SSM (Mamba2) fused kernel.
+        /// Whether the fused single-token SSM update kernel can run: the
+        /// resolved GPU backend has a port in `ssm_ports()` (Metal, CUDA,
+        /// ROCm), the default device is the GPU, and neither
+        /// `MLXCEL_SSM_KERNEL=0` nor its older alias
+        /// `MLXCEL_SSM_CUDA_KERNEL=0` is set.
         fn ssm_kernel_available() -> bool;
 
         /// Fused SSM update kernel for single-token decode
-        /// Replaces ~55 individual ops with a single Metal kernel call
-        /// Used by: NemotronH, NemotronNAS, Mamba2
+        /// Replaces ~55 individual ops with a single kernel launch
+        /// Used by: GraniteMoeHybrid, Falcon-H1, PLaMo 2, NemotronH
         fn ssm_update_kernel(
             hidden_states: &MlxArray,
             a_log: &MlxArray,
@@ -1725,12 +1853,67 @@ mod ffi {
             time_step_max: f32,
             output: &mut UniquePtr<MlxArray>,
             next_state: &mut UniquePtr<MlxArray>,
-        );
+        ) -> Result<()>;
+
+        /// Whether the fused Mamba1 selective-scan kernel can run (Metal,
+        /// CUDA and ROCm; `MLXCEL_MAMBA1_SCAN_KERNEL=0` forces the graph
+        /// scan).
+        fn mamba1_scan_kernel_available() -> bool;
+
+        /// Whether the kernel that can run is the float32-state variant
+        /// (Metal, and ROCm since issue #2069) rather than CUDA's graph-exact
+        /// one (#1981). Mamba / Falcon-Mamba take only this variant.
+        fn mamba1_scan_float_state_kernel_available() -> bool;
+
+        /// Whether the fused scan can serve these inputs: it is available, the
+        /// default device is the GPU, `N <= 32`, and on CUDA all six inputs
+        /// share one floating dtype (the condition under which the CUDA kernel
+        /// is bit-identical to the graph scan, issue #1981). Callers take the
+        /// graph scan when this is false.
+        fn mamba1_scan_kernel_accepts(
+            x: &MlxArray,
+            delta: &MlxArray,
+            b: &MlxArray,
+            c: &MlxArray,
+            a: &MlxArray,
+            d: &MlxArray,
+        ) -> bool;
+
+        /// Mamba1 selective scan fused over the sequence (issues #2005, #1981).
+        /// x, delta `[B, L, D]`, b, c `[B, L, N]`, a `[D, N]` (= -exp(A_log)),
+        /// d `[D]`, state_in `[B, D, N]`. Writes y `[B, L, D]` in x's dtype and
+        /// the final state `[B, D, N]`: float32 on Metal, x's dtype on CUDA,
+        /// where every step rounds like the graph scan.
+        /// Used by: Jamba, Mamba, Falcon-Mamba
+        ///
+        /// `Result` because the launcher refuses through `select_kernel_port`
+        /// where the backend has no usable port (for example a wave64 ROCm
+        /// device, #2147); a throw across a non-`Result` extern would end the
+        /// process. Callers gate on `mamba1_scan_kernel_accepts`, which reads
+        /// the same tables, and `expect` the launch.
+        #[allow(clippy::too_many_arguments)]
+        fn mamba1_selective_scan(
+            x: &MlxArray,
+            delta: &MlxArray,
+            b: &MlxArray,
+            c: &MlxArray,
+            a: &MlxArray,
+            d: &MlxArray,
+            state_in: &MlxArray,
+            y: &mut UniquePtr<MlxArray>,
+            state_out: &mut UniquePtr<MlxArray>,
+        ) -> Result<()>;
 
         /// Fused MoE expert kernel for single-token decode. gate/up use
         /// `gu_bits` (power-of-2: 4/8), down uses `d_bits` (4/8/6); group_size
         /// is shared. Mixed widths support e.g. dots.llm1 (gate/up 4, down 6).
         #[allow(clippy::too_many_arguments)]
+        ///
+        /// `Result` because the launcher refuses on a backend with no kernel
+        /// port rather than falling into the Metal arm and aborting the process
+        /// on a C++ throw across a `noexcept` extern (issue #1885). Production
+        /// gates on the support predicate and takes the graph fallback, so the
+        /// `Err` is reachable only from a direct call.
         fn fused_moe_expert_kernel(
             x: &MlxArray,
             indices: &MlxArray,
@@ -1750,11 +1933,17 @@ mod ffi {
             gu_bits: i32,
             d_bits: i32,
             group_size: i32,
-        ) -> UniquePtr<MlxArray>;
+        ) -> Result<UniquePtr<MlxArray>>;
 
         /// Like `fused_moe_expert_kernel` but GeGLU (gelu tanh approx) instead
         /// of SwiGLU for the gate/up activation (gemma4 experts).
         #[allow(clippy::too_many_arguments)]
+        ///
+        /// `Result` because the launcher refuses on a backend with no kernel
+        /// port rather than falling into the Metal arm and aborting the process
+        /// on a C++ throw across a `noexcept` extern (issue #1885). Production
+        /// gates on the support predicate and takes the graph fallback, so the
+        /// `Err` is reachable only from a direct call.
         fn fused_moe_geglu_kernel(
             x: &MlxArray,
             indices: &MlxArray,
@@ -1774,21 +1963,30 @@ mod ffi {
             gu_bits: i32,
             d_bits: i32,
             group_size: i32,
-        ) -> UniquePtr<MlxArray>;
+        ) -> Result<UniquePtr<MlxArray>>;
 
-        /// Fused xIELU activation (Apertus): one Metal launch covering the
-        /// `apertus_xielu` elementwise graph (square/min/expm1/where/...). The
-        /// per-layer scalars `alpha_p` / `alpha_n` (post-softplus) and `beta` /
-        /// `eps` are passed by value. Greedy temp-0 byte-identical to the
-        /// elementwise path on Apple Silicon; falls back to an equivalent
-        /// elementwise graph on non-Metal back-ends. Gated by `MLXCEL_FUSED_XIELU`.
+        /// True when [`fused_xielu`] runs its fused kernel on this backend,
+        /// that is Metal or ROCm (issue #2069), rather than the elementwise
+        /// fallback. Read from the kernel's port table, the one the dispatch
+        /// reads.
+        fn fused_xielu_kernel_available() -> bool;
+
+        /// Fused xIELU activation (Apertus): one kernel launch (Metal, ROCm)
+        /// covering the `apertus_xielu` elementwise graph
+        /// (square/min/expm1/where/...). The per-layer scalars `alpha_p` /
+        /// `alpha_n` (post-softplus) and `beta` / `eps` are passed by value.
+        /// Byte-identical to the elementwise path where tested: Metal in bf16,
+        /// ROCm (gfx1151) in f32, f16 and bf16; Metal f32 and f16 are held to
+        /// a tolerance only. Falls back to an equivalent elementwise graph where
+        /// [`fused_xielu_kernel_available`] is false (CUDA, CPU). Gated by
+        /// `MLXCEL_FUSED_XIELU`.
         fn fused_xielu(
             x: &MlxArray,
             alpha_p: f32,
             alpha_n: f32,
             beta: f32,
             eps: f32,
-        ) -> UniquePtr<MlxArray>;
+        ) -> Result<UniquePtr<MlxArray>>;
 
         /// BitLinear ternary matmul (BitNet b1.58). `packed_weights` is
         /// [out_features/4, in_features] uint8 (2-bit ternary, 4 rows/byte),
@@ -1808,6 +2006,36 @@ mod ffi {
             in_features: i32,
             out_features: i32,
             invert_weight_scales: bool,
+        ) -> Result<UniquePtr<MlxArray>>;
+
+        /// Affine 1-bit quantized linear `x @ dequant(weight)^T` (issue
+        /// #1370). `weight` is `uint32 [N, K / 32]` (bit `j` of word `c` is
+        /// column `32c + j`), `scales` / `biases` are `[N, K / group_size]`,
+        /// `group_size` is 32, 64 or 128. Dispatches the fused Metal qmv
+        /// (fewer than 16 rows) or qmm kernel, or the dequantize graph when
+        /// `force_fallback` is set, `MLXCEL_ONE_BIT_KERNEL=0`, or the backend
+        /// has no port. `Err` on an inconsistent triple.
+        ///
+        /// The load path does not call this directly: the `quantized_matmul`,
+        /// `quantized_linear_forward` and `dequantize` bridge primitives
+        /// route an affine `bits == 1` triple to the same implementation.
+        fn one_bit_quantized_matmul(
+            x: &MlxArray,
+            weight: &MlxArray,
+            scales: &MlxArray,
+            biases: &MlxArray,
+            group_size: i32,
+            force_fallback: bool,
+        ) -> Result<UniquePtr<MlxArray>>;
+
+        /// Dense `[..., N, K]` weight of an affine 1-bit packed triple, in
+        /// the dtype of `scales` (issue #1370). The reference the kernels are
+        /// tested against. `Err` on an inconsistent triple.
+        fn one_bit_dequantize(
+            weight: &MlxArray,
+            scales: &MlxArray,
+            biases: &MlxArray,
+            group_size: i32,
         ) -> Result<UniquePtr<MlxArray>>;
 
         /// Fused gated-delta single-token decode step.
@@ -2082,6 +2310,13 @@ mod ffi {
         /// for the graph that produces the given pair of arrays.
         fn astype_breakdown_pair(a: &MlxArray, b: &MlxArray) -> String;
 
+        /// Sorted flags of every `GatherMM` / `GatherQMM` node in the
+        /// unevaluated graph that produces `out`, three bytes per node in
+        /// depth-first discovery order: `[quantized, left_sorted,
+        /// right_sorted]` as 0 or 1. Traversal only, no eval; the typed form
+        /// is [`gather_sorted_flags`].
+        fn gather_sorted_flags_raw(out: &MlxArray) -> Vec<u8>;
+
         /// Set default stream for subsequent operations
         fn set_default_stream(stream: &MlxStream);
 
@@ -2099,21 +2334,136 @@ mod ffi {
         fn gpu_backend_available() -> bool;
 
         /// True when the resolved GPU backend has mlxcel's fused kernel ports,
-        /// that is Metal or CUDA (issue #1803). ROCm has a GPU but no ports
-        /// yet, so it answers `false` and callers take the MLX graph fallback
-        /// their family already has. This is deliberately narrower than
+        /// that is Metal or CUDA (issue #1803). ROCm has a GPU and HIP ports
+        /// for some kernels only (#1814), so it answers `false`; a ported
+        /// kernel's own predicate (for example `bitlinear_kernel_available`,
+        /// `fused_moe_kernels_available`) reads its port table and is what
+        /// gates it there. This is deliberately narrower than
         /// `gpu_backend_available`, which only says a GPU exists: conflating
         /// the two is what sent ROCm into `fast::cuda_kernel` and aborted the
         /// process.
         fn custom_kernels_available() -> bool;
 
+        /// The resolved GPU backend as a small integer: 0 none, 1 Metal,
+        /// 2 CUDA, 3 ROCm. Prefer the safe wrapper
+        /// [`crate::hardware::gpu_backend_kind`], which maps it to an enum.
+        fn gpu_backend_kind() -> i32;
+
+        /// Whether a ROCm kernel port may run on a device whose wavefront
+        /// is `warp_size` lanes wide (issue #2147): true when the port is
+        /// marked correct at any width, or the width is 32. A width of 0
+        /// (the query failed) counts as "not 32". The pure rule that every
+        /// port table lookup applies on ROCm, exposed so it is tested on
+        /// every backend.
+        fn rocm_port_allowed(any_wave_size: bool, warp_size: i32) -> bool;
+
+        /// The hardware wavefront width of the current HIP device: 32 on
+        /// RDNA, 64 on CDNA, 0 off ROCm or when the query fails. Never the
+        /// `MLX_ROCM_FORCE_WARP_SIZE` launch-width override (issue #2147).
+        fn rocm_device_warp_size() -> i32;
+
+        /// Raw counters of the ROCm QuantizedMatmul dequantized-weight
+        /// cache (issue #2151): hits, misses, inserts, evictions, bypasses,
+        /// entries, bytes. Seven zeros off ROCm. Prefer
+        /// [`crate::rocm_qmm_cache::dequant_cache_stats`].
+        fn rocm_dequant_cache_stats() -> Vec<u64>;
+
+        /// Test-only seam (issue #2147): replaces the wavefront width the
+        /// ROCm port tables are checked against for the rest of the process
+        /// (0 restores the hardware value), so the wave64 refusal can be
+        /// exercised on a wave32 host. `make verify-kernel-port-dispatch`
+        /// fails on a call outside test code. The port predicates' Rust
+        /// gates cache a `true` answer, so set it before the first
+        /// predicate call, in a test binary of its own.
+        fn set_rocm_port_warp_size_for_tests(warp_size: i32);
+
+        /// Test-only (issue #1804): a lazy array whose evaluation fails on
+        /// the GPU. `kind` 0 launches a kernel with a 2048-thread block, which
+        /// HIP rejects synchronously; `kind` 1 launches a kernel that writes
+        /// far outside its buffer, an asynchronous queue fault after which the
+        /// device context is unusable for the rest of the process. Built
+        /// through the same custom-kernel path the fused ports use, so
+        /// [`try_eval`] on the result exercises the real launch, wait and
+        /// error path. Errors on backends other than ROCm. Prefer the typed
+        /// wrapper [`crate::rocm_faults::fault_probe_array`].
+        fn rocm_fault_probe_array(kind: i32) -> Result<UniquePtr<MlxArray>>;
+
+        /// Test-only (issue #2149): one `fast::hip_kernel` launch under a
+        /// fixed name with no template args, returning an array of
+        /// `input.size() + 1` elements (f16 when `f16_output`, else f32):
+        /// `inp_shape[0]` (-1 for a 0-d input) followed by the input's
+        /// values. Two calls that differ only in the input's dtype, the
+        /// output's dtype or the input's 0-d-ness must not share a compiled
+        /// module.
+        /// Errors on backends other than ROCm and for an input that is not a
+        /// float32, float16 or bfloat16 array, 0-d or 1-d with 1 to 1024
+        /// elements. Prefer the wrapper
+        /// [`crate::rocm_faults::jit_key_probe_array`].
+        fn rocm_jit_key_probe(input: &MlxArray, f16_output: bool) -> Result<UniquePtr<MlxArray>>;
+
+        /// Test-only (issue #2183): one `fast::hip_kernel` launch named
+        /// `mlxcel_jit_race_probe_v<variant>` returning a float32 array whose
+        /// element `i` is `input[i] * 2 + 1`. The first launch of a variant
+        /// in a process misses the JIT module cache and compiles; later
+        /// launches hit it. Errors on backends other than ROCm, for an input
+        /// that is not a 1-d float32 array of 1 to 1024 elements, and for a
+        /// negative variant. Prefer the wrapper
+        /// [`crate::rocm_faults::jit_race_probe_array`].
+        fn rocm_jit_race_probe_array(input: &MlxArray, variant: i32)
+        -> Result<UniquePtr<MlxArray>>;
+
         /// True when this backend has a BitLinear kernel port, that is Metal,
-        /// CUDA or ROCm (issues #1803, #1862). Separate from
+        /// CUDA or ROCm (issues #1803, #1862), read from the kernel's port
+        /// table, so false on a wave64 ROCm device (#2147). Separate from
         /// `custom_kernels_available` on purpose: kernels are ported one at a
         /// time, so "this backend has fused kernels" and "this backend has
         /// *this* kernel" stopped being the same question the moment ROCm got
         /// its first port.
         fn bitlinear_kernel_available() -> bool;
+
+        /// True when this backend has both fused decode-MoE kernel ports
+        /// (gate-up and down), that is Metal, CUDA or ROCm (issues #1803,
+        /// #2065). Read from the kernels' own port tables, so the
+        /// `MLXCEL_FUSED_MOE` gate and the launchers behind it
+        /// ([`fused_moe_expert_kernel`], [`fused_moe_geglu_kernel`]) cannot
+        /// disagree. False while the default device is the CPU
+        /// (`MLXCEL_DEVICE=cpu`), where a custom kernel cannot run.
+        fn fused_moe_kernels_available() -> bool;
+
+        /// True when this backend has the fused decode-MoE down kernel port
+        /// alone, which Nemotron-H's [`fused_moe_forward`] reuses for its fc2
+        /// (issue #2065). Its opt-in `MLXCEL_FUSED_MOE_RELU2` branch also needs
+        /// the fc1 squared-ReLU port and declines to `gather_qmm` without it.
+        /// False while the default device is the CPU.
+        fn moe_down_kernel_available() -> bool;
+
+        /// True when this backend has both kernels of [`fused_moe_forward`]'s
+        /// opt-in `MLXCEL_FUSED_MOE_RELU2` branch (the fc1 squared-ReLU kernel
+        /// and the down kernel), that is Metal or ROCm (issue #2069). The
+        /// branch reads this same predicate, so where it is false the flag
+        /// leaves the `gather_qmm` routed path in place.
+        fn fused_moe_relu2_kernels_available() -> bool;
+
+        /// Whether `quantized_matmul` for this transposed affine projection
+        /// runs the same dense GEMM as `dequantize` + `matmul`, so the two
+        /// return the same bytes (lablup/mlxcel#2081). Reads the
+        /// QuantizedMatmul route on ROCm; true on every other backend, whose
+        /// rule is the output-tile count in
+        /// [`crate::layers::prefill_dense_gemm_eligible`]. `biases` may be
+        /// null.
+        unsafe fn quantized_matmul_matches_dense_gemm(
+            x: &MlxArray,
+            weight: &MlxArray,
+            scales: &MlxArray,
+            biases: *const MlxArray,
+            group_size: i32,
+            bits: i32,
+        ) -> bool;
+
+        /// True when this backend has a fused affine 1-bit kernel port
+        /// (Metal). Other backends run 1-bit weights through the dequantize
+        /// graph (issue #1370).
+        fn one_bit_kernel_available() -> bool;
 
         /// True when the MLX Metal backend is available at runtime (macOS
         /// Apple Silicon). False on CUDA-only and CPU-only builds. Mirrors the
@@ -2217,13 +2567,25 @@ mod ffi {
         /// uint32 token-id array drawn from `softmax(logits / temperature)`.
         /// Requires `temperature > 0` and a backend for which
         /// [`sampling_gumbel_available`] reports support.
-        fn gumbel_max_sample(logits: &MlxArray, temperature: f32) -> UniquePtr<MlxArray>;
+        ///
+        /// `Result` because the launcher refuses on a backend with no kernel
+        /// port rather than falling into the Metal arm and aborting the process
+        /// on a C++ throw across a `noexcept` extern (issue #1885). Production
+        /// never sees that `Err`: it gates on the support predicate above and
+        /// takes the graph fallback. A direct caller gets a named error.
+        fn gumbel_max_sample(logits: &MlxArray, temperature: f32) -> Result<UniquePtr<MlxArray>>;
 
         /// True when [`fused_sample`]'s no-filter stochastic path takes the
-        /// Gumbel-max kernel: the backend supports it (GPU default device with
-        /// Metal or CUDA available) and `MLXCEL_SAMPLING_GUMBEL` is not falsy.
+        /// Gumbel-max kernel: the default device is the GPU, its backend has a
+        /// Gumbel-max port (Metal, CUDA or ROCm) and `MLXCEL_SAMPLING_GUMBEL`
+        /// is not falsy.
         /// The env value is read once per process.
         fn sampling_gumbel_available() -> bool;
+
+        /// The backend half of [`sampling_gumbel_available`], ignoring
+        /// `MLXCEL_SAMPLING_GUMBEL`: true when the default device is the GPU
+        /// and its backend has a Gumbel-max port.
+        fn sampling_gumbel_backend_supported() -> bool;
 
         /// Threadgroups the Gumbel-max kernel cooperates on one row with, for a
         /// `[batch, vocab]` launch. Always a power of two in `[1, 64]`. Exposed
@@ -2234,6 +2596,12 @@ mod ffi {
         /// forced. Bypasses the `MLXCEL_SAMPLING_REJECTION` gate and takes an
         /// explicit round cap so a test can drive the cap-overflow fallback.
         /// Returns `[batch]` uint32 token ids.
+        ///
+        /// `Result` because the launcher refuses on a backend with no kernel
+        /// port rather than falling into the Metal arm and aborting the process
+        /// on a C++ throw across a `noexcept` extern (issue #1885). Production
+        /// never sees that `Err`: it gates on the support predicate above and
+        /// takes the graph fallback. A direct caller gets a named error.
         fn fused_sample_rejection(
             logits: &MlxArray,
             temperature: f32,
@@ -2241,13 +2609,14 @@ mod ffi {
             top_p: f32,
             min_p: f32,
             max_rounds: i32,
-        ) -> UniquePtr<MlxArray>;
+        ) -> Result<UniquePtr<MlxArray>>;
 
         /// The production rejection launch with an explicit round cap (#901),
         /// landed and checked in place. Shares the overflow counting rule with
         /// the deferred drain, so a test can pin that rule and its report
         /// without depending on the best-effort ring that delivers the flags in
-        /// production.
+        /// production. Shares the guarded launcher with
+        /// [`fused_sample_rejection`], so it is `Result` for the same reason.
         fn fused_sample_rejection_deferred(
             logits: &MlxArray,
             temperature: f32,
@@ -2255,7 +2624,7 @@ mod ffi {
             top_p: f32,
             min_p: f32,
             max_rounds: i32,
-        ) -> UniquePtr<MlxArray>;
+        ) -> Result<UniquePtr<MlxArray>>;
 
         /// Raw rejection kernel outputs stacked as `[3, batch]` uint32: row 0
         /// sampled ids, row 1 the per-row converged flag, row 2 rounds
@@ -2275,6 +2644,11 @@ mod ffi {
         /// and `MLXCEL_SAMPLING_REJECTION` is not falsy. Read once per process.
         fn sampling_rejection_available() -> bool;
 
+        /// The backend half of [`sampling_rejection_available`], ignoring
+        /// `MLXCEL_SAMPLING_REJECTION`: true when the default device is the GPU
+        /// and its backend has a rejection-sampling port.
+        fn sampling_rejection_backend_supported() -> bool;
+
         /// Pure routing policy (#901): would `fused_sample` send this
         /// configuration to the rejection kernel, ignoring backend support and
         /// the env switch? The kernel replaces a sort, so it is routed only
@@ -2282,6 +2656,14 @@ mod ffi {
         /// combination is capped at the vocabulary where it measured a win.
         /// Pure host arithmetic, so it answers on a CPU-only build too.
         fn sampling_rejection_routes(vocab: i32, top_k: i32, top_p: f32, min_p: f32) -> bool;
+
+        /// The vocabulary ceiling [`sampling_rejection_routes`] applies to
+        /// top-k and top-p together on this build: the compile-time
+        /// `REJECTION_JOINT_VOCAB_MAX` in `mlx_cxx_bridge.cpp`, 152064 on a
+        /// ROCm build (gfx1151, #2157) and 32768 on every other build (M1
+        /// Ultra, #901). It is chosen by build flag, never by a runtime
+        /// backend check.
+        fn sampling_rejection_joint_vocab_max() -> i32;
 
         /// Threads per threadgroup the rejection kernel launches with. The
         /// determinism argument rests on this being fixed, so it is exposed.
@@ -2750,6 +3132,16 @@ mod ffi {
             key: *const MlxArray,
         ) -> UniquePtr<MlxArray>;
 
+        /// Raw random words (`random::bits`): `width` bytes per element,
+        /// returned as uint32 / uint16 / uint8. A null `key` draws from the
+        /// default key sequence, which is how the fused samplers draw their
+        /// Philox key, so a test can recover the key a launch will use.
+        unsafe fn random_bits(
+            shape: &[i32],
+            width: i32,
+            key: *const MlxArray,
+        ) -> UniquePtr<MlxArray>;
+
         /// Gumbel random samples
         unsafe fn random_gumbel(
             shape: &[i32],
@@ -2862,7 +3254,7 @@ mod ffi {
             dim: i32,
             n_rep: i32,
             threshold: f32,
-        ) -> UniquePtr<MlxArray>;
+        ) -> Result<UniquePtr<MlxArray>>;
 
         // -------------------------------------------------------------------
         // Fused Turbo4Delegated cold-V weighted-sum kernel.
@@ -2910,7 +3302,7 @@ mod ffi {
             dim: i32,
             n_rep: i32,
             threshold: f32,
-        ) -> UniquePtr<MlxArray>;
+        ) -> Result<UniquePtr<MlxArray>>;
 
         /// Fused bulk rotated dequant for the Swift-LM-style
         /// Turbo4Delegated dequant-first SDPA path.
@@ -2927,7 +3319,7 @@ mod ffi {
             v_rescale: &MlxArray,
             codebook: &MlxArray,
             dim: i32,
-        ) -> UniquePtr<MlxArray>;
+        ) -> Result<UniquePtr<MlxArray>>;
 
         // Steel-attention-envelope fused Turbo4Delegated SDPA
         // kernel launcher. One Metal dispatch performs the entire post-Q·K
@@ -2987,7 +3379,7 @@ mod ffi {
             cold_offset: i32,
             hot_offset: i32,
             threshold: f32,
-        ) -> UniquePtr<Turbo4DelegatedSteelOutputs>;
+        ) -> Result<UniquePtr<Turbo4DelegatedSteelOutputs>>;
 
         /// Take (move out) the unrotated cold weighted sum from a steel SDPA
         /// outputs struct. After this call the struct's `out_cold_pre` slot
@@ -3020,6 +3412,37 @@ mod ffi {
 
 // Re-export the FFI types and functions
 pub use ffi::*;
+
+/// The sorted flags of one `GatherMM` or `GatherQMM` node, as the primitive
+/// carries them (issue #2241).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GatherSortedFlags {
+    /// `GatherQMM` (true) or `GatherMM` (false).
+    pub quantized: bool,
+    /// Upstream sets this to `sorted_indices && !rhs_indices`.
+    pub left_sorted: bool,
+    /// Upstream sets this to `sorted_indices && !lhs_indices`; every
+    /// backend's sorted MoE prefill kernel keys on it.
+    pub right_sorted: bool,
+}
+
+/// Sorted flags of every `GatherMM` / `GatherQMM` node in the unevaluated
+/// graph that produces `out`, in depth-first discovery order. Traversal only,
+/// no eval; an evaluated array has no graph left to walk and gives an empty
+/// list.
+///
+/// Used by: the `SwitchGLU` sorted-path regression tests (issue #2241)
+#[must_use]
+pub fn gather_sorted_flags(out: &MlxArray) -> Vec<GatherSortedFlags> {
+    ffi::gather_sorted_flags_raw(out)
+        .chunks_exact(3)
+        .map(|node| GatherSortedFlags {
+            quantized: node[0] != 0,
+            left_sorted: node[1] != 0,
+            right_sorted: node[2] != 0,
+        })
+        .collect()
+}
 
 /// Deprecated name for [`default_device_is_gpu`] (issue #1421).
 ///
@@ -3054,6 +3477,9 @@ pub use session::{InferenceSession, MlxInferenceSession, SessionCapabilities};
 // Re-export N-gram loop-detection so the server control plane and CLI decode
 // loops can configure and run early-stop on degenerate token-repetition.
 pub use loop_detection::{LoopDetectionConfig, detect_repetition_loop};
+// Re-export the shared post-sample finish step (#2168) so the server batch
+// scheduler and the CLI decode loops run one finish decision.
+pub use decode_finish::{FinishCause, FinishHooks, FinishInput, NoStopHooks, finish_step};
 // Re-export B9 observability counter accessors so the server `/metrics` handler
 // can read process-wide lang-bias counters without a struct dependency.
 // Includes the byte-fragment suppression counter added.
@@ -3423,9 +3849,12 @@ pub fn causal_attention(
     // (e.g. head_dim > 128) would materialize the full [heads, L, L] score
     // matrix in MLX's fallback; chunk the query axis instead (issue #672).
     // `k_len >= q_len` guards the bottom-right causal alignment the chunked
-    // path reproduces.
+    // path reproduces. This call is maskless and causal, so it passes
+    // `arr_masked = false, do_causal = true`: #1820's bucketing needs an array
+    // mask to widen and declines here, which leaves #1799's ops fallback
+    // running and the chunking it needs still switched on.
     if k_len >= q_len
-        && let Some(chunk) = layers::materializing_sdpa_query_chunk(q, k, v, 0.0, true)
+        && let Some(chunk) = layers::materializing_sdpa_query_chunk(q, k, v, 0.0, false, true)
     {
         return layers::chunked_causal_attention(q, k, v, scale, chunk);
     }
@@ -3463,10 +3892,13 @@ pub mod weights;
 
 // Token generation
 pub mod generate;
+// `LanguageModel` for `&M`, so a raw-completion client can open an
+// `Engine<&M>` over a model its caller keeps (#2176).
+mod language_model_ref;
 
 // Inference-session contract (issue #448, ADR 0004). The engine-neutral
-// `InferenceSession` trait plus the MLX `MlxInferenceSession` that wraps
-// `CxxGenerator`. The CLI single-sequence paths drive generation through this.
+// `InferenceSession` trait plus the MLX `MlxInferenceSession`, a one-sequence
+// client of the batch-native engine (`engine::DirectEngine`, ADR 0007).
 pub mod session;
 
 // Backend-neutral owned tensors produced by host-side multimodal preprocessing.
@@ -3483,9 +3915,27 @@ pub mod generation_policy;
 // degenerate generation early (e.g. Gemma 4 token-repetition collapse).
 pub mod loop_detection;
 
+// The one post-sample finish step (EOS, stop strings, bounds, budget, context
+// bound, loop detection, cache-clear cadence) shared by every CLI and server
+// decode site (#2168).
+pub mod decode_finish;
+
 // Shared sampling and token-penalty policy helpers.
 // Public so that the server batch scheduler can perform step-level sampling.
 pub mod sampling;
+
+// The one per-row sampling step and its sampler-state lifecycle, shared by the
+// CLI decode loops and the server scheduler (#2169, ADR 0007).
+pub mod sampling_row_step;
+
+// The one token-bias composition (request bias, language bias, output
+// suppression) the CLI and the server both call once per request (#2169).
+pub mod sampling_token_bias;
+
+// The opt-in gate for the B9 pre-bias suppression counters, read once from
+// `MLXCEL_LANG_BIAS_COUNTERS`, plus the per-thread scoped override tests use
+// instead of mutating the environment (#2187).
+pub mod lang_bias_counters;
 
 // Which sampling path a decode step actually took, announced at INFO (#901).
 // Public so every `fused_sample` call site can drain the report, and so the
@@ -3516,6 +3966,21 @@ pub mod dtype;
 // Re-exported through `hardware` so callers have one place to ask about the
 // machine, whichever backend they are on.
 pub mod cuda_arch;
+pub mod rocm_arch;
+
+// Counters of the ROCm QuantizedMatmul dequantized-weight cache (#2151), for
+// tests and memory diagnostics.
+pub mod rocm_qmm_cache;
+
+// Deliberate ROCm GPU failures for tests (#1804): a typed wrapper over the
+// bridge's fault-probe fixture, so `tests/rocm_gpu_faults.rs` can provoke a
+// rejected launch and a queue fault without knowing the bridge's integers.
+// It also wraps the custom-kernel JIT-key probe (#2149) used by
+// `tests/rocm_custom_kernel_jit_key.rs`.
+// Test support only: a queue fault kills the device for the rest of the
+// process, so this is hidden from the public docs.
+#[doc(hidden)]
+pub mod rocm_faults;
 
 // The CUDA graph capture budget applied on GB10 (#1798): a pure policy over
 // the compute capability plus the env-wins applier, re-exported through
@@ -3525,6 +3990,11 @@ pub mod cuda_graph_budget;
 // Runtime Apple Silicon generation detection.
 // Public so that mlxcel (the main crate) can log hardware info at startup.
 pub mod hardware;
+
+// Decode-only raise of MLX's per-command-buffer input budget; prefill keeps
+// the device default so long prompts do not hold their activations longer.
+pub mod command_buffer_budget;
+pub use command_buffer_budget::DecodeCommandBufferBudget;
 
 // Typed wrappers around MLX's runtime memory accounting APIs (issue #55).
 // Public so that the CLI generate path can surface post-load resident
@@ -3539,6 +4009,17 @@ pub mod rope_proportional;
 // model whose RoPE table is chosen from the whole prompt length can still make
 // that choice from inside a chunked prefill (Phi-3 / Phi-4 LongRoPE, #1358).
 pub mod prefill_span;
+
+// One description of how a prompt is prefilled: adopted prefix, history
+// boundary, chunking, tile padding and the trim that undoes it, shared by the
+// CLI generator and the server scheduler (ADR 0007, #2170).
+pub mod prefill_plan;
+
+// The batch-native decode engine: owns the model and the KV pool and runs
+// every forward through `open` / `prefill` / `step` / `close`; a single
+// sequence is a batch of one (ADR 0007, #2172).
+pub mod engine;
+mod eval_faults;
 
 pub mod runtime_lora;
 
@@ -3583,6 +4064,24 @@ pub(crate) mod test_support;
 #[path = "ffi_tests.rs"]
 mod ffi_tests;
 
+#[cfg(test)]
+#[path = "array_evaluated_bytes_tests.rs"]
+mod array_evaluated_bytes_tests;
+
+// Affine 1-bit quantization (issue #1370): fused Metal qmv / qmm parity against
+// a host f64 oracle, the dequantize reference, load validation and layer
+// routing.
+#[cfg(test)]
+#[path = "one_bit_tests.rs"]
+mod one_bit_tests;
+
+// CPU quantized matmul accumulates in f32 for bf16 and f16 activations (issue
+// #2248): affine transposed and plain, 3/4/6/8-bit, and MXFP4, each against a
+// host f64 reference on the CPU stream. Runs on every backend.
+#[cfg(test)]
+#[path = "cpu_qmm_accum_tests.rs"]
+mod cpu_qmm_accum_tests;
+
 // CUDA architecture-list parsing and the coverage/mismatch predicate. Pure
 // functions over strings and tuples, so these run on every host including
 // ones with no GPU at all.
@@ -3624,12 +4123,27 @@ mod grouped_gemm_arch_tests;
 #[path = "grouped_gemm_numeric_tests.rs"]
 mod grouped_gemm_numeric_tests;
 
+// [#1820] The bucketed cuDNN SDPA plan-cache path points the kernel at the
+// whole KV cache buffer instead of the live prefix, so these check that the
+// columns past `k_len` stay out of the result. CUDA-only: the patched file
+// compiles into the CUDA backend and nowhere else.
+#[cfg(all(test, feature = "cuda"))]
+#[path = "sdpa_plan_bucket_tests.rs"]
+mod sdpa_plan_bucket_tests;
+
 // Numeric-parity, determinism, and SGY-invariance tests for the fused
 // single-token decode-MoE GeGLU kernel (#886). GPU-only (Metal or CUDA);
 // they skip on CPU-only builds.
 #[cfg(test)]
 #[path = "fused_moe_parity_tests.rs"]
 mod fused_moe_parity_tests;
+
+// Parity for `fused_moe_forward`'s opt-in squared-ReLU kernel branch
+// (`MLXCEL_FUSED_MOE_RELU2`, ROCm port in #2069) against a dense f32 reference
+// and the `gather_qmm` branch. Metal and ROCm; skips elsewhere.
+#[cfg(test)]
+#[path = "fused_moe_relu2_parity_tests.rs"]
+mod fused_moe_relu2_parity_tests;
 
 // Statistical-correctness, determinism, and routing tests for the Gumbel-max
 // sampling kernel (#900). The kernel replaces `random::categorical` with a
@@ -3645,6 +4159,19 @@ mod sampling_gumbel_tests;
 #[cfg(test)]
 #[path = "sampling_rejection_tests.rs"]
 mod sampling_rejection_tests;
+
+// Fixed-key and graph-parity tests shared by every port of the two sampler
+// kernels (#2064): the kernel's draw recomputed from the key it consumed, and a
+// two-sample test against the graph sampler. GPU-only; they skip without a port.
+#[cfg(test)]
+#[path = "sampling_fixed_key_tests.rs"]
+mod sampling_fixed_key_tests;
+
+// A `top_k` at or above the vocabulary is "no top-k" on every fused sampler
+// entry point instead of aborting the process in `argpartition` (#2247).
+#[cfg(test)]
+#[path = "sampling_top_k_vocab_tests.rs"]
+mod sampling_top_k_vocab_tests;
 
 // Numeric-parity, Gemma `(1 + w)` convention, kill-switch and greedy-argmax
 // tests for the fused residual-add RMSNorm kernel (#905). GPU-only; they skip
@@ -3671,6 +4198,17 @@ mod cuda_test_serialization_tests;
 #[path = "fused_norm_parity_tests.rs"]
 mod fused_norm_parity_tests;
 
+#[cfg(test)]
+#[path = "mamba1_scan_parity_tests.rs"]
+mod mamba1_scan_parity_tests;
+
+// Kernel-against-graph parity for the fused single-token Mamba2 SSM update
+// (#2067) at the granite-4.0-h-tiny and Nemotron-H shapes, f32 and bf16, plus
+// the `MLXCEL_SSM_KERNEL` kill switch. GPU-only; they skip on CPU-only builds.
+#[cfg(test)]
+#[path = "ssm_update_parity_tests.rs"]
+mod ssm_update_parity_tests;
+
 // Numeric regression tests for `fast::rms_norm` on the small-axis CUDA dispatch
 // band (#830/#831): the deleted pre-#3792 overlay read past its shared scratch
 // for 16-bit axes in (256, 512] (f32: (128, 256]), which is exactly the
@@ -3680,6 +4218,13 @@ mod fused_norm_parity_tests;
 #[path = "rms_norm_small_axis_tests.rs"]
 mod rms_norm_small_axis_tests;
 
+// The wavefront rule every ROCm port table lookup applies (#2147). Pure, so
+// it runs on every backend; the device-level tests are in the root crate's
+// `tests/rocm_wave_size.rs` and `tests/rocm_wave64_port_refusal.rs`.
+#[cfg(test)]
+#[path = "kernel_port_tests.rs"]
+mod kernel_port_tests;
+
 // RoPE-parity tests for the fused q/k RoPE + KV-append-layout kernel (#905):
 // position offsets including the absolute positions rotated/ring caches use,
 // both rotation conventions, partial rope dims, and both destination layouts.
@@ -3688,18 +4233,28 @@ mod rms_norm_small_axis_tests;
 #[path = "fused_rope_parity_tests.rs"]
 mod fused_rope_parity_tests;
 
-/// Pin f32 GEMMs to full precision for this test process (issue #1259).
+/// Pin f32 GEMMs to full precision for this test process (issues #1065,
+/// #1088, #1259).
 ///
-/// MLX selects its reduced-precision NAX matmul kernel as
-/// `is_nax_available() && (enable_tf32() || dtype != float32)`, and
-/// `MLX_ENABLE_TF32` defaults to 1 in `mlx/utils.h`, so on Apple GPU
-/// generation 17 an f32 GEMM runs at TF32-class precision. The suite's
-/// algorithm-equivalence tests (chunked vs sequential, prefill vs the
-/// single-token chain, absorbed vs decompressed) assert full-f32 agreement
-/// and break under that default, on this hardware only. Shipped numerics
+/// `MLX_ENABLE_TF32` defaults to 1 in `mlx/utils.h`, and MLX then runs an
+/// f32 GEMM at TF32-class precision (10-bit mantissa inputs) on two
+/// backends: CUDA Ampere and later through cuBLAS
+/// `CUBLAS_COMPUTE_32F_FAST_TF32`, and Apple GPU generation 17 through the
+/// NAX kernel (`is_nax_available() && (enable_tf32() || dtype != float32)`).
+/// The suite's algorithm-equivalence tests (chunked vs sequential, prefill
+/// vs the single-token chain, absorbed vs decompressed) assert full-f32
+/// agreement and break under that default; which ones break depends on
+/// whether a fixture's shapes reach the GEMM rather than MLX's gemv or SDPA
+/// kernels, so the set differs per backend. `tf32_pin_tests` fails on both
+/// backends if this pin stops taking effect. Shipped numerics
 /// stay on MLX defaults and are covered by the runtime exactness probes
 /// instead. This runs before `main`, before MLX latches the value into its
 /// process-wide static; an explicit operator setting wins.
+// Sentinel for the pin below: an f32 GEMM checked against an f64 reference.
+#[cfg(test)]
+#[path = "tf32_pin_tests.rs"]
+mod tf32_pin_tests;
+
 #[cfg(test)]
 #[ctor::ctor(unsafe)]
 fn pin_full_precision_f32_matmuls_for_tests() {

@@ -31,7 +31,7 @@ or test scaffolding.
 | `metal` | off | Apple Silicon Metal GPU backend (delegates to `mlxcel-core/metal`). Standard on macOS. |
 | `accelerate` | off | Apple Accelerate CPU BLAS backend (delegates to `mlxcel-core/accelerate`). Standard on macOS. |
 | `cuda` | off | NVIDIA CUDA GPU backend (delegates to `mlxcel-core/cuda`). Required on NVIDIA hosts; a plain build is CPU-only (see the footgun note below). |
-| `rocm` | off | AMD GPU backend on Linux (delegates to `mlxcel-core/rocm`), built from the ROCm overlay in `src/lib/mlx-cpp/patches-rocm/`. Cannot be combined with `cuda` or `metal`. Experimental; see [Linux with AMD ROCm](#linux-with-amd-rocm-experimental). |
+| `rocm` | off | AMD GPU backend on Linux (delegates to `mlxcel-core/rocm`), built from the ROCm overlay in `src/lib/mlxcelverse/overlays/rocm/`. Cannot be combined with `cuda` or `metal`. Experimental; see [Linux with AMD ROCm](#linux-with-amd-rocm-experimental). |
 | `experimental-backend` | off | Reserves the non-MLX compute-backend seam slot (issue #338). Ships no kernels and adds no runtime dispatch; it only compiles the plug-in boundary where a future non-MLX engine (e.g. FuriosaAI RNGD) would implement `ComputeBackend`. `select_backend()` still folds to MLX. |
 | `xla-backend` | off | OpenXLA / StableHLO backend seam (issue #449, [ADR 0004](adr/0004-compute-backend-session-seam-and-stablehlo-family.md)). Pulls in `mlxcel-xla` and compiles the `Backend::Xla` / `Session::Xla` arms and the `MLXCEL_BACKEND=xla` selector, but no native execution engine: the crate is pure-Rust stubs plus the StableHLO graph emitter, so CI builds it unchanged. |
 | `xla-iree` | off | `xla-backend` plus real IREE execution (`mlxcel-xla/iree`). Compiles a C shim against a prebuilt IREE runtime and drives the bundled prefill / decode_step graphs. Needs `IREE_DIST` (or the source-build vars below) at build time, so it is a local / opt-in build, not a CI or release default. |
@@ -63,6 +63,11 @@ builds, so those binaries compile none of it and the seam folds to MLX:
   - `IREE_CUDA_HOME` (+ `IREE_CUDA_COMPILE`): a source-built CUDA-enabled IREE
     runtime and a matching cuda-capable `iree-compile`, for the GB10-class GPU
     path. `scripts/iree/setup-cuda.sh` produces this tree.
+  - `IREE_ROCM_HOME` (+ `IREE_ROCM_COMPILE`): a source-built HIP/ROCm-enabled
+    IREE runtime (`IREE_HAL_DRIVER_HIP=ON`) and a matching rocm-capable
+    `iree-compile`, for the AMD ROCm GPU path (`gfx1151` / `gfx1100` /
+    `gfx942`). `scripts/iree/setup-rocm.sh` (or `make iree-rocm`) produces this
+    tree and prints the matching environment.
   - `IREE_MACOS_HOME` (+ `IREE_MACOS_COMPILE`): a source-built macOS runtime and
     a Metal-capable `iree-compile`, for the Apple Silicon dev path.
     `scripts/iree/setup-macos.sh` produces this tree and prints the matching
@@ -96,6 +101,12 @@ git clone https://github.com/lablup/mlxcel.git
 cd mlxcel
 cargo build --release --features metal,accelerate
 ```
+
+On macOS, MLX also enables Metal and Accelerate for a plain `cargo build --release`; the explicit features above document the intended backend. Runtime controls such as the MTP `qmv_wide` retry follow the backend actually built, including plain builds. `MLXCEL_BUILD_METAL=OFF` disables the Metal backend and its controls even if the Cargo `metal` feature is selected.
+
+To verify the runtime controls without loading a checkpoint, run `cargo run -p mlxcel-core --profile test-fast --example metal_runtime_switch_probe`. It checks both QMV selection and the decode command-buffer override, then restores their previous values. It reports a skip when no Metal device is available.
+
+For an older plain macOS build affected by [#1988](https://github.com/lablup/mlxcel/issues/1988), start a fresh process with `MLXCEL_QMV_WIDE=0` before the existing server command. This pins the narrower Metal projection kernel at startup while keeping the exactness gate enabled. It may reduce throughput, applies only to Metal, and still requires the loaded model's probe to pass.
 
 The build outputs:
 
@@ -164,24 +175,94 @@ CUDA_HOME=/opt/cuda cargo build --release --features cuda
 
 
 `src/lib/mlxcel-core/build.rs` reads `MLX_CUDA_ARCHITECTURES`. If it is unset,
-the build script tries to detect the compute capability with `nvidia-smi` and
-falls back to `90a` when detection fails. For SM 90 and above it appends CUDA's
-architecture-specific `a` suffix (so `90` becomes `90a`), because the dedicated
-Hopper quantized kernel (`qmm_sm90`) is only compiled when `90a` is in the arch
-list. An explicitly set `MLX_CUDA_ARCHITECTURES` is used verbatim, so include the
-suffix yourself for Hopper (`90a`).
+the build script detects the compute capability with `nvidia-smi` and spells it
+the way the release workflow spells it: Hopper gets CUDA's architecture-specific
+`a` suffix (`90` becomes `90a`), and Blackwell (`sm_100`, `sm_120`, `sm_121`)
+stays plain. Detection failure falls back to `90a`. An auto-detected build and a
+published one therefore differ in which architectures they cover and never in
+what machine code those architectures get, which is the point: before issue
+#1943 the rule suffixed everything from SM 90 up, so a default build on a GB10
+produced `121a` while the release archives for the same card carried `121`.
+
+An explicitly set `MLX_CUDA_ARCHITECTURES` is used verbatim, so spell it the same
+way by hand: `90a` for Hopper, plain for Blackwell. The rest of this section is
+why Blackwell is plain.
+
+On Blackwell the `a` suffix decides something else. MLX compiles the hardware
+block-float converters in `mlx/backend/cuda/quantized/nvfp4_quantize.cuh`, the
+ones that issue `cvt.rn.satfinite.e2m1x2.f32`, only when nvcc is compiling for
+an architecture-specific target, which it signals with `__CUDA_ARCH_SPECIFIC__`.
+A plain `121` build therefore compiles them out, and both NVFP4 and MXFP4
+quantization fall back to a scalar CUTLASS conversion sequence with nothing in
+the build output saying so.
+
+Putting `121a` in the list would fix that by charging every translation unit
+for it. CUTLASS derives `CUTLASS_ARCH_MMA_SM121A_ENABLED` from the same macro,
+so the decode kernels compile differently too, and on a device the suffix
+matches, the architecture-specific image is the one the driver loads rather
+than an alternative it can ignore. On this project's GB10 that is 12.7 MB of
+extra archive and a different `qmv` on every Blackwell machine, to fix a
+converter no decode kernel calls.
+
+So the list stays plain and `src/lib/mlxcelverse/CMakeLists.txt` adds the
+architecture-specific image to `fp_quantize.cu` alone, which is the only
+translation unit that can reach those converters. You get the hardware path
+without asking for it, and without it reaching anything else. Building with
+`121a` is a step backwards, not a step forwards, and it is also self-defeating:
+the injection skips a capability the list already names architecture-specific,
+because asking nvcc for the same `--generate-code` twice is an error rather than
+a no-op. `121f` is worse still, because it satisfies the converters' dispatcher
+gate but not their own gate and fails to compile outright.
+
+Hopper's `90a` is a different case: it is what both release lists ship, so the
+auto-detected spelling matches it. At the current MLX pin the suffix no longer
+gates anything on its own. Upstream commit `44540d12` moved `qmm_sm80`,
+`qmm_sm90` and `gather_gemm` to runtime NVRTC compilation and removed the
+`MLX_CUDA_SM90A_ENABLED` definition an earlier version of this section cited,
+and `jit_module.cpp` now derives the NVRTC `--gpu-architecture` from the running
+device, appending `a` itself from compute capability 9 up. Cross-compiling the
+pinned tree at `90` and at `90a` agrees: `qmm_sm90.cu`, `qmm.cu` and
+`qmm_sm80.cu` emit no device function at either spelling, and `qmv.cu` and
+`fp_qmv.cu` emit identical SASS apart from the `EF_CUDA_ACCELERATORS` header
+flag that marks a cubin architecture-specific.
+`CUTLASS_ARCH_MMA_SM90A_ENABLED` still keys on `__CUDA_ARCH_FEAT_SM90_ALL`, so
+a later pin can make it matter again.
 
 ```bash
-# Hopper / GH200-style target. The `a` suffix is required for the Hopper
-# quantized kernel; plain `90` builds without it.
+# Hopper / GH200-style target, spelled the way the release workflow spells it.
 MLX_CUDA_ARCHITECTURES=90a cargo build --release --features cuda
 
-# GB10 / DGX Spark-style target used by the release workflow.
+# GB10 / DGX Spark-style target used by the release workflow. Plain: the
+# hardware NVFP4/MXFP4 converter is added to one translation unit by CMake.
 MLX_CUDA_ARCHITECTURES=121 cargo build --release --features cuda
 
 # Multiple targets, if your MLX/CUDA toolchain supports them.
 MLX_CUDA_ARCHITECTURES="90a;121" cargo build --release --features cuda
 ```
+
+To confirm what a finished build carries, read the archive rather than the
+environment variable. A correct Blackwell build has the fp4 instruction in
+`fp_quantize.cu.o`, exactly one architecture-specific image in the whole
+archive, and its forward-JIT PTX untouched:
+
+```bash
+A=$(ls -d target/release/build/mlxcel-core-*/out/build/lib/libmlx.a | head -1)
+mkdir -p /tmp/mlxq && (cd /tmp/mlxq && ar x "$A" fp_quantize.cu.o qmv.cu.o)
+cuobjdump --dump-sass /tmp/mlxq/fp_quantize.cu.o | grep -c F2FP.SATFINITE.E2M1  # > 0
+cuobjdump --list-elf  /tmp/mlxq/qmv.cu.o | grep -c 'sm_[0-9]*a'                 # 0: decode untouched
+cuobjdump --list-elf  "$A" | grep -c 'sm_[0-9]*a'                               # 1
+cuobjdump --dump-ptx  "$A" | grep -c '.target sm_121$'                          # > 0
+```
+
+One checkout can hold several of those build directories, one per feature set
+and architecture list, so confirm the one you are reading is the one you meant:
+`grep MLX_CUDA_ARCHITECTURES "$(dirname "$A")/../CMakeCache.txt"` names the list
+it was configured with.
+
+Do not look for `cvt.rn.satfinite.e2m1x2` in the PTX. The injection emits a
+cubin and no PTX, and the PTX that is emitted comes from the plain `compute_121`
+pass, which takes the fallback arm, so that grep returns zero on a correct
+build. The SASS count above is the one that distinguishes the two builds.
 
 If the architecture list a binary was built with does not cover the GPU it is
 started on, it refuses to start and says so, naming both the list it carries and
@@ -201,13 +282,31 @@ wrong architecture can still be run on the CPU while a correct one is built.
 The repository release workflow builds two Linux CUDA targets on self-hosted
 runners, each as one fat binary: aarch64 covering GH200 (`90a`), GB200 (`100`),
 and GB10 (`121`) in a single build (`90a;100;121`), and x86_64 covering Ampere
-through Blackwell (`80;86;89;90a;100;120`). For each target the `mlxcel` CLI and the
+through Blackwell (`80;86;89;90a;100;120`). Blackwell is plain in both for the
+reason above, with the hardware converter added to one translation unit by
+CMake. For each target the `mlxcel` CLI and the
 `mlxcel-server` are published as separate archives (`mlxcel-...` and
 `mlxcel-server-...`, each roughly 347 MB) so a consumer downloads only the one
 it needs. Every published release also ships a CycloneDX SBOM named
 `sbom-<version>.cyclonedx.json.gz` for supply-chain transparency and
 vulnerability scanning. Treat other GPU/OS combinations as source builds that
 need local validation.
+
+### ROCm architecture selection
+
+`src/lib/mlxcel-core/build.rs` reads `MLX_ROCM_ARCHITECTURES`. If it is unset, the build script asks `rocminfo` for the GPU agent's `gfx` target and fails with a named error when no agent is reported, which is what happens in a container that cannot reach `/dev/kfd`. Setting the variable bypasses detection entirely and is used verbatim, so a build host with no visible GPU can still produce a binary for one.
+
+```bash
+# The Radeon 8060S (Ryzen AI MAX+ 395) used for ROCm validation.
+MLX_ROCM_ARCHITECTURES=gfx1151 cargo build --release --features rocm
+
+# Multiple targets, semicolon-separated.
+MLX_ROCM_ARCHITECTURES="gfx1100;gfx1151" cargo build --release --features rocm
+```
+
+HIP coverage is not the ordering CUDA coverage is. A CUDA cubin runs on a higher minor revision and its PTX JITs forward across majors, so a list can cover a device it does not name. A HIP code object is built for one `gfx` target and runs on that target only, with no JIT fallback, so `gfx1151` and `gfx1150` are unrelated despite the adjacent numbers and a list covers exactly the targets it names. Target-feature suffixes (`gfx90a:xnack+`) select code-object features on one target rather than naming another, so they are ignored when the list is compared against the device.
+
+A binary whose compiled `gfx` list does not contain the device it is started on refuses to start and names both, rather than failing later with an opaque HIP error at the first kernel launch (issue #1805). Set `MLXCEL_TRACE_ARCH` (see [Environment variables](environment-variables.md)) to print the running target, the compiled list and whether it is covered; the same summary appears next to the `Detected N GPU(s)` line at startup, alongside the device name and its memory. `MLXCEL_DEVICE=cpu` bypasses the refusal, so a binary built for the wrong target can still run on the CPU while a correct one is built.
 
 ### Prebuilt CUDA artifact: runtime requirements
 
@@ -273,21 +372,23 @@ MLXCEL_CXX_MARCH=none cargo build --release --features cuda
 
 **Experimental.** AMD GPU support on Linux was added in lablup/mlxcel#1802 and
 is tracked by lablup/mlxcel#1801. It is a source build only: there is no
-release artifact and no ROCm CI job yet, and the gaps listed below are open.
+release artifact and no ROCm CI job running yet, and the gaps listed below are open.
 
 The backend is not part of upstream MLX. mlxcel vendors the ROCm backend from
 the `rocm-support` branch of
 [NripeshN/mlx](https://github.com/NripeshN/mlx/tree/rocm-support) (MIT) into
-`src/lib/mlx-cpp/patches-rocm/` and applies it on top of the same pinned MLX
+`src/lib/mlxcelverse/overlays/rocm/` and applies it on top of the same pinned MLX
 commit that the Metal and CUDA builds use. See
 [mlxcelverse](architecture.md#mlxcelverse-the-mlx-side-layer) for how the
-overlay is organized, and `src/lib/mlx-cpp/patches-rocm/LOCAL_FIXES.md` for the
+overlay is organized, and `src/lib/mlxcelverse/overlays/rocm/LOCAL_FIXES.md` for the
 changes mlxcel carries on top of the fork.
 
 Tested configuration: AMD Ryzen AI MAX+ 395 with Radeon 8060S (`gfx1151`,
 RDNA 3.5) and a 96 GiB VRAM carve-out, Debian 13, ROCm 10.0.0 packages
 (HIP 7.15, AMD clang 23). Other RDNA 3, 3.5 and 4 parts are expected to build;
-CDNA parts (for example MI300) compile but carry no tuning.
+CDNA parts (for example MI300) compile but carry no tuning, and on them the
+fused kernels that reduce across a 32-lane wavefront fall back to the MLX
+graph until validated (see "Wave64 devices" below).
 
 ### Prerequisites
 
@@ -326,6 +427,34 @@ make release-rocm
 naming the conflict. The first build compiles the MLX device code with `hipcc`,
 which takes a few minutes on top of the Rust build.
 
+Incremental builds track headers: `hipcc` writes a dependency file next to
+each HIP object, so after you change a header under
+`src/lib/mlxcelverse/overlays/rocm/`, the next build recompiles exactly the `.hip`
+files that include it, directly or transitively, and a build with no change
+recompiles none. The overlay reaches the build tree through CMake's
+`configure_file`, which rewrites a copy only when its content differs, so a
+bare `touch` of an overlay header rebuilds nothing; its content has to change.
+The dependency files also list ROCm and system headers, so updating those
+rebuilds every HIP object on its own. They do not list headers that only the
+device compilation includes (today only rocWMMA's), nor the compiler itself.
+
+To force a clean HIP rebuild anyway (for example after upgrading `hipcc` or
+rocWMMA, or to rule out a stale object while bisecting), delete the HIP objects
+of the build profile you use and touch any overlay file so that Cargo reruns
+the build script:
+
+```bash
+rm -rf target/release/build/mlxcel-core-*/out/build/_deps/mlx-build/mlx/backend/rocm/hip_objs
+touch src/lib/mlxcelverse/overlays/rocm/mlx/backend/rocm/CMakeLists.txt
+cargo build --release --features rocm
+```
+
+Replace `release` with the profile directory you build (`debug`, `test-fast`,
+and so on). Without the `touch`, Cargo sees no changed input, skips the build
+script and keeps linking the old kernels. `cargo clean -p mlxcel-core
+--release` (or `--profile <name>`) also forces it, but rebuilds the whole MLX
+C++ library too.
+
 ### HIP architecture selection
 
 The build compiles MLX device code for the `gfx` targets that `rocminfo`
@@ -355,6 +484,13 @@ A GPU run prints `Runtime device: GPU` at startup, and the process appears in
 ./target/release/mlxcel generate -m models/mlx/Qwen3-0.6B-4bit -p "Hello" -n 50 --temp 0
 ```
 
+To take the per-row MoE kernels instead of the expert-batched `gather_qmm` kernel
+(on by default for bf16 and f16 affine and for bf16 mxfp4), for example to A/B
+a throughput change or to bisect a MoE regression, set
+`MLX_ROCM_GATHER_QMV_EXPERT_BATCHED=0`. The variable is read on every call. It
+and the other ROCm variables the backend reads at run time are listed in
+[ROCm backend variables](environment-variables.md#rocm-backend-variables).
+
 On a UMA host the GPU shares memory with the operating system and with any
 other GPU process, so check `rocm-smi --showpids` for other tenants before
 loading a large model.
@@ -363,9 +499,12 @@ To check the HTTP server rather than the CLI, start it and run the chat smoke
 script against it. Both a dense and an affine MoE checkpoint pass on `gfx1151`;
 the results are in
 [`docs/benchmark_results/rocm-correctness-gfx1151-2026-09-12.md`](benchmark_results/rocm-correctness-gfx1151-2026-09-12.md).
+A sliding-window model, two SSM hybrids and a VLM were added, and compared
+against an Apple M5 Max Metal reference, in
+[`docs/benchmark_results/rocm-correctness-gfx1151-2026-09-30.md`](benchmark_results/rocm-correctness-gfx1151-2026-09-30.md).
 
 ```bash
-MLXCEL_FUSED_MOE=0 ./target/release/mlxcel-server -m models/mlx/Qwen3-30B-A3B-4bit --port 8080 &
+./target/release/mlxcel-server -m models/mlx/Qwen3-30B-A3B-4bit --port 8080 &
 ./scripts/server_chat_smoke.sh --port 8080
 ```
 
@@ -374,26 +513,99 @@ streaming and non-streaming. It counts the reasoning channel as output, so a
 thinking model that spends its whole budget inside the thinking block reports
 `channel=reasoning only` rather than looking like an empty response.
 
+bf16 and f16 GEMMs on gfx11 (hipBLASLt, and rocBLAS with a bf16 output) run
+on `v_wmma_f32_16x16x16_bf16` and its f16 twin, which do not add
+opposite-sign terms the IEEE way: `1 + -1` in one instruction gives `-2^-24`.
+An output whose exact value is zero can therefore come back as a value like
+`-2^-22`, even for integer inputs. The error measured within 2.1% of the
+standard f32 dot-product bound `K u sum_k |a_k b_k|` and no hipBLASLt solution
+avoids the instruction, so the backend leaves it alone; tests that compare
+bf16 GEMMs on ROCm do so within that bound rather than exactly. The
+measurements, kernels and probes are in
+[`docs/benchmark_results/rocm-bf16-gemm-residue-gfx1151-2026-10-08.md`](benchmark_results/rocm-bf16-gemm-residue-gfx1151-2026-10-08.md)
+(lablup/mlxcel#2206).
+
+Decode and prefill throughput on `gfx1151`, against mlx-lm on the same host, is
+in
+[`docs/benchmark_results/rocm-baseline-gfx1151-2026-09-30.md`](benchmark_results/rocm-baseline-gfx1151-2026-09-30.md);
+`scripts/bench_decode.sh` recognises a ROCm host on its own (see
+[Benchmarks](benchmarks.md#rocm-hosts-issue-1810)).
+Where that decode time goes, per kernel, and the order the #1814 kernel ports
+should land in, is in
+[`docs/benchmark_results/rocm-decode-profile-gfx1151-2026-09-30.md`](benchmark_results/rocm-decode-profile-gfx1151-2026-09-30.md).
+The unified decode engine (epic #2166) was verified on `gfx1151` after it
+merged: the ROCm gate, every ROCm-only test, CLI-vs-server parity (dense and
+paged) and decode throughput against the pre-epic loop, in
+[`docs/benchmark_results/rocm-unified-engine-gfx1151-2026-10-08.md`](benchmark_results/rocm-unified-engine-gfx1151-2026-10-08.md).
+
+#### Memory footprint
+
+Two defaults keep the allocator's footprint close to the weights
+(lablup/mlxcel#2062). Measured on `gfx1151` at pp512/tg128, the MLX peak for
+Meta-Llama-3.1-8B-Instruct-4bit went from 20.60 GB to 6.14 GB and for
+Qwen3-30B-A3B-4bit from 23.56 GB to 18.58 GB, with decode throughput
+unchanged and prefill within 2%; the breakdown and every knob compared are in
+[`docs/benchmark_results/rocm-memory-gfx1151-2026-09-30.md`](benchmark_results/rocm-memory-gfx1151-2026-09-30.md).
+
+- **In-flight bound, `MLX_ROCM_MAX_INFLIGHT_MB` (default 1024).** Most of
+  the old peak was not cache: a prefill allocates a transient for every
+  operation (for an f16 4-bit model on the dequantize-and-GEMM path, an f16
+  copy of each weight matrix), each one is released only when its command batch
+  finishes on the GPU, and the host could encode far ahead of the GPU. The
+  backend now commits a batch once it has allocated a quarter of this budget
+  and waits for the oldest batch while more than the budget is in flight, so
+  the transients stay within roughly this many MiB (the count is of
+  allocations, so it is approximate). `0` restores the unbounded behavior.
+- **Buffer-cache bound, `MLXCEL_CACHE_LIMIT` (default 2 GiB on ROCm).** Freed
+  buffers are cached for reuse, and the ROCm allocator only reuses a buffer of
+  exactly the requested size, with a cache limit that defaulted to its memory
+  limit (76.8 GiB here). A ROCm build now caps the cache at 2 GiB unless
+  `MLXCEL_CACHE_LIMIT` says otherwise; `0` or `none` removes the cap. Before
+  this change the allocator ignored the cache limit altogether, so
+  `MLXCEL_CACHE_LIMIT` had no effect on ROCm. Decode throughput did not move
+  between 128 MiB and no cap on either model; prefill lost 16% on the 8B at
+  128 MiB, because each f16 weight copy is reallocated once the cache cannot
+  hold it, and nothing measurable from 512 MiB up. 2 GiB is four times that
+  smallest free value, which leaves room for the larger weight copies of
+  bigger models.
+
+The allocator's peak counts live buffers only, so the most the allocator
+holds is the peak plus the cache limit. The memory limit the pre-load
+estimate reads (`memory_limit()`, 76.80 GiB) is unchanged by either default.
+The estimate's total does include the in-flight budget on ROCm builds, as its
+own `Backend in-flight` line in `mlxcel inspect` (lablup/mlxcel#2155): with it
+the estimate is above the measured peak for Llama-3.1-8B, Qwen2.5-7B and
+Qwen3-30B-A3B at 640 and 4096 tokens and budgets from 256 to 4096 MiB, where
+the 1.20 headroom factor alone fell short for the dense models.
+
 ### Current status
 
 | Area | Status on ROCm |
 |------|----------------|
 | Affine 4-bit / 8-bit checkpoints | Run natively. |
-| mxfp8 and mxfp4 checkpoints | Run natively, including MoE experts through `gather_qmm` (for example gpt-oss-20b-MXFP4-Q4). |
-| NVFP4 checkpoints | No native kernel; load-time conversion is tracked in lablup/mlxcel#1806. |
-| Affine MoE models (for example Qwen3-30B-A3B) | Set `MLXCEL_FUSED_MOE=0`; the fused MoE path aborts on ROCm until lablup/mlxcel#1803. |
-| mlxcel's fused kernels (sampling, fused norm, RoPE + KV append, paged attention) | Run as MLX graph fallbacks on the paths that have one (lablup/mlxcel#1803); ROCm ports are lablup/mlxcel#1814. |
-| GPU faults | May show up as NaN output or a hang instead of an error (lablup/mlxcel#1804). |
-| Memory estimation on UMA hosts | Reads host RAM, not the VRAM carve-out; set `MLXCEL_MEMORY_LIMIT` if a model that fits is refused (lablup/mlxcel#1805). |
-| Diagnostics | Print a CUDA compute capability line for the AMD device (lablup/mlxcel#1805). |
+| mxfp8 and mxfp4 checkpoints | Run natively, including MoE experts through `gather_qmm` (for example gpt-oss-20b-MXFP4-Q4). The load log says so once per mode (`Quantization mode mxfp4: running on native ROCm kernels, no load-time conversion ...`). mxfp4 `quantize`, `quantized_matmul` and `gather_qmm` are checked against CPU references by `tests/rocm_mxfp4_quant.rs` (lablup/mlxcel#1808). Vendor FP8 block checkpoints (`quant_method: fp8`, 128x128 blocks) are requantized to mxfp8 at load and run natively; verified end to end on a dense 0.8B Qwen3.5 FP8 checkpoint, with mxfp8 `gather_qmm` and `quantized_matmul` checked by `models::switch_layers::mxfp_tests`. The official Qwen3.5 FP8 MoE releases have not been run on ROCm (lablup/mlxcel#1807). |
+| NVFP4 checkpoints | No native kernel. ModelOpt NVFP4 checkpoints (for example the Gemma 4 NVFP4 exports) are converted to affine 4-bit at load with no environment variables, and the load log names the route and the reason. A layer that cannot be converted fails the load with its name and the reason. MLX-native NVFP4 exports (`"mode": "nvfp4"` in `config.json`, such as `mlx-community/*-nvfp4`) have no load-time conversion and are refused at load; use an affine export instead (lablup/mlxcel#1806). |
+| Affine MoE models (for example Qwen3-30B-A3B) | Run natively. Single-token decode takes the fused two-kernel MoE path (gate-up, then down) through its HIP port (lablup/mlxcel#2065), as on Metal and CUDA: Qwen3-30B-A3B-4bit decode on `gfx1151` went from 61.3 to 62.5 tok/s, with logits matching Metal's fused kernel at every decided position ([results](benchmark_results/rocm-fused-moe-gfx1151-2026-10-05.md)); `MLXCEL_FUSED_MOE=0` selects the `gather_qmm` graph path instead. Experts wider than `MLXCEL_FUSED_MOE_MAX_DFF` (8192 by default, as on CUDA; Mixtral-8x7B's 14336) stay on `gather_qmm`. |
+| Model-specific fused kernels (Apertus xIELU, Cohere2 add3 + LayerNorm, Mamba1 selective scan, Nemotron-H's opt-in `MLXCEL_FUSED_MOE_RELU2`) | Run as HIP ports (lablup/mlxcel#2069). xIELU and the add3 LayerNorm are byte-identical to ROCm's own unfused graph; the Mamba1 scan keeps its state in f32 as on Metal; the relu2 path is performance-neutral on Nemotron-H and stays opt-in. Apertus, Cohere2 and the Mamba1 families have no checkpoint on the tested host, so they are covered by kernel tests only ([results](benchmark_results/rocm-metal-only-ports-gfx1151-2026-10-05.md)). |
+| Fused residual-add RMSNorm and RoPE + KV append (`MLXCEL_FUSED_ADD_RMSNORM`, `MLXCEL_FUSED_ROPE_APPEND`) | On by default on ROCm (lablup/mlxcel#2145), off on Metal and CUDA. Both run as HIP ports (lablup/mlxcel#2063) whose output is byte-identical to the graph they replace, so they change no logits; decode on `gfx1151` was never slower with them (+0.3% on Llama 3.1 8B, +1.7% on Qwen2.5 7B, inside run-to-run drift). Set either variable to `0` to fall back to the graph. Llama 3.1 keeps the graph RoPE because of its `rope_scaling` table; Gemma and IQuest Loop Coder also take the norm port but have no checkpoint measured on ROCm ([results](benchmark_results/rocm-fused-norm-rope-gfx1151-2026-10-05.md)). |
+| Paged attention (the server's batched paged decode, MLA split-KV, sparse paged decode) | The v1 decode, v2 partial and merge kernels run as HIP ports (lablup/mlxcel#2068), so these paths take the fused kernels instead of gather-then-SDPA, as on Metal and CUDA; the kernels' tests match the gather and host references on `gfx1151`. Server decode on `gfx1151` with Meta-Llama-3.1-8B-Instruct-4bit, against the gather path on the same binary: 1.28x per-request decode at batch 4 and ~16K tokens, 1.40x and 1.77x for one sequence at ~16K and ~32K, no measurable change at batch 4 and ~4K ([results](benchmark_results/rocm-paged-attention-gfx1151-2026-10-05.md)). `MLXCEL_PAGED_ATTENTION_NATIVE=0` forces the gather path. |
+| Sampled decode (`temperature > 0`) | The fused Gumbel-max sampler (no filter) and the dual-pivot rejection sampler (top-p, and the other filter combinations its routing admits) run as HIP kernels, as on Metal and CUDA (lablup/mlxcel#2064). On `gfx1151` with Meta-Llama-3.1-8B-Instruct-4bit, decode at `--temperature 0.8 --top-p 0.95` went from 33.98 to 37.56 tok/s (medians of three; the before runs drifted from 36.26 down to 32.81, the after runs held 37.06 to 37.82); at `--temperature 0.8` alone the change is inside the noise ([results](benchmark_results/rocm-samplers-gfx1151-2026-10-05.md)). At the Llama 3 vocabulary (128256) and at Qwen's 151936 and 152064, top-p alone, top-p with min-p, and top-k with top-p (for example `--top-k 40 --top-p 0.95`) take the rejection kernel; top-k alone, min-p alone, and top-k with min-p take the stock chain. A ROCm build routes top-k with top-p up to vocab 152064 (32768 on Metal and CUDA): with it, `--temperature 0.8 --top-k 40 --top-p 0.95` decode went from 33.15 to 37.73 tok/s on Meta-Llama-3.1-8B-Instruct-4bit and from 41.91 to 46.92 tok/s on Qwen2.5-7B-Instruct-4bit (medians of three interleaved pairs, [joint-cap results](benchmark_results/rocm-rejection-joint-cap-gfx1151-2026-10-07.md), lablup/mlxcel#2157). `MLXCEL_SAMPLING_GUMBEL=0` and `MLXCEL_SAMPLING_REJECTION=0` force the graph. |
+| Hybrid SSM decode (granite-4.0-h, falcon-h1, plamo-2, Nemotron-H) | The single-token Mamba2 SSM update runs the fused HIP kernel instead of the ~55-op SSD graph (lablup/mlxcel#2067): decode on `gfx1151` went from 60.4 to 88.4 tok/s on granite-4.0-h-tiny-4bit and from 51.4 to 74.4 tok/s on Nemotron-3-Nano-30B-A3B-4bit, with model logits matching the graph and Metal's kernel at every decided position ([results](benchmark_results/rocm-ssm-update-kernel-gfx1151-2026-10-04.md)). Measured on granite and Nemotron-H; falcon-h1 and plamo-2 take the same gate but have not been run on ROCm. `MLXCEL_SSM_KERNEL=0` forces the graph. |
+| GPU faults | Reported as errors (lablup/mlxcel#1804). A launch HIP rejects (an oversized block, no code object for the device) fails the evaluation that issued it and the device stays usable. An asynchronous fault (an out-of-bounds access) fails the evaluation waiting on it within about a second instead of hanging or returning NaN; the server fails that request and answers later ones with the same error, because after a queue fault the HIP runtime rejects every call for the rest of the process, so the process has to restart, and its shutdown may need a SIGKILL (HIP's teardown waits on callbacks the faulted queue never runs). A kernel that never finishes is not detected; `MLX_ROCM_GPU_WATCHDOG_SECS` (default off) fails any single host wait that outlives it. |
+| Memory estimation on UMA hosts | Correct. Measured on the tested configuration: the ROCm allocator reports a nonzero cap (76.80 GiB of the 96 GiB carve-out), which the estimator reads before it would ever reach host RAM, so nothing that fits the carve-out is refused for that reason (lablup/mlxcel#1805). |
+| Diagnostics | Report the AMD vendor, device name, `gfx` target and device memory, and no longer print a CUDA compute capability for it (lablup/mlxcel#1805). A binary whose compiled `gfx` list does not cover the device refuses to start rather than failing at the first kernel launch. |
+| CPU device on a ROCm build (`MLXCEL_DEVICE=cpu`) | Runs, but slowly: on the tested host a Qwen3-0.6B-4bit decode step takes about two minutes, so it is a correctness reference and an escape hatch for a mismatched `gfx` build, not a serving mode. Before lablup/mlxcel#1807 every attention model aborted at the first token with `NYI`. BLAS work on this device (f32 matmul, convolution, linear algebra) runs on one OpenBLAS thread: with OpenBLAS's default thread count it intermittently wrote wrong output columns into the ROCm allocator's fine-grained memory (lablup/mlxcel#2072, `overlays/rocm/LOCAL_FIXES.md` item 27). |
 | `mlxcel-server` chat completions | Work for dense and affine MoE checkpoints, streaming and non-streaming; verified with `scripts/server_chat_smoke.sh`. |
-| Audio (speech to text, text to speech) | Works. The FFT primitive runs on hipFFT; `MLX_ROCM_FFT_CACHE_SIZE` bounds how many transform plans stay alive (lablup/mlxcel#1825). |
+| Audio (speech to text, text to speech) | Works. The FFT primitive runs on hipFFT; plans are cached up to `MLX_ROCM_FFT_CACHE_SIZE` (default 128, as on CUDA; lablup/mlxcel#1825, #1876); a value that is not a positive integer is ignored with a warning (#2051). |
+| Wave64 devices (CDNA: MI200 `gfx90a`, MI300 `gfx942`) | Not run. The fused HIP kernels that reduce across lanes (BitLinear, the two fused MoE kernels and the squared-ReLU one, the Mamba2 SSM update, the Mamba1 scan, the add3 LayerNorm, the fused residual-add RMSNorm, and the paged-attention v1 decode and v2 partial) have only run on 32-lane wavefronts, and their compile-time wavefront guards do nothing with AMD clang 23. So mlxcel selects them only when the device reports a 32-lane wavefront (the hardware value, which `MLX_ROCM_FORCE_WARP_SIZE` does not change); on a 64-lane device those paths use their MLX graph fallbacks, and stderr says so once per process (lablup/mlxcel#2147). The kernels with no cross-lane operation (xIELU, RoPE + KV append, the paged-attention merge, both samplers) are selected at any width. BitLinear has no graph fallback, so BitNet checkpoints are refused at load on a wave64 device. |
 | Windows, multiple GPUs, distributed inference | Not supported. |
 
 Decode throughput measured on the tested configuration, for orientation only
 (greedy, short prompt): Qwen3-0.6B-4bit about 250 tok/s, Qwen3-30B-A3B-4bit
-about 55 tok/s with `MLXCEL_FUSED_MOE=0`, gpt-oss-20b-MXFP4-Q4 about 3.6 tok/s
-(generic gather kernel). A benchmark page is tracked in lablup/mlxcel#1810.
+about 55 tok/s (measured with `MLXCEL_FUSED_MOE=0`, before lablup/mlxcel#1803
+made that unnecessary; not re-measured since), gpt-oss-20b-MXFP4-Q4 about 8 tok/s
+(generic gather kernel; 8.07 tok/s in the baseline page linked above, up from the
+3.6 tok/s lablup/mlxcel#1818 measured).
 
 ## Runtime environment variables
 
@@ -408,6 +620,8 @@ about 55 tok/s with `MLXCEL_FUSED_MOE=0`, gpt-oss-20b-MXFP4-Q4 about 3.6 tok/s
 | `MLXCEL_QUIET_JIT` | Suppress the one-time "compiling CUDA kernels" notice on a cold first run | unset (notice shown) |
 | `MLXCEL_DEVICE` | Runtime device hint (`gpu`, `metal`, or `cpu`) | `gpu` |
 | `MLXCEL_WIRED_LIMIT` | Apple Silicon wired-memory ceiling, e.g. `64GB`; `0`/`none` disables it | `max` |
+| `MLXCEL_REQUEST_MEMORY_BUDGET` | Lower-only positive byte/size ceiling for [Nemotron-H request admission](request-memory-admission.md), e.g. `24GB`; invalid explicit values stop startup | runtime device/wired/allocator minimum |
+| `MLX_ROCM_*` and other ROCm backend variables | ROCm backend tuning, A/B and diagnostics, for example `MLX_ROCM_GATHER_QMV_EXPERT_BATCHED`, `MLX_ROCM_MAX_INFLIGHT_MB`, `MLX_NO_HIPBLASLT`; see [ROCm backend variables](environment-variables.md#rocm-backend-variables) | see that section |
 | `LLAMA_ARG_*` | Environment-backed server options accepted by clap | unset |
 
 For the complete `MLXCEL_*` reference, see
@@ -566,6 +780,16 @@ covered is a defect that reproduces only under release LTO or `codegen-units = 1
 Reach for `cargo test --release --features metal,accelerate` by hand when you
 are chasing one of those.
 
+### CPU-only link check
+
+A Linux build with no GPU feature compiles MLX without any GPU backend, so MLX's GPU-side helpers (for example `copy_gpu_inplace`) do not exist in it. Bridge C++ under `src/lib/mlxcelverse/kernels/` and `src/lib/mlxcel-core/cpp/` that calls one must sit behind `MLXCEL_BRIDGE_GPU_BACKEND`, which `mlxcel-core/build.rs` defines exactly when MLX builds Metal, CUDA or ROCm. A missed guard is a link error that only this configuration shows: `cargo check` does not link, and every GB10 CI job passes `--features cuda`. Check it locally with a separate target directory so it does not evict a CUDA cache:
+
+```bash
+CARGO_TARGET_DIR=target/cpu cargo test -p mlxcel-core --profile test-fast --lib --no-run
+```
+
+Measured on GB10 (2026-10, lablup/mlxcel#2108): about 2.5 minutes cold, including the CPU-only MLX tree, and about 6 seconds to rebuild and relink after a one-file change in the bridge or in `mlxcel-core`. CI runs the same command as the `CPU-only link` job in `.github/workflows/ci.yml`, on the GB10 runner with its own persistent target directory (`$HOME/.cargo-target/mlxcel-cpu-link-ci`), whenever a pull request changes Rust sources, manifests, or the bridge C++ under `src/lib/mlxcelverse/` or `src/lib/mlxcel-core/cpp/` (lablup/mlxcel#2111).
+
 ## Why the gate says `--workspace`
 
 `make verify-clippy` and `make verify-test` pass `--workspace`, and dropping it
@@ -705,5 +929,9 @@ check that the user is in the `video` and `render` groups so `rocminfo` can open
 `/dev/kfd`.
 
 **ROCm: `[cuda_kernel] No CUDA back-end.` followed by an abort**: a fused path
-without a ROCm fallback was reached. For MoE models set `MLXCEL_FUSED_MOE=0`;
-otherwise report the model in lablup/mlxcel#1803.
+without a ROCm fallback was reached. lablup/mlxcel#1803 routed the fused paths
+that had a graph fallback, MoE included, so this should no longer happen on a
+routed path; report the model and the traceback. A direct call to a fused
+kernel entry point that has no ROCm port returns an error naming the kernel and
+its fallback rather than aborting (lablup/mlxcel#1885); the Gumbel-max and
+rejection samplers have HIP ports (lablup/mlxcel#2064).

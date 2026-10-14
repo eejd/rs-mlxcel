@@ -128,6 +128,7 @@ export interface BootstrapResponse {
   readonly actions: Record<string, ActionAvailability>;
   readonly roots: ReadonlyArray<RootSummary>;
   readonly limits: LimitSummary;
+  readonly media_limits: MediaLimits;
 }
 
 export interface ModelIdentity {
@@ -204,6 +205,7 @@ export interface ModelActionRequest {
   readonly idempotency_key: IdempotencyKey;
   readonly load_profile?: LoadProfile;
   readonly eviction_target_id?: ModelId;
+  readonly eviction_target_expected_revision?: number;
 }
 
 export interface DownloadRequest {
@@ -229,6 +231,7 @@ export interface ModelOperationTarget {
   readonly model_id: ModelId;
   readonly requested_revision: number | null;
   readonly eviction_target_id?: ModelId | null;
+  readonly eviction_target_expected_revision?: number | null;
 }
 
 export interface DownloadOperationTarget {
@@ -332,6 +335,7 @@ export interface RuntimeSnapshot {
   readonly measurements: Record<string, MeasuredValue>;
   readonly settings: RuntimeSettingsReport;
   readonly snapshot_sequence: EventSequence;
+  readonly slots: RuntimeSlots;
 }
 
 export type UiEvent = SnapshotEvent | ModelRevisionEvent | OperationEvent | DownloadProgressEvent | RuntimeEvent | SettingsEvent | ResetEvent | GapEvent | ServerRestartEvent | HeartbeatEvent;
@@ -379,6 +383,7 @@ export interface CatalogMetadata {
   readonly input_tasks: ReadonlyArray<TaskKind>;
   readonly output_tasks: ReadonlyArray<TaskKind>;
   readonly quantization: string | null;
+  readonly dtype: string | null;
   readonly format: string | null;
   readonly parameter_count: number | null;
   readonly disk_bytes: number | null;
@@ -581,4 +586,32 @@ export interface CatalogMetadataUnknownReasons {
   readonly parameter_count?: string | null;
   readonly disk_bytes?: string | null;
   readonly memory_estimate_bytes?: string | null;
+}
+
+export interface RuntimeSlot {
+  readonly id: number;
+  readonly processing: boolean;
+  readonly prompt_tokens: number | null;
+  readonly cached_prompt_tokens: number | null;
+  readonly decoded_tokens: number | null;
+}
+
+export interface RuntimeSlots {
+  readonly available: boolean;
+  readonly reason: string | null;
+  readonly measured_at: string | null;
+  readonly configured_parallelism: number;
+  readonly effective_parallelism: number | null;
+  readonly request_context_tokens: number | null;
+  readonly shared_pool_context_tokens: number | null;
+  readonly items: ReadonlyArray<RuntimeSlot>;
+}
+
+export interface MediaLimits {
+  readonly max_images: number;
+  readonly max_image_bytes: number;
+  readonly max_width: number;
+  readonly max_height: number;
+  readonly max_decoded_bytes: number;
+  readonly max_body_bytes: number;
 }

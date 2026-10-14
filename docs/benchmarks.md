@@ -59,6 +59,10 @@ reference runtime) live alongside the snapshot:
 - [Fused decode-MoE kernel: design and roadmap](benchmark_results/fused-moe-decode-kernel-design.md)
 - [Gemma3n decode profile: is a compiled fusion justified?](benchmark_results/gemma3n-decode-profile.md)
 - [Gemma3n decode profile on M5 Max](benchmark_results/gemma3n-decode-profile-m5max.md)
+- [Gemma 4 31B QAT/non-QAT MTP exactness on M5 Max](benchmark_results/gemma4-31b-mtp-exactness-2026-09-26.md)
+- [Unified engine baseline: CLI vs server B=1 decode, prefill chunk and KV storage (GB10)](benchmark_results/unified-engine-baseline-gb10-2026-10-07.md)
+- [Unified engine final measurement: pre-epic CxxGenerator vs the engine, batched serving, prefill chunk under live decode (GB10)](benchmark_results/unified-engine-final-gb10-2026-10-08.md)
+- [Penalty pipelining and server prompt lookup: penalty requests across three builds, prompt lookup at B=1, under concurrency and on long paged prompts (GB10)](benchmark_results/server-prompt-lookup-gb10-2026-10-11.md)
 
 Embedding and rerank throughput (`/v1/embeddings`, `/v1/rerank`) has its own
 ladder, driven by `scripts/bench_embeddings.py`:
@@ -77,7 +81,10 @@ three depending on which script wrote it. They are now separate:
 | `mlxcel_commit` | the same two | the 8-character source revision measured, `-dirty` when tracked files were modified |
 | `mlx_commit` | the same two | the 8-character pinned MLX C++ revision the binary links |
 | `mlx_version` | historical CSVs only | the MLX library version, back when the column was hardcoded to it |
-| `baseline_version` | `bench_mlxlm.py` | the Python baseline, as `mlx-lm-<v>` or `mlx-vlm-<v>` |
+| `baseline_version` | `bench_mlxlm.py` | the Python baseline, as `mlx-lm-<v>` or `mlx-vlm-<v>`; on a ROCm host `+mlx-<v>` follows, since MLX there is a source build whose version carries its commit |
+| `mlx_rocm_overlay_commit` | `bench_decode.sh`, ROCm rows only | the 8-character source commit of the MLX ROCm overlay (`src/lib/mlxcelverse/overlays/rocm/UPSTREAM`); `mlx_commit` stays the upstream pin |
+| `hip_version` | `bench_decode.sh`, ROCm rows only | the HIP runtime version from `hipconfig --version`; the ROCm release is in the `hardware` string |
+| `decode_path` | `bench_decode.sh` | the decode loop the runner timed: `engine` (the batch-native engine's raw-completion client, the loop `mlxcel generate` and the server's B=1 row run, epic #2166 Phase 6) on every row since #2176; empty on earlier rows, which timed the retired `CxxGenerator` |
 
 Do not drop these when transcribing the speculative or batched-serving tables by
 hand.
@@ -146,11 +153,22 @@ BENCH_MEM_OVERHEAD_FACTOR=1.209 ./scripts/bench_decode.sh all --cooldown 30 --bi
 # transcribe it into benchmarks/{backend}_{hw}_spec_{date}.csv.
 ./target/release/speculative_bench --sweep --max-tokens 128
 
+# Prompt lookup (`generate --prompt-lookup`): plain decoding against both
+# drafting policies, arms interleaved per repetition, plus the verify-width
+# cost the policies are built on. Method and GB10 results:
+# docs/benchmark_results/prompt-lookup-governor-gb10-2026-10-02.md.
+CASES=qwen3-8b-4bit:edit_json:400,qwen3-8b-4bit:story:800 REPS=3 BENCH_OUT=out-ab \
+    python3 docs/benchmark_results/data/prompt-lookup-governor-gb10-2026-10-02/harness/ab.py
+cargo run --release --features cuda --example verify_width_cost -- models/mlx/qwen3-8b-4bit
+
 # Batched serving ladder, against a server started with
 # --parallel 4 --max-batch-prefill 4. Writes no CSV; transcribe into
 # benchmarks/{backend}_{hw}_batch_{date}.csv.
+# --metrics also prints, per level, the batch scheduler's decode steps, mean
+# batch occupancy, interleaved prefill chunks and mixed steps, and the mean
+# decode step ms from /metrics (issue #2156).
 python3 scripts/bench_serving_concurrency.py --port <port> \
-    --concurrency 1,2,4 --prompt-tokens 512 --max-tokens 128
+    --concurrency 1,2,4 --prompt-tokens 512 --max-tokens 128 --metrics
 
 # Embedding and rerank ladder. One server per checkpoint; writes its own CSV.
 python3 scripts/bench_embeddings.py --bin target/release/mlxcel-server \
@@ -159,6 +177,24 @@ python3 scripts/bench_embeddings.py --bin target/release/mlxcel-server \
 # Continuous-batching sweep over every model dir. Takes ONE positional
 # argument, the output log path, and no flags.
 ./scripts/bench_all_models.sh <output_file>
+
+# Single-stream (B=1) decode, CLI path (the engine's raw-completion client) next to the server path
+# (the BatchScheduler, driven in-process), at a 256- and an 8192-token prompt.
+# One pass is a functional check; for numbers use the interleaved rounds with a
+# null arm. ADR 0007 lists the baseline and A/B commands it is decided by.
+make bench-engine MODEL=models/mlx/qwen3-1.7b-4bit
+scripts/engine_bench_rounds.py --model models/mlx/qwen3-1.7b-4bit --rounds 5 \
+    --null-every-arm --arm cli="--path cli" --arm server="--path server" \
+    --out baseline-qwen.jsonl
+# Each benchmark process is killed after --run-timeout seconds (default 3600,
+# 0 disables). Arm names ending in -null are reserved for the generated null
+# arms and are rejected.
+
+# CLI vs server token parity (first divergent token per pair), same prompt and
+# SamplingConfig, B=1 dense and paged, MLXCEL_SDPA_DETERMINISTIC=1. The prompt
+# must render to at least two tokens (one with --no-prompt-cache-case); an
+# empty or one-token prompt is rejected before any model loads.
+make engine-parity MODEL=models/mlx/qwen3-1.7b-4bit
 
 # Sampling step, no model attached. Gumbel-max (#900) covers the no-filter
 # path; the rejection kernel (#901) covers top-k / top-p / min-p.
@@ -172,6 +208,99 @@ lines before you read the numbers. Issue #899 shipped a production benchmark
 that compared the fallback against itself across a full sweep and returned a
 clean-looking null result, because nothing said which path had run; a sampling
 sweep whose two arms report the same path is measuring nothing.
+
+### ROCm hosts (issue #1810)
+
+On Linux, when `nvidia-smi` finds no GPU, `bench_decode.sh` spends a one-token
+`mlxcel generate` run on the smallest checkpoint (or the named one) and reads the
+backend, `gfx` target, device name and device memory from the lines `generate`
+prints, with `rocminfo` as the fallback. A ROCm run is then written as
+`benchmarks/rocm_<hw>_<date>.csv`, where `<hw>` is `strixhalo-gfx1151` on the
+Radeon 8060S host and `amd-<gfx>` elsewhere, and the 85% memory guard is taken
+against device memory: on the UMA carve-out the GPU has 96 GiB while the host
+sees about 31 GiB. `bench_mlxlm.py` tags the host the same way, so the pair
+compares with `compare_bench_csv.py --reference`. MLX has no ROCm wheel, so the
+Python baseline needs a source build of MLX with the ROCm backend: point
+`MLXLM_PYTHON` at its interpreter. Stop other GPU tenants first; the published
+gfx1151 baseline records how it checked
+([rocm-baseline-gfx1151-2026-09-30.md](benchmark_results/rocm-baseline-gfx1151-2026-09-30.md)).
+
+```bash
+MODELS_DIR=models/mlx ./scripts/bench_decode.sh all --cooldown 30 --big-cooldown 30
+MLXLM_PYTHON=<mlx-rocm-venv>/bin/python LD_LIBRARY_PATH=/opt/rocm/lib \
+    MODELS_DIR=models/mlx ./scripts/bench_mlxlm.py all --cooldown 30 --big-cooldown 60 --big-threshold-gb 10
+```
+
+`bench_mlxlm.py`'s `--big-cooldown` replaces the normal cooldown after a big
+model where `bench_decode.sh` adds it, so 60 there matches 30 + 30 here.
+
+`bench_decode.sh --temperature T [--top-p P]` measures sampled decode, which is where the fused samplers run (greedy never dispatches them); the CSV has no sampling column, so the auto-generated filename gains `_t<T>` and `_p<P>`.
+
+`scripts/rocm_gpu_guard.sh -- <command>` is that check as a script: it waits
+for 90 s with `/sys/class/kfd/kfd/proc` empty and no compiler process, runs the
+command under a 1 Hz monitor, reruns it if any sample shows another GPU process
+or a compiler, and appends every sample to `--log`, which is the evidence a
+published page cites.
+
+Guards on one host take turns: each holds an `flock` on `ROCM_GPU_GUARD_LOCK` (default `/tmp/mlxcel-rocm-gpu-guard.lock`) from before its first idle wait until it exits, so two guards started together run one after the other instead of rejecting each other's command as contention (issue #2146), and parallel jobs no longer need different `--idle-secs` values. Any user's guard can share the lock file: it is created world-writable if missing and opened read-only. `--max-wait` is one budget for the lock wait and the idle waits together, counted from guard start without the time the command runs; a guard that runs out of it while waiting for the lock exits 75 without running the command. The command runs without the lock descriptor and with `ROCM_GPU_GUARD_LOCK_HELD` set, so a guard nested inside it (one whose ancestor is that guard) skips the lock rather than deadlocking; guards nested in the same outer guard are not serialized among themselves, and nesting through `sudo` needs `--preserve-env=ROCM_GPU_GUARD_LOCK_HELD`. The guard needs `flock` (util-linux) and exits 2 without it. Any local user can open the default lock file and so hold it, or pre-create it unreadable; on a host shared with untrusted users, point `ROCM_GPU_GUARD_LOCK` at a path only the benchmarking users can reach.
+
+#### Sessions on a shared host (issue #2244)
+
+A guard takes the lock for one command, so a gate or a measurement that guards each run separately queues again for every run, and other units' compiles and test runs fill the gaps between them. Hold the lock once for the whole session instead: `scripts/rocm_gpu_guard.sh --hold [--max-wait SECS] -- COMMAND` takes the lock through the same wait (exit 75 when `--max-wait` runs out), does no idle wait and no monitoring, exports `ROCM_GPU_GUARD_LOCK_HELD`, runs COMMAND in the foreground, exits with its status and releases the lock on exit, INT and TERM. Guards started inside COMMAND skip the lock but keep their idle wait and monitor, so each run is still checked. `--idle-secs`, `--max-attempts` and `--log` are rejected with `--hold` (exit 2); under an outer guard `--hold` just runs COMMAND.
+
+- Build first, without the lock: a hold taken before a compile makes everyone else wait through it, and the compiler would also keep the inner guards from finding an idle window.
+- Gate: `make verify-rocm-held` builds the test, release and clippy artifacts unlocked, then runs `make verify-rocm` under one `--hold`, so its rebuilds are cache hits. Do not run a bare `make verify-rocm` on a shared host: it runs GPU tests with no lock and invalidates other guards' idle windows (#2192's parity guard was rejected 28 times that way).
+- Measurement: wrap the whole session in one hold and keep a guard on each run inside it, for example `scripts/rocm_gpu_guard.sh --hold -- bash -c 'for i in 1 2 3; do scripts/rocm_gpu_guard.sh --log run$i.log -- ./scripts/bench_decode.sh ...; done'`.
+- `scripts/rocm_gpu_guard.sh --status` prints whether the lock is held and by whom, read from `ROCM_GPU_GUARD_LOCK.holder` (pid, start time, mode, command line), which every holder writes after it takes the lock and removes on exit; a file naming a pid that is gone is reported as stale. Exit 0 when the lock is free, 1 when it is held. A lock taken by plain `flock` has no holder file.
+
+The lock is not a queue: `flock` does not serve waiters in order. If `--hold` sessions still starve, file a FIFO ticket queue with the measurements.
+
+### ROCm per-kernel decode profile (issue #2061)
+
+`scripts/rocm_decode_profile.sh` answers where ROCm decode time goes, per
+kernel. For each model it takes one plain `mlxcel-bench-decode` run and one
+under `rocprofv3 --kernel-trace --hip-graph-trace --stats -f csv`, both at the
+default pp512/tg128 shape and both through `rocm_gpu_guard.sh`. The bench runs
+with `MLXCEL_BENCH_PHASE_MARKS=1`, which prints the host-clock time of its
+warmup, measured prefill, measured decode and end
+(`src/bin/bench_decode/phase_marks.rs`), and
+`scripts/rocm_decode_profile.py` keeps the dispatches that start inside the
+measured decode. From those it writes a per-kernel table
+(`<run>_decode_kernels.csv`: calls, GPU time, share of decode GPU time, kernel
+class, #1814 port unit) and a summary (`<run>_summary.json`: decode GPU time and
+host gap per token, profiler overhead, share per port unit), next to
+rocprofv3's own whole-process `<run>_kernel_stats.csv`.
+
+```bash
+cargo build --release --features rocm --bin mlxcel-bench-decode
+scripts/rocm_decode_profile.sh models/mlx/Meta-Llama-3.1-8B-Instruct-4bit models/mlx/Qwen3-30B-A3B-4bit
+scripts/rocm_decode_profile.sh --temperature 0.7 --top-p 0.95 --no-plain models/mlx/Meta-Llama-3.1-8B-Instruct-4bit
+python3 scripts/rocm_decode_profile.py report benchmarks/rocm_profiles/gfx1151_<commit>
+```
+
+Results go to `benchmarks/rocm_profiles/gfx1151_<commit>/`; the full traces go
+to a temporary directory (`--trace-dir` to keep them) because they run to
+hundreds of MB. Read shares rather than absolute times from the profiled run:
+the tracer slows decode, and the summary records by how much against the plain
+run. `--temperature` and `--top-p` exist so a profile can see the sampler; the
+greedy default never dispatches it.
+
+A port unit's share of decode GPU time implies a speedup ceiling of
+`1 / (1 - share)` (`ceiling_gpu_share` in the summary), but that share ignores
+the host launch gaps between dispatches, so it underrates a port that replaces
+many small dispatches with one kernel (issue #2148). The summary therefore also
+charges each idle stretch of the decode window to the dispatch that ends it
+(`scripts/rocm_decode_gaps.py`): per role `role_host_gap_ms_per_token`, and per
+port unit its host gap per token and per dispatch, its share of decode wall
+time (kernels plus the gaps in front of them) and `ceiling_wall`, the speedup
+bound that share implies. With a plain run the gaps are scaled to the plain
+run's host gap (the tracer inflates host gaps, not kernel time) and divided by
+its wall time per token: `plain_ceiling_wall_est`. That is the bound to compare
+a port's measured speedup against; `report` prints it beside the GPU-share
+ceiling. The same fields exist for the roles reached with shipped defaults
+(`reached_default_*`). The published profile and how each kernel
+name was attributed to a port unit are in
+[rocm-decode-profile-gfx1151-2026-09-30.md](benchmark_results/rocm-decode-profile-gfx1151-2026-09-30.md).
 
 ### An op-level number is not a decode number (issue #901)
 
@@ -263,7 +392,8 @@ A speedup below 1.00 for either op is the signal to flip
 `FUSED_ADD_RMSNORM_DEFAULT` or `FUSED_ROPE_APPEND_DEFAULT` in
 `src/lib/mlxcel-core/src/layers.rs`, which leaves the kernel available and
 opt-in through `MLXCEL_FUSED_ADD_RMSNORM=1` / `MLXCEL_FUSED_ROPE_APPEND=1`
-instead of removing it.
+instead of removing it. Both constants are `cfg!(feature = "rocm")`: off on
+Metal and CUDA builds, on in a ROCm build (#2145).
 
 The op-level number is a lower bound on the end-to-end effect. Both fusions also
 remove a full-width intermediate from the MLX graph per call, which shows up as
@@ -427,6 +557,20 @@ cargo build --release --features metal,accelerate --example logit_trace
 MLXCEL_QMV_WIDE=0 \
 ./target/release/examples/logit_trace  MODEL CORPUS.txt 5 60 8 512 > b.tsv
 python3 scripts/compare_logit_traces.py b.tsv a.tsv
+```
+
+Gemma 4 verify changes need the actual MTP path. Set `MLXCEL_TRACE_GEMMA4=chain|block|verify`: `chain` runs each traced token as an M=1 decode; `block` reproduces the ordinary block arithmetic; `verify` enables the MTP verification corrections. Both block arms prefill through the real target adapter, including its rotating-cache buffer. `MLXCEL_TRACE_START_TOKEN` starts the measured continuation after a fixed corpus context. `MLXCEL_TRACE_CONTIGUOUS=1` prefills once and advances the same forced token stream across chunks, exercising buffered full-accept progression as context grows (rejection/rollback is covered by generation tests); it requires a Gemma 4 mode and nonzero start/prefill.
+
+```bash
+# Same 256 teacher-forced tokens in all arms, behind 1536 tokens of context.
+cargo build --profile test-fast --features metal,accelerate --example logit_trace
+for arm in chain block verify; do
+  MLXCEL_QMV_WIDE=0 MLXCEL_TRACE_GEMMA4="$arm" \
+  MLXCEL_TRACE_START_TOKEN=1536 MLXCEL_TRACE_CONTIGUOUS=1 \
+  ./target/test-fast/examples/logit_trace MODEL docs/architecture.md 4 64 8 1536 > "$arm.tsv"
+done
+python3 scripts/compare_logit_traces.py chain.tsv block.tsv --decided 2
+python3 scripts/compare_logit_traces.py chain.tsv verify.tsv --decided 2
 ```
 
 The metric to gate on is **disagreement on decided positions**: the fraction
@@ -1118,6 +1262,19 @@ enabling this pairing on generation 13.
 
 ### Gemma 4 31B + bf16 assistant
 
+**Current exactness (2026-09-26, #1983/#1279):** both QAT and non-QAT 31B now pass the startup probe after the automatic narrow-kernel retry on M5 Max, without `MLXCEL_MTP_ALLOW_INEXACT`. Non-QAT widths 2, 3 and 4 all pass. The fix matches full-attention query/mask geometry, sliding-cache physical ring order, and classic prefill chunking. It is limited to singleton linear verification; batched MTP falls back to classic; nonlinear tree rounds are disabled, so dispatch uses the supported linear path. See the [matched QAT/non-QAT measurements](benchmark_results/gemma4-31b-mtp-exactness-2026-09-26.md) for long-context logit metrics, greedy parity and current test-fast throughput. The static hardware preference remains subordinate to measured exactness and adaptive profitability.
+
+Current M5 Max / 128 GiB, test-fast profile, width 4, three 256-token outputs (one observation per scenario and arm):
+
+| Target | Classic after (tok/s range) | MTP (tok/s range) | Paired MTP/classic range | Greedy parity |
+| --- | ---: | ---: | ---: | --- |
+| 31B QAT 4-bit | 8.97–17.28 | 10.87–19.76 | 0.85–1.21x | 3/3 byte-identical |
+| 31B non-QAT 4-bit | 12.20–13.77 | 15.99–17.80 | 1.18–1.38x | 3/3 byte-identical |
+
+Run-order drift and thermal pressure limit throughput conclusions; these are observations, not a guaranteed speedup. See the linked report for individual samples, baseline comparisons and host evidence.
+
+The M3 Ultra figures below are **historical measurements before the exactness gate and this correction**. They describe that implementation's throughput and do not establish the speed of today's exact path.
+
 The 31B text target is batch-capable, which is the case the B=1 static gate
 (`mtp_b1_default`) governs. Until issue #1217 that gate ran the singleton path
 only where `has_neural_accelerator` held, on the reading that this pairing's
@@ -1146,7 +1303,7 @@ costs about 1.9x as much per extra block position and the two lines cross near
 K = 4, which is the only reason the block-4 round costs match. Do not carry a
 round cost between these two pairings at any other width.
 
-The gate now reads Apple GPU generation instead: on from generation 15 (M3, M4,
+The static gate introduced then reads Apple GPU generation: on from generation 15 (M3, M4,
 M5), classic decode on generation 13 (M1, M2). M4 is grouped by the shared
 `use_qmv_wide` dispatch rather than measured. Generation 13 was not re-measured
 for want of a host, and carrying the slope ratio above onto its

@@ -14,7 +14,7 @@
 
 //! Stream-selection wrappers for generation-time pipelining.
 //!
-//! Generation owners ([`crate::generate::CxxGenerator`],
+//! Generation owners ([`crate::engine::DirectEngine`],
 //! [`crate::speculative::SpeculativeGenerator`], and the server-side
 //! `BatchScheduler`) create a dedicated MLX stream up front and install
 //! it as the default for the worker thread that drives the generation
@@ -59,10 +59,31 @@ use crate::ffi::{MlxStream, MlxThreadLocalStream};
 /// to bind its dedicated per-thread stream as the default for
 /// subsequent MLX dispatches on that thread.
 ///
-/// Used by: CxxGenerator, SpeculativeGenerator, BatchScheduler, AudioWorker
+/// Used by: BatchScheduler, AudioWorker, embedding and rerank workers, Kokoro
 pub fn new_thread_local_generation_stream() -> Option<UniquePtr<MlxThreadLocalStream>> {
     if ffi::default_device_is_gpu() {
         Some(ffi::new_thread_local_stream_gpu())
+    } else {
+        None
+    }
+}
+
+/// Hand out the process-wide thread-local generation stream handle.
+///
+/// Same contract as [`new_thread_local_generation_stream`], except every
+/// call returns the same underlying handle, so successive generators run
+/// on one thread resolve to one MLX stream, as mlx-lm's module-level
+/// `generation_stream` does. MLX registers a fresh stream (a new command
+/// queue that is never freed) for every new handle a thread resolves. On M1
+/// Ultra, command-r7b pp512/tg128, a second generator on a fresh stream paid
+/// about 25 ms in prefill and 20-40 ms at the start of decode; on the shared
+/// stream it pays neither. Different threads still resolve different
+/// streams, so dispatch and synchronization stay paired per thread.
+///
+/// Used by: DirectEngine, SpeculativeGenerator
+pub fn shared_thread_local_generation_stream() -> Option<UniquePtr<MlxThreadLocalStream>> {
+    if ffi::default_device_is_gpu() {
+        Some(ffi::shared_thread_local_stream_gpu())
     } else {
         None
     }
@@ -81,7 +102,7 @@ pub fn new_thread_local_generation_stream() -> Option<UniquePtr<MlxThreadLocalSt
 ///
 /// `None` is a safe no-op for CPU-only builds.
 ///
-/// Used by: CxxGenerator, SpeculativeGenerator, BatchScheduler, AudioWorker
+/// Used by: DirectEngine, SpeculativeGenerator, BatchScheduler, AudioWorker
 pub fn install_thread_local_default_stream(tls: Option<&UniquePtr<MlxThreadLocalStream>>) {
     if let Some(tls) = tls {
         let stream = ffi::stream_from_thread_local_stream(tls);
@@ -562,20 +583,28 @@ mod tests {
 
     /// `gpu_backend_available` answers whether a GPU backend exists, and that
     /// answer does not move with the default device: it is the same before,
-    /// during and after a CPU guard. On Apple Silicon (Metal) it is `true`;
-    /// on a build with neither Metal nor CUDA it is `false`.
+    /// during and after a CPU guard.
+    ///
+    /// The premise is the resolved backend, not "Metal, or CUDA, or CPU-only".
+    /// That enumeration was true while Metal and CUDA were the only GPU
+    /// backends; on ROCm both `metal_is_available()` and `cuda_is_available()`
+    /// are false while a real GPU is present, so the old third branch asserted
+    /// "no GPU backend" on a host that has one (issue #1805).
     #[test]
     fn gpu_backend_available_does_not_track_the_default_device() {
+        use crate::hardware::{GpuBackendKind, gpu_backend_kind};
+
         let _lock = lock_default_device();
         let available = ffi::gpu_backend_available();
-        if crate::metal_is_available() {
-            assert!(
+        match gpu_backend_kind() {
+            GpuBackendKind::None => assert!(
+                !available,
+                "no resolved GPU backend, so none may be reported available"
+            ),
+            kind => assert!(
                 available,
-                "Metal is a GPU backend, so Apple Silicon must report one"
-            );
-        }
-        if !crate::metal_is_available() && !crate::cuda_is_available() {
-            assert!(!available, "a CPU-only build has no GPU backend to report");
+                "{kind:?} is a GPU backend, so one must be reported available"
+            ),
         }
         let baseline = ffi::default_device_is_gpu();
         {
@@ -700,6 +729,35 @@ mod tests {
     #[test]
     fn new_thread_local_generation_stream_is_total() {
         let _ = new_thread_local_generation_stream();
+    }
+
+    /// Generators built one after another on a thread must land on one MLX
+    /// stream: a fresh stream per generator adds a start-of-decode stall to
+    /// every generation after the first. A handle from
+    /// `new_thread_local_generation_stream` must still get its own stream.
+    #[test]
+    fn shared_generation_stream_resolves_to_one_stream_per_thread() {
+        let (Some(a), Some(b)) = (
+            shared_thread_local_generation_stream(),
+            shared_thread_local_generation_stream(),
+        ) else {
+            return;
+        };
+        let ia = ffi::stream_index(&ffi::stream_from_thread_local_stream(&a));
+        let ib = ffi::stream_index(&ffi::stream_from_thread_local_stream(&b));
+        assert_eq!(ia, ib, "shared handles must resolve to the same stream");
+
+        let fresh = new_thread_local_generation_stream().expect("GPU build");
+        let ic = ffi::stream_index(&ffi::stream_from_thread_local_stream(&fresh));
+        assert_ne!(ia, ic, "a fresh handle must resolve to its own stream");
+
+        let other = std::thread::spawn(|| {
+            let h = shared_thread_local_generation_stream().expect("GPU build");
+            ffi::stream_index(&ffi::stream_from_thread_local_stream(&h))
+        })
+        .join()
+        .expect("thread");
+        assert_ne!(ia, other, "another thread must resolve its own stream");
     }
 
     /// `new_generation_stream` (the deprecated, non-thread-local

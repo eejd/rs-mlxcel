@@ -14,11 +14,13 @@
 
 use std::path::{Path, PathBuf};
 
+use mlxcel_core::hardware::{GpuBackendKind, gpu_backend_kind};
 use serde_json::Value;
 
 use crate::models::detect_model_type_with_probes;
 use crate::models::registry::{
-    ArchitectureFamily, BackendStatus, Modality, OutputKind, Runtime, build_architecture_registry,
+    ArchitectureFamily, BackendStatus, BackendSupport, Modality, OutputKind, Runtime,
+    build_architecture_registry,
 };
 use crate::server::AppState;
 use crate::server::router_lifecycle::{DownloadState, LifecycleSnapshot, ModelLifecycleState};
@@ -31,7 +33,7 @@ use super::catalog_fs::{
     completeness, content_fingerprint, disk_size, format_for, read_json_bounded,
 };
 use super::catalog_metadata_config::{
-    declared_architectures_from_config, declared_model_type_from_config,
+    declared_architectures_from_config, declared_model_type_from_config, dtype_from_config,
 };
 
 use super::catalog_types::{
@@ -39,18 +41,26 @@ use super::catalog_types::{
     MAX_CONFIG_BYTES, ModelIdentity, RemovalStatus, SupportStatus, TaskKind,
 };
 
+#[path = "catalog_provider_capabilities.rs"]
+mod provider_capabilities;
+use provider_capabilities::apply_provider_confirmed_capabilities;
+
 pub(super) fn catalog_entry(model: RouterCatalogModel) -> CatalogEntry {
     let metadata = metadata_for(&model.path);
     let complete = metadata.support.complete;
     let supported = metadata.support.architecturally_supported
         && metadata.support.runnable_on_backend
         && complete;
-    let removal = removal_status(model.source, &model.lifecycle);
+    let removal = removal_status(
+        model.source,
+        &model.lifecycle,
+        model.removal_blocked_reason.as_deref(),
+    );
     let mut entry = CatalogEntry {
         identity: ModelIdentity {
             id: model.ui_model_id,
             inference_id: model.name.clone(),
-            display_name: display_name(&model.name),
+            display_name: display_name(&model.name, source_kind(model.source)),
             source: source_kind(model.source),
             source_key_hash: model.source_key_hash,
             generation: model.generation,
@@ -77,7 +87,11 @@ pub(super) fn apply_runtime_fields(entry: &mut CatalogEntry, model: &RouterCatal
     entry.identity.revision = model.revision;
     entry.identity.generation = model.generation;
     entry.lifecycle = model.lifecycle.clone();
-    let removal = removal_status(model.source, &model.lifecycle);
+    let removal = removal_status(
+        model.source,
+        &model.lifecycle,
+        model.removal_blocked_reason.as_deref(),
+    );
     entry.removable = removal.eligible;
     entry.removal = removal;
     apply_provider_confirmed_capabilities(entry, model.provider_capabilities);
@@ -162,7 +176,7 @@ pub(super) fn single_model_entry_with_provider(
         identity: ModelIdentity {
             id,
             inference_id: inference_id.clone(),
-            display_name: display_name(&inference_id),
+            display_name: display_name(&inference_id, CatalogSourceKind::SingleModel),
             source: CatalogSourceKind::SingleModel,
             source_key_hash,
             generation: 1,
@@ -227,6 +241,7 @@ fn metadata_for(path: &Path) -> CatalogMetadata {
     let (disk_bytes, disk_reason) = disk_size(path);
     reasons.disk_bytes = disk_reason;
     let quantization = config.as_ref().and_then(quantization_from_config);
+    let dtype = config.as_ref().and_then(dtype_from_config);
     if quantization.is_none() {
         reasons.quantization = Some("quantization is not declared in bounded metadata".to_string());
     }
@@ -269,6 +284,7 @@ fn metadata_for(path: &Path) -> CatalogMetadata {
         input_tasks,
         output_tasks,
         quantization,
+        dtype,
         format,
         parameter_count: None,
         disk_bytes,
@@ -281,10 +297,21 @@ fn metadata_for(path: &Path) -> CatalogMetadata {
 
 fn sanitize_detection_error(path: &Path, message: &str) -> String {
     let path_text = path.display().to_string();
-    if path_text.is_empty() {
+    let redacted = if path_text.is_empty() {
         message.to_string()
     } else {
         message.replace(&path_text, "model directory")
+    };
+    // JSON Schema maxLength counts Unicode scalar values, not UTF-8 bytes.
+    // Redact first so truncation cannot leave a partial private path behind.
+    if redacted.chars().count() > 512 {
+        redacted
+            .chars()
+            .take(511)
+            .chain(std::iter::once('…'))
+            .collect()
+    } else {
+        redacted
     }
 }
 
@@ -296,14 +323,26 @@ fn family_for_registry_id(registry_id: &str) -> Option<ArchitectureFamily> {
 }
 
 fn runnable_on_backend(family: &ArchitectureFamily) -> bool {
-    let status = if cfg!(all(target_os = "macos", feature = "metal")) {
-        family.backends.metal
-    } else if cfg!(feature = "cuda") {
-        family.backends.cuda
-    } else {
-        BackendStatus::Unsupported
-    };
-    matches!(status, BackendStatus::Supported | BackendStatus::Partial)
+    matches!(
+        backend_status_for(gpu_backend_kind(), &family.backends),
+        BackendStatus::Supported | BackendStatus::Partial
+    )
+}
+
+/// The registry column for the GPU backend MLX resolved at runtime, not a `cfg!`
+/// chain: that chain sent every ROCm build to `Unsupported` (issue #1886) and
+/// cannot express a multi-backend build. `gpu_backend_kind()` works on every
+/// build and returns `None` when the build has no GPU backend (or, on ROCm, no
+/// visible device), which reads as `Unsupported`: the whole no-GPU fallback.
+fn backend_status_for(kind: GpuBackendKind, backends: &BackendSupport) -> BackendStatus {
+    match kind {
+        GpuBackendKind::Metal => backends.metal,
+        GpuBackendKind::Cuda => backends.cuda,
+        GpuBackendKind::Rocm => backends.rocm,
+        GpuBackendKind::None => BackendStatus::Unsupported,
+        // Required by `#[non_exhaustive]`; a kind with no column fails the `ALL` walk test.
+        _ => BackendStatus::Unsupported,
+    }
 }
 
 fn tasks_for_family(family: &ArchitectureFamily) -> (Vec<TaskKind>, Vec<TaskKind>) {
@@ -371,48 +410,6 @@ fn capabilities_for(metadata: &CatalogMetadata, supported: bool) -> Vec<Capabili
         .collect()
 }
 
-fn apply_provider_confirmed_capabilities(
-    entry: &mut CatalogEntry,
-    provider: Option<RouterCatalogProviderCapabilities>,
-) {
-    reset_provider_ready_capabilities(entry);
-    let Some(provider) = provider else { return };
-    for capability in &mut entry.capabilities {
-        if capability.task == TaskKind::VisionInput {
-            capability.available = provider.image_input && entry.supported;
-            capability.reason = if capability.available {
-                None
-            } else if provider.image_input {
-                entry.metadata.support.reason.clone()
-            } else {
-                Some("loaded provider does not advertise image input".to_string())
-            };
-        }
-        if capability.task == TaskKind::AudioTranscription && provider.audio_input {
-            capability.available = entry.supported;
-            capability.reason = if entry.supported {
-                None
-            } else {
-                entry.metadata.support.reason.clone()
-            };
-        }
-    }
-}
-
-fn reset_provider_ready_capabilities(entry: &mut CatalogEntry) {
-    for capability in &mut entry.capabilities {
-        if capability.phase == "provider_ready" {
-            capability.available = false;
-            capability.reason = entry
-                .metadata
-                .support
-                .reason
-                .clone()
-                .or_else(|| Some("provider readiness is confirmed after load".to_string()));
-        }
-    }
-}
-
 fn quantization_from_config(config: &Value) -> Option<String> {
     config
         .get("quantization")
@@ -439,13 +436,27 @@ fn support_reason(architectural: bool, runnable: bool, complete_reason: &str) ->
     }
 }
 
-fn removal_status(source: RouterModelSource, lifecycle: &LifecycleSnapshot) -> RemovalStatus {
+fn removal_status(
+    source: RouterModelSource,
+    lifecycle: &LifecycleSnapshot,
+    blocked_reason: Option<&str>,
+) -> RemovalStatus {
     if source != RouterModelSource::Cache {
         return RemovalStatus {
             eligible: false,
             reason: Some("only managed cache entries can be removed".to_string()),
             instructions: Some(
                 "Use model-free mode with the managed cache to delete downloaded snapshots."
+                    .to_string(),
+            ),
+        };
+    }
+    if let Some(reason) = blocked_reason {
+        return RemovalStatus {
+            eligible: false,
+            reason: Some(reason.to_string()),
+            instructions: Some(
+                "Remove the non-cache alias or reconfigure overlapping roots before deleting the managed cache snapshot."
                     .to_string(),
             ),
         };
@@ -467,11 +478,20 @@ fn removal_status(source: RouterModelSource, lifecycle: &LifecycleSnapshot) -> R
     }
 }
 
-fn display_name(name: &str) -> String {
-    name.rsplit('/')
-        .next()
-        .unwrap_or(name)
-        .replace(['-', '_'], " ")
+/// The label every WebUI surface prints for a model: its inference id
+/// verbatim, with no character rewriting. Cache and preset names are kept
+/// whole (`owner/name`); models-dir and single-model names keep their last
+/// `/` segment, or the whole name when that segment is empty.
+fn display_name(name: &str, source: CatalogSourceKind) -> String {
+    match source {
+        CatalogSourceKind::Cache | CatalogSourceKind::Preset => name.to_string(),
+        CatalogSourceKind::ModelsDir | CatalogSourceKind::SingleModel => name
+            .rsplit('/')
+            .next()
+            .filter(|segment| !segment.is_empty())
+            .unwrap_or(name)
+            .to_string(),
+    }
 }
 
 fn source_kind(source: RouterModelSource) -> CatalogSourceKind {
@@ -481,3 +501,11 @@ fn source_kind(source: RouterModelSource) -> CatalogSourceKind {
         RouterModelSource::Preset => CatalogSourceKind::Preset,
     }
 }
+
+#[cfg(test)]
+#[path = "catalog_reason_tests.rs"]
+mod reason_tests;
+
+#[cfg(test)]
+#[path = "catalog_backend_tests.rs"]
+mod backend_tests;

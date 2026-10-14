@@ -1,0 +1,1167 @@
+// Copyright 2025-2026 Lablup Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::*;
+use crate::engine::{DirectEngine, DirectRequest, SpeculativeRunError};
+use crate::ffi;
+use crate::generate::{LanguageModel, SamplingConfig};
+use crate::layers::KVCache;
+use crate::speculative::prompt_lookup_drafter::PromptLookupDrafter;
+use crate::test_support::induction::{
+    INDUCTION_MODELS, INDUCTION_VOCAB, InductionModel, lcg_tokens, sequential_reference,
+};
+use cxx::UniquePtr;
+
+/// Plain decoding on the engine's raw-completion client: the reference every
+/// lookup run must reproduce token for token.
+fn plain<M: LanguageModel>(
+    model: &M,
+    prompt: &[i32],
+    max_tokens: usize,
+    sampling: &SamplingConfig,
+) -> Vec<i32> {
+    DirectEngine::new(model, 0)
+        .run(prompt, max_tokens, sampling)
+        .expect("plain decoding runs")
+}
+
+/// Prompt lookup on the engine: the token-only round loop driving a
+/// [`PromptLookupDrafter`] under `config`, returning the tokens and the
+/// drafter's acceptance accounting.
+fn lookup<M: LanguageModel>(
+    model: &M,
+    config: PromptLookupConfig,
+    prompt: &[i32],
+    max_tokens: usize,
+    sampling: &SamplingConfig,
+) -> (Vec<i32>, PromptLookupStats) {
+    let mut drafter = PromptLookupDrafter::new(config);
+    let run = DirectEngine::new(model, 0)
+        .generate_with_drafter(
+            &DirectRequest::text(prompt, max_tokens, sampling),
+            &mut drafter,
+            config.max_draft,
+            |_| true,
+        )
+        .expect("prompt lookup runs");
+    (run.run.tokens, drafter.stats())
+}
+
+fn cfg(ngram_max: usize, ngram_min: usize, max_draft: usize) -> PromptLookupConfig {
+    PromptLookupConfig {
+        ngram_max,
+        ngram_min,
+        max_draft,
+        adaptive: true,
+        policy: DraftPolicy::Graded,
+        ..PromptLookupConfig::default()
+    }
+}
+
+fn gated(max_draft: usize) -> PromptLookupConfig {
+    PromptLookupConfig {
+        policy: DraftPolicy::Gated,
+        ..cfg(3, 2, max_draft)
+    }
+}
+
+#[test]
+fn proposes_the_tokens_after_an_earlier_occurrence() {
+    // "... 1 2 3 4 5 6 ... 1 2" -> propose "3 4 5".
+    let context = [9, 1, 2, 3, 4, 5, 6, 8, 1, 2];
+    assert_eq!(find_draft(&context, &cfg(2, 1, 3)), vec![3, 4, 5]);
+}
+
+#[test]
+fn draft_is_capped_by_max_draft_and_context_end() {
+    let context = [1, 2, 3, 4, 1, 2];
+    assert_eq!(find_draft(&context, &cfg(2, 1, 7)), vec![3, 4, 1, 2]);
+    assert_eq!(find_draft(&context, &cfg(2, 1, 1)), vec![3]);
+}
+
+#[test]
+fn prefers_the_longest_matching_suffix() {
+    // Suffix [5, 2]: the 2-gram matches at index 3, the 1-gram [2] matches
+    // later at index 6. The longer match must win.
+    let context = [0, 0, 0, 5, 2, 7, 2, 9, 5, 2];
+    assert_eq!(find_draft(&context, &cfg(2, 1, 1)), vec![7]);
+}
+
+#[test]
+fn prefers_the_most_recent_occurrence_of_a_given_length() {
+    let context = [1, 2, 10, 1, 2, 20, 1, 2];
+    assert_eq!(find_draft(&context, &cfg(2, 2, 1)), vec![20]);
+}
+
+#[test]
+fn never_matches_the_suffix_against_itself() {
+    // The only occurrence of [4] is the suffix itself.
+    assert!(find_draft(&[1, 2, 3, 4], &cfg(1, 1, 3)).is_empty());
+}
+
+#[test]
+fn falls_back_to_shorter_ngrams() {
+    // [3, 4] never occurred before, [4] did.
+    let context = [4, 7, 8, 3, 4];
+    assert_eq!(find_draft(&context, &cfg(2, 1, 2)), vec![7, 8]);
+    assert!(find_draft(&context, &cfg(2, 2, 2)).is_empty());
+}
+
+#[test]
+fn short_and_empty_contexts_propose_nothing() {
+    let c = cfg(3, 1, 7);
+    assert!(find_draft(&[], &c).is_empty());
+    assert!(find_draft(&[1], &c).is_empty());
+    assert_eq!(find_draft(&[1, 1], &c), vec![1]);
+}
+
+#[test]
+fn repeated_run_proposes_the_run() {
+    // A run of one token: the latest occurrence of [7, 7] is one back, so
+    // exactly one token is available after it.
+    let context = [7, 7, 7, 7];
+    assert_eq!(find_draft(&context, &cfg(2, 1, 5)), vec![7]);
+}
+
+#[test]
+fn config_validation() {
+    assert!(PromptLookupConfig::default().validate().is_ok());
+    assert!(cfg(3, 0, 7).validate().is_err());
+    assert!(cfg(1, 2, 7).validate().is_err());
+    assert!(cfg(3, 1, 0).validate().is_err());
+}
+
+#[test]
+fn tokens_per_forward_excludes_the_prefill_token() {
+    let stats = PromptLookupStats {
+        rounds: 4,
+        drafted_rounds: 4,
+        paused_rounds: 0,
+        proposed_draft_tokens: 28,
+        accepted_draft_tokens: 20,
+        shadow_confirmations: 0,
+    };
+    // 25 generated: 1 from prefill, 24 over 4 rounds.
+    assert!((stats.tokens_per_forward(25) - 6.0).abs() < 1e-9);
+    assert!((stats.acceptance_rate() - 20.0 / 28.0).abs() < 1e-9);
+    assert_eq!(PromptLookupStats::default().tokens_per_forward(1), 0.0);
+}
+
+#[test]
+fn governor_starts_with_the_full_block() {
+    let mut g = DraftGovernor::new(&cfg(3, 2, 7));
+    assert_eq!(g.budget(), 7);
+}
+
+#[test]
+fn governor_keeps_the_full_block_while_blocks_land() {
+    let mut g = DraftGovernor::new(&cfg(3, 2, 7));
+    for _ in 0..10 {
+        g.record(6);
+    }
+    assert_eq!(g.budget(), 7);
+}
+
+#[test]
+fn governor_shortens_the_block_when_few_tokens_land() {
+    let mut g = DraftGovernor::new(&cfg(3, 2, 7));
+    for _ in 0..10 {
+        g.record(1);
+    }
+    // EMA converges on 1: twice that plus two.
+    assert_eq!(g.budget(), 4);
+}
+
+/// Record one miss streak long enough to start a pause.
+fn miss_streak(g: &mut DraftGovernor) {
+    for _ in 0..MISSES_BEFORE_COOLDOWN {
+        g.record(0);
+    }
+}
+
+/// Count the paused rounds, ending on the first round that proposes again.
+fn pause_len(g: &mut DraftGovernor) -> usize {
+    let mut paused = 0;
+    while g.budget() == 0 {
+        paused += 1;
+    }
+    paused
+}
+
+#[test]
+fn governor_pauses_after_repeated_misses_and_backs_off() {
+    let mut g = DraftGovernor::new(&cfg(3, 2, 7));
+    for _ in 1..MISSES_BEFORE_COOLDOWN {
+        g.record(0);
+    }
+    assert!(g.budget() > 0, "a shorter run of misses is not a streak");
+    g.record(0);
+    assert_eq!(pause_len(&mut g), MIN_COOLDOWN);
+    // A second streak pauses twice as long.
+    miss_streak(&mut g);
+    assert_eq!(pause_len(&mut g), 2 * MIN_COOLDOWN);
+}
+
+#[test]
+fn governor_backoff_resets_once_a_round_lands() {
+    let mut g = DraftGovernor::new(&cfg(3, 2, 7));
+    for _ in 0..3 {
+        miss_streak(&mut g);
+        pause_len(&mut g);
+    }
+    g.record(2);
+    miss_streak(&mut g);
+    assert_eq!(pause_len(&mut g), MIN_COOLDOWN);
+}
+
+#[test]
+fn governor_backoff_is_capped() {
+    let mut g = DraftGovernor::new(&cfg(3, 2, 7));
+    let mut last = 0;
+    for _ in 0..10 {
+        miss_streak(&mut g);
+        last = pause_len(&mut g);
+    }
+    assert_eq!(last, MAX_COOLDOWN);
+}
+
+#[test]
+fn non_adaptive_governor_always_proposes_max_draft() {
+    let mut c = cfg(3, 2, 7);
+    c.adaptive = false;
+    let mut g = DraftGovernor::new(&c);
+    for _ in 0..10 {
+        g.record(0);
+        assert_eq!(g.budget(), 7);
+    }
+}
+
+#[test]
+fn default_ngram_min_skips_single_token_matches() {
+    // Only a 1-gram ([4]) recurs; the default minimum of 2 proposes nothing.
+    let context = [4, 7, 8, 3, 4];
+    assert!(find_draft(&context, &PromptLookupConfig::default()).is_empty());
+}
+
+#[test]
+fn index_matches_the_scan_at_every_length() {
+    for (seed, alphabet) in [(1, 3), (2, 5), (3, 11), (4, 40)] {
+        for config in [cfg(3, 1, 7), cfg(3, 2, 7), cfg(5, 2, 4), cfg(1, 1, 3)] {
+            let tokens = lcg_tokens(seed, 300, alphabet);
+            let mut index = NgramIndex::new(&config);
+            // Grow the context one token at a time, as decoding does.
+            for len in 0..=tokens.len() {
+                let context = &tokens[..len];
+                index.extend(context);
+                assert_eq!(
+                    index.find(context, &config),
+                    find_draft(context, &config),
+                    "seed {seed} alphabet {alphabet} {config:?} len {len}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn index_matches_the_scan_when_extended_in_blocks() {
+    // A verify round emits several tokens before the next lookup.
+    let config = cfg(3, 2, 7);
+    let tokens = lcg_tokens(7, 400, 6);
+    let mut index = NgramIndex::new(&config);
+    let mut len = 50;
+    while len <= tokens.len() {
+        let context = &tokens[..len];
+        index.extend(context);
+        assert_eq!(index.find(context, &config), find_draft(context, &config));
+        len += 1 + len % 7;
+    }
+}
+
+/// Target that always predicts token 3 at every position, so a reply is a run
+/// of 3s: lookup proposes full blocks and the loop guard has a loop to catch.
+struct ConstantModel;
+
+impl LanguageModel for ConstantModel {
+    fn forward(
+        &self,
+        input_ids: &ffi::MlxArray,
+        _caches: &mut [KVCache],
+        _mask: Option<&ffi::MlxArray>,
+    ) -> UniquePtr<ffi::MlxArray> {
+        let seq_len = ffi::array_shape(input_ids)[1] as usize;
+        let mut logits = Vec::with_capacity(seq_len * 8);
+        for _ in 0..seq_len {
+            logits.extend_from_slice(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
+        }
+        ffi::from_slice_f32(&logits, &[1, seq_len as i32, 8])
+    }
+
+    fn make_caches(&self) -> Vec<KVCache> {
+        vec![KVCache::new()]
+    }
+
+    fn num_layers(&self) -> usize {
+        1
+    }
+
+    fn eos_token_ids(&self) -> Vec<i32> {
+        vec![7]
+    }
+}
+
+#[test]
+fn loop_guard_stops_mid_block_where_plain_decoding_stops() {
+    let sampling = SamplingConfig {
+        loop_detection: crate::loop_detection::LoopDetectionConfig::new(1, 1, 8),
+        ..SamplingConfig::greedy()
+    };
+    let prompt = [1, 2, 3, 3];
+    let expected = plain(&ConstantModel, &prompt, 64, &sampling);
+    assert_eq!(
+        expected,
+        vec![3; 8],
+        "plain decoding stops on the 8th repeat"
+    );
+
+    let (tokens, stats) = lookup(
+        &ConstantModel,
+        PromptLookupConfig::default(),
+        &prompt,
+        64,
+        &sampling,
+    );
+    assert_eq!(tokens, expected);
+    assert!(
+        stats.accepted_draft_tokens > 0,
+        "the run verified lookup blocks"
+    );
+}
+
+#[test]
+fn without_the_loop_guard_lookup_runs_to_max_tokens() {
+    let (tokens, _) = lookup(
+        &ConstantModel,
+        PromptLookupConfig::default(),
+        &[1, 2, 3, 3],
+        64,
+        &SamplingConfig::greedy(),
+    );
+    assert_eq!(tokens, vec![3; 64]);
+}
+
+#[test]
+fn config_validation_bounds_the_index_and_the_verify_block() {
+    assert!(cfg(NGRAM_MAX_LIMIT, 2, MAX_DRAFT_LIMIT).validate().is_ok());
+    let err = cfg(NGRAM_MAX_LIMIT + 1, 2, 7).validate().unwrap_err();
+    assert!(err.contains("ngram-max"), "{err}");
+    let err = cfg(3, 2, MAX_DRAFT_LIMIT + 1).validate().unwrap_err();
+    assert!(err.contains("max-draft"), "{err}");
+}
+
+/// Run prompt lookup on both [`INDUCTION_MODELS`] over several prompts and
+/// configurations, assert every reply equals `reference(model, prompt)`, and
+/// return the summed acceptance accounting per model, for `policy` only.
+fn induction_parity(
+    sampling: &SamplingConfig,
+    policy: DraftPolicy,
+    reference: impl Fn(&InductionModel, &[i32]) -> Vec<i32>,
+) -> [PromptLookupStats; 2] {
+    let mut totals = [PromptLookupStats::default(); 2];
+    for (model, total) in INDUCTION_MODELS.iter().zip(&mut totals) {
+        for seed in 1..=6 {
+            let prompt = lcg_tokens(seed, 48, INDUCTION_VOCAB as u64);
+            let expected = reference(model, &prompt);
+            assert_eq!(expected.len(), 96, "seed {seed}: the reference ran short");
+            let bases = [
+                cfg(3, 2, 7),
+                cfg(3, 1, 7),
+                cfg(4, 2, 3),
+                // Six-token matches are rare in a random prompt and appear
+                // once the reply repeats itself, so the loop first runs a
+                // long run of plain rounds and then switches to verifying.
+                cfg(6, 6, 7),
+                PromptLookupConfig {
+                    adaptive: false,
+                    ..cfg(3, 2, 7)
+                },
+            ];
+            for config in bases
+                .iter()
+                .map(|&base| PromptLookupConfig { policy, ..base })
+            {
+                let (tokens, stats) = lookup(model, config, &prompt, 96, sampling);
+                assert_eq!(
+                    tokens, expected,
+                    "earliest={} seed {seed} {config:?}",
+                    model.earliest
+                );
+                total.rounds += stats.rounds;
+                total.drafted_rounds += stats.drafted_rounds;
+                total.paused_rounds += stats.paused_rounds;
+                total.proposed_draft_tokens += stats.proposed_draft_tokens;
+                total.accepted_draft_tokens += stats.accepted_draft_tokens;
+                total.shadow_confirmations += stats.shadow_confirmations;
+            }
+        }
+    }
+    totals
+}
+
+/// Both acceptance regimes showed up under `policy`: blocks that land and
+/// blocks that are trimmed, governor pauses, and, for [`DraftPolicy::Gated`]
+/// only, resumes on a confirmed proposal.
+fn assert_both_regimes(policy: DraftPolicy, totals: &[PromptLookupStats; 2]) {
+    for stats in totals {
+        assert!(
+            stats.accepted_draft_tokens > 0,
+            "no proposal landed: {stats:?}"
+        );
+        assert!(
+            stats.proposed_draft_tokens > stats.accepted_draft_tokens,
+            "no proposal was rejected, so no trim was exercised: {stats:?}"
+        );
+    }
+    let confirmations: usize = totals.iter().map(|stats| stats.shadow_confirmations).sum();
+    match policy {
+        // A gated governor pauses on its first miss while on probation, so
+        // the missing model always exercises the pause and the resume. The
+        // graded governor pauses only after three misses in a row; on the
+        // engine loop every proposal is looked up from the complete context
+        // (the old loop proposed from a context missing its in-flight token
+        // while pipelining), so the missing model's misses no longer cluster
+        // and its graded pause is not guaranteed here. The governor's own
+        // tests pin that pause.
+        DraftPolicy::Gated => {
+            let missing = &totals[1];
+            assert!(
+                missing.paused_rounds > 0,
+                "the missing model never paused the gated governor: {missing:?}"
+            );
+            assert!(
+                confirmations > 0,
+                "no paused gated governor ever resumed on a confirmed proposal: {totals:?}"
+            );
+        }
+        _ => assert_eq!(confirmations, 0, "only a gated governor probes: {totals:?}"),
+    }
+}
+
+/// The rollback contract: after every verify round the caches must hold
+/// exactly the emitted tokens, so a cache-dependent target produces plain
+/// decoding's reply token for token, through accepted blocks, rejected tails,
+/// and the plain rounds between them.
+#[test]
+fn rollback_keeps_a_cache_dependent_target_identical_to_plain_decoding() {
+    let sampling = SamplingConfig::greedy();
+    for policy in [DraftPolicy::Graded, DraftPolicy::Gated] {
+        let totals = induction_parity(&sampling, policy, |model, prompt| {
+            let plain = plain(model, prompt, 96, &sampling);
+            assert_eq!(
+                plain,
+                sequential_reference(model, prompt, 96, &sampling),
+                "greedy plain decoding is the sequential reference"
+            );
+            plain
+        });
+        assert_both_regimes(policy, &totals);
+    }
+}
+
+/// Same contract on the per-position sampler path: a repetition penalty
+/// reads the emitted history, so every verify position samples on its own
+/// through the incremental sampler state, and each must see every token
+/// emitted before it, including the ones accepted earlier in the same block.
+#[test]
+fn rollback_matches_plain_decoding_under_a_repetition_penalty() {
+    let sampling = SamplingConfig {
+        repetition_penalty: 1.3,
+        penalty_last_n: 3,
+        ..SamplingConfig::greedy()
+    };
+    assert!(sampling.needs_token_history());
+    for policy in [DraftPolicy::Graded, DraftPolicy::Gated] {
+        let totals = induction_parity(&sampling, policy, |model, prompt| {
+            let plain = plain(model, prompt, 96, &sampling);
+            assert_eq!(
+                plain,
+                sequential_reference(model, prompt, 96, &sampling),
+                "plain decoding under a penalty is the sequential reference (#2090)"
+            );
+            plain
+        });
+        assert_both_regimes(policy, &totals);
+    }
+}
+
+/// A dense-cache target that nonetheless owns its sequence state, the shape
+/// Gemma 4 and Llama 4 have: it batches and accepts padded prefill, so only
+/// the layout says the external caches are placeholders.
+struct ModelOwnedStateModel;
+
+impl LanguageModel for ModelOwnedStateModel {
+    fn forward(
+        &self,
+        input_ids: &ffi::MlxArray,
+        caches: &mut [KVCache],
+        mask: Option<&ffi::MlxArray>,
+    ) -> UniquePtr<ffi::MlxArray> {
+        ConstantModel.forward(input_ids, caches, mask)
+    }
+
+    fn make_caches(&self) -> Vec<KVCache> {
+        Vec::new()
+    }
+
+    fn num_layers(&self) -> usize {
+        1
+    }
+
+    fn eos_token_ids(&self) -> Vec<i32> {
+        vec![7]
+    }
+
+    fn sequence_state_layout(&self) -> crate::cache::SequenceStateLayout {
+        crate::cache::SequenceStateLayout::model_owned(1)
+    }
+}
+
+#[test]
+fn model_owned_sequence_state_is_refused_even_when_other_flags_allow_it() {
+    let model = ModelOwnedStateModel;
+    assert!(model.supports_batching() && model.supports_padded_prefill());
+    let reason = prompt_lookup_unsupported_reason(&model).expect("must be refused");
+    assert!(reason.contains("internally"), "{reason}");
+    assert!(supports_prompt_lookup(&ConstantModel));
+}
+
+#[test]
+fn generate_refuses_a_model_without_external_caches() {
+    let mut drafter = PromptLookupDrafter::new(PromptLookupConfig::default());
+    let greedy = SamplingConfig::greedy();
+    let err = DirectEngine::new(&ModelOwnedStateModel, 0)
+        .generate_with_drafter(
+            &DirectRequest::text(&[1, 2, 3], 8, &greedy),
+            &mut drafter,
+            4,
+            |_| true,
+        )
+        .expect_err("a model without trimmable external caches is refused");
+    assert_eq!(err, SpeculativeRunError::NotTrimmable);
+}
+
+#[test]
+fn generate_refuses_a_sampler_with_feedback_state() {
+    let sampling = SamplingConfig {
+        mirostat: 2,
+        ..SamplingConfig::with_temperature(0.8)
+    };
+    let mut drafter = PromptLookupDrafter::new(PromptLookupConfig::default());
+    let err = DirectEngine::new(&ConstantModel, 0)
+        .generate_with_drafter(
+            &DirectRequest::text(&[1, 2, 3], 8, &sampling),
+            &mut drafter,
+            4,
+            |_| true,
+        )
+        .expect_err("a feedback sampler is refused");
+    assert_eq!(err, SpeculativeRunError::SamplerFeedbackState);
+}
+
+/// Records the width of every forward and keeps the tokens in its cache, so
+/// the warmup's trims are observable.
+struct WidthRecordingModel {
+    widths: std::cell::RefCell<Vec<i32>>,
+}
+
+impl LanguageModel for WidthRecordingModel {
+    fn forward(
+        &self,
+        input_ids: &ffi::MlxArray,
+        caches: &mut [KVCache],
+        _mask: Option<&ffi::MlxArray>,
+    ) -> UniquePtr<ffi::MlxArray> {
+        let seq_len = ffi::array_shape(input_ids)[1];
+        self.widths.borrow_mut().push(seq_len);
+        let kv = ffi::ones(&[1, 1, seq_len, 1], crate::dtype::FLOAT32);
+        caches[0].update(kv, ffi::ones(&[1, 1, seq_len, 1], crate::dtype::FLOAT32));
+        ConstantModel.forward(input_ids, &mut [], None)
+    }
+
+    fn make_caches(&self) -> Vec<KVCache> {
+        vec![KVCache::new()]
+    }
+
+    fn num_layers(&self) -> usize {
+        1
+    }
+
+    fn eos_token_ids(&self) -> Vec<i32> {
+        vec![7]
+    }
+}
+
+#[test]
+fn warmup_runs_every_verify_width_and_rolls_each_back() {
+    let model = WidthRecordingModel {
+        widths: std::cell::RefCell::new(Vec::new()),
+    };
+    let prompt = [1, 2, 3, 4, 5];
+    let mut client = DirectEngine::new(&model, 0);
+    client
+        .warm_up_verify_widths(&prompt, 4)
+        .expect("the warmup runs");
+    assert_eq!(*model.widths.borrow(), vec![5, 2, 3, 4, 5]);
+    // Every width was rolled back: a plain run afterwards prefills the whole
+    // prompt again on a fresh sequence and sees no leftover positions.
+    model.widths.borrow_mut().clear();
+    client
+        .run(&prompt, 1, &SamplingConfig::greedy())
+        .expect("plain run");
+    assert_eq!(*model.widths.borrow(), vec![5]);
+}
+
+#[test]
+fn gated_governor_starts_narrow_on_probation() {
+    let mut g = DraftGovernor::new(&gated(7));
+    assert_eq!(g.budget(), GATED_NARROW_DRAFT);
+    // The first round of a reply has nothing behind it: one miss pauses.
+    g.record(0);
+    assert_eq!(g.budget(), 0);
+    assert!(g.probes_while_paused());
+}
+
+#[test]
+fn gated_pause_has_no_length_and_ends_on_a_confirmed_proposal() {
+    let mut g = DraftGovernor::new(&gated(7));
+    g.record(0);
+    for _ in 0..1000 {
+        assert_eq!(g.budget(), 0, "a gated pause must not expire on its own");
+    }
+    g.shadow_confirmed();
+    assert!(!g.probes_while_paused());
+    assert_eq!(g.budget(), GATED_NARROW_DRAFT, "it resumes narrow");
+    // Resumed on probation: one more miss pauses again at once.
+    g.record(0);
+    assert_eq!(g.budget(), 0);
+}
+
+#[test]
+fn gated_block_widens_after_a_whole_narrow_block_and_narrows_after_misses() {
+    let mut g = DraftGovernor::new(&gated(7));
+    g.record(GATED_NARROW_DRAFT);
+    assert_eq!(
+        g.budget(),
+        7,
+        "a narrow block that landed whole earns the full one"
+    );
+    g.record(5);
+    assert_eq!(g.budget(), 7);
+    // Off probation now, so misses shrink the block before they pause it.
+    g.record(0);
+    g.record(0);
+    assert_eq!(g.budget(), GATED_NARROW_DRAFT);
+    g.record(0);
+    assert_eq!(g.budget(), 0, "the third miss in a row pauses");
+}
+
+#[test]
+fn gated_block_never_uses_the_widths_between_narrow_and_full() {
+    let mut g = DraftGovernor::new(&gated(7));
+    for accepted in [2, 7, 3, 1, 0, 1, 2, 6, 0, 4, 1, 2, 2, 0, 5] {
+        let budget = g.budget();
+        assert!(
+            budget == 0 || budget == GATED_NARROW_DRAFT || budget == 7,
+            "budget {budget}"
+        );
+        if budget > 0 {
+            g.record(accepted.min(budget));
+        } else {
+            g.shadow_confirmed();
+        }
+    }
+}
+
+#[test]
+fn gated_respects_a_max_draft_below_the_narrow_block() {
+    let mut g = DraftGovernor::new(&gated(1));
+    assert_eq!(g.budget(), 1);
+    g.record(1);
+    assert_eq!(g.budget(), 1);
+}
+
+#[test]
+fn shadow_confirmation_is_ignored_unless_paused_and_gated() {
+    let mut g = DraftGovernor::new(&gated(7));
+    g.record(2);
+    g.shadow_confirmed();
+    assert_eq!(g.budget(), 7, "a drafting governor keeps its full block");
+
+    let mut graded = DraftGovernor::new(&cfg(3, 2, 7));
+    for _ in 0..MISSES_BEFORE_COOLDOWN {
+        graded.record(0);
+    }
+    assert!(!graded.probes_while_paused());
+    graded.shadow_confirmed();
+    assert_eq!(
+        pause_len(&mut graded),
+        MIN_COOLDOWN,
+        "graded pauses are unchanged"
+    );
+
+    let mut fixed = DraftGovernor::new(&PromptLookupConfig {
+        adaptive: false,
+        ..gated(7)
+    });
+    fixed.record(0);
+    assert_eq!(fixed.budget(), 7);
+    assert!(!fixed.probes_while_paused());
+}
+
+#[test]
+fn shadow_probe_settles_on_the_first_two_emitted_tokens() {
+    let probe = ShadowProbe {
+        start: 3,
+        proposal: vec![7, 8, 9],
+    };
+    assert_eq!(
+        probe.settle(&[1, 2, 3], SHADOW_CONFIRM),
+        None,
+        "nothing emitted yet"
+    );
+    assert_eq!(
+        probe.settle(&[1, 2, 3, 7], SHADOW_CONFIRM),
+        None,
+        "one token is not enough"
+    );
+    assert_eq!(probe.settle(&[1, 2, 3, 7, 8], SHADOW_CONFIRM), Some(true));
+    assert_eq!(
+        probe.settle(&[1, 2, 3, 7, 8, 0], SHADOW_CONFIRM),
+        Some(true),
+        "only the first two count"
+    );
+    assert_eq!(
+        probe.settle(&[1, 2, 3, 6], SHADOW_CONFIRM),
+        Some(false),
+        "settles at the first miss"
+    );
+    assert_eq!(probe.settle(&[1, 2, 3, 7, 6], SHADOW_CONFIRM), Some(false));
+}
+
+#[test]
+fn default_policy_follows_the_build() {
+    let expected = if cfg!(feature = "cuda") {
+        DraftPolicy::Gated
+    } else {
+        DraftPolicy::Graded
+    };
+    assert_eq!(PromptLookupConfig::default().policy, expected);
+}
+
+/// Vocabulary of [`ScriptModel`].
+const SCRIPT_VOCAB: usize = 1024;
+
+/// Target that emits a fixed script by absolute position: the logits after
+/// position `p` peak at `script[p + 1]`. Every token is unique except where
+/// the script copies its own prompt, so a lookup proposal is right exactly
+/// when it is aligned with the copy.
+struct ScriptModel {
+    script: Vec<i32>,
+}
+
+impl LanguageModel for ScriptModel {
+    fn forward(
+        &self,
+        input_ids: &ffi::MlxArray,
+        caches: &mut [KVCache],
+        _mask: Option<&ffi::MlxArray>,
+    ) -> UniquePtr<ffi::MlxArray> {
+        let seq_len = ffi::array_shape(input_ids)[1];
+        let offset = caches[0].offset as usize;
+        let kv = || ffi::ones(&[1, 1, seq_len, 1], crate::dtype::FLOAT32);
+        caches[0].update(kv(), kv());
+        let mut logits = vec![0.0f32; seq_len as usize * SCRIPT_VOCAB];
+        for row in 0..seq_len as usize {
+            let next = self.script[offset + row + 1] as usize;
+            logits[row * SCRIPT_VOCAB + next] = 10.0;
+        }
+        ffi::from_slice_f32(&logits, &[1, seq_len, SCRIPT_VOCAB as i32])
+    }
+
+    fn make_caches(&self) -> Vec<KVCache> {
+        vec![KVCache::new()]
+    }
+
+    fn num_layers(&self) -> usize {
+        1
+    }
+
+    fn eos_token_ids(&self) -> Vec<i32> {
+        Vec::new()
+    }
+}
+
+/// A reply that starts copying its prompt, breaks off for one token, and
+/// resumes the copy: the first drafted round misses on probation, the
+/// governor pauses, and a shadow probe must notice the resumed copy.
+///
+/// Prompt `100..=119`; reply `300, 100, 101, 999, 102, 103, ..., 119`. After
+/// `100 101` the lookup proposes `102 103`, the target emits `999`, and that
+/// probation miss pauses. Two rounds later `102 103` matches again and the
+/// probe made there proposes `104 105`, which come true, so drafting resumes
+/// and copies the rest. A probe recorded one position early or late compares
+/// `104` with `103` or `105` and never confirms.
+fn copy_break_copy_script() -> (Vec<i32>, usize) {
+    let prompt: Vec<i32> = (100..120).collect();
+    let mut script = prompt.clone();
+    script.extend([300, 100, 101, 999]);
+    script.extend(102..120);
+    // Room for the model to look one position past the last emitted token.
+    script.push(0);
+    (script, prompt.len())
+}
+
+#[test]
+fn gated_shadow_probe_confirms_exactly_the_resumed_copy() {
+    let (script, prompt_len) = copy_break_copy_script();
+    let model = ScriptModel {
+        script: script.clone(),
+    };
+    let expected = &script[prompt_len..script.len() - 1];
+    let penalty = SamplingConfig {
+        repetition_penalty: 1.1,
+        penalty_last_n: 8,
+        ..SamplingConfig::greedy()
+    };
+    // The batched-argmax verify path, and the per-position sampler path a
+    // history-reading sampler forces.
+    for sampling in [SamplingConfig::greedy(), penalty] {
+        let (tokens, stats) = lookup(
+            &model,
+            gated(7),
+            &script[..prompt_len],
+            expected.len(),
+            &sampling,
+        );
+        assert_eq!(tokens, expected, "{sampling:?}");
+        assert_eq!(
+            stats.shadow_confirmations, 1,
+            "the resumed copy is confirmed once: {stats:?}"
+        );
+        assert!(
+            stats.drafted_rounds >= 3 && stats.accepted_draft_tokens >= 10,
+            "drafting resumed and copied the rest: {stats:?}"
+        );
+    }
+}
+
+#[test]
+fn gated_probation_ends_only_on_a_whole_narrow_block() {
+    let mut g = DraftGovernor::new(&gated(7));
+    // One stray token is not evidence of a copy: still on probation.
+    g.record(1);
+    assert_eq!(g.budget(), GATED_NARROW_DRAFT);
+    g.record(0);
+    assert_eq!(
+        g.budget(),
+        0,
+        "a miss on probation pauses even after a partial round"
+    );
+
+    let mut g = DraftGovernor::new(&gated(7));
+    g.record(GATED_NARROW_DRAFT);
+    g.record(0);
+    assert_eq!(
+        g.budget(),
+        GATED_NARROW_DRAFT,
+        "off probation, one miss narrows the block instead of pausing"
+    );
+}
+
+#[test]
+fn server_break_even_pauses_partial_matches_without_changing_cli() {
+    let cli = PromptLookupConfig {
+        policy: DraftPolicy::Gated,
+        ..PromptLookupConfig::default()
+    };
+    for accepted in [1, 2] {
+        let mut baseline = DraftGovernor::new(&cli);
+        let mut server = DraftGovernor::new(&PromptLookupConfig {
+            min_tokens_per_round: Some(4),
+            ..cli
+        });
+        baseline.record(accepted);
+        server.record(accepted);
+        assert!(server.budget() > 0, "one sample cannot trigger break-even");
+        baseline.record(accepted);
+        server.record(accepted);
+        assert!(baseline.budget() > 0, "CLI retains partial-match behavior");
+        assert_eq!(server.budget(), 0);
+        assert!(server.probes_while_paused());
+        server.shadow_confirmed();
+        server.record(2);
+        server.record(7);
+        assert_eq!(
+            server.budget(),
+            7,
+            "fresh copy evidence replaces old low yield"
+        );
+    }
+}
+
+#[test]
+fn server_break_even_ignores_fixed_and_graded_policies() {
+    for (adaptive, policy) in [(false, DraftPolicy::Gated), (true, DraftPolicy::Graded)] {
+        let mut g = DraftGovernor::new(&PromptLookupConfig {
+            adaptive,
+            policy,
+            min_tokens_per_round: Some(4),
+            ..PromptLookupConfig::default()
+        });
+        for _ in 0..8 {
+            g.record(1);
+            assert!(g.budget() > 0);
+        }
+    }
+}
+
+#[test]
+fn longer_shadow_probe_requires_all_tokens_and_rejects_short_proposals() {
+    let probe = ShadowProbe {
+        start: 0,
+        proposal: vec![0, 1, 2, 3, 4, 5, 6],
+    };
+    assert_eq!(probe.settle(&[0, 1], 7), None);
+    assert_eq!(probe.settle(&[0, 1, 2, 3, 4, 5, 9], 7), Some(false));
+    assert_eq!(probe.settle(&probe.proposal, 7), Some(true));
+    assert_eq!(probe.settle(&probe.proposal, 8), Some(false));
+}
+
+#[test]
+fn server_break_even_keeps_fully_accepted_blocks_at_every_width() {
+    for max_draft in 1..=7 {
+        let mut governor = DraftGovernor::new(&PromptLookupConfig {
+            min_tokens_per_round: Some(4),
+            ..gated(max_draft)
+        });
+        for _ in 0..10 {
+            let proposed = governor.budget();
+            assert!(
+                proposed > 0,
+                "width {max_draft}: fully accepted blocks never pause"
+            );
+            governor.record_round(proposed, proposed);
+        }
+        assert!(!governor.probes_while_paused());
+    }
+}
+
+#[test]
+fn server_break_even_keeps_a_fully_accepted_short_ramp() {
+    let mut governor = DraftGovernor::new(&PromptLookupConfig {
+        min_tokens_per_round: Some(4),
+        ..gated(7)
+    });
+    governor.record_round(1, 2);
+    assert_eq!(governor.budget(), GATED_NARROW_DRAFT);
+    governor.record_round(2, 2);
+    assert_eq!(
+        governor.budget(),
+        7,
+        "a fully accepted narrow proposal widens instead of pausing"
+    );
+    governor.record_round(2, 7);
+    assert_eq!(
+        governor.budget(),
+        0,
+        "partial low yield after the short ramp pauses immediately"
+    );
+}
+
+#[test]
+fn server_break_even_floor_meeting_round_repays_ema_debt() {
+    let mut governor = DraftGovernor::new(&PromptLookupConfig {
+        min_tokens_per_round: Some(4),
+        ..gated(7)
+    });
+    governor.record(2); // Three emissions: optimistic narrow startup.
+    governor.record(3); // Four emissions: the current round meets the floor.
+    assert!(
+        governor.emitted_ema < 4.0,
+        "the current floor-meeting round need not erase all earlier EMA debt"
+    );
+    assert!(
+        governor.budget() > 0,
+        "meeting the floor keeps drafting active"
+    );
+    governor.record(2); // Three emissions while the EMA remains below four.
+    assert_eq!(governor.budget(), 0, "a later partial low round pauses");
+
+    governor.shadow_confirmed();
+    governor.record(2); // Three emissions from a full narrow block.
+    governor.record(4); // Five emissions lift the EMA to exactly four.
+    assert_eq!(governor.emitted_ema, 4.0);
+    assert!(
+        governor.budget() > 0,
+        "the break-even threshold is strictly below the floor"
+    );
+    governor.record(2);
+    assert_eq!(governor.budget(), 0, "falling below the floor pauses again");
+}
+
+#[test]
+fn server_break_even_graces_only_a_complete_miss_after_profitable_history() {
+    fn established_governor() -> DraftGovernor {
+        let mut governor = DraftGovernor::new(&PromptLookupConfig {
+            min_tokens_per_round: Some(4),
+            ..gated(7)
+        });
+        governor.accepted_ema = 4.0;
+        governor.emitted_ema = 4.5;
+        governor.drafted_samples = 2;
+        governor.probation = false;
+        governor
+    }
+
+    let mut boundary_miss = established_governor();
+    boundary_miss.record_round(0, 7);
+    assert_eq!(boundary_miss.budget(), 7, "an abrupt miss gets one probe");
+    assert_eq!(boundary_miss.low_yield_rounds, 1);
+    assert_eq!(
+        boundary_miss.misses, 1,
+        "legacy miss accounting is retained"
+    );
+    boundary_miss.record_round(0, 7);
+    assert_eq!(boundary_miss.budget(), 0, "a consecutive miss pauses");
+    assert_eq!(boundary_miss.misses, 0);
+
+    for accepted in [1, 2] {
+        let mut partial = established_governor();
+        partial.record_round(accepted, 7);
+        assert_eq!(
+            partial.budget(),
+            0,
+            "partial low yield ({accepted}/7) is sustained weak-match evidence"
+        );
+    }
+}
+
+#[test]
+fn server_break_even_boundary_grace_starts_at_the_accepted_floor() {
+    for (accepted_ema, expected_budget) in [(3.999, 0), (4.0, 7)] {
+        let mut governor = DraftGovernor::new(&PromptLookupConfig {
+            min_tokens_per_round: Some(4),
+            ..gated(7)
+        });
+        governor.accepted_ema = accepted_ema;
+        governor.emitted_ema = 5.0;
+        governor.drafted_samples = 2;
+        governor.probation = false;
+        governor.record_round(0, 7);
+        assert_eq!(
+            governor.budget(),
+            expected_budget,
+            "accepted EMA {accepted_ema}"
+        );
+    }
+}
+
+#[test]
+fn server_break_even_preserves_traced_copy_boundary_grace() {
+    let mut governor = DraftGovernor::new(&PromptLookupConfig {
+        min_tokens_per_round: Some(4),
+        ..gated(7)
+    });
+    governor.record_round(2, 2);
+    governor.record_round(7, 7);
+    governor.record_round(0, 7);
+    assert_eq!(
+        governor.budget(),
+        7,
+        "the traced 2/2, 7/7, 0/7 boundary keeps looking for the next copy span"
+    );
+    governor.record_round(7, 7);
+    governor.record_round(0, 7);
+    assert!(
+        governor.budget() > 0,
+        "a later isolated miss is also tolerated"
+    );
+    governor.record_round(0, 7);
+    assert_eq!(governor.budget(), 0, "two consecutive misses still pause");
+}
+
+#[test]
+fn server_break_even_does_not_extend_boundary_grace_at_large_width() {
+    let mut governor = DraftGovernor::new(&PromptLookupConfig {
+        max_draft: 16,
+        min_tokens_per_round: Some(4),
+        ..gated(16)
+    });
+    governor.record_round(2, 2);
+    governor.record_round(16, 16);
+    governor.record_round(0, 16);
+    assert!(governor.accepted_ema >= 4.0);
+    assert!(
+        governor.budget() > 0,
+        "the first abrupt miss gets one probe"
+    );
+    governor.record_round(0, 16);
+    assert_eq!(governor.budget(), 0, "the streak bounds grace to one probe");
+}
+
+#[test]
+fn server_break_even_shadow_resume_clears_boundary_history() {
+    let mut governor = DraftGovernor::new(&PromptLookupConfig {
+        min_tokens_per_round: Some(4),
+        ..gated(7)
+    });
+    governor.record_round(2, 2);
+    governor.record_round(7, 7);
+    governor.record_round(1, 7);
+    assert!(governor.probes_while_paused());
+
+    governor.shadow_confirmed();
+    assert_eq!(governor.accepted_ema, GATED_START_EMA);
+    assert_eq!(governor.emitted_ema, 0.0);
+    assert_eq!(governor.drafted_samples, 0);
+    assert_eq!(governor.low_yield_rounds, 0);
+    governor.record_round(2, 2);
+    governor.record_round(0, 7);
+    assert_eq!(governor.budget(), 0, "pre-resume profit cannot grant grace");
+}
+
+#[test]
+fn server_break_even_caps_floor_for_small_max_draft() {
+    let mut governor = DraftGovernor::new(&PromptLookupConfig {
+        min_tokens_per_round: Some(4),
+        ..gated(1)
+    });
+    assert_eq!(governor.min_tokens_per_round, Some(2));
+    governor.record_round(1, 1);
+    assert_eq!(
+        governor.budget(),
+        1,
+        "a fully accepted short block stays active"
+    );
+    governor.record_round(0, 1);
+    assert_eq!(governor.budget(), 0, "a weak short-width miss still pauses");
+}
+
+#[test]
+fn cli_defaults_keep_original_resume_and_pipeline_policy() {
+    let config = PromptLookupConfig::default();
+    assert_eq!(config.min_tokens_per_round, None);
+    assert_eq!(config.shadow_confirm_tokens, 2);
+    assert_eq!(config.plain_rounds_before_pipeline, 2);
+}

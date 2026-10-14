@@ -29,6 +29,44 @@ use crate::server::prompt_cache::key::MultimodalDigest;
 use mlxcel_core::lang_analyzer::LangBiasConfig;
 use mlxcel_core::sampling::LogprobsConfig;
 
+/// Default `--kv-admission-watermark` (issue #2088): the fraction of the
+/// paged KV block budget a prefill admission keeps free for decode growth
+/// while rows are decoding. The smallest value on the measured grid (0.01 to
+/// 0.15) that lowered preemptions without losing a turn: on GB10 with
+/// meta-llama-3.1-8b-instruct-4bit at a 4444-block budget, three concurrent
+/// 3-turn conversations went from 10 preemptions to 6 in both repeats. See
+/// `docs/CONTINUOUS_BATCHING.md`.
+pub const DEFAULT_KV_ADMISSION_WATERMARK: f64 = 0.01;
+
+/// Largest accepted `--kv-admission-watermark`. Above half the budget the
+/// server would mostly admit one sequence at a time.
+pub const MAX_KV_ADMISSION_WATERMARK: f64 = 0.5;
+
+/// Clamp an admission watermark into `0.0..=MAX_KV_ADMISSION_WATERMARK`; NaN
+/// disables it.
+#[must_use]
+pub fn clamp_kv_admission_watermark(fraction: f64) -> f64 {
+    if fraction.is_nan() {
+        return 0.0;
+    }
+    fraction.clamp(0.0, MAX_KV_ADMISSION_WATERMARK)
+}
+
+/// clap value parser for `--kv-admission-watermark`: a fraction of the block
+/// budget in `0.0..=MAX_KV_ADMISSION_WATERMARK`.
+pub fn parse_kv_admission_watermark(s: &str) -> Result<f64, String> {
+    let value: f64 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{s}` is not a number; expected a fraction such as 0.1"))?;
+    if !(0.0..=MAX_KV_ADMISSION_WATERMARK).contains(&value) {
+        return Err(format!(
+            "`{s}` is out of range; expected a fraction in 0.0..={MAX_KV_ADMISSION_WATERMARK}"
+        ));
+    }
+    Ok(value)
+}
+
 /// Storage backend used by the server batch scheduler for decode-time state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DecodeStorageBackend {
@@ -293,6 +331,8 @@ pub struct ServerGenerateOptions {
     /// `None` on every request that rendered through a chat template, which is
     /// every request that predates #1338.
     pub pre_rendered_prompt_tokens: Option<Vec<i32>>,
+    /// HTTP-only admission handshake, removed before dispatch to the scheduler.
+    pub admission_notification: Option<crate::server::model_provider::AdmissionNotification>,
 }
 
 /// Per-request context-retention overrides (b10621 `n_keep` / `n_discard`,
@@ -739,9 +779,8 @@ pub struct ServerConfig {
     ///
     /// `None` means the server should auto-detect the drafter kind from
     /// `draft_model_path` via
-    /// [`mlxcel_core::drafter::resolve_drafter_kind`], OR run the
-    /// classic [`crate::SpeculativeGenerator`] path when no drafter is
-    /// configured. Stored as a raw `Option<String>` because parsing
+    /// [`mlxcel_core::drafter::resolve_drafter_kind`], OR run plain decode
+    /// when no drafter is configured. Stored as a raw `Option<String>` because parsing
     /// only succeeds for `dflash` / `mtp` (the `internal-mtp` variant of
     /// [`mlxcel_core::drafter::DrafterKind`] is auto-detected, not
     /// user-selectable) and the parse error must surface at the
@@ -751,6 +790,10 @@ pub struct ServerConfig {
     /// "use the per-kind default" — `4` for MTP, `16` for DFlash. See
     /// [`crate::cli::speculative_args::default_block_size_for_kind`].
     pub draft_block_size: Option<u32>,
+    /// `--prompt-lookup-max-batch`: under `--draft-kind prompt-lookup`, a
+    /// sequence runs its own verify round only on ticks whose active decode
+    /// batch has at most this many rows (#2255).
+    pub prompt_lookup_max_batch: usize,
     /// Maximum number of sequences in the active decode batch.
     /// Defaults to `n_parallel` (4 as of #628); the worker clamps it to 1 for
     /// model families that cannot batch (`supports_batching() == false`).
@@ -793,9 +836,11 @@ pub struct ServerConfig {
     /// takes the loaded reranker kind's own default. See
     /// [`DEFAULT_RERANK_BATCH_SIZE`].
     pub rerank_batch_size: usize,
-    /// Number of tokens per prefill chunk. When 0, chunking is disabled and
-    /// the full prompt is prefilled in a single pass.
+    /// Number of tokens per prefill chunk when no other sequence is decoding.
+    /// When 0, chunking is disabled and the full prompt is one pass.
     pub prefill_chunk_size: usize,
+    /// Number of tokens per prefill chunk while another sequence is decoding.
+    pub prefill_chunk_size_contended: usize,
     /// #1011 prefill fairness interval (`--prefill-grant-interval`): decode
     /// ticks a parked chunked prefill yields before the scheduler grants it
     /// one, bounding the admitted request's time to first token. `None` lets
@@ -900,7 +945,7 @@ pub struct ServerConfig {
     /// Resolved from `--cache-type-k`/`--cache-type-v` (llama-server split
     /// flags) or the legacy `--kv-cache-mode` shorthand.  Defaults to
     /// `KVCacheMode::Fp16` (bit-exact baseline). The model worker uses this
-    /// when constructing per-sequence `CxxGenerator` instances so that every
+    /// when opening engine sequences so that every
     /// sequence in the batch sees the same KV quantization policy.
     pub kv_cache_mode: mlxcel_core::cache::KVCacheMode,
 
@@ -980,6 +1025,11 @@ pub struct ServerConfig {
     /// [`crate::server::batch::BatchScheduler::with_paged_block_budget`]. Only
     /// meaningful for pool-backed (Fp16, dense-natural-backend) sequences.
     pub kv_cache_budget: Option<crate::memory_estimate::PagedBudgetDirective>,
+    /// Paged KV admission watermark (issue #2088, `--kv-admission-watermark`):
+    /// the fraction of the block budget a prefill admission keeps free for
+    /// the running rows' decode growth while a decode batch is live. `0.0`
+    /// disables it. Inert without a block budget.
+    pub kv_admission_watermark: f64,
     /// `--enable-vlm-prefix-cache` (#124 step c). Default off. When on, the
     /// scheduler permits VLM (image/audio) chat requests to adopt and donate
     /// KV prefixes for multi-turn same-image conversations; text-only and
@@ -1040,6 +1090,9 @@ pub struct ServerConfig {
 
 impl Default for ServerConfig {
     fn default() -> Self {
+        let prefill_chunk_policy = mlxcel_core::prefill_plan::PrefillChunkPolicy::resolve(
+            mlxcel_core::prefill_plan::prefill_chunk_override(),
+        );
         Self {
             gcp: None,
             reasoning_format: crate::server::ReasoningFormat::default(),
@@ -1109,10 +1162,12 @@ impl Default for ServerConfig {
             draft_model_path: None,
             num_draft_tokens: 3,
             // default to "auto-detect from drafter config"
-            // when a drafter is supplied; the classic
-            // `SpeculativeGenerator` path runs when no drafter is set.
+            // when a drafter is supplied; plain decode runs when no
+            // drafter is set.
             draft_kind: None,
             draft_block_size: None,
+            prompt_lookup_max_batch:
+                crate::server::speculative_dispatch::DEFAULT_PROMPT_LOOKUP_MAX_BATCH,
             // Serving-throughput default: batched decode up to 4 sequences
             // (#628). Clamped to 1 by the worker for non-batching families.
             max_batch_size: 4,
@@ -1126,7 +1181,8 @@ impl Default for ServerConfig {
             embedding_request_timeout_secs: DEFAULT_EMBEDDING_REQUEST_TIMEOUT_SECS,
             reranker_model_path: None,
             rerank_batch_size: DEFAULT_RERANK_BATCH_SIZE,
-            prefill_chunk_size: 512,
+            prefill_chunk_size: prefill_chunk_policy.alone,
+            prefill_chunk_size_contended: prefill_chunk_policy.contended,
             // #1011: unset -> scheduler resolves the env override / default.
             prefill_grant_interval: None,
             enable_preemption: false,
@@ -1135,7 +1191,7 @@ impl Default for ServerConfig {
             // Serving-throughput default: batched prefill of up to 4 pending
             // requests (#628). No-ops for families without batched prefill.
             max_batch_prefill: 4,
-            // #715: unset -> scheduler derives `max_batch_prefill * prefill_chunk_size`.
+            // #715: unset -> scheduler derives `2 * max_batch_prefill * min(prefill_chunk_size, 512)`.
             max_batch_prefill_tokens: None,
             decode_storage_backend: DecodeStorageBackend::Auto,
             pipeline_parallel_runtime: None,
@@ -1157,6 +1213,7 @@ impl Default for ServerConfig {
             // default with an `auto` paged KV budget so admission sheds load
             // instead of OOMing. Disable with `--kv-cache-budget none`.
             kv_cache_budget: Some(crate::memory_estimate::PagedBudgetDirective::Auto),
+            kv_admission_watermark: DEFAULT_KV_ADMISSION_WATERMARK,
             enable_vlm_prefix_cache: false,
             cors_policy: crate::server::CorsPolicy::default(),
             serving_mode: crate::distributed::disaggregated::ServingMode::Hybrid,

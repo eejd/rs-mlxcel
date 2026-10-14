@@ -136,6 +136,16 @@ async fn run_serve_async(mut args: crate::ServeArgs) -> anyhow::Result<()> {
         );
         args.draft_model = None;
     }
+    // `none` disables prompt lookup as well (#2255): it needs no draft model,
+    // so the draft-model drop above does not reach it.
+    if spec_type.disable_speculation
+        && args.speculative.draft_kind.as_deref() == Some("prompt-lookup")
+    {
+        tracing::warn!(
+            "--spec-type none disables speculative decoding (b10621 semantics); ignoring --draft-kind prompt-lookup"
+        );
+        args.speculative.draft_kind = None;
+    }
     if let Some(kind) = spec_type.draft_kind {
         match args.speculative.draft_kind.as_deref() {
             None => args.speculative.draft_kind = Some(kind.to_string()),
@@ -168,8 +178,9 @@ async fn run_serve_async(mut args: crate::ServeArgs) -> anyhow::Result<()> {
     args.ui_compat
         .apply_env_bindings()
         .map_err(|(var, raw)| anyhow::anyhow!("{var} has an invalid boolean value {raw:?}"))?;
-    args.ui_compat
-        .ensure_inert()
+    let webui_enabled = args
+        .ui_compat
+        .webui_enabled()
         .map_err(|rejection| anyhow::anyhow!("{rejection}"))?;
     let image_token_bounds = args
         .multimodal_compat
@@ -235,11 +246,16 @@ async fn run_serve_async(mut args: crate::ServeArgs) -> anyhow::Result<()> {
     set_offline_mode(args.offline);
     // b10621 router mode (#1438): `--models-dir` with no model argument
     // serves the router surface and never resolves a checkpoint here.
-    let router_mode = args.models_dir.is_some()
-        && args.model.is_none()
-        && args.hf_repo.is_none()
-        && args.model_url.is_none()
-        && args.docker_repo.is_none();
+    let has_model_source = args.model.is_some()
+        || args.hf_repo.is_some()
+        || args.model_url.is_some()
+        || args.docker_repo.is_some()
+        || args.hf_file.is_some();
+    let router_mode = (args.models_dir.is_some() || args.models_preset.is_some() || webui_enabled)
+        && !has_model_source;
+    if webui_enabled && router_mode {
+        args.models_autoload = false;
+    }
     // The #1438 migration guard, raised BEFORE model resolution so the old
     // store-root combination fails in milliseconds instead of after a
     // multi-gigabyte download. `into_startup_config` re-checks it for
@@ -490,6 +506,13 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         long_cli_flag_was_set("cors-credentials"),
         long_cli_flag_was_set("no-cors-credentials"),
     );
+    args.ui_compat
+        .apply_env_bindings()
+        .map_err(|(var, raw)| anyhow::anyhow!("{var} has an invalid boolean value {raw:?}"))?;
+    let webui_enabled = args
+        .ui_compat
+        .webui_enabled()
+        .map_err(|rejection| anyhow::anyhow!("{rejection}"))?;
 
     // Axis B (B8): resolve --lang-bias / --lang-bias-config early so
     // errors surface before the server starts. Empty resolution = None =
@@ -546,8 +569,10 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         reasoning_alias_field: args.reasoning_alias_field,
         model_path: match args.model.clone() {
             Some(path) => path,
-            // Router mode (#1438): no model argument plus `--models-dir`.
-            None if args.models_dir.is_some() => std::path::PathBuf::new(),
+            // Router/WebUI model-free mode: no startup checkpoint.
+            None if args.models_dir.is_some() || args.models_preset.is_some() || webui_enabled => {
+                std::path::PathBuf::new()
+            }
             None => anyhow::bail!(
                 "--model/-m is required to start the server (set the \
                  LLAMA_ARG_MODEL environment variable, pass -m \
@@ -582,6 +607,7 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         decode_timeout_was_set: long_cli_flag_was_set("decode-timeout")
             || std::env::var_os("MLXCEL_DECODE_TIMEOUT").is_some(),
         api_prefix: args.api_prefix,
+        webui_enabled,
         sse_ping_interval: args.sse_ping_interval,
         threads_http: args.threads_http,
         reuse_port: args.reuse_port,
@@ -599,6 +625,7 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         // typed `DrafterKind` happens later, at the dispatch site.
         draft_kind: args.speculative.draft_kind,
         draft_block_size: args.speculative.draft_block_size,
+        prompt_lookup_max_batch: args.prompt_lookup_max_batch,
         max_batch_size: args.max_batch_size,
         no_batch: args.no_batch,
         max_queue_depth: args.max_queue_depth,
@@ -766,6 +793,8 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         // clap into a `PagedBudgetDirective` (`Bytes`/`Auto`); resolved to a
         // block count on the worker thread.
         kv_cache_budget: args.kv_cache_budget,
+        // paged KV admission watermark (#2088).
+        kv_admission_watermark: args.kv_admission_watermark,
         // experimental VLM prompt-prefix cache toggle (#124 step c).
         enable_vlm_prefix_cache: args.enable_vlm_prefix_cache,
         // CORS allow-list origins (#244); validated in into_startup_config.

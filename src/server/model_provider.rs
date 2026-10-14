@@ -170,12 +170,187 @@ fn uses_single_stream_queue_admission(model_path: &std::path::Path) -> bool {
             crate::models::ModelType::DiffusionGemma
                 | crate::models::ModelType::Llada2Moe
                 | crate::models::ModelType::Florence2VLM
+                | crate::models::ModelType::NemotronParseVLM
+                | crate::models::ModelType::NemotronVoiceChat
         )
     })
 }
 
+/// Whether the configured worker uses the local non-speculative scheduler
+/// path covered by request-memory admission. Check runtime/model eligibility
+/// separately: a checkpoint architecture does not identify its serving engine.
+// Used by: NemotronH provider admission and model-worker scheduler policy setup.
+pub(crate) fn request_memory_worker_path_supported(
+    has_pipeline: bool,
+    tp_size: usize,
+    serving_mode: crate::distributed::disaggregated::ServingMode,
+    has_speculation: bool,
+) -> bool {
+    use crate::distributed::disaggregated::ServingMode;
+    !has_pipeline
+        && tp_size == 1
+        && matches!(serving_mode, ServingMode::Hybrid | ServingMode::Router)
+        && !has_speculation
+}
+
+// Used by: NemotronH scheduler-backed provider constructors; pure device input
+// keeps CPU/non-Metal bypass tests independent of the process-global MLX device.
+fn request_memory_provider_wait_enabled(
+    worker_path_supported: bool,
+    metal_gpu: bool,
+    model_type: Option<crate::models::ModelType>,
+) -> bool {
+    worker_path_supported
+        && metal_gpu
+        && matches!(model_type, Some(crate::models::ModelType::NemotronH))
+}
+
+// Used by: NemotronH legacy sequential provider. The legacy worker still uses
+// BatchScheduler at width one; it forwards TP but not PP, serving roles, or
+// speculation. Match its actual execution, not those ignored request settings.
+fn legacy_request_memory_admission_enabled(
+    tp_size: usize,
+    metal_gpu: bool,
+    model_type: Option<crate::models::ModelType>,
+) -> bool {
+    request_memory_provider_wait_enabled(
+        request_memory_worker_path_supported(
+            false,
+            tp_size,
+            crate::distributed::disaggregated::ServingMode::Hybrid,
+            false,
+        ),
+        metal_gpu,
+        model_type,
+    )
+}
+
+// Used by: NemotronH scheduler-backed provider constructors.
+fn uses_request_memory_admission(
+    model_path: &std::path::Path,
+    config: &model_worker::WorkerSchedulerConfig,
+) -> bool {
+    request_memory_provider_wait_enabled(
+        request_memory_worker_path_supported(
+            config.pipeline_parallel_runtime.is_some(),
+            config.tensor_parallel.tp_size,
+            config.serving_mode,
+            !matches!(
+                config.speculative_dispatch,
+                crate::server::SpeculativeDispatch::Disabled
+            ),
+        ),
+        cfg!(all(target_os = "macos", feature = "metal")) && mlxcel_core::default_device_is_gpu(),
+        crate::models::get_model_type(model_path).ok(),
+    )
+}
+
+/// One-shot HTTP admission signal. Clones share a single sender, not multiple
+/// acknowledgements. Providers remove this from generation options before enqueue.
+#[derive(Debug, Clone)]
+pub struct AdmissionNotification(Arc<Mutex<Option<tokio::sync::oneshot::Sender<Result<()>>>>>);
+
+impl AdmissionNotification {
+    fn complete<T>(self, result: &Result<T>) {
+        let result = match result {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                if let Some(rejection) =
+                    error.downcast_ref::<crate::execution::request_memory::RequestMemoryRejection>()
+                {
+                    Err(anyhow::Error::new(*rejection))
+                } else if let Some(queue) = error.downcast_ref::<QueueFullError>() {
+                    Err(anyhow::Error::new(QueueFullError {
+                        max_queue_depth: queue.max_queue_depth,
+                    }))
+                } else if error.downcast_ref::<ChatWorkerGoneError>().is_some() {
+                    Err(anyhow::Error::new(ChatWorkerGoneError))
+                } else {
+                    Err(anyhow::anyhow!(error.to_string()))
+                }
+            }
+        };
+        if let Ok(mut sender) = self.0.lock()
+            && let Some(sender) = sender.take()
+        {
+            let _ = sender.send(result);
+        }
+    }
+}
+
+/// Dropping an HTTP handler before admission must cancel its queued work even
+/// though its blocking generation task cannot be aborted by Tokio.
+pub(crate) struct AdmissionWaiter {
+    receiver: Option<tokio::sync::oneshot::Receiver<Result<()>>>,
+    cancelled: Arc<AtomicBool>,
+    admitted: bool,
+}
+
+impl AdmissionWaiter {
+    // Used by: NemotronH (guarded), all other serving models (immediate bypass).
+    pub(crate) fn arm(options: &mut ServerGenerateOptions, cancelled: Arc<AtomicBool>) -> Self {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        options.admission_notification =
+            Some(AdmissionNotification(Arc::new(Mutex::new(Some(sender)))));
+        Self {
+            receiver: Some(receiver),
+            cancelled,
+            admitted: false,
+        }
+    }
+
+    pub(crate) async fn wait(mut self) -> Result<()> {
+        let result = match self.receiver.take() {
+            Some(receiver) => receiver
+                .await
+                .unwrap_or_else(|_| Err(anyhow::Error::new(ChatWorkerGoneError))),
+            None => Err(anyhow::Error::new(ChatWorkerGoneError)),
+        };
+        self.admitted = result.is_ok();
+        result
+    }
+}
+
+impl Drop for AdmissionWaiter {
+    fn drop(&mut self) {
+        if !self.admitted {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
+// Used by: NemotronH scheduler-backed text serving, independent of HTTP dialect.
+fn await_request_admission(
+    receiver: &mpsc::Receiver<GenerateEvent>,
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            anyhow::bail!("request cancelled before memory admission");
+        }
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(GenerateEvent::Admitted) => return Ok(()),
+            Ok(GenerateEvent::RequestMemoryRejected(error)) => {
+                return Err(anyhow::Error::new(error));
+            }
+            Ok(GenerateEvent::Error(error)) => return Err(anyhow::anyhow!(error)),
+            Ok(_) => {
+                anyhow::bail!("model worker emitted generation output before memory admission")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(anyhow::Error::new(ChatWorkerGoneError));
+            }
+        }
+    }
+}
+
 /// Events from generation
 pub enum GenerateEvent {
+    /// Admission completed before request cache or GPU work.
+    Admitted,
+    /// Predictable memory rejection, preserving its typed HTTP discriminator.
+    RequestMemoryRejected(crate::execution::request_memory::RequestMemoryRejection),
     Token(String, TokenMeta),
     /// Token with associated log probability data (emitted when logprobs are enabled)
     TokenWithLogprobs(String, TokenMeta, TokenLogprobData),
@@ -427,6 +602,7 @@ pub struct ModelProvider {
     batch_observability: Arc<BatchObservability>,
     max_queue_depth: usize,
     single_stream_queue_admission: Arc<AtomicBool>,
+    request_memory_admission: bool,
     /// b10621 `--sleep-idle-seconds` state (#1440): `true` while the serving
     /// worker has freed the model and is parked on the request channel. Only
     /// the batch worker ever sets it; every other worker leaves it `false`,
@@ -581,8 +757,8 @@ impl ModelProvider {
 
     /// Same as [`Self::new_with_server_config`] but also wires the
     /// cross-request prompt-prefix KV cache store.
-    /// The legacy (`config.no_batch`) worker ignores the store because that
-    /// path never calls the batch scheduler that manages the cache.
+    /// The legacy (`config.no_batch`) worker ignores the store because its
+    /// size-one scheduler does not attach cross-request prompt caching.
     pub fn new_with_server_config_and_prompt_cache(
         model_path: PathBuf,
         adapter_path: Option<PathBuf>,
@@ -600,11 +776,13 @@ impl ModelProvider {
         // resolve the speculative-decoding dispatch once
         // from the `ServerConfig::{draft_model_path, draft_kind,
         // draft_block_size}` fields. The resolution reads the drafter's
-        // `config.json` so it must happen on the main thread before we
-        // hand the resolved value to the worker thread. Failures are
+        // `config.json` and, since issue #1797, the target's as well (the
+        // block-width default is keyed on the target's quantization), so it
+        // must happen on the main thread before we hand the resolved value
+        // to the worker thread. Failures are
         // surfaced as `anyhow::Error` here so the operator gets a clear
         // startup-time error rather than a per-request 5xx.
-        let speculative_dispatch = crate::server::SpeculativeDispatch::resolve(config)
+        let speculative_dispatch = crate::server::SpeculativeDispatch::resolve(config, &model_path)
             .map_err(|e| anyhow::anyhow!("Speculative decoding dispatch resolution failed: {e}"))?;
 
         // OpenXLA backend (issue #449 M3 Stage 2c): when `MLXCEL_BACKEND=xla` is
@@ -649,8 +827,38 @@ impl ModelProvider {
             .as_deref()
             .is_some_and(|reranker| reranker == model_path.as_path())
         {
+            let reason = format!(
+                "Chat generation is disabled: {} is served as a reranker on /v1/rerank, so the \
+                 chat worker did not load a second copy of its weights",
+                model_path.display()
+            );
             return Self::new_without_chat_model(
                 model_path,
+                "model-worker-rerank-only",
+                reason,
+                batch_metrics,
+                batch_observability,
+                decode_hang_timeout,
+            );
+        }
+
+        // Nemotron VoiceChat (#1376) has no chat or completions surface; the
+        // realtime engine thread (`server/realtime_engine.rs`) owns the only
+        // copy of its weights and serves `/v1/realtime`. Starting the chat
+        // worker would load the 11B checkpoint a second time for nothing.
+        if matches!(
+            crate::models::get_model_type(&model_path),
+            Ok(crate::models::ModelType::NemotronVoiceChat)
+        ) {
+            let reason = format!(
+                "Chat generation is disabled: {} is a Nemotron VoiceChat checkpoint served on the \
+                 /v1/realtime WebSocket",
+                model_path.display()
+            );
+            return Self::new_without_chat_model(
+                model_path,
+                "model-worker-realtime-only",
+                reason,
                 batch_metrics,
                 batch_observability,
                 decode_hang_timeout,
@@ -685,8 +893,8 @@ impl ModelProvider {
             provider.decode_hang_timeout = decode_hang_timeout;
             // log a warning if the operator asked for
             // speculative decoding but selected `--no-batch`. The legacy
-            // sequential worker bypasses the BatchScheduler entirely so
-            // the dispatch is inactive on this path.
+            // sequential worker does not attach speculative dispatch to its
+            // size-one scheduler, so dispatch is inactive on this path.
             if !matches!(
                 speculative_dispatch,
                 crate::server::SpeculativeDispatch::Disabled
@@ -708,7 +916,10 @@ impl ModelProvider {
                 config.lora_runtime.clone(),
                 config.max_batch_size,
                 config.max_queue_depth,
-                config.prefill_chunk_size,
+                mlxcel_core::prefill_plan::PrefillChunkPolicy {
+                    alone: config.prefill_chunk_size,
+                    contended: config.prefill_chunk_size_contended,
+                },
                 config.enable_preemption,
                 config.preemption_policy,
                 config.max_batch_prefill,
@@ -741,6 +952,8 @@ impl ModelProvider {
                 },
                 // forward the --kv-cache-budget directive to the worker.
                 config.kv_cache_budget,
+                // forward the --kv-admission-watermark fraction (#2088).
+                config.kv_admission_watermark,
                 // experimental VLM prompt-prefix cache toggle (#124 step c).
                 config.enable_vlm_prefix_cache,
                 // disaggregated serving role from `--node-role` (#126 B2).
@@ -767,7 +980,9 @@ impl ModelProvider {
     /// Build a provider whose chat worker never loads a model.
     ///
     /// Used when `-m` names the checkpoint `--reranker-model` already owns
-    /// (#1356), so the reranker worker keeps the only copy of those weights.
+    /// (#1356), so the reranker worker keeps the only copy of those weights,
+    /// and for a Nemotron VoiceChat checkpoint, whose realtime engine owns
+    /// them (#1376). `reason` is logged once when the worker exits.
     /// The worker thread starts, logs why chat is unavailable and exits, which
     /// drops the request receiver and records a terminal no-chat state. Failed
     /// chat loads record the same state (`-m <embedding checkpoint>` reaches
@@ -775,6 +990,8 @@ impl ModelProvider {
     /// `/health` keeps its existing `loading model` behavior.
     fn new_without_chat_model(
         model_path: PathBuf,
+        thread_name: &str,
+        reason: String,
         batch_metrics: Arc<BatchMetrics>,
         batch_observability: Arc<BatchObservability>,
         decode_hang_timeout: Duration,
@@ -785,16 +1002,13 @@ impl ModelProvider {
             .unwrap_or_else(|| "unknown".to_string());
         let (request_tx, request_rx) = mpsc::channel::<ModelRequest>();
         let chat_unavailable = Arc::new(AtomicBool::new(true));
-        let display_path = model_path.display().to_string();
-        let worker_handle = thread::Builder::new()
-            .name("model-worker-rerank-only".to_string())
-            .spawn(move || {
-                drop(request_rx);
-                tracing::info!(
-                    "Chat generation is disabled: {display_path} is served as a reranker on \
-                     /v1/rerank, so the chat worker did not load a second copy of its weights"
-                );
-            })?;
+        let worker_handle =
+            thread::Builder::new()
+                .name(thread_name.to_string())
+                .spawn(move || {
+                    drop(request_rx);
+                    tracing::info!("{reason}");
+                })?;
         let (worker_handle, worker_exit) = observe_worker_exit(worker_handle);
         Ok(Self {
             request_tx,
@@ -807,6 +1021,7 @@ impl ModelProvider {
             batch_observability,
             max_queue_depth: 1,
             single_stream_queue_admission: Arc::new(AtomicBool::new(false)),
+            request_memory_admission: false,
             // This path has no idle-sleep lifecycle, so the flag is truthfully
             // never set (#1440).
             sleeping: Arc::new(AtomicBool::new(false)),
@@ -855,6 +1070,12 @@ impl ModelProvider {
         let metrics_clone = batch_metrics.clone();
         let obs_clone = batch_observability.clone();
 
+        let request_memory_admission = legacy_request_memory_admission_enabled(
+            tensor_parallel.tp_size,
+            cfg!(all(target_os = "macos", feature = "metal"))
+                && mlxcel_core::default_device_is_gpu(),
+            crate::models::get_model_type(&model_path).ok(),
+        );
         let worker_handle = model_worker::spawn_legacy_model_worker(
             model_path,
             adapter_path,
@@ -882,6 +1103,7 @@ impl ModelProvider {
             chat_unavailable,
             max_queue_depth,
             single_stream_queue_admission,
+            request_memory_admission,
             sleeping,
             prompt_cache: None,
             prompt_tokenizer: None,
@@ -942,6 +1164,7 @@ impl ModelProvider {
             chat_unavailable: Arc::new(AtomicBool::new(false)),
             max_queue_depth: usize::MAX,
             single_stream_queue_admission,
+            request_memory_admission: false,
             // The OpenXLA serve worker has no idle-sleep lifecycle, so the flag
             // is truthfully never set on this path (#1440).
             sleeping: Arc::new(AtomicBool::new(false)),
@@ -1100,7 +1323,7 @@ impl ModelProvider {
             None,
             max_batch_size,
             max_queue_depth,
-            prefill_chunk_size,
+            mlxcel_core::prefill_plan::PrefillChunkPolicy::resolve(Some(prefill_chunk_size)),
             enable_preemption,
             preemption_policy,
             max_batch_prefill,
@@ -1126,6 +1349,7 @@ impl ModelProvider {
             // legacy wrapper: b10621 defaults (shift disabled, keep 0).
             Default::default(),
             kv_cache_budget,
+            crate::server::DEFAULT_KV_ADMISSION_WATERMARK,
             enable_vlm_prefix_cache,
             serving_mode,
             decode_peers,
@@ -1161,7 +1385,7 @@ impl ModelProvider {
         lora_runtime: Option<Arc<crate::lora::RuntimeLoraSet>>,
         max_batch_size: usize,
         max_queue_depth: usize,
-        prefill_chunk_size: usize,
+        prefill_chunk_policy: mlxcel_core::prefill_plan::PrefillChunkPolicy,
         enable_preemption: bool,
         preemption_policy: crate::server::config::PreemptionPolicy,
         max_batch_prefill: usize,
@@ -1184,6 +1408,7 @@ impl ModelProvider {
         // b10621 context-retention policy at the KV bound (#1472).
         context_retention: crate::server::batch::ContextRetentionPolicy,
         kv_cache_budget: Option<crate::memory_estimate::PagedBudgetDirective>,
+        kv_admission_watermark: f64,
         enable_vlm_prefix_cache: bool,
         serving_mode: crate::distributed::disaggregated::ServingMode,
         decode_peers: Vec<std::net::SocketAddr>,
@@ -1223,7 +1448,7 @@ impl ModelProvider {
             lora_runtime,
             max_batch_size,
             max_queue_depth,
-            prefill_chunk_size,
+            prefill_chunk_policy,
             enable_preemption,
             preemption_policy,
             max_batch_prefill: max_batch_prefill.max(1),
@@ -1253,6 +1478,7 @@ impl ModelProvider {
             // paged KV pool block-budget directive; resolved to a block count
             // on the worker thread once the model geometry is known.
             kv_cache_budget,
+            kv_admission_watermark,
             // experimental VLM prompt-prefix cache toggle (#124 step c).
             enable_vlm_prefix_cache,
             // disaggregated serving role from `--node-role` (#126 B2). The
@@ -1274,6 +1500,7 @@ impl ModelProvider {
             diffusion_threshold,
         };
 
+        let request_memory_admission = uses_request_memory_admission(&model_path, &sched_config);
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(
             model_path,
             adapter_path,
@@ -1301,6 +1528,7 @@ impl ModelProvider {
             max_queue_depth,
             chat_unavailable,
             single_stream_queue_admission,
+            request_memory_admission,
             sleeping,
             prompt_cache: prompt_cache_store,
             prompt_tokenizer: None,
@@ -1351,7 +1579,7 @@ impl ModelProvider {
         let sched_config = model_worker::WorkerSchedulerConfig {
             max_batch_size,
             max_queue_depth,
-            prefill_chunk_size: 0,
+            prefill_chunk_policy: mlxcel_core::prefill_plan::PrefillChunkPolicy::resolve(Some(0)),
             // #1011: chunking is off on this path, so no prefill can ever park
             // and the fairness grant is unreachable; keep the default.
             lora_adapters: Vec::new(),
@@ -1379,6 +1607,7 @@ impl ModelProvider {
             context_size_total: 0,          // model default in minimal test path
             explicit_max_kv_size: None,     // unset in minimal test path
             kv_cache_budget: None,          // unbounded in minimal test path
+            kv_admission_watermark: 0.0,    // inert without a budget
             enable_vlm_prefix_cache: false, // off in minimal test path
             // minimal test path is single-node.
             serving_mode: crate::distributed::disaggregated::ServingMode::Hybrid,
@@ -1394,6 +1623,7 @@ impl ModelProvider {
             diffusion_threshold: 0.9,
         };
 
+        let request_memory_admission = uses_request_memory_admission(&model_path, &sched_config);
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(
             model_path,
             adapter_path,
@@ -1421,6 +1651,7 @@ impl ModelProvider {
             max_queue_depth,
             chat_unavailable,
             single_stream_queue_admission,
+            request_memory_admission,
             sleeping,
             prompt_cache: None,
             prompt_tokenizer: None,
@@ -1475,6 +1706,13 @@ impl ModelProvider {
     /// Get creation timestamp
     pub fn created_at(&self) -> i64 {
         self.created_at
+    }
+
+    /// CPU-only worker-family flag; single-stream workers do not publish batch
+    /// active/decode counters even though their queue reservation gauge is valid.
+    #[cfg(feature = "webui")]
+    pub(crate) fn uses_single_stream_observation(&self) -> bool {
+        self.single_stream_queue_admission.load(Ordering::Acquire)
     }
 
     /// Check if model is loaded and ready for inference
@@ -1559,9 +1797,10 @@ impl ModelProvider {
     /// full result.
     ///
     /// Server video routes pass `videos` through here once the path-traversal
-    /// guard in [`crate::server::media::extract_chat_video_paths`] has cleared
-    /// each entry against `MLXCEL_VIDEO_DIR_ALLOWLIST`. Empty `videos` matches
-    /// earlier behavior bit-for-bit.
+    /// guard in
+    /// [`crate::server::media::extract_chat_video_paths_with_allowlist`] has
+    /// cleared each entry against `MLXCEL_VIDEO_DIR_ALLOWLIST`. Empty `videos`
+    /// matches earlier behavior bit-for-bit.
     ///
     /// Restricted to `pub(crate)` because the input type [`ResolvedVideo`] is
     /// crate-internal — it carries an [`crate::multimodal::video::VideoSource`]
@@ -2214,6 +2453,7 @@ impl ModelProvider {
         )
     }
 
+    // Used by: all serving models via every generation HTTP dialect and in-process callers.
     #[allow(clippy::too_many_arguments)]
     fn send_generate_request_with_cancellation_and_metadata(
         &self,
@@ -2228,6 +2468,53 @@ impl ModelProvider {
         queue_reservation_mode: QueueReservationMode,
     ) -> Result<mpsc::Receiver<GenerateEvent>> {
         let mut options = options;
+        let mut notification = options.admission_notification.take();
+        // Unsupported paths keep their existing streaming semantics: this
+        // handshake must not wait for their worker's first event or reclassify
+        // asynchronous errors that previously followed SSE headers.
+        if (!self.request_memory_admission
+            || !images.is_empty()
+            || !audio.is_empty()
+            || !videos.is_empty())
+            && let Some(notification) = notification.take()
+        {
+            notification.complete(&Ok(()));
+        }
+        let result = self.send_generate_request_with_cancellation_and_metadata_inner(
+            prompt,
+            options,
+            images,
+            audio,
+            videos,
+            media,
+            cancelled,
+            runtime,
+            queue_reservation_mode,
+        );
+        if let Some(notification) = notification {
+            notification.complete(&result);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_generate_request_with_cancellation_and_metadata_inner(
+        &self,
+        prompt: String,
+        options: ServerGenerateOptions,
+        images: Vec<Vec<u8>>,
+        audio: Vec<Vec<u8>>,
+        videos: Vec<ResolvedVideo>,
+        media: MediaRequestMetadata,
+        cancelled: Arc<AtomicBool>,
+        runtime: Option<RequestRuntimeDefaults>,
+        queue_reservation_mode: QueueReservationMode,
+    ) -> Result<mpsc::Receiver<GenerateEvent>> {
+        let mut options = options;
+        let wait_for_admission = self.request_memory_admission
+            && images.is_empty()
+            && audio.is_empty()
+            && videos.is_empty();
         let (response_tx, response_rx) = mpsc::channel();
         media
             .validate_resolved_image_count()
@@ -2310,13 +2597,22 @@ impl ModelProvider {
                 media,
                 queue_reservation,
                 response_tx,
-                cancelled,
+                cancelled: cancelled.clone(),
             })
             .is_err()
         {
             return Err(anyhow::Error::new(ChatWorkerGoneError));
         }
 
+        let admission = if wait_for_admission {
+            await_request_admission(&response_rx, &cancelled)
+        } else {
+            Ok(())
+        };
+        if admission.is_err() {
+            cancelled.store(true, Ordering::Release);
+        }
+        admission?;
         Ok(response_rx)
     }
 }
@@ -2515,6 +2811,8 @@ where
             GenerateEvent::Prefill(_) => Ok(None),
             GenerateEvent::Done(result) => Ok(Some(result)),
             GenerateEvent::Error(err) => Err(anyhow::anyhow!(err)),
+            GenerateEvent::Admitted => Ok(None),
+            GenerateEvent::RequestMemoryRejected(err) => Err(anyhow::Error::new(err)),
         })?;
 
     if !accumulated_logprobs.is_empty() {
@@ -2559,6 +2857,8 @@ where
             }
             GenerateEvent::Done(result) => Ok(Some(result)),
             GenerateEvent::Error(err) => Err(anyhow::anyhow!(err)),
+            GenerateEvent::Admitted => Ok(None),
+            GenerateEvent::RequestMemoryRejected(err) => Err(anyhow::Error::new(err)),
         })?;
 
     if !accumulated_logprobs.is_empty() {
@@ -2596,6 +2896,8 @@ where
         GenerateEvent::Prefill(_) => Ok(None),
         GenerateEvent::Done(result) => Ok(Some(result)),
         GenerateEvent::Error(err) => Err(anyhow::anyhow!(err)),
+        GenerateEvent::Admitted => Ok(None),
+        GenerateEvent::RequestMemoryRejected(err) => Err(anyhow::Error::new(err)),
     })
 }
 
@@ -2630,6 +2932,8 @@ where
         }
         GenerateEvent::Done(result) => Ok(Some(result)),
         GenerateEvent::Error(err) => Err(anyhow::anyhow!(err)),
+        GenerateEvent::Admitted => Ok(None),
+        GenerateEvent::RequestMemoryRejected(err) => Err(anyhow::Error::new(err)),
     })
 }
 
@@ -2669,6 +2973,8 @@ where
         }
         GenerateEvent::Done(result) => Ok(Some(result)),
         GenerateEvent::Error(err) => Err(anyhow::anyhow!(err)),
+        GenerateEvent::Admitted => Ok(None),
+        GenerateEvent::RequestMemoryRejected(err) => Err(anyhow::Error::new(err)),
     })
 }
 
@@ -2744,7 +3050,9 @@ where
             // must NOT open the bounded decode window: doing so would start
             // the hang timer while the first token is still being sampled.
             GenerateEvent::Prefill(_) => {}
-            GenerateEvent::Error(_) => {}
+            GenerateEvent::Error(_)
+            | GenerateEvent::Admitted
+            | GenerateEvent::RequestMemoryRejected(_) => {}
         }
 
         if let Some(result) = handler(event)? {

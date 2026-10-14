@@ -72,6 +72,8 @@ pub mod llmjp_vl;
 pub(crate) mod llmjp_vl_test_support;
 pub mod llmjp_vl_text;
 pub mod locateanything;
+pub mod mage_vl;
+pub mod mage_vl_config;
 pub mod minicpmo_vl;
 pub mod minicpmv4_6_vl;
 pub mod minimax_m3_vl;
@@ -126,6 +128,7 @@ pub use lfm2_vl::Lfm2VlModel;
 pub use llmjp_vl::LlmJpVlModel;
 pub use llmjp_vl_text::LlmJpTextModel;
 pub use locateanything::{LocateAnythingConnector, LocateAnythingVLM};
+pub use mage_vl::MageVlModel;
 pub use minicpmo_vl::MiniCPMOVLModel;
 pub use minicpmv4_6_vl::MiniCPMV46VLModel;
 pub use minimax_m3_vl::MiniMaxM3VlModel;
@@ -369,8 +372,24 @@ impl LanguageModel for VisionLanguageModel {
         self.text_model.reset_runtime_state()
     }
 
-    fn trim_internal_caches(&self, excess: i32) {
-        self.text_model.trim_internal_caches(excess)
+    fn trim_state(
+        &self,
+        seq: Option<mlxcel_core::cache::SequenceId>,
+        excess: i32,
+    ) -> Result<(), String> {
+        self.text_model.trim_state(seq, excess)
+    }
+
+    fn supports_decode_lookahead_rewind(&self) -> bool {
+        self.text_model.supports_decode_lookahead_rewind()
+    }
+
+    fn rewind_decode_appends(
+        &self,
+        seq_id: mlxcel_core::cache::SequenceId,
+        n: i32,
+    ) -> Result<(), String> {
+        self.text_model.rewind_decode_appends(seq_id, n)
     }
 
     fn release_sequence_state(&self, caches: &mut [KVCache]) {
@@ -491,6 +510,53 @@ impl LanguageModel for VisionLanguageModel {
         )
     }
 
+    // The three last-logits entry points go to the text model too, so a text
+    // model that projects only the sampled row through its LM head (Llama 3,
+    // cohere2, gemma4, ...) keeps that saving behind the vision wrapper
+    // instead of falling back to the trait default's full-logits slice.
+    fn forward_last_logits(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        self.text_model
+            .forward_last_logits(input_ids, caches, mask, last_pos)
+    }
+
+    fn forward_last_logits_with_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        seq_id: Option<mlxcel_core::cache::SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        self.text_model
+            .forward_last_logits_with_sequence_id(input_ids, seq_id, caches, mask, last_pos)
+    }
+
+    fn forward_last_logits_with_embeddings_and_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        seq_id: Option<mlxcel_core::cache::SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        self.text_model
+            .forward_last_logits_with_embeddings_and_sequence_id(
+                input_ids,
+                input_embeddings,
+                seq_id,
+                caches,
+                mask,
+                last_pos,
+            )
+    }
+
     fn sync_sequence_storage(
         &self,
         seq_id: mlxcel_core::cache::SequenceId,
@@ -509,38 +575,25 @@ impl LanguageModel for VisionLanguageModel {
             .forward_batched(input_ids, batch_caches, mask)
     }
 
-    fn forward_batched_with_context(
-        &self,
-        input_ids: &MlxArray,
-        batch_caches: &mut [&mut [KVCache]],
-        mask: Option<&MlxArray>,
-        context: Option<&mlxcel_core::generate::DecodeBatchContext>,
-    ) -> UniquePtr<MlxArray> {
-        self.text_model
-            .forward_batched_with_context(input_ids, batch_caches, mask, context)
-    }
-
-    fn forward_batched_with_context_and_ids(
+    fn forward_batched_with_ids(
         &self,
         input_ids: &MlxArray,
         seq_ids: Option<&[mlxcel_core::cache::SequenceId]>,
         batch_caches: &mut [&mut [KVCache]],
         mask: Option<&MlxArray>,
-        context: Option<&mlxcel_core::generate::DecodeBatchContext>,
     ) -> UniquePtr<MlxArray> {
-        self.text_model.forward_batched_with_context_and_ids(
-            input_ids,
-            seq_ids,
-            batch_caches,
-            mask,
-            context,
-        )
+        self.text_model
+            .forward_batched_with_ids(input_ids, seq_ids, batch_caches, mask)
     }
 }
 
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "snapshot_forwarding_tests.rs"]
+mod snapshot_forwarding_tests;
 
 #[cfg(test)]
 #[path = "moondream3_vl_tests.rs"]

@@ -117,6 +117,8 @@ pub enum LoadedModel {
     LlmJpVL(vision::LlmJpVlModel),
     /// GOT-OCR 2.0 (`GOT`): SAM ViT-B tower + linear projector + Qwen2-0.5B.
     GotOcrVLM(vision::GotOcrVlModel),
+    /// Mage-VL (`mage_vl`): Mage-ViT tower + 2x2 patch merger + Qwen3 decoder.
+    MageVLM(vision::MageVlModel),
     KimiVL(vision::KimiVLModel),
     LocateAnythingVLM(vision::LocateAnythingVLM),
     SmolVLM(vision::SmolVLMModel),
@@ -132,6 +134,15 @@ pub enum LoadedModel {
     /// its dedicated seq2seq worker before the batched/paged scheduler; the
     /// `LanguageModel` delegation below exists for trait completeness.
     Florence2VLM(models::Florence2VlmModel),
+    /// Nemotron-Parse (issue #1369): C-RADIO ViT-H + neck encoder and a
+    /// pre-norm mBART decoder. Seq2seq, routed exactly like Florence-2: the
+    /// CLI early-exits to its page driver and the server serves it on its
+    /// dedicated single-stream worker.
+    NemotronParseVLM(models::NemotronParseVlmModel),
+    /// Nemotron VoiceChat (issue #1374): full-duplex speech model. The CLI
+    /// routes it to its offline timeline loop before the autoregressive
+    /// loop; the `LanguageModel` delegation exists for trait completeness.
+    NemotronVoiceChat(models::NemotronVoiceChatModel),
     Gemma3n(models::Gemma3nModel),
     Gemma3nVLM(vision::Gemma3nVLModel),
     Phi(models::PhiModel),
@@ -192,6 +203,7 @@ pub enum LoadedModel {
     Gpt2(models::Gpt2Model),
     GptBigCode(models::GptBigCodeModel),
     GptNeoX(models::GptNeoxModel),
+    NanoChat(models::NanoChatModel),
     Helium(models::HeliumModel),
     TeleChat3(models::TeleChat3Model),
     StarCoder2(models::StarCoder2Model),
@@ -300,6 +312,7 @@ macro_rules! delegate_language_model {
             LoadedModel::InternVLChatVLM(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::LlmJpVL(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::GotOcrVLM(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::MageVLM(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::KimiVL(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::LocateAnythingVLM(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::SmolVLM(inner) => LanguageModel::$method(inner, $($arg),*),
@@ -310,6 +323,8 @@ macro_rules! delegate_language_model {
             LoadedModel::Moondream3VLM(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Moondream2VLM(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Florence2VLM(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::NemotronParseVLM(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::NemotronVoiceChat(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Gemma3n(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Gemma3nVLM(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Phi(inner) => LanguageModel::$method(inner, $($arg),*),
@@ -370,6 +385,7 @@ macro_rules! delegate_language_model {
             LoadedModel::Gpt2(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::GptBigCode(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::GptNeoX(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::NanoChat(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Helium(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::TeleChat3(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::StarCoder2(inner) => LanguageModel::$method(inner, $($arg),*),
@@ -527,6 +543,29 @@ impl LanguageModel for LoadedModel {
         delegate_language_model!(self, reset_runtime_state())
     }
 
+    fn trim_state(
+        &self,
+        seq: Option<mlxcel_core::cache::SequenceId>,
+        excess: i32,
+    ) -> Result<(), String> {
+        delegate_language_model!(self, trim_state(seq, excess))
+    }
+
+    // #2159: the scheduler pipelines a model-owned family only through these
+    // two hooks; a dropped delegation silently turns the pipeline off (or, for
+    // the rewind, fails every teardown), the #1755 lesson.
+    fn supports_decode_lookahead_rewind(&self) -> bool {
+        delegate_language_model!(self, supports_decode_lookahead_rewind())
+    }
+
+    fn rewind_decode_appends(
+        &self,
+        seq_id: mlxcel_core::cache::SequenceId,
+        n: i32,
+    ) -> Result<(), String> {
+        delegate_language_model!(self, rewind_decode_appends(seq_id, n))
+    }
+
     fn release_sequence_state(&self, caches: &mut [mlxcel_core::layers::KVCache]) {
         delegate_language_model!(self, release_sequence_state(caches))
     }
@@ -612,19 +651,6 @@ impl LanguageModel for LoadedModel {
         delegate_language_model!(self, forward_batched(input_ids, batch_caches, mask))
     }
 
-    fn forward_batched_with_context(
-        &self,
-        input_ids: &mlxcel_core::MlxArray,
-        batch_caches: &mut [&mut [mlxcel_core::layers::KVCache]],
-        mask: Option<&mlxcel_core::MlxArray>,
-        context: Option<&mlxcel_core::generate::DecodeBatchContext>,
-    ) -> UniquePtr<mlxcel_core::MlxArray> {
-        delegate_language_model!(
-            self,
-            forward_batched_with_context(input_ids, batch_caches, mask, context)
-        )
-    }
-
     fn forward_with_sequence_id(
         &self,
         input_ids: &mlxcel_core::MlxArray,
@@ -666,17 +692,16 @@ impl LanguageModel for LoadedModel {
         delegate_language_model!(self, sync_sequence_storage(seq_id, cache_pool))
     }
 
-    fn forward_batched_with_context_and_ids(
+    fn forward_batched_with_ids(
         &self,
         input_ids: &mlxcel_core::MlxArray,
         seq_ids: Option<&[mlxcel_core::cache::SequenceId]>,
         batch_caches: &mut [&mut [mlxcel_core::layers::KVCache]],
         mask: Option<&mlxcel_core::MlxArray>,
-        context: Option<&mlxcel_core::generate::DecodeBatchContext>,
     ) -> UniquePtr<mlxcel_core::MlxArray> {
         delegate_language_model!(
             self,
-            forward_batched_with_context_and_ids(input_ids, seq_ids, batch_caches, mask, context)
+            forward_batched_with_ids(input_ids, seq_ids, batch_caches, mask)
         )
     }
 

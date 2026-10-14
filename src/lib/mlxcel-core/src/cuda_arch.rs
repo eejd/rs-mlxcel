@@ -43,11 +43,29 @@
 use std::fmt;
 use std::sync::OnceLock;
 
+/// First SM number this project names plainly even though CUDA offers an
+/// architecture-specific spelling for it: Blackwell's `sm_100`.
+///
+/// The same boundary as `FIRST_PLAIN_SM` in `build.rs`, which auto-detection
+/// spells architecture lists with. Duplicated rather than shared because a
+/// build script cannot import from the crate it builds; the guard in
+/// `scripts/ci/check_cuda_arch_lists.py` keeps the two from drifting apart.
+const FIRST_PLAIN_SM: u32 = 100;
+
 // ── Compiled architecture list ────────────────────────────────────────────────
 
 /// The `MLX_CUDA_ARCHITECTURES` list this binary's MLX device code was
-/// compiled for, as a CMake-style semicolon-separated string
-/// (`"80;86;89;90a;100;120"`).
+/// compiled for, as a CMake-style semicolon-separated string. An x86_64 release
+/// build records `"80;86;89;90a;100;120"`, the list
+/// `.github/workflows/release.yml` passes it.
+///
+/// The example is a real shipped list rather than a tour of the grammar, so it
+/// cannot drift into recommending a spelling the project rejects: Blackwell is
+/// plain because the architecture-specific image belongs on `fp_quantize.cu`
+/// alone (lablup/mlxcel#1934, #1943). The `a`, `f`, `-real` and `-virtual`
+/// forms this module still has to parse are described on
+/// `parse_cuda_arch_entry` and round-tripped in
+/// `entry_display_round_trips_through_the_parser`.
 ///
 /// Empty on any build without the `cuda` feature, and empty on a CUDA build
 /// whose build script predates this record. Callers treat empty as "unknown",
@@ -81,8 +99,18 @@ static COMPUTE_CAPABILITY: OnceLock<Option<(u32, u32)>> = OnceLock::new();
 /// instead of dying first.
 #[must_use]
 pub fn cuda_compute_capability() -> Option<(u32, u32)> {
-    *COMPUTE_CAPABILITY
-        .get_or_init(|| unpack_compute_capability(crate::ffi::gpu_compute_capability(0)))
+    *COMPUTE_CAPABILITY.get_or_init(|| {
+        // The backend gate is not redundant with the key lookup underneath.
+        // MLX's ROCm backend fills `compute_capability_major`/`minor` from the
+        // HIP device properties, so on a gfx1151 host the bridge hands back a
+        // well-formed `(11, 5)` that is not a CUDA compute capability at all,
+        // and `cuda_arch_startup_summary` printed it as `sm_115` for an AMD
+        // device (issue #1805). Only CUDA has a CUDA compute capability.
+        if crate::hardware::gpu_backend_kind() != crate::hardware::GpuBackendKind::Cuda {
+            return None;
+        }
+        unpack_compute_capability(crate::ffi::gpu_compute_capability(0))
+    })
 }
 
 /// Split the bridge's `major * 1000 + minor` packing, mapping the `-1`
@@ -315,16 +343,24 @@ impl CudaArchMismatch {
     /// The `MLX_CUDA_ARCHITECTURES` value that would build for this device.
     ///
     /// Applies the same rule `build.rs`'s `sm_arch_with_suffix` applies when it
-    /// auto-detects: CUDA's architecture-specific `a` suffix from SM 90 up. The
-    /// suffix is load-bearing on Hopper and newer, where MLX compiles its
-    /// dedicated quantized kernel only when the list says `90a` rather than
-    /// `90`. Suggesting anything else here would send an operator to a rebuild
-    /// that differs from the one auto-detection would have produced.
+    /// auto-detects: CUDA's architecture-specific `a` suffix on Hopper, plain
+    /// from Blackwell up. This message is the one place the project hands an
+    /// operator an `MLX_CUDA_ARCHITECTURES` value to paste, so a suffix here
+    /// that auto-detection would not produce sends them to a build the project
+    /// rejects everywhere else: `121a` compiles every translation unit
+    /// architecture-specific rather than letting `src/lib/mlxcelverse/CMakeLists.txt`
+    /// give that image to `fp_quantize.cu` alone, and
+    /// `scripts/ci/check_cuda_arch_lists.py` fails any workflow list spelled
+    /// that way (lablup/mlxcel#1934, #1943).
     #[must_use]
     pub fn suggested_architecture(&self) -> String {
         let (major, minor) = self.device;
         let sm = major * 10 + minor;
-        let suffix = if sm >= 90 { "a" } else { "" };
+        let suffix = if (90..FIRST_PLAIN_SM).contains(&sm) {
+            "a"
+        } else {
+            ""
+        };
         format!("{sm}{suffix}")
     }
 }

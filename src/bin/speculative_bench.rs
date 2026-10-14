@@ -20,8 +20,8 @@
 //! Captures **no-drafter baseline** throughput numbers for the two reachable
 //! target models (`models/qwen3.5-4b-4bit`, `models/gemma-4-31b-it-4bit`).
 //! These numbers are the denominator of every "speedup vs no-drafter" cell
-//! in `docs/model_tests.md::Speculative drafters` and can be
-//! captured today against real on-disk checkpoints.
+//! in `docs/benchmark_results/model_tests.md::Speculative drafters` and can
+//! be captured today against real on-disk checkpoints.
 //!
 //! ## MTP speculative path (Gemma 4 and Qwen 3.5 families)
 //!
@@ -74,7 +74,8 @@ use clap::{Parser, ValueEnum};
 
 use mlxcel::tokenizer::MlxcelTokenizer;
 use mlxcel::{LanguageModel, LoadedModel, SamplingConfig, initialize_runtime, load_model};
-use mlxcel_core::generate::{CxxGenerator, GenerationStats};
+use mlxcel_core::engine::{DirectEngine, DirectRequest};
+use mlxcel_core::generate::GenerationStats;
 use mlxcel_core::speculative::mtp::MtpAcceptanceSummary;
 
 /// Default 17-token prompt that matches the upstream MTP perf-table conditions
@@ -150,7 +151,12 @@ struct Args {
     prompt: String,
 
     /// Block size for the speculative path (ignored when `--kind none`).
-    /// Mirrors the upstream defaults: 4 for MTP, 16 for DFlash.
+    /// Unset takes the per-pairing value in this file's own catalog, which
+    /// mirrors the upstream constants: 4 for MTP, 16 for DFlash. This bench
+    /// binary deliberately does NOT go through
+    /// `mlxcel::cli::speculative_args::resolve_draft_block_size_for_target`,
+    /// so the per-device policy of issue #1797 does not apply here and a
+    /// sweep row is comparable across hosts.
     #[arg(long)]
     block_size: Option<u32>,
 
@@ -340,15 +346,15 @@ fn resolve_model_dir(name: &str) -> PathBuf {
     primary
 }
 
-/// Encode a prompt with a tokenizer, mirroring `tests/tensor_parallel_real_models.rs`.
-fn encode_prompt(tokenizer: &MlxcelTokenizer, prompt: &str) -> Vec<i32> {
+/// Encode a prompt with a tokenizer, returning a diagnostic error instead of
+/// panicking when the tokenizer rejects `--prompt`, mirroring `tokenize_prompt`
+/// in `bench_decode.rs`.
+fn encode_prompt(tokenizer: &MlxcelTokenizer, prompt: &str) -> Result<Vec<i32>> {
     let add_special = !tokenizer.prompt_carries_bos(prompt);
-    tokenizer
+    let ids = tokenizer
         .encode(prompt, add_special)
-        .expect("tokenizer.encode must succeed on a valid utf-8 prompt")
-        .into_iter()
-        .map(|t| t as i32)
-        .collect()
+        .map_err(|err| anyhow::anyhow!("--prompt failed to tokenize: {err}"))?;
+    Ok(ids.into_iter().map(|t| t as i32).collect())
 }
 
 /// Run the no-drafter baseline against a real on-disk target. Returns the
@@ -366,39 +372,41 @@ fn run_baseline(target_dir: &Path, prompt: &str, max_tokens: usize) -> Result<(f
     mlxcel_core::clear_memory_cache();
 
     let (model, tokenizer) = load_model(target_dir).context("load_model failed")?;
-    let prompt_tokens = encode_prompt(&tokenizer, prompt);
+    let prompt_tokens = encode_prompt(&tokenizer, prompt)?;
     eprintln!(
         "[bench/baseline] Prompt {} tokens, max_new {}",
         prompt_tokens.len(),
         max_tokens
     );
 
-    let num_layers = model.num_layers();
-
-    // Warm-up: a single forward to pull lazy MLX kernels onto the GPU before
-    // the timed run. Upstream MLX defers Metal kernel compilation until the
-    // first call; without the warm-up the first generation reports an
-    // inflated decode time. Bound the warm-up to 4 new tokens so it adds
-    // negligible total wall-clock.
+    // Warm-up: a single run to pull lazy MLX kernels onto the GPU before the
+    // timed run. Upstream MLX defers Metal kernel compilation until the first
+    // call; without the warm-up the first generation reports an inflated
+    // decode time. Bound the warm-up to 4 new tokens so it adds negligible
+    // total wall-clock.
+    // The raw-completion client `mlxcel generate` runs (ADR 0007, #2176);
+    // each run opens and closes its own engine sequence.
+    let mut client = DirectEngine::with_default_chunk(&model);
     {
         eprintln!("[bench/baseline] Warm-up (4 tokens)...");
-        let mut warmup_gen = CxxGenerator::new(num_layers);
-        let _ = warmup_gen.generate(&model, &prompt_tokens, 4, &SamplingConfig::greedy());
+        client
+            .run(&prompt_tokens, 4, &SamplingConfig::greedy())
+            .context("baseline warm-up failed")?;
         mlxcel_core::synchronize_default();
     }
 
     eprintln!("[bench/baseline] Timed run starts");
-    let mut generator = CxxGenerator::new(num_layers);
     let started = Instant::now();
-    let (tokens, stats): (Vec<i32>, GenerationStats) = generator.generate_with_stats(
-        &model,
-        &prompt_tokens,
-        max_tokens,
-        &SamplingConfig::greedy(),
-    );
+    let run = client
+        .generate(
+            &DirectRequest::text(&prompt_tokens, max_tokens, &SamplingConfig::greedy()),
+            |_| true,
+        )
+        .context("baseline generation failed")?;
+    let (tokens, stats): (Vec<i32>, GenerationStats) = (run.tokens, run.stats);
     mlxcel_core::synchronize_default();
     let elapsed = started.elapsed();
-    // `generate_with_stats` returns only the generated tokens (not the
+    // `DirectEngine::generate` returns only the generated tokens (not the
     // prompt prepended) in `tokens`, and `GenerationStats::generated_tokens`
     // carries the count internally. The wall-clock used for tok/s is the
     // `decode_time_ms` field of GenerationStats, which excludes the
@@ -461,7 +469,7 @@ fn mtp_target_supported(model: &LoadedModel) -> bool {
 ///
 /// Mirrors [`run_baseline`]: same runtime init, warm-up, and streaming
 /// progress, but drives the MTP round loop through the target family's
-/// `MtpTarget` adapter + `MtpGenerator` instead of the plain `CxxGenerator`.
+/// `MtpTarget` adapter + `MtpGenerator` instead of the plain engine client.
 ///
 /// Variant dispatch mirrors the server burst path
 /// (`src/server/batch/speculative_burst.rs`): the Gemma 4 text, VLM and
@@ -536,7 +544,7 @@ fn run_mtp(
         mlxcel::model_variant_label(&model)
     );
 
-    let prompt_tokens = encode_prompt(&tokenizer, prompt);
+    let prompt_tokens = encode_prompt(&tokenizer, prompt)?;
     eprintln!(
         "[bench/mtp] Prompt {} tokens, max_new {}",
         prompt_tokens.len(),
@@ -742,7 +750,7 @@ fn summary_accepted_len(s: &MtpAcceptanceSummary) -> f64 {
 
 /// Render a Markdown perf table from the collected rows. Output goes to
 /// stdout; the parent script captures this and pastes it into
-/// `docs/model_tests.md`.
+/// `docs/benchmark_results/model_tests.md`.
 fn print_markdown_table(rows: &[Row]) {
     println!();
     println!("### Speculative drafter perf table");

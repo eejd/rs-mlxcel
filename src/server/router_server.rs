@@ -27,28 +27,34 @@
 #[cfg(feature = "webui")]
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 #[cfg(feature = "webui")]
 use std::sync::{Mutex, OnceLock};
 
 use axum::body::Body;
-use axum::extract::{Path as AxumPath, Query, State};
+#[cfg(feature = "webui")]
+use axum::extract::Path as AxumPath;
+use axum::extract::{Query, State};
+#[cfg(feature = "webui")]
 use axum::http::HeaderMap;
-use axum::http::{Method, Request, StatusCode, Uri};
+#[cfg(feature = "webui")]
+use axum::http::Uri;
+use axum::http::{Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 
 use super::config::ServerConfig;
+#[cfg(feature = "webui")]
 use super::router_lifecycle::{
-    CancelError, ErrorBody, ErrorEnvelope, FieldError, MAX_SAFE_EVENT_SEQUENCE, OperationError,
-    OperationKind, OperationResult, OperationState, OperationTarget, ReplaySubscribeError,
-    ResetEventKind, UiEvent, UiReplayCursor,
+    CancelError, ErrorBody, ErrorEnvelope, FieldError, OperationError, OperationKind,
+    OperationResult, OperationState, OperationTarget,
 };
-use super::router_models::{
-    ROUTER_SHUTDOWN_TIMEOUT, RouterModelAction, RouterPool, RouterPoolError,
-};
+#[cfg(feature = "webui")]
+use super::router_models::{ModelActionEvictionTarget, RouterModelAction};
+use super::router_models::{ROUTER_SHUTDOWN_TIMEOUT, RouterPool, RouterPoolError};
 use super::routes::slots::{llama_error_response, llama_invalid_request};
 
 /// How long an autoload dispatch waits for the model to become ready before
@@ -59,7 +65,7 @@ const AUTOLOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 /// Largest request body the dispatcher buffers while resolving `model`.
 /// Matches the most permissive sub-app limit (the 25 MiB audio uploads) with
 /// headroom.
-const DISPATCH_BODY_CAP: usize = 64 * 1024 * 1024;
+pub(crate) const DISPATCH_BODY_CAP: usize = 64 * 1024 * 1024;
 
 #[cfg(feature = "webui")]
 static CATALOG_REFRESH_OWNERS: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
@@ -125,6 +131,8 @@ pub struct RouterServerState {
     pub pool: Arc<RouterPool>,
     pub config: Arc<ServerConfig>,
     #[cfg(feature = "webui")]
+    pub startup: Arc<super::ServerStartupConfig>,
+    #[cfg(feature = "webui")]
     pub catalog_cache: Arc<super::webui::catalog::CatalogProjectionCache>,
 }
 
@@ -136,10 +144,12 @@ fn llama_not_found(message: &str) -> Response {
     llama_error_response(StatusCode::NOT_FOUND, "not_found_error", message)
 }
 
+#[cfg(feature = "webui")]
 fn request_id() -> String {
     format!("req_{}", chrono::Utc::now().timestamp_micros())
 }
 
+#[cfg(feature = "webui")]
 fn webui_error(
     status: StatusCode,
     code: &str,
@@ -163,6 +173,7 @@ fn webui_error(
         .into_response()
 }
 
+#[cfg(feature = "webui")]
 fn webui_field_error(
     status: StatusCode,
     code: &str,
@@ -222,10 +233,15 @@ fn pool_error_response(err: RouterPoolError) -> Response {
     }
 }
 
+#[cfg(feature = "webui")]
 fn webui_pool_error_response(err: RouterPoolError) -> Response {
     match err {
         RouterPoolError::OperationRejected(error) => (
-            StatusCode::CONFLICT,
+            if error.code == "unsupported" {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::CONFLICT
+            },
             Json(ErrorEnvelope {
                 error,
                 request_id: request_id(),
@@ -447,57 +463,41 @@ async fn router_models_unload(
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg(feature = "webui")]
 enum UiModelActionKind {
     Load,
     Unload,
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UiLoadProfile {
-    ctx_size: Option<u64>,
-    n_parallel: Option<u64>,
-    kv_cache_mode: Option<String>,
-}
+#[cfg(feature = "webui")]
+use super::webui::load_profile::UiLoadProfile;
 
-impl UiLoadProfile {
-    fn has_overrides(&self) -> bool {
-        self.ctx_size.is_some() || self.n_parallel.is_some() || self.kv_cache_mode.is_some()
-    }
-}
-
+#[cfg(feature = "webui")]
 const MODEL_ID_PREFIX: &str = "mdl_";
+#[cfg(feature = "webui")]
 const MODEL_ID_SUFFIX_LEN: usize = 43;
+#[cfg(feature = "webui")]
 const IDEMPOTENCY_KEY_MIN: usize = 8;
+#[cfg(feature = "webui")]
 const IDEMPOTENCY_KEY_MAX: usize = 128;
+#[cfg(feature = "webui")]
 const OPERATION_ID_MAX: usize = 128;
+#[cfg(feature = "webui")]
 const CURSOR_TOKEN_MAX: usize = 512;
+#[cfg(feature = "webui")]
 const OPERATION_TARGET_TOKEN_MAX: usize = 128;
-const KV_CACHE_MODE_NAMES: &[&str] = &[
-    "fp16",
-    "float16",
-    "int8",
-    "i8",
-    "turbo4-asym",
-    "fp16+turbo4",
-    "turbo3-asym",
-    "fp16+turbo3",
-    "turbo3",
-    "turbo4",
-    "turbo4-sym",
-    "turbo4-delegated",
-    "fp16+turbo4-delegated",
-];
-
+#[cfg(feature = "webui")]
 fn is_webui_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'~' | b'-')
 }
 
+#[cfg(feature = "webui")]
 fn is_webui_token(value: &str, min: usize, max: usize) -> bool {
     let bytes = value.as_bytes();
     (min..=max).contains(&bytes.len()) && bytes.iter().copied().all(is_webui_token_byte)
 }
 
+#[cfg(feature = "webui")]
 fn valid_model_id(value: &str) -> bool {
     let Some(suffix) = value.strip_prefix(MODEL_ID_PREFIX) else {
         return false;
@@ -509,6 +509,7 @@ fn valid_model_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
+#[cfg(feature = "webui")]
 fn invalid_webui_field(
     field: &str,
     field_code: &str,
@@ -524,6 +525,7 @@ fn invalid_webui_field(
     )
 }
 
+#[cfg(feature = "webui")]
 fn validate_idempotency_key(value: &str) -> Option<Response> {
     if value.len() < IDEMPOTENCY_KEY_MIN {
         return Some(invalid_webui_field(
@@ -549,6 +551,7 @@ fn validate_idempotency_key(value: &str) -> Option<Response> {
     None
 }
 
+#[cfg(feature = "webui")]
 fn validate_model_id(value: &str, field: &str) -> Option<Response> {
     if !valid_model_id(value) {
         return Some(invalid_webui_field(
@@ -560,6 +563,7 @@ fn validate_model_id(value: &str, field: &str) -> Option<Response> {
     None
 }
 
+#[cfg(feature = "webui")]
 fn validate_operation_id(value: &str, field: &str) -> Option<Response> {
     if !is_webui_token(value, 1, OPERATION_ID_MAX) {
         return Some(invalid_webui_field(
@@ -571,6 +575,7 @@ fn validate_operation_id(value: &str, field: &str) -> Option<Response> {
     None
 }
 
+#[cfg(feature = "webui")]
 fn validate_cursor(value: &str) -> Option<Response> {
     if !is_webui_token(value, 1, CURSOR_TOKEN_MAX) {
         return Some(invalid_webui_field(
@@ -596,6 +601,7 @@ fn validate_cursor(value: &str) -> Option<Response> {
     None
 }
 
+#[cfg(feature = "webui")]
 fn validate_target_filter(value: &str) -> Option<Response> {
     if !is_webui_token(value, 1, OPERATION_TARGET_TOKEN_MAX) {
         return Some(invalid_webui_field(
@@ -607,35 +613,12 @@ fn validate_target_filter(value: &str) -> Option<Response> {
     None
 }
 
+#[cfg(feature = "webui")]
 fn validate_load_profile(profile: &UiLoadProfile) -> Option<Response> {
-    if let Some(ctx_size) = profile.ctx_size
-        && !(1..=262_144).contains(&ctx_size)
-    {
-        return Some(invalid_webui_field(
-            "load_profile.ctx_size",
-            "out_of_range",
-            "ctx_size must be between 1 and 262144",
-        ));
-    }
-    if let Some(n_parallel) = profile.n_parallel
-        && !(1..=32).contains(&n_parallel)
-    {
-        return Some(invalid_webui_field(
-            "load_profile.n_parallel",
-            "out_of_range",
-            "n_parallel must be between 1 and 32",
-        ));
-    }
-    if let Some(mode) = profile.kv_cache_mode.as_deref()
-        && !KV_CACHE_MODE_NAMES.contains(&mode)
-    {
-        return Some(invalid_webui_field(
-            "load_profile.kv_cache_mode",
-            "invalid_enum",
-            "kv_cache_mode must be one of the WebUI contract KV cache mode names",
-        ));
-    }
-    None
+    profile
+        .validate()
+        .err()
+        .map(|error| invalid_webui_field(error.field, error.code, error.message))
 }
 
 #[cfg(feature = "webui")]
@@ -691,6 +674,103 @@ async fn ui_catalog_get(
             StatusCode::SERVICE_UNAVAILABLE,
             "unavailable",
             format!("catalog projection task failed: {err}"),
+            true,
+        ),
+    }
+}
+
+#[cfg(feature = "webui")]
+async fn ui_bootstrap(State(state): State<RouterServerState>) -> Response {
+    let coordinator = state.pool.lifecycle_coordinator();
+    let mode = if state.pool.snapshot().is_empty() {
+        super::webui::api::WebUiServerMode::ModelFree
+    } else {
+        super::webui::api::WebUiServerMode::RouterPool
+    };
+    Json(super::webui::api::bootstrap_response(
+        &state.startup,
+        &state.config,
+        coordinator.server_instance_id().to_string(),
+        mode,
+        state.pool.has_cache(),
+    ))
+    .into_response()
+}
+
+#[cfg(feature = "webui")]
+#[derive(Default, serde::Deserialize)]
+struct UiRuntimeQuery {
+    model_id: Option<String>,
+    autoload: Option<bool>,
+}
+
+#[cfg(feature = "webui")]
+async fn ui_runtime(
+    State(state): State<RouterServerState>,
+    Query(query): Query<UiRuntimeQuery>,
+) -> Response {
+    if query.autoload.unwrap_or(false) {
+        return invalid_webui_field(
+            "autoload",
+            "unsupported",
+            "runtime observations must use autoload=false",
+        );
+    }
+    let Some(model_id) = query.model_id else {
+        return invalid_webui_field("model_id", "required", "model_id is required");
+    };
+    if let Some(response) = validate_model_id(&model_id, "model_id") {
+        return response;
+    }
+    let models = state.pool.catalog_snapshot();
+    let catalog_cache = state.catalog_cache.clone();
+    let model_id_for_task = model_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        super::webui::catalog::get_catalog_entry_with_cache(
+            &catalog_cache,
+            models,
+            &model_id_for_task,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(entry)) => {
+            let Some(config) = state.pool.config_for_visible_model_id(&model_id) else {
+                return webui_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable",
+                    "runtime configuration for the selected model is unavailable",
+                    true,
+                );
+            };
+            let coordinator = state.pool.lifecycle_coordinator();
+            let observed = state
+                .pool
+                .get_by_model_id(&model_id)
+                .and_then(|observed| observed.runtime_observation_state(entry.identity.revision));
+            let config = observed
+                .as_ref()
+                .map(|state| (*state.config).clone())
+                .unwrap_or(config);
+            let mut snapshot = super::webui::runtime::runtime_snapshot(
+                coordinator.server_instance_id().to_string(),
+                model_id.clone(),
+                entry.identity.revision,
+                coordinator.snapshot_sequence(),
+                &config,
+                observed.as_ref(),
+            );
+            snapshot.settings.overridden_by_cli = state.pool.next_load_cli_overrides();
+            Json(snapshot).into_response()
+        }
+        Ok(Err(super::webui::catalog::CatalogError::NotFound)) => {
+            webui_error(StatusCode::NOT_FOUND, "not_found", "model not found", true)
+        }
+        Ok(Err(err)) => catalog_error_response(err),
+        Err(err) => webui_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            format!("runtime projection task failed: {err}"),
             true,
         ),
     }
@@ -832,6 +912,7 @@ fn catalog_error_response(err: super::webui::catalog::CatalogError) -> Response 
     }
 }
 
+#[cfg(feature = "webui")]
 fn operation_begin_error_response(err: OperationError) -> Response {
     match err {
         OperationError::Conflict { operation_id } => (
@@ -860,6 +941,7 @@ fn operation_begin_error_response(err: OperationError) -> Response {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(feature = "webui")]
 struct UiModelActionRequest {
     model_id: String,
     action: UiModelActionKind,
@@ -867,8 +949,10 @@ struct UiModelActionRequest {
     idempotency_key: String,
     load_profile: Option<UiLoadProfile>,
     eviction_target_id: Option<String>,
+    eviction_target_expected_revision: Option<u64>,
 }
 
+#[cfg(feature = "webui")]
 fn ui_action_to_router(action: &UiModelActionKind) -> RouterModelAction {
     match action {
         UiModelActionKind::Load => RouterModelAction::Load,
@@ -877,6 +961,7 @@ fn ui_action_to_router(action: &UiModelActionKind) -> RouterModelAction {
 }
 
 /// POST /ui-api/v1/model-actions.
+#[cfg(feature = "webui")]
 async fn ui_model_actions(
     State(state): State<RouterServerState>,
     body: axum::body::Bytes,
@@ -910,41 +995,90 @@ async fn ui_model_actions(
     {
         return response;
     }
+    match (
+        request.eviction_target_id.as_ref(),
+        request.eviction_target_expected_revision,
+    ) {
+        (Some(_), None) => {
+            return invalid_webui_field(
+                "eviction_target_expected_revision",
+                "required",
+                "eviction_target_expected_revision is required when eviction_target_id is set",
+            );
+        }
+        (None, Some(_)) => {
+            return invalid_webui_field(
+                "eviction_target_expected_revision",
+                "unexpected",
+                "eviction_target_expected_revision requires eviction_target_id",
+            );
+        }
+        (_, Some(0)) => {
+            return invalid_webui_field(
+                "eviction_target_expected_revision",
+                "out_of_range",
+                "eviction_target_expected_revision must be at least 1",
+            );
+        }
+        _ => {}
+    }
     if let Some(profile) = request.load_profile.as_ref()
         && let Some(response) = validate_load_profile(profile)
     {
         return response;
     }
-    if request
-        .load_profile
-        .as_ref()
-        .is_some_and(UiLoadProfile::has_overrides)
+    if matches!(request.action, UiModelActionKind::Unload)
+        && request
+            .load_profile
+            .as_ref()
+            .is_some_and(UiLoadProfile::has_overrides)
     {
-        return webui_field_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "unsupported",
-            "next-load profile overrides are not implemented in this runtime path yet",
+        return invalid_webui_field(
             "load_profile",
-            "unsupported",
-            "ctx_size, n_parallel and kv_cache_mode are parsed but not applied by issue #1839",
+            "invalid_action",
+            "a next-load profile is only valid for load actions",
         );
     }
-    match state.pool.submit_model_action(
-        &request.model_id,
-        ui_action_to_router(&request.action),
-        request.expected_revision,
-        &request.idempotency_key,
-        request.eviction_target_id.as_deref(),
-    ) {
-        Ok(accepted) => (StatusCode::ACCEPTED, Json(accepted)).into_response(),
-        Err(err) => {
+    // Admission runs before filesystem-backed profile resolution inside this
+    // blocking task. The lifecycle coordinator bounds admitted operations;
+    // duplicate/over-capacity requests never reach metadata/config reads.
+    let pool = state.pool.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let eviction_target = request
+            .eviction_target_id
+            .as_deref()
+            .zip(request.eviction_target_expected_revision)
+            .map(|(target_id, revision)| ModelActionEvictionTarget::new(target_id, revision));
+        pool.submit_model_action_with_profile(
+            &request.model_id,
+            ui_action_to_router(&request.action),
+            request.expected_revision,
+            &request.idempotency_key,
+            eviction_target,
+            request.load_profile,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(accepted)) => (StatusCode::ACCEPTED, Json(accepted)).into_response(),
+        Ok(Err(err)) => {
             tracing::warn!(error = ?err, "router: rejected WebUI model action request");
             webui_pool_error_response(err)
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "router: model action admission task failed");
+            webui_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "model action admission is unavailable",
+                true,
+            )
         }
     }
 }
 
 #[derive(Default, serde::Deserialize)]
+#[cfg(feature = "webui")]
 struct OperationsQuery {
     limit: Option<usize>,
     cursor: Option<String>,
@@ -953,6 +1087,7 @@ struct OperationsQuery {
     target: Option<String>,
 }
 
+#[cfg(feature = "webui")]
 fn parse_operation_state(value: Option<&str>) -> Option<OperationState> {
     match value? {
         "queued" => Some(OperationState::Queued),
@@ -965,6 +1100,7 @@ fn parse_operation_state(value: Option<&str>) -> Option<OperationState> {
     }
 }
 
+#[cfg(feature = "webui")]
 fn parse_operation_kind(value: Option<&str>) -> Option<OperationKind> {
     match value? {
         "catalog_refresh" => Some(OperationKind::CatalogRefresh),
@@ -977,6 +1113,7 @@ fn parse_operation_kind(value: Option<&str>) -> Option<OperationKind> {
     }
 }
 
+#[cfg(feature = "webui")]
 async fn ui_operations_list(
     State(state): State<RouterServerState>,
     Query(query): Query<OperationsQuery>,
@@ -1036,6 +1173,7 @@ async fn ui_operations_list(
     .into_response()
 }
 
+#[cfg(feature = "webui")]
 async fn ui_operation_get(
     State(state): State<RouterServerState>,
     AxumPath(id): AxumPath<String>,
@@ -1054,6 +1192,7 @@ async fn ui_operation_get(
     }
 }
 
+#[cfg(feature = "webui")]
 async fn ui_operation_cancel(
     State(state): State<RouterServerState>,
     AxumPath(id): AxumPath<String>,
@@ -1090,193 +1229,24 @@ async fn ui_operation_cancel(
     }
 }
 
-fn event_to_sse(event: UiEvent) -> Event {
-    let id = event.event_id.clone();
-    let name = event.event_type.clone();
-    let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-    Event::default().id(id).event(name).data(data)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct UiEventCursorError {
-    field: &'static str,
-    code: &'static str,
-    message: &'static str,
-}
-
-impl UiEventCursorError {
-    const fn new(field: &'static str, code: &'static str, message: &'static str) -> Self {
-        Self {
-            field,
-            code,
-            message,
-        }
-    }
-
-    fn into_response(self) -> Response {
-        invalid_webui_field(self.field, self.code, self.message)
-    }
-}
-
-fn parse_ui_event_cursor(
-    query: Option<&str>,
-    last_event_id: Option<&str>,
-) -> Result<UiReplayCursor, UiEventCursorError> {
-    let Some(query) = query.filter(|query| !query.is_empty()) else {
-        return Ok(match last_event_id {
-            Some(value) => UiReplayCursor::LastEventId(value.to_string()),
-            None => UiReplayCursor::Snapshot,
-        });
-    };
-    let mut server_instance_id: Option<String> = None;
-    let mut after_sequence: Option<u64> = None;
-    for pair in query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else {
-            return Err(UiEventCursorError::new(
-                "events_query",
-                "malformed",
-                "event replay query parameters must be key=value pairs",
-            ));
-        };
-        match key {
-            "server_instance_id" => {
-                if server_instance_id.is_some() {
-                    return Err(UiEventCursorError::new(
-                        "server_instance_id",
-                        "duplicate",
-                        "server_instance_id may appear at most once",
-                    ));
-                }
-                if !is_webui_token(value, 1, 128) {
-                    return Err(UiEventCursorError::new(
-                        "server_instance_id",
-                        "invalid_format",
-                        "server_instance_id must be a printable token",
-                    ));
-                }
-                server_instance_id = Some(value.to_string());
-            }
-            "after_sequence" => {
-                if after_sequence.is_some() {
-                    return Err(UiEventCursorError::new(
-                        "after_sequence",
-                        "duplicate",
-                        "after_sequence may appear at most once",
-                    ));
-                }
-                if value.is_empty() || !value.as_bytes().iter().all(|byte| byte.is_ascii_digit()) {
-                    return Err(UiEventCursorError::new(
-                        "after_sequence",
-                        "invalid_format",
-                        "after_sequence must be a base-10 integer",
-                    ));
-                }
-                let parsed = value.parse::<u64>().map_err(|_| {
-                    UiEventCursorError::new(
-                        "after_sequence",
-                        "invalid_format",
-                        "after_sequence must be a base-10 integer",
-                    )
-                })?;
-                if parsed > MAX_SAFE_EVENT_SEQUENCE {
-                    return Err(UiEventCursorError::new(
-                        "after_sequence",
-                        "out_of_range",
-                        "after_sequence must be a JavaScript-safe integer",
-                    ));
-                }
-                after_sequence = Some(parsed);
-            }
-            _ => {
-                return Err(UiEventCursorError::new(
-                    "events_query",
-                    "unknown_parameter",
-                    "only server_instance_id and after_sequence are accepted",
-                ));
-            }
-        }
-    }
-    if last_event_id.is_some() {
-        return Err(UiEventCursorError::new(
-            "Last-Event-ID",
-            "conflict",
-            "Last-Event-ID cannot be combined with paired replay query parameters",
-        ));
-    }
-    match (server_instance_id, after_sequence) {
-        (Some(server_instance_id), Some(after_sequence)) => Ok(UiReplayCursor::Sequence {
-            server_instance_id,
-            after_sequence,
-        }),
-        (Some(_), None) => Err(UiEventCursorError::new(
-            "after_sequence",
-            "required",
-            "after_sequence is required when server_instance_id is supplied",
-        )),
-        (None, Some(_)) => Err(UiEventCursorError::new(
-            "server_instance_id",
-            "required",
-            "server_instance_id is required when after_sequence is supplied",
-        )),
-        (None, None) => Ok(UiReplayCursor::Snapshot),
-    }
-}
-
+#[cfg(feature = "webui")]
 async fn ui_events(
     State(state): State<RouterServerState>,
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    let coordinator = state.pool.lifecycle_coordinator();
-    let last_event_id = headers
-        .get("last-event-id")
-        .or_else(|| headers.get("Last-Event-ID"))
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty());
-    let cursor = match parse_ui_event_cursor(uri.query(), last_event_id) {
-        Ok(cursor) => cursor,
-        Err(error) => return error.into_response(),
-    };
-    let (receiver, replay) =
-        match coordinator.subscribe_for_ui(cursor, state.pool.runtime_model_ids()) {
-            Ok(subscription) => subscription,
-            Err(ReplaySubscribeError::FutureSequence) => {
-                return invalid_webui_field(
-                    "after_sequence",
-                    "future_sequence",
-                    "after_sequence cannot be newer than the current server sequence",
-                );
-            }
-        };
-    let stream = futures::stream::unfold(
-        (replay.into_iter(), receiver, coordinator),
-        |state| async move {
-            let (mut replay, mut receiver, coordinator) = state;
-            if let Some(event) = replay.next() {
-                return Some((
-                    Ok::<Event, std::convert::Infallible>(event_to_sse(event)),
-                    (replay, receiver, coordinator),
-                ));
-            }
-            match receiver.recv().await {
-                Ok(event) => Some((Ok(event_to_sse(event)), (replay, receiver, coordinator))),
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    let event = coordinator.local_reset_event("gap", ResetEventKind::Gap);
-                    Some((Ok(event_to_sse(event)), (replay, receiver, coordinator)))
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
-            }
-        },
-    );
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    super::webui::events::ui_events_response(
+        state.pool.lifecycle_coordinator(),
+        state.pool.runtime_model_ids(),
+        headers,
+        uri,
+    )
 }
 
-/// POST /models (b10621 `post_router_models`): validate the name as a
-/// fetchable HuggingFace repository, then download it into the model cache
+/// POST /models (b10621 `post_router_models`): enqueue a cache download
 /// in the background, reporting progress through `GET /models/sse`
-/// (issue #1438).
+/// (issue #1438). Network validation runs inside the bounded download
+/// operation so duplicate/queue admission happens before any Hub request.
 async fn router_models_add(
     State(state): State<RouterServerState>,
     body: axum::body::Bytes,
@@ -1304,17 +1274,6 @@ async fn router_models_add(
     };
     if repo_id != name && state.pool.lookup(&repo_id).is_some() {
         return llama_invalid_request(&format!("model '{repo_id}' already exists"));
-    }
-    // b10621 validates by fetching repository metadata before answering; a
-    // failed probe is a 500 from its handler wrapper. The probe blocks on
-    // the network, so it runs on the blocking pool.
-    let probe_pool = state.pool.clone();
-    let probe_repo = repo_id.clone();
-    let probed = tokio::task::spawn_blocking(move || probe_pool.validate_cache_repo(&probe_repo))
-        .await
-        .unwrap_or_else(|join_err| Err(anyhow::anyhow!(join_err.to_string())));
-    if let Err(err) = probed {
-        return llama_server_error(&format!("model validation failed: {err:#}"));
     }
     match state.pool.start_download(&repo_id) {
         Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
@@ -1527,9 +1486,11 @@ fn router_base_routes() -> axum::Router<RouterServerState> {
 #[cfg(feature = "webui")]
 fn router_ui_routes(state: RouterServerState) -> axum::Router<RouterServerState> {
     axum::Router::new()
+        .route("/ui-api/v1/bootstrap", get(ui_bootstrap))
         .route("/ui-api/v1/catalog", get(ui_catalog_list))
         .route("/ui-api/v1/catalog/refresh", post(ui_catalog_refresh))
         .route("/ui-api/v1/catalog/:id", get(ui_catalog_get))
+        .route("/ui-api/v1/runtime", get(ui_runtime))
         .route("/ui-api/v1/model-actions", post(ui_model_actions))
         .route("/ui-api/v1/operations", get(ui_operations_list))
         .route("/ui-api/v1/operations/:id", get(ui_operation_get))
@@ -1538,6 +1499,7 @@ fn router_ui_routes(state: RouterServerState) -> axum::Router<RouterServerState>
             post(ui_operation_cancel),
         )
         .route("/ui-api/v1/events", get(ui_events))
+        .nest("/ui-api/v1", super::webui::library::routes())
         .layer(middleware::from_fn_with_state(
             state,
             router_ui_api_key_auth,
@@ -1569,18 +1531,21 @@ fn finish_router_app(
 }
 
 #[cfg(feature = "webui")]
-fn finish_router_app_with_security(
-    routes: axum::Router<RouterServerState>,
-    state: RouterServerState,
-    policy: super::webui::security::WebUiSecurityPolicy,
-) -> axum::Router {
-    let api_keys = state.config.api_keys.clone();
-    super::webui::security::secure_webui_router(
-        finish_router_layers(routes, &state),
-        api_keys,
-        policy,
-    )
-    .with_state(state)
+fn router_webui_static_routes(state: &RouterServerState) -> axum::Router<RouterServerState> {
+    if state.config.api_prefix.is_empty() {
+        super::webui::assets::router()
+    } else {
+        axum::Router::new().nest(&state.config.api_prefix, super::webui::assets::router())
+    }
+}
+
+#[cfg(feature = "webui")]
+fn router_webui_api_routes(state: RouterServerState) -> axum::Router<RouterServerState> {
+    if state.config.api_prefix.is_empty() {
+        router_ui_routes(state)
+    } else {
+        axum::Router::new().nest(&state.config.api_prefix.clone(), router_ui_routes(state))
+    }
 }
 
 /// Assemble the router-mode llama-compatible application. WebUI management
@@ -1611,8 +1576,13 @@ pub(crate) fn create_router_app_with_secured_ui(
     state: RouterServerState,
     policy: super::webui::security::WebUiSecurityPolicy,
 ) -> axum::Router {
-    let routes = router_base_routes().merge(router_ui_routes(state.clone()));
-    finish_router_app_with_security(routes, state, policy)
+    let secured_api_routes = finish_router_layers(
+        router_base_routes().merge(router_webui_api_routes(state.clone())),
+        &state,
+    );
+    let routes = secured_api_routes.merge(router_webui_static_routes(&state));
+    let api_keys = state.config.api_keys.clone();
+    super::webui::security::secure_webui_router(routes, api_keys, policy).with_state(state)
 }
 
 #[cfg(test)]
@@ -1631,13 +1601,41 @@ mod router_server_security_prefix_tests;
 #[path = "router_server_security_tests.rs"]
 mod router_server_security_tests;
 
+#[cfg(all(test, feature = "webui"))]
+#[path = "router_webui_playwright_harness_tests.rs"]
+mod router_webui_playwright_harness_tests;
+
+fn validate_readable_model_store_root(path: &Path, source: &str) -> anyhow::Result<()> {
+    std::fs::read_dir(path).map(|_| ()).map_err(|err| {
+        anyhow::anyhow!(
+            "{source} {}: explicit WebUI/router cache root must be a readable directory: {err}",
+            path.display()
+        )
+    })
+}
+
+fn validate_explicit_model_store_root(startup: &super::ServerStartupConfig) -> anyhow::Result<()> {
+    if let Some(root) = startup.model_store_root.as_ref() {
+        return validate_readable_model_store_root(root, "--model-store-root");
+    }
+    if let Ok(raw) = std::env::var("MLXCEL_MODELS_DIR") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return validate_readable_model_store_root(Path::new(trimmed), "MLXCEL_MODELS_DIR");
+        }
+    }
+    Ok(())
+}
+
 /// Run the router server: discover models (cache, `--models-dir`, presets),
 /// build the pool, and serve the b10621 router surface (issue #1438).
 /// Reached from [`super::startup::start_server`] when `--models-dir` or
 /// `--models-preset` is set and no model argument was given.
-pub async fn run_router_server(
+pub(crate) async fn run_router_server(
     startup: super::ServerStartupConfig,
     api_keys: super::ApiKeys,
+    #[cfg(feature = "webui")] webui_policy: Option<super::webui::security::WebUiSecurityPolicy>,
+    #[cfg(not(feature = "webui"))] _webui_policy: Option<()>,
 ) -> anyhow::Result<()> {
     let models_dir = startup.router_models_dir.clone();
 
@@ -1650,6 +1648,7 @@ pub async fn run_router_server(
 
     // The router's model cache is the mlxcel model store (the b10621 cache
     // equivalent): removable entries, POST /models downloads into it.
+    validate_explicit_model_store_root(&startup)?;
     let cache = crate::downloader::models_root(startup.model_store_root.as_deref()).map(|root| {
         super::router_cache::CacheSource::new(
             root,
@@ -1697,8 +1696,16 @@ pub async fn run_router_server(
         pool,
         config: Arc::new(base_config),
         #[cfg(feature = "webui")]
+        startup: Arc::new(startup.clone()),
+        #[cfg(feature = "webui")]
         catalog_cache: Arc::new(super::webui::catalog::CatalogProjectionCache::new()),
     };
+    #[cfg(feature = "webui")]
+    let app = match webui_policy {
+        Some(policy) => create_router_app_with_secured_ui(state, policy),
+        None => create_router_app(state),
+    };
+    #[cfg(not(feature = "webui"))]
     let app = create_router_app(state);
     tokio::select! {
         served = super::startup::serve_http(&startup, app) => served,

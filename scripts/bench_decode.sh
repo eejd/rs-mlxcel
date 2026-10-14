@@ -9,6 +9,9 @@
 #
 # Default output: benchmarks/{backend}_{hardware}_{YYYY-MM-DD}.csv
 #   e.g. benchmarks/metal_m1ultra_2026-03-31.csv
+#        benchmarks/rocm_strixhalo-gfx1151_2026-09-30.csv
+#   backend is metal, cuda or rocm. On a Linux host where nvidia-smi finds no
+#   GPU, a one-token probe run names it (see "ROCm runtime probe" below).
 #   VLM: benchmarks/metal_m1ultra_vlm_2026-03-31.csv
 #
 # The script uses `mlxcel-bench-decode` so each model is loaded once and the
@@ -23,12 +26,19 @@
 #   date, hardware, mlxcel_version, build_type, max_tokens, prompt,
 #   prompt_target_len
 #
+#   ...then mlxcel_commit, mlx_commit (the upstream MLX pin), on ROCm only
+#   mlx_rocm_overlay_commit and hip_version (issue #1810; Metal and CUDA rows
+#   carry neither), and last decode_path, the decode loop the runner timed
+#   (`engine` since epic #2166 Phase 6, #2176; empty on rows written before
+#   that column existed, which all timed the retired `CxxGenerator`).
+#
 # The first 14 columns are unchanged from the historical schema so older CSVs
 # stay comparable. Column 15 (prompt_target_len) records the --prompt-tokens
 # target for long-prompt prefill runs (epic #623 #624) and is empty for the
 # default short-prompt path. The actual prompt length used (after capping at the
 # model context) is still reported in the prompt_tokens column. Any trailing
-# result-classification token (SKIP:*/FAIL:*) follows prompt_target_len.
+# result-classification token (SKIP:*/FAIL:*) follows the last named column
+# (decode_path, which such a row leaves empty).
 #
 # Result classifications (trailing CSV token):
 #   (none)               successful decode with profiling numbers
@@ -79,6 +89,10 @@
 #   groups are printed to stderr before the first model is measured.
 #   --no-dedup restores the pre-#1615 behavior exactly (every directory
 #   measured, no alias rows). Single-model mode is never affected by dedup.
+#
+# BENCH_RAW_DIR=<dir> also writes each model's full runner output to
+# <dir>/<model>.log, including the MLX allocator memory lines (`[Memory] ...`,
+# `MLX peak memory`) that the CSV does not carry (issue #2062).
 #
 # Filename convention:
 #   {backend}_{hardware}_{YYYY-MM-DD}.csv                (text suite, 'all')
@@ -144,6 +158,14 @@ NO_CHAT_TEMPLATE=0
 NO_DEDUP=0
 OUTPUT=""
 SUFFIX=""
+# Sampling for both passes (issue #2064; --top-k from #2157). Empty means the
+# runner's default, greedy argmax, which never dispatches a sampler kernel; a
+# sampled run is how the Gumbel-max and rejection kernels are measured. The CSV
+# schema records none of them, so a non-greedy run also tags the
+# auto-generated filename.
+TEMPERATURE=""
+TOP_P=""
+TOP_K=""
 DATE=$(date '+%Y-%m-%d')
 # Version recorded in the CSV `mlxcel_version` column. This is the mlxcel
 # version from Cargo.toml (the /update-benchmarks staleness check compares
@@ -198,6 +220,7 @@ if [[ -x "$MLXCEL_BENCH" && "${BENCH_ALLOW_STALE_BINARY:-0}" != "1" ]]; then
     echo "       Newer than the binary:" >&2
     printf '         %s\n' $newer_src >&2
     echo "       Rebuild first:  cargo build --release --features metal,accelerate" >&2
+    echo "       (--features cuda on an NVIDIA host, --features rocm on an AMD one)" >&2
     echo "       Or set BENCH_ALLOW_STALE_BINARY=1 if the old binary is the point (bisect)." >&2
     exit 1
   fi
@@ -234,6 +257,167 @@ PRE_WARM_SETTLE_SECS=30
 BIG_MODEL_THRESHOLD_BYTES=$((10 * 1024 * 1024 * 1024))
 
 # ---------------------------------------------------------------------------
+# ROCm runtime probe (issue #1810)
+# ---------------------------------------------------------------------------
+# Nothing on the command line reports the AMD device without loading a model:
+# `generate --help` is identical across backends and `nvidia-smi` obviously
+# finds nothing. What does name it is a short `mlxcel generate` run, which
+# prints the same resolution `mlxcel_core::gpu_backend_kind()` reports
+# (`[mlxcel] custom kernel backend: rocm`, stderr, under
+# MLXCEL_DEBUG_KERNEL_BACKEND=1), the running `gfx` target
+# (`HIP architecture gfx1151; compiled for [...]`) and the device with its
+# memory (`GPU: <name> (Amd), <N> GiB device memory.`). scripts/ci/rocm_smoke.sh
+# asserts the same lines. The probe loads the smallest checkpoint in MODELS_DIR and
+# generates one token, a few seconds on the Strix Halo host, and runs only on a
+# Linux host where nvidia-smi finds no GPU, so the Metal and CUDA paths never
+# pay for it and never change. `rocminfo` is the fallback when the probe run
+# itself fails, so a broken checkpoint does not mislabel the whole sweep.
+ROCM_DETECTED=0
+ROCM_GFX=""
+ROCM_DEVICE_NAME=""
+ROCM_VERSION=""
+HIP_VERSION=""
+DEVICE_MEMORY_BYTES=0
+DEVICE_MEMORY_SOURCE=""
+PROBE_BACKEND=""
+PROBE_TIMEOUT="${BENCH_PROBE_TIMEOUT:-300}"
+
+# Parsers for the probe output. Each reads `mlxcel generate` output on stdin
+# and prints the one field, or nothing when the line is absent.
+probe_kernel_backend() {
+  sed -n 's/^\[mlxcel\] custom kernel backend: \([a-z]*\).*/\1/p' | head -1
+}
+probe_gfx_target() {
+  sed -n 's/^HIP architecture \(gfx[0-9a-f]*\).*/\1/p' | head -1
+}
+probe_gpu_name() {
+  sed -n 's/^GPU: \(.*\) ([A-Za-z]*)\(, [0-9.]* GiB device memory\)\{0,1\}\.$/\1/p' | head -1
+}
+probe_device_memory_bytes() {
+  sed -n 's/^GPU: .* ([A-Za-z]*), \([0-9.]*\) GiB device memory\.$/\1/p' | head -1 \
+    | awk 'NF{printf "%.0f\n", $1 * 1073741824}'
+}
+
+# First GPU agent in `rocminfo` output on stdin, as "<gfx>|<marketing name>".
+# Agents list `Name:` and `Marketing Name:` before `Device Type:`, and the CPU
+# and NPU agents come first on an APU, so the type decides which pair to keep.
+rocminfo_first_gpu() {
+  awk '
+    /^Agent [0-9]+/                { name = ""; market = "" }
+    /^  Name:/                     { name = $2 }
+    /^  Marketing Name:/           { sub(/^  Marketing Name:[ \t]*/, ""); sub(/[ \t]+$/, ""); market = $0 }
+    /^  Device Type:[ \t]+GPU/     { if (name ~ /^gfx/) { print name "|" market; exit } }
+  '
+}
+
+rocm_tool() {
+  command -v "$1" 2>/dev/null || { [[ -x "${ROCM_PATH:-/opt/rocm}/bin/$1" ]] && echo "${ROCM_PATH:-/opt/rocm}/bin/$1"; }
+}
+
+# ROCm release, from the version file the ROCm packages install
+# (`/opt/rocm/.info/version`, or `core-<N>/.info/version` in the versioned
+# layout). HIP has its own runtime version, recorded separately.
+detect_rocm_version() {
+  local root="${ROCM_PATH:-/opt/rocm}" f
+  for f in "$root/.info/version" "$root"/core*/.info/version; do
+    if [[ -f "$f" ]]; then
+      head -1 "$f" | tr -d '[:space:]'
+      return 0
+    fi
+  done
+  return 0
+}
+
+detect_hip_version() {
+  local bin
+  bin=$(rocm_tool hipconfig) || return 0
+  "$bin" --version 2>/dev/null | tail -1 | sed 's/-.*//' || true
+}
+
+# The kernel's own figure for the device's memory. Used when the probe run did
+# not print one; on the UMA host it is the carve-out, like the probe's figure.
+sysfs_vram_bytes() {
+  local f v
+  for f in /sys/class/drm/card*/device/mem_info_vram_total; do
+    [[ -r "$f" ]] || continue
+    v=$(cat "$f" 2>/dev/null)
+    [[ "$v" =~ ^[0-9]+$ && "$v" -gt 0 ]] && { echo "$v"; return 0; }
+  done
+  # Every helper here runs under `set -euo pipefail` inside a command
+  # substitution, so a missing figure must not become a silent script exit.
+  return 0
+}
+
+# $1 is the model the sweep will measure (empty in `all` mode). The probe
+# prefers the smallest checkpoint in MODELS_DIR even in single-model mode: it
+# runs before bench_one's SKIP:oom_estimate guard, so probing with the named
+# model would load a checkpoint the guard might refuse, and a large one twice.
+probe_runtime() {
+  local named="$1" model out="" gpu
+  [[ "$(uname)" == "Linux" ]] || return 0
+  nvidia-smi &>/dev/null && return 0
+  model=$(smallest_checkpoint)
+  [[ -n "$model" ]] || model="$named"
+  if [[ -n "$model" ]]; then
+    >&2 echo "Runtime probe: $(basename "$model") (1 token, reads the backend and device lines)"
+    out=$(MLXCEL_DEBUG_KERNEL_BACKEND=1 run_with_timeout "$PROBE_TIMEOUT" \
+        "$MLXCEL" generate -m "$model" -p "Hello" -n 1 2>&1) || true
+    PROBE_BACKEND=$(printf '%s\n' "$out" | probe_kernel_backend)
+  fi
+  if [[ "$PROBE_BACKEND" == "rocm" ]]; then
+    ROCM_DETECTED=1
+    ROCM_GFX=$(printf '%s\n' "$out" | probe_gfx_target)
+    ROCM_DEVICE_NAME=$(printf '%s\n' "$out" | probe_gpu_name)
+    DEVICE_MEMORY_BYTES=$(printf '%s\n' "$out" | probe_device_memory_bytes)
+    [[ -n "$DEVICE_MEMORY_BYTES" ]] && DEVICE_MEMORY_SOURCE="probe GPU line"
+  fi
+  # A probe that printed no backend at all (the run failed before any kernel
+  # resolved) is not evidence against ROCm, so ask rocminfo. A probe that named
+  # another backend is, and the rocminfo agent list is not consulted then.
+  if [[ -z "$PROBE_BACKEND" || "$ROCM_DETECTED" == "1" ]]; then
+    local ri
+    # Bounded: rocminfo can block when the KFD driver is wedged.
+    ri=$(rocm_tool rocminfo) && gpu=$(run_with_timeout 60 "$ri" 2>/dev/null | rocminfo_first_gpu) || gpu=""
+    if [[ -n "${gpu:-}" ]]; then
+      if [[ -z "$PROBE_BACKEND" ]]; then
+        ROCM_DETECTED=1
+        >&2 echo "Runtime probe printed no backend line; rocminfo reports ${gpu%%|*}, so this is a ROCm host."
+      fi
+      [[ -n "$ROCM_GFX" ]] || ROCM_GFX="${gpu%%|*}"
+      [[ -n "$ROCM_DEVICE_NAME" ]] || ROCM_DEVICE_NAME="${gpu#*|}"
+    fi
+  fi
+  if [[ "$ROCM_DETECTED" == "1" ]]; then
+    if [[ -z "$DEVICE_MEMORY_BYTES" || "$DEVICE_MEMORY_BYTES" -eq 0 ]]; then
+      DEVICE_MEMORY_BYTES=$(sysfs_vram_bytes)
+      [[ -n "$DEVICE_MEMORY_BYTES" ]] && DEVICE_MEMORY_SOURCE="sysfs mem_info_vram_total"
+    fi
+    ROCM_VERSION=$(detect_rocm_version)
+    HIP_VERSION=$(detect_hip_version)
+    # These land in CSV fields unquoted; a comma or quote would shift columns.
+    ROCM_DEVICE_NAME=$(printf '%s' "$ROCM_DEVICE_NAME" | tr -d ',"')
+    ROCM_VERSION=$(printf '%s' "$ROCM_VERSION" | tr -d ',"')
+    HIP_VERSION=$(printf '%s' "$HIP_VERSION" | tr -d ',"')
+  fi
+  [[ -n "$DEVICE_MEMORY_BYTES" ]] || DEVICE_MEMORY_BYTES=0
+}
+
+# Smallest checkpoint under MODELS_DIR, the cheapest model to probe with.
+smallest_checkpoint() {
+  local best="" best_size=-1 dir size
+  for dir in "$MODELS_DIR"/*/; do
+    [[ -f "$dir/config.json" ]] || continue
+    size=$(estimate_model_size "$dir")
+    [[ "$size" -gt 0 ]] || continue
+    if [[ "$best_size" -lt 0 || "$size" -lt "$best_size" ]]; then
+      best="$dir"
+      best_size="$size"
+    fi
+  done
+  echo "${best%/}"
+}
+
+# ---------------------------------------------------------------------------
 # Hardware detection
 # ---------------------------------------------------------------------------
 
@@ -244,7 +428,8 @@ detect_hardware_full() {
     chip=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "unknown")
     mem=$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0fGB", $1/1073741824}')
   else
-    # Linux: detect NVIDIA GPU or fall back to CPU
+    # Linux: detect NVIDIA GPU, then an AMD GPU found by the probe, or fall
+    # back to CPU
     local gpu_name
     gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo "")
     local cuda_ver
@@ -257,10 +442,22 @@ detect_hardware_full() {
         chip="NVIDIA_${gpu_name}"
       fi
       [[ -n "$cuda_ver" ]] && chip="${chip}_CUDA${cuda_ver}"
+    elif [[ "$ROCM_DETECTED" == "1" ]]; then
+      # Shaped like the CUDA string: device name, the `gfx` target (which
+      # decides the kernels that run), then the ROCm release.
+      chip="${ROCM_DEVICE_NAME:-AMD_GPU}_${ROCM_GFX:-gfxunknown}"
+      [[ -n "$ROCM_VERSION" ]] && chip="${chip}_ROCm${ROCM_VERSION}"
     else
       chip=$(cat /proc/cpuinfo 2>/dev/null | grep "model name" | head -1 | sed 's/.*: //' || echo "unknown")
     fi
-    mem=$(free -b 2>/dev/null | awk '/^Mem:/{printf "%.0fGB", $2/1073741824}' || echo "")
+    if [[ -z "$gpu_name" && "$ROCM_DETECTED" == "1" && "$DEVICE_MEMORY_BYTES" -gt 0 ]]; then
+      # The device's memory, not the host's. On a UMA carve-out they differ
+      # by 3x (96 GiB against 31 GiB on the Strix Halo host), and only the
+      # device figure says how large a model the GPU holds.
+      mem=$(awk -v b="$DEVICE_MEMORY_BYTES" 'BEGIN{printf "%.0fGB", b/1073741824}')
+    else
+      mem=$(free -b 2>/dev/null | awk '/^Mem:/{printf "%.0fGB", $2/1073741824}' || echo "")
+    fi
   fi
   echo "${chip}_${mem}" | tr ' ' '_'
 }
@@ -289,6 +486,12 @@ detect_hardware_short() {
     # the same directory listing. Added with the sm_70 baseline (#1538), the
     # first non-GB10 CUDA sweep in `benchmarks/`.
     *V100*)      echo "v100" ;;
+    # AMD (#1810). gfx1151 is the Strix Halo iGPU (Radeon 8060S and 8050S), so
+    # the platform name leads for a reader of the directory listing. Another
+    # `gfx` target gets `amd-<gfx>`, never the truncation below, which would
+    # cut the target off the end of `amd_radeon_..._gfx...`.
+    *_gfx1151_*) echo "strixhalo-gfx1151" ;;
+    *_gfx[0-9]*) echo "amd-$(printf '%s\n' "$full" | grep -oE '_gfx[0-9a-f]+' | head -1 | cut -c2-)" ;;
     *)           echo "${full}" | tr '[:upper:]' '[:lower:]' | tr ',' '_' | cut -c1-20 ;;
   esac
 }
@@ -297,6 +500,8 @@ detect_hardware_short() {
 detect_backend() {
   if [[ "$(uname)" == "Linux" ]] && nvidia-smi &>/dev/null; then
     echo "cuda"
+  elif [[ "$ROCM_DETECTED" == "1" ]]; then
+    echo "rocm"
   elif "$MLXCEL" generate --help 2>&1 | grep -q "cuda"; then
     echo "cuda"
   else
@@ -304,25 +509,53 @@ detect_backend() {
   fi
 }
 
-HARDWARE_FULL=$(detect_hardware_full)
-HARDWARE_SHORT=$(detect_hardware_short)
-BACKEND=$(detect_backend)
-
 # ---------------------------------------------------------------------------
 # Memory-based model size check
 # ---------------------------------------------------------------------------
-# Detect available system memory in bytes.
+# Detect the memory budget base in bytes: host memory everywhere except ROCm,
+# where it is the device's memory. The UMA carve-out is the case that forced
+# this: the host sees about 31 GiB, the GPU 96 GiB, and 85% of host memory
+# skipped a 25 GB Mixtral the GPU holds with room to spare.
 detect_memory_bytes() {
   if [[ "$(uname)" == "Darwin" ]]; then
     sysctl -n hw.memsize 2>/dev/null || echo 0
+  elif [[ "$BACKEND" == "rocm" && "$DEVICE_MEMORY_BYTES" -gt 0 ]]; then
+    echo "$DEVICE_MEMORY_BYTES"
   else
     free -b 2>/dev/null | awk '/^Mem:/{print $2}' || echo 0
   fi
 }
 
-SYSTEM_MEMORY_BYTES=$(detect_memory_bytes)
-# Reserve 15% for OS/runtime overhead; use 85% as the usable limit.
-MEMORY_LIMIT_BYTES=$(( SYSTEM_MEMORY_BYTES * 85 / 100 ))
+# Resolved after argument parsing (resolve_platform below), because the ROCm
+# probe needs a model to load.
+HARDWARE_FULL=""
+HARDWARE_SHORT=""
+BACKEND=""
+SYSTEM_MEMORY_BYTES=0
+MEMORY_LIMIT_BYTES=0
+# The trailing commit columns of every row. ROCm rows carry two more: the
+# source commit of the MLX ROCm overlay (src/lib/mlxcelverse/overlays/rocm/UPSTREAM),
+# since `mlx_commit` names only the upstream pin and cannot tell upstream MLX
+# from a build carrying the overlay, and the HIP runtime version.
+COMMIT_FIELDS=""
+CSV_HEADER_EXTRA=""
+
+resolve_platform() {
+  probe_runtime "$1"
+  HARDWARE_FULL=$(detect_hardware_full)
+  HARDWARE_SHORT=$(detect_hardware_short)
+  BACKEND=$(detect_backend)
+  SYSTEM_MEMORY_BYTES=$(detect_memory_bytes)
+  # Reserve 15% for OS/runtime overhead; use 85% as the usable limit.
+  MEMORY_LIMIT_BYTES=$(( SYSTEM_MEMORY_BYTES * 85 / 100 ))
+  COMMIT_FIELDS="${SOURCE_COMMIT},${MLX_COMMIT}"
+  if [[ "$BACKEND" == "rocm" ]]; then
+    local overlay
+    overlay=$(sed -n 's/^commit:[[:space:]]*//p' src/lib/mlxcelverse/overlays/rocm/UPSTREAM 2>/dev/null | cut -c1-8)
+    COMMIT_FIELDS="${COMMIT_FIELDS},${overlay:-unknown},${HIP_VERSION:-unknown}"
+    CSV_HEADER_EXTRA=",mlx_rocm_overlay_commit,hip_version"
+  fi
+}
 
 # Estimate model weight size from safetensors files (bytes).
 # Returns 0 if no safetensors files found.
@@ -602,7 +835,7 @@ emit_duplicate_row() {
   local ptl="$PROMPT_TOKENS"
   [[ "$VLM_MODE" -eq 1 ]] && ptl=""
   >&2 printf '>>> [skip]   %s duplicate of %s (SKIP:duplicate_of)\n' "$model_name" "$owner"
-  echo "${model_name},${dir},,,,,,,$DATE,$HARDWARE_FULL,$MLXCEL_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\",${ptl},${SOURCE_COMMIT},${MLX_COMMIT},SKIP:duplicate_of=${owner}"
+  echo "${model_name},${dir},,,,,,,$DATE,$HARDWARE_FULL,$MLXCEL_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\",${ptl},${COMMIT_FIELDS},,SKIP:duplicate_of=${owner}"
 }
 
 # ---------------------------------------------------------------------------
@@ -628,6 +861,16 @@ Options:
   --jit-preheat-timeout N  Timeout for CUDA JIT warmup in seconds (default: 600)
   --output PATH       Write CSV to specific file (overrides auto-naming)
   --suffix TAG        Append suffix to auto-generated filename (e.g. --suffix baseline)
+  --temperature T     Sampling temperature for both passes (default: the
+                      runner's 0, greedy). A positive value reaches the
+                      sampler kernels; the auto-generated filename gains
+                      `_t<T>` because the CSV has no sampling column.
+  --top-p P           Nucleus threshold, effective with a positive
+                      --temperature (default: the runner's 1.0, off). Tags
+                      the filename with `_p<P>`.
+  --top-k K           Top-k cutoff, effective with a positive --temperature
+                      (default: the runner's 0, off). Tags the filename with
+                      `_k<K>`.
   --cooldown N        Sleep N seconds after every model to let the GPU cool
                       down (default: 0). Use on thermally constrained
                       hardware such as the MacBook Pro M5 Max where back-to-
@@ -667,6 +910,12 @@ Environment variables:
                              to add headroom for activations and KV cache on
                              memory-constrained hosts; models that exceed the
                              adjusted limit are classified SKIP:oom_estimate.
+                             The budget is 85% of host memory, except on ROCm,
+                             where it is 85% of the GPU's device memory (the
+                             UMA carve-out on an APU).
+  BENCH_PROBE_TIMEOUT        Seconds allowed for the one-token runtime probe
+                             that identifies a ROCm host (default 300). Runs
+                             only on Linux when nvidia-smi finds no GPU.
 
 Result classifications (trailing CSV token):
   (none)               successful decode with profiling numbers
@@ -713,6 +962,9 @@ default_output_path() {
     name="${name}_vlm"
   fi
   name="${name}_${DATE}"
+  [[ -n "$TEMPERATURE" ]] && name="${name}_t${TEMPERATURE}"
+  [[ -n "$TOP_P" ]] && name="${name}_p${TOP_P}"
+  [[ -n "$TOP_K" ]] && name="${name}_k${TOP_K}"
   if [[ -n "$SUFFIX" ]]; then
     name="${name}_${SUFFIX}"
   fi
@@ -741,6 +993,15 @@ parse_profile() {
   echo "${prompt_tok:-},${gen_tok:-},${prefill_ms:-},${prefill_tps:-},${decode_ms:-},${decode_tps:-}"
 }
 
+# The decode path the runner reports (`Decode path:` in `[Profile Results]`):
+# `engine` since epic #2166 Phase 6 (#2176), when `mlxcel-bench-decode` moved
+# from the retired `CxxGenerator` loop onto the engine's raw-completion client.
+# Rows written before that line existed carry no value here, which is how a
+# reader tells a pre-engine row from an engine row.
+parse_decode_path() {
+  echo "$1" | sed -n 's/.*Decode path:[[:space:]]*\([a-z_-]*\).*/\1/p' | head -1
+}
+
 # ---------------------------------------------------------------------------
 # Benchmark a single model
 # ---------------------------------------------------------------------------
@@ -766,7 +1027,7 @@ bench_one() {
   # dangling symlink into a pruned HuggingFace cache.
   if [[ ! -f "$model_path/config.json" ]]; then
     >&2 printf '>>> [skip]   %s (no config.json; not a checkpoint)\n' "$model_name"
-    echo "${model_name},${model_path},,,,,,,$DATE,$HARDWARE_FULL,$MLXCEL_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$TEXT_PROMPT\",${ptl},${SOURCE_COMMIT},${MLX_COMMIT},SKIP:not_a_checkpoint"
+    echo "${model_name},${model_path},,,,,,,$DATE,$HARDWARE_FULL,$MLXCEL_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$TEXT_PROMPT\",${ptl},${COMMIT_FIELDS},,SKIP:not_a_checkpoint"
     return
   fi
   local _w _have_weights=0
@@ -777,7 +1038,7 @@ bench_one() {
   done
   if [[ "$_have_weights" -eq 0 ]]; then
     >&2 printf '>>> [skip]   %s (config.json present but no readable *.safetensors)\n' "$model_name"
-    echo "${model_name},${model_path},,,,,,,$DATE,$HARDWARE_FULL,$MLXCEL_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$TEXT_PROMPT\",${ptl},${SOURCE_COMMIT},${MLX_COMMIT},SKIP:missing_weights"
+    echo "${model_name},${model_path},,,,,,,$DATE,$HARDWARE_FULL,$MLXCEL_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$TEXT_PROMPT\",${ptl},${COMMIT_FIELDS},,SKIP:missing_weights"
     return
   fi
 
@@ -790,7 +1051,7 @@ bench_one() {
     effective_mb=$(awk -v b="$est_bytes" -v f="$BENCH_MEM_OVERHEAD_FACTOR" 'BEGIN{printf "%.0f", b * f / 1048576}')
     limit_mb=$(( MEMORY_LIMIT_BYTES / 1048576 ))
     >&2 printf '>>> [skip]   %s (%d MB > %d MB limit)\n' "$model_name" "$effective_mb" "$limit_mb"
-    echo "${model_name},${model_path},,,,,,,$DATE,$HARDWARE_FULL,$MLXCEL_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$TEXT_PROMPT\",${ptl},${SOURCE_COMMIT},${MLX_COMMIT},SKIP:oom_estimate"
+    echo "${model_name},${model_path},,,,,,,$DATE,$HARDWARE_FULL,$MLXCEL_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$TEXT_PROMPT\",${ptl},${COMMIT_FIELDS},,SKIP:oom_estimate"
     return
   fi
 
@@ -799,7 +1060,7 @@ bench_one() {
   if [[ "$VLM_MODE" -eq 1 ]]; then
     prompt="$VLM_PROMPT"
     if [[ ! -f "$VLM_IMAGE" ]]; then
-      echo "${model_name},${model_path},,,,,,,$DATE,$HARDWARE_FULL,$MLXCEL_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\",${ptl},${SOURCE_COMMIT},${MLX_COMMIT},SKIP:vlm_image_not_found"
+      echo "${model_name},${model_path},,,,,,,$DATE,$HARDWARE_FULL,$MLXCEL_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\",${ptl},${COMMIT_FIELDS},,SKIP:vlm_image_not_found"
       return
     fi
     extra_args+=(--image "$VLM_IMAGE")
@@ -827,6 +1088,9 @@ bench_one() {
   if [[ "$NO_CHAT_TEMPLATE" -eq 1 ]]; then
     extra_args+=(--no-chat-template)
   fi
+  [[ -n "$TEMPERATURE" ]] && extra_args+=(--temperature "$TEMPERATURE")
+  [[ -n "$TOP_P" ]] && extra_args+=(--top-p "$TOP_P")
+  [[ -n "$TOP_K" ]] && extra_args+=(--top-k "$TOP_K")
 
   >&2 printf '>>> [bench]  %s (same-process warmup=%s) ...\n' "$model_name" "$WARMUP_TOKENS"
   local raw rc=0
@@ -840,13 +1104,21 @@ bench_one() {
       ${eos_args[@]+"${eos_args[@]}"} \
       ${extra_args[@]+"${extra_args[@]}"} 2>&1) || rc=$?
 
+  # Keep the runner's full output when asked (issue #2062). The CSV carries
+  # throughput only; the `[Memory]` phase lines and the `MLX peak memory`
+  # line are in this log.
+  if [[ -n "${BENCH_RAW_DIR:-}" ]]; then
+    mkdir -p "$BENCH_RAW_DIR"
+    printf '%s\n' "$raw" > "$BENCH_RAW_DIR/${model_name}.log"
+  fi
+
   if [[ "$rc" -ne 0 ]]; then
     if is_oom_failure "$rc" "$raw"; then
       >&2 printf '    OOM at load/run (exit %d) — SKIP:oom\n' "$rc"
-      echo "${model_name},${model_path},,,,,,,$DATE,$HARDWARE_FULL,$MLXCEL_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\",${ptl},${SOURCE_COMMIT},${MLX_COMMIT},SKIP:oom"
+      echo "${model_name},${model_path},,,,,,,$DATE,$HARDWARE_FULL,$MLXCEL_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\",${ptl},${COMMIT_FIELDS},,SKIP:oom"
     else
       >&2 printf '    benchmark failed (exit %d)\n' "$rc"
-      echo "${model_name},${model_path},,,,,,,$DATE,$HARDWARE_FULL,$MLXCEL_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\",${ptl},${SOURCE_COMMIT},${MLX_COMMIT},FAIL:bench"
+      echo "${model_name},${model_path},,,,,,,$DATE,$HARDWARE_FULL,$MLXCEL_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\",${ptl},${COMMIT_FIELDS},,FAIL:bench"
     fi
     return
   fi
@@ -858,10 +1130,12 @@ bench_one() {
 
   if [[ -z "$decode_tps" ]]; then
     >&2 echo "    no decode output"
-    echo "${model_name},${model_path},${fields},$DATE,$HARDWARE_FULL,$MLXCEL_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\",${ptl},${SOURCE_COMMIT},${MLX_COMMIT},FAIL:no_output"
+    echo "${model_name},${model_path},${fields},$DATE,$HARDWARE_FULL,$MLXCEL_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\",${ptl},${COMMIT_FIELDS},,FAIL:no_output"
   else
     >&2 printf '    decode: %s tok/s\n' "$decode_tps"
-    echo "${model_name},${model_path},${fields},$DATE,$HARDWARE_FULL,$MLXCEL_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\",${ptl},${SOURCE_COMMIT},${MLX_COMMIT}"
+    local decode_path
+    decode_path=$(parse_decode_path "$raw")
+    echo "${model_name},${model_path},${fields},$DATE,$HARDWARE_FULL,$MLXCEL_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\",${ptl},${COMMIT_FIELDS},${decode_path}"
   fi
 }
 
@@ -906,6 +1180,9 @@ while [[ $# -gt 0 ]]; do
     --jit-preheat-timeout) JIT_PREHEAT_TIMEOUT="$2"; shift 2 ;;
     --output)         OUTPUT="$2"; shift 2 ;;
     --suffix)         SUFFIX="$2"; shift 2 ;;
+    --temperature)    TEMPERATURE="$2"; shift 2 ;;
+    --top-p)          TOP_P="$2"; shift 2 ;;
+    --top-k)          TOP_K="$2"; shift 2 ;;
     --cooldown)       COOLDOWN_SECS="$2"; shift 2 ;;
     --big-cooldown)   BIG_MODEL_COOLDOWN_SECS="$2"; shift 2 ;;
     --big-threshold-gb)
@@ -921,6 +1198,21 @@ while [[ $# -gt 0 ]]; do
     *)                MODEL_ARG="$1"; shift ;;
   esac
 done
+
+# Both values end up in the auto-generated filename, so only plain decimals.
+for _sampling_opt in "--temperature:$TEMPERATURE" "--top-p:$TOP_P"; do
+  _value="${_sampling_opt#*:}"
+  if [[ -n "$_value" && ! "$_value" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "Error: ${_sampling_opt%%:*} takes a non-negative decimal, got '$_value'" >&2
+    exit 1
+  fi
+done
+# No leading zeros (the filename tag would not match the value) and at most
+# nine digits (the runner takes an i32).
+if [[ -n "$TOP_K" && ! "$TOP_K" =~ ^(0|[1-9][0-9]{0,8})$ ]]; then
+  echo "Error: --top-k takes a non-negative integer, got '$TOP_K'" >&2
+  exit 1
+fi
 
 if [[ -z "$MODEL_ARG" ]]; then
   echo "Error: model path or 'all' required" >&2
@@ -1001,6 +1293,15 @@ if [[ "$MODEL_ARG" == "all" ]]; then
   fi
 fi
 
+# Backend, hardware tag and memory budget. Resolved here rather than at load
+# because on a Linux host without an NVIDIA GPU they come from a probe run,
+# which needs a model: the smallest checkpoint in the store, else the named one.
+if [[ "$MODEL_ARG" == "all" ]]; then
+  resolve_platform ""
+else
+  resolve_platform "${MODEL_ARG%/}"
+fi
+
 # Auto-generate output path if not specified
 if [[ -z "$OUTPUT" ]]; then
   OUTPUT=$(default_output_path)
@@ -1009,13 +1310,23 @@ fi
 # ---------------------------------------------------------------------------
 # CSV header
 # ---------------------------------------------------------------------------
-CSV_HEADER="model,model_path,prompt_tokens,generated_tokens,prefill_ms,prefill_tok_s,decode_ms,decode_tok_s,date,hardware,mlxcel_version,build_type,max_tokens,prompt,prompt_target_len,mlxcel_commit,mlx_commit"
+CSV_HEADER="model,model_path,prompt_tokens,generated_tokens,prefill_ms,prefill_tok_s,decode_ms,decode_tok_s,date,hardware,mlxcel_version,build_type,max_tokens,prompt,prompt_target_len,mlxcel_commit,mlx_commit${CSV_HEADER_EXTRA},decode_path"
 
 mkdir -p "$(dirname "$OUTPUT")"
 echo "$CSV_HEADER" > "$OUTPUT"
 >&2 echo "Output: $OUTPUT"
 >&2 echo "Hardware: $HARDWARE_FULL ($HARDWARE_SHORT)"
 >&2 echo "Backend: $BACKEND"
+if [[ "$BACKEND" == "rocm" ]]; then
+  >&2 echo "ROCm: ${ROCM_VERSION:-unknown} (HIP ${HIP_VERSION:-unknown}), ${ROCM_GFX:-gfx unknown}"
+  if [[ -n "$DEVICE_MEMORY_SOURCE" ]]; then
+    budget_base="device memory, from the $DEVICE_MEMORY_SOURCE"
+  else
+    budget_base="host memory: no device figure was found"
+  fi
+  >&2 printf 'Memory budget: 85%% of %s GiB (%s)\n' \
+    "$(awk -v b="$SYSTEM_MEMORY_BYTES" 'BEGIN{printf "%.1f", b/1073741824}')" "$budget_base"
+fi
 >&2 echo ""
 
 emit() {

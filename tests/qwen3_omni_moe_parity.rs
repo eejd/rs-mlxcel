@@ -63,7 +63,7 @@ fn audio_out_len_formula() {
 /// Diagnostic: greedy-decode a few steps after a TEMPLATED image prefill and
 /// dump raw ids. Ignored by default.
 #[test]
-#[ignore]
+#[ignore = "diagnostic; needs a real Qwen3-Omni checkpoint on disk"]
 fn debug_templated_image_greedy_ids() {
     let Some(dir) = model_dir() else { return };
     let (model, tokenizer) = mlxcel::load_model(&dir).expect("load qwen3-omni");
@@ -95,7 +95,7 @@ fn debug_templated_image_greedy_ids() {
             .map(|&t| t as i32)
             .collect();
 
-        let prepared = mlxcel::vlm_runtime::prepare_and_compute_vlm_embeddings(
+        let prepared = mlxcel::vlm_runtime::prepare_vlm_embeddings(
             &model,
             &mut prompt_tokens,
             &prompt,
@@ -170,7 +170,7 @@ fn image_forward_produces_finite_logits() {
         .map(|&t| t as i32)
         .collect();
 
-    let prepared = mlxcel::vlm_runtime::prepare_and_compute_vlm_embeddings(
+    let prepared = mlxcel::vlm_runtime::prepare_vlm_embeddings(
         &model,
         &mut prompt_tokens,
         "What colors are in this image?",

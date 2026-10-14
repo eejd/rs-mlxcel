@@ -59,6 +59,37 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// Borrowed serialization shape for templates that require typed text parts.
+///
+/// The explicit, exhaustive destructuring in [`From`] makes adding a field to
+/// [`ChatMessage`] a compile error here until that field is preserved in this
+/// rendering shape as well.
+#[derive(Serialize)]
+struct TypedTextChatMessage<'a> {
+    role: &'a str,
+    content: [TypedTextContentPart<'a>; 1],
+}
+
+#[derive(Serialize)]
+struct TypedTextContentPart<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+}
+
+impl<'a> From<&'a ChatMessage> for TypedTextChatMessage<'a> {
+    fn from(message: &'a ChatMessage) -> Self {
+        let ChatMessage { role, content } = message;
+        Self {
+            role,
+            content: [TypedTextContentPart {
+                kind: "text",
+                text: content,
+            }],
+        }
+    }
+}
+
 /// Sentinel attached as the [`std::error::Error::source`] of every error a
 /// chat template raises through the `raise_exception(...)` callable.
 ///
@@ -178,6 +209,12 @@ pub struct ChatTemplateProcessor {
     bos_token: String,
     eos_token: String,
     add_generation_prompt: bool,
+    /// Whether typed [`ChatMessage`] renders must express text as content parts.
+    ///
+    /// Some multimodal checkpoint templates silently drop a plain string even
+    /// though they render an equivalent typed text part.  This is detected once
+    /// while loading the checkpoint and never changes the raw JSON contract.
+    wrap_string_content: bool,
     /// Cached result of `supports_tools()` introspection.
     /// `None` means not yet computed.
     supports_tools_cached: Option<bool>,
@@ -370,6 +407,18 @@ impl ChatTemplateProcessor {
             .or(config_template)
             .or(jinja_template)
             .or(json_template);
+        // Nemotron-Parse (issue #1369): the Hub checkpoint ships a
+        // `chat_template.jinja` that prints `message['content']` raw. For the
+        // image request this family requires, content is a typed list, so the
+        // shipped template would render the list itself (base64 page bytes
+        // included) as the decoder seed. The built-in template renders the
+        // text parts only, which is what the shipped one does for a plain
+        // string, so it replaces the checkpoint's for this family.
+        let template = if builtin_template_overrides_checkpoint(model_path) {
+            None
+        } else {
+            template
+        };
 
         // A conversion can legitimately lose the template. Fall back to a
         // built-in only after every declared source has come up empty, so this
@@ -394,12 +443,13 @@ impl ChatTemplateProcessor {
 
         let template = preprocess_template(template);
         let forced_tool_call_format = detect_forced_tool_call_format(&template);
-        Ok(Some(Self {
+        let mut processor = Self {
             template,
             compiled_template: Arc::new(OnceLock::new()),
             bos_token,
             eos_token,
             add_generation_prompt: true,
+            wrap_string_content: false,
             supports_tools_cached: None,
             forced_tool_call_format,
             default_enable_thinking: false,
@@ -408,7 +458,9 @@ impl ChatTemplateProcessor {
             kimi_k3_family_unrenderable: false,
             #[cfg(test)]
             template_compile_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        }))
+        };
+        processor.wrap_string_content = template_requires_typed_text_content(&processor);
+        Ok(Some(processor))
     }
 
     /// Create a processor with a custom template string
@@ -421,6 +473,7 @@ impl ChatTemplateProcessor {
             bos_token: String::new(),
             eos_token: String::new(),
             add_generation_prompt: true,
+            wrap_string_content: false,
             supports_tools_cached: None,
             forced_tool_call_format,
             default_enable_thinking: false,
@@ -430,6 +483,17 @@ impl ChatTemplateProcessor {
             #[cfg(test)]
             template_compile_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Whether this processor renders with the generic fallback template
+    /// rather than one the checkpoint or an override supplied. That is what
+    /// [`Self::default`] and `resolve_chat_template` yield for a checkpoint
+    /// that ships no template, so a front end can tell a likely base model
+    /// from the already-loaded processor without re-reading the model
+    /// directory.
+    #[must_use]
+    pub fn is_generic_default(&self) -> bool {
+        self.template == preprocess_template(default_chat_template().to_string())
     }
 
     /// Install a generation-prompt completion rule.
@@ -1068,7 +1132,16 @@ impl ChatTemplateProcessor {
             .filter(|t| !t.is_empty())
             .map(minijinja::Value::from_serialize);
 
-        let messages_val = minijinja::Value::from_serialize(messages);
+        let wrapped_messages = self.wrap_string_content.then(|| {
+            messages
+                .iter()
+                .map(TypedTextChatMessage::from)
+                .collect::<Vec<_>>()
+        });
+        let messages_val = match wrapped_messages.as_ref() {
+            Some(messages) => minijinja::Value::from_serialize(messages),
+            None => minijinja::Value::from_serialize(messages),
+        };
         let context = build_template_context(
             messages_val,
             &self.bos_token,
@@ -1448,6 +1521,34 @@ fn template_renders_typed_image_content(template: &str) -> bool {
             with_image.contains("__mlxcel_text_probe__")
                 && text_only.contains("__mlxcel_text_probe__")
                 && with_image != text_only
+        }
+        _ => false,
+    }
+}
+
+const TEXT_CONTENT_PROBE_MARKER: &str = "__mlxcel_text_probe__";
+
+/// Detect a checkpoint template that accepts typed text parts but drops strings.
+///
+/// Both probes go through the raw renderer so this decision cannot observe or
+/// recursively trigger the typed-message adaptation it controls.  Any render
+/// error is treated conservatively as no adaptation.
+fn template_requires_typed_text_content(processor: &ChatTemplateProcessor) -> bool {
+    let string_content = serde_json::json!([{
+        "role": "user",
+        "content": TEXT_CONTENT_PROBE_MARKER,
+    }]);
+    let typed_content = serde_json::json!([{
+        "role": "user",
+        "content": [{"type": "text", "text": TEXT_CONTENT_PROBE_MARKER}],
+    }]);
+    match (
+        processor.apply_raw(&string_content, None),
+        processor.apply_raw(&typed_content, None),
+    ) {
+        (Ok(string_render), Ok(typed_render)) => {
+            !string_render.contains(TEXT_CONTENT_PROBE_MARKER)
+                && typed_render.contains(TEXT_CONTENT_PROBE_MARKER)
         }
         _ => false,
     }
@@ -2019,10 +2120,22 @@ const GOT_OCR_CHAT_TEMPLATE: &str = concat!(
 /// the normalized path (mixed casing, tolerated JSON) silently fall back to
 /// the generic `User:`/`Assistant:` template, which for Florence-2 rejects
 /// every request at the task-marker parse.
+/// Families whose built-in template replaces any template the checkpoint
+/// ships (see the Nemotron-Parse note in the loader above).
+fn builtin_template_overrides_checkpoint(model_path: &Path) -> bool {
+    matches!(
+        crate::models::get_model_type(model_path),
+        Ok(crate::models::ModelType::NemotronParseVLM)
+    )
+}
+
 fn builtin_chat_template(model_path: &Path) -> Option<&'static str> {
     match crate::models::get_model_type(model_path).ok()? {
         crate::models::ModelType::JinaVLM => Some(JINA_VLM_CHAT_TEMPLATE),
         crate::models::ModelType::Florence2VLM => Some(FLORENCE2_CHAT_TEMPLATE),
+        // Same text-verbatim contract: the rendered text is the task prompt
+        // that seeds the decoder, and the page travels out-of-band.
+        crate::models::ModelType::NemotronParseVLM => Some(FLORENCE2_CHAT_TEMPLATE),
         crate::models::ModelType::GotOcrVLM => Some(GOT_OCR_CHAT_TEMPLATE),
         _ => None,
     }
@@ -2098,6 +2211,34 @@ impl std::fmt::Debug for ChatTemplateProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_default_is_true_only_for_the_fallback_template() {
+        assert!(ChatTemplateProcessor::default().is_generic_default());
+        let custom = ChatTemplateProcessor::with_template(
+            "{% for m in messages %}{{ m.content }}{% endfor %}".to_string(),
+        );
+        assert!(!custom.is_generic_default());
+
+        let shipped = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            shipped.path().join("tokenizer_config.json"),
+            r#"{"chat_template": "{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}"}"#,
+        )
+        .expect("write config");
+        let loaded = ChatTemplateProcessor::from_model_path(shipped.path())
+            .expect("load")
+            .expect("template present");
+        assert!(!loaded.is_generic_default());
+
+        // A checkpoint with no template resolves to the default processor,
+        // which is what the in-process server holds for a base model.
+        let bare = tempfile::tempdir().expect("tempdir");
+        let resolved = ChatTemplateProcessor::from_model_path(bare.path())
+            .expect("load")
+            .unwrap_or_default();
+        assert!(resolved.is_generic_default());
+    }
 
     fn fresh_render_context(
         processor: &ChatTemplateProcessor,
@@ -2560,6 +2701,44 @@ mod tests {
             )
             .expect("render");
         assert_eq!(rendered, "<CAPTION_TO_PHRASE_GROUNDING> a green car");
+    }
+
+    /// Nemotron-Parse (issue #1369): the Hub checkpoint ships a
+    /// `chat_template.jinja` that prints `message['content']` raw, which for
+    /// the typed image request would render the whole content list as the
+    /// decoder seed. The built-in text-only template must win, so only the
+    /// task prompt reaches the worker.
+    #[test]
+    fn a_nemotron_parse_checkpoint_template_is_replaced_by_the_text_only_builtin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type": "nemotron_parse"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{% for message in messages %}{{ message['content'] }}{% endfor %}",
+        )
+        .unwrap();
+
+        let processor = ChatTemplateProcessor::from_model_path(dir.path())
+            .expect("template resolution succeeds")
+            .expect("a built-in template is supplied");
+        let prompt = "</s><s><predict_bbox><predict_classes><output_markdown>";
+        let rendered = processor
+            .apply_raw(
+                &serde_json::json!([{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                        {"type": "text", "text": prompt},
+                    ],
+                }]),
+                None,
+            )
+            .expect("render");
+        assert_eq!(rendered, prompt);
     }
 
     /// Built-in template selection must ride the same normalization as model
@@ -4935,3 +5114,7 @@ TOOL
         assert!(out.starts_with("<think>"));
     }
 }
+
+#[cfg(test)]
+#[path = "chat_template_text_wrap_tests.rs"]
+mod text_wrap_tests;

@@ -36,10 +36,10 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use common::{repo_binary_path, repo_model_dir};
 
-const GEMMA3N_E2B_MODEL: &str = "gemma3n-e2b-4bit";
-const GEMMA3N_E4B_MODEL: &str = "gemma3n-e4b-4bit";
-const QWEN2_5_VL_MODEL: &str = "qwen2.5-vl-3b-4bit";
-const QWEN2_VL_MODEL: &str = "qwen2-vl-2b-4bit";
+const GEMMA3N_E2B_MODEL: &str = "gemma-3n-e2b-it-4bit";
+const GEMMA3N_E4B_MODEL: &str = "gemma-3n-e4b-it-4bit";
+const QWEN2_5_VL_MODEL: &str = "qwen2.5-vl-3b-instruct-4bit";
+const QWEN2_VL_MODEL: &str = "qwen2-vl-2b-instruct-4bit";
 
 fn reserve_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -170,7 +170,7 @@ fn gemma3n_vlm_single_row_bench_prefill_accepts_m5_tile_padding() {
 /// KV-cache rebuild missing for some VLM paths — the warmup pass left stale KV
 /// state that caused a 4-D attention mask broadcast to abort on the subsequent
 /// measured pass. PR #34 fixed this by rebuilding generator-owned KV caches
-/// before each single-row run in `CxxGenerator::reset_with_model()`.
+/// before each bare single-row run through `reset_runtime_state()`.
 /// `qwen2_5_vl` has no model-owned fallback state, so the fix applied
 /// transitively.
 ///

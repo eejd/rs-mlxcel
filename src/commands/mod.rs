@@ -19,6 +19,9 @@
 //! isolated modules.
 
 pub(crate) mod chat;
+mod chat_transcript;
+mod cli_server;
+mod cli_turn;
 pub(crate) mod detect;
 pub(crate) mod download;
 pub(crate) mod embed;
@@ -28,7 +31,9 @@ mod generate_diffusion;
 mod generate_falcon_ocr;
 mod generate_florence2;
 mod generate_llada2;
+mod generate_nemotron_parse;
 mod generate_vlm;
+mod generate_voicechat;
 pub(crate) mod inspect;
 pub(crate) mod models;
 pub(crate) mod rerank;

@@ -18,8 +18,17 @@
 //! into server startup yet. The startup owner mounts this router under the
 //! server's validated API prefix when `--webui` becomes active.
 
+pub(crate) mod api;
 pub(crate) mod assets;
 pub(crate) mod catalog;
+pub(crate) mod events;
+pub(crate) mod library;
+pub(crate) mod library_policy;
+pub(crate) mod load_profile;
+pub(crate) mod runtime;
 pub(crate) mod security;
 
 pub use assets::{WEBUI_PREFIX, manifest_json, router};
+
+#[cfg(test)]
+mod media_limits_tests;

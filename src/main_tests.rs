@@ -17,8 +17,8 @@ use std::ffi::OsString;
 use std::sync::{Mutex, OnceLock};
 
 use super::{
-    Cli, Commands, FAMILY_ORDER, PipelineParallelOptions, TensorParallelOptions,
-    write_supported_models, write_supported_models_json,
+    Cli, Commands, FAMILY_ORDER, PipelineParallelOptions, PromptLookupOptions,
+    TensorParallelOptions, write_supported_models, write_supported_models_json,
 };
 
 static CLI_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -95,6 +95,136 @@ fn run_defaults_match_clap_defaults() {
     assert_eq!(
         args.pipeline_parallel.pp_micro_batch_size,
         pp_default.pp_micro_batch_size
+    );
+
+    let pl_default = PromptLookupOptions::default();
+    assert_eq!(args.prompt_lookup.prompt_lookup, pl_default.prompt_lookup);
+    assert_eq!(args.prompt_lookup.config(), pl_default.config());
+}
+
+fn try_parse_cli(args: &'static [&'static str]) -> Result<Cli, clap::Error> {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || Cli::try_parse_from(args))
+        .expect("spawn CLI parser thread")
+        .join()
+        .expect("CLI parser thread panicked")
+}
+
+#[test]
+fn prompt_lookup_flags_parse_into_the_generator_config() {
+    let cli = parse_cli(&[
+        "mlxcel",
+        "generate",
+        "-m",
+        "models/foo",
+        "-p",
+        "hi",
+        "--prompt-lookup",
+        "--prompt-lookup-ngram-max",
+        "4",
+        "--prompt-lookup-ngram-min",
+        "1",
+        "--prompt-lookup-max-draft",
+        "5",
+        "--prompt-lookup-no-adaptive",
+        "--prompt-lookup-policy",
+        "graded",
+    ]);
+    let Commands::Generate(args) = cli.command else {
+        panic!("expected generate command");
+    };
+    assert!(args.prompt_lookup.prompt_lookup);
+    assert_eq!(
+        args.prompt_lookup.config(),
+        mlxcel::PromptLookupConfig {
+            ngram_max: 4,
+            ngram_min: 1,
+            max_draft: 5,
+            adaptive: false,
+            policy: mlxcel::DraftPolicy::Graded,
+            ..mlxcel::PromptLookupConfig::default()
+        }
+    );
+}
+
+#[test]
+fn prompt_lookup_policy_auto_follows_the_build_and_names_override_it() {
+    let pick = |args: &'static [&'static str]| {
+        let Commands::Generate(args) = parse_cli(args).command else {
+            panic!("expected generate command");
+        };
+        args.prompt_lookup.config().policy
+    };
+    assert_eq!(
+        pick(&[
+            "mlxcel",
+            "generate",
+            "-m",
+            "m",
+            "-p",
+            "hi",
+            "--prompt-lookup"
+        ]),
+        mlxcel::DraftPolicy::default_for_backend()
+    );
+    assert_eq!(
+        pick(&[
+            "mlxcel",
+            "generate",
+            "-m",
+            "m",
+            "-p",
+            "hi",
+            "--prompt-lookup",
+            "--prompt-lookup-policy",
+            "gated"
+        ]),
+        mlxcel::DraftPolicy::Gated
+    );
+}
+
+/// A tuning flag without `--prompt-lookup` would otherwise be accepted and
+/// silently do nothing.
+#[test]
+fn prompt_lookup_tuning_flags_require_prompt_lookup() {
+    for flag in [
+        &["--prompt-lookup-ngram-max", "4"][..],
+        &["--prompt-lookup-ngram-min", "1"][..],
+        &["--prompt-lookup-max-draft", "5"][..],
+        &["--prompt-lookup-no-adaptive"][..],
+        &["--prompt-lookup-policy", "gated"][..],
+    ] {
+        let mut args = vec!["mlxcel", "generate", "-m", "models/foo", "-p", "hi"];
+        args.extend_from_slice(flag);
+        let args: &'static [&'static str] = Vec::leak(args);
+        let err = try_parse_cli(args).expect_err("tuning flag alone must be refused");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "{flag:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn prompt_lookup_conflicts_with_a_draft_model() {
+    let err = try_parse_cli(&[
+        "mlxcel",
+        "generate",
+        "-m",
+        "models/foo",
+        "-p",
+        "hi",
+        "--prompt-lookup",
+        "--draft-model",
+        "models/draft",
+    ])
+    .expect_err("--prompt-lookup with --draft-model must be refused");
+    assert_eq!(
+        err.kind(),
+        clap::error::ErrorKind::ArgumentConflict,
+        "{err}"
     );
 }
 

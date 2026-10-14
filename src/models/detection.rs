@@ -56,8 +56,50 @@ fn dflash_drafter_not_standalone_error(model_path: &Path) -> anyhow::Error {
     )
 }
 
+/// Weight-name prefixes that mark a checkpoint as carrying a vision tower (#1367).
+///
+/// One list for every probe (filesystem and catalog) so the two cannot drift.
+pub(crate) const VLM_VISION_WEIGHT_PREFIXES: &[&str] = &[
+    "vision_tower.",
+    "model.visual.",
+    "model.vision_tower.",
+    "visual.",
+    "vision_model.",
+];
+
+/// `true` when `config.json` still declares a vision tower (#1367).
+///
+/// A VLM `model_type` is text-only when `vision_config` is absent, `null` or an
+/// empty object, or when top-level `language_model_only` is `true` (the flag
+/// wins even if vision weights ship). A non-boolean `language_model_only` is
+/// left to the Qwen3.5 loader, which rejects it by name.
 pub(crate) fn has_vision_config(config: &serde_json::Value) -> bool {
-    config.get("vision_config").is_some()
+    let declared = match config.get("vision_config") {
+        None | Some(Value::Null) => false,
+        Some(Value::Object(map)) => !map.is_empty(),
+        Some(_) => true,
+    };
+    if !declared {
+        return false;
+    }
+    if config.get("language_model_only") == Some(&Value::Bool(true)) {
+        static NOTICE: std::sync::Once = std::sync::Once::new();
+        NOTICE.call_once(|| {
+            eprintln!(
+                "mlxcel: config.json sets language_model_only=true; loading the checkpoint text-only and ignoring vision_config"
+            );
+        });
+        return false;
+    }
+    true
+}
+
+/// The whole text-only decision for a VLM `model_type`: the config rules of
+/// [`has_vision_config`] plus a scan of the checkpoint's weight names. When no
+/// weight source can be read the config answer stands.
+pub(crate) fn vlm_has_vision(config: &Value, model_path: &Path) -> bool {
+    has_vision_config(config)
+        && checkpoint_weight_prefix_scan(model_path, VLM_VISION_WEIGHT_PREFIXES) != Some(false)
 }
 
 /// Classify an `iquestcoder` config, refusing the two switches that would make
@@ -294,6 +336,10 @@ const MAX_SAFETENSORS_HEADER_BYTES: u64 = 128 * 1024 * 1024;
 
 /// `true` when one safetensors shard's header names a tensor under `prefix`.
 fn safetensors_header_has_key_prefix(path: &Path, prefix: &str) -> bool {
+    safetensors_header_has_any_key_prefix(path, &[prefix])
+}
+
+fn safetensors_header_has_any_key_prefix(path: &Path, prefixes: &[&str]) -> bool {
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
@@ -315,9 +361,11 @@ fn safetensors_header_has_key_prefix(path: &Path, prefix: &str) -> bool {
     serde_json::from_slice::<Value>(&header)
         .ok()
         .and_then(|value| {
-            value
-                .as_object()
-                .map(|entries| entries.keys().any(|key| key.starts_with(prefix)))
+            value.as_object().map(|entries| {
+                entries
+                    .keys()
+                    .any(|key| prefixes.iter().any(|p| key.starts_with(p)))
+            })
         })
         .unwrap_or(false)
 }
@@ -344,6 +392,37 @@ pub(crate) fn checkpoint_has_weight_prefix(model_path: &Path, prefix: &str) -> b
     })
 }
 
+/// `Some(found)` when a weight source was readable (a safetensors index with a
+/// `weight_map`, else at least one shard header), `None` when there is nothing
+/// to scan, so callers can keep their config-derived answer.
+pub(crate) fn checkpoint_weight_prefix_scan(model_path: &Path, prefixes: &[&str]) -> Option<bool> {
+    let index_path = model_path.join("model.safetensors.index.json");
+    if let Ok(index) = std::fs::read_to_string(index_path)
+        && let Ok(index) = serde_json::from_str::<Value>(&index)
+        && let Some(weights) = index.get("weight_map").and_then(Value::as_object)
+    {
+        return Some(
+            weights
+                .keys()
+                .any(|key| prefixes.iter().any(|p| key.starts_with(p))),
+        );
+    }
+    let shards: Vec<_> = std::fs::read_dir(model_path)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|v| v.to_str()) == Some("safetensors"))
+        .collect();
+    if shards.is_empty() {
+        return None;
+    }
+    Some(
+        shards
+            .iter()
+            .any(|shard| safetensors_header_has_any_key_prefix(shard, prefixes)),
+    )
+}
+
 pub(crate) fn inkling_has_vision_weights(model_path: &Path) -> bool {
     checkpoint_has_weight_prefix(model_path, "model.visual.")
 }
@@ -362,6 +441,22 @@ pub(crate) fn detect_text_or_vlm(
         vlm_model
     } else {
         text_model
+    }
+}
+
+/// [`detect_text_or_vlm`] plus the weight scan of #1367: a VLM `model_type`
+/// whose checkpoint ships no vision tower weights loads as its text model.
+fn detect_text_or_vlm_by_weights<P: ModelDetectionProbes + ?Sized>(
+    config: &Value,
+    model_path: &Path,
+    probes: &P,
+    text_model: ModelType,
+    vlm_model: ModelType,
+) -> Result<ModelType> {
+    if has_vision_config(config) && probes.vlm_has_vision_weights(model_path)? {
+        Ok(vlm_model)
+    } else {
+        Ok(text_model)
     }
 }
 
@@ -577,9 +672,9 @@ pub(crate) fn is_embedding_checkpoint(
 /// turns it into `ModelMediaSupport::video_native` and
 /// `commands::generate` uses it to decide whether `--video` needs the
 /// frames fallback, so the HTTP boundary and the CLI cannot drift apart.
-/// Mirror the dispatch in `commands/generate_vlm::compute_vlm_embeddings` and
-/// `server::model_worker::prepare_request_video_embeddings` when a family
-/// gains a native path.
+/// Mirror `server::model_worker::prepare_request_video_embeddings` (which
+/// `mlxcel generate` also reaches, issue #2173) when a family gains a native
+/// path.
 #[must_use]
 pub fn model_type_has_native_video(model_type: ModelType) -> bool {
     matches!(
@@ -619,6 +714,11 @@ pub(crate) trait ModelDetectionProbes {
     fn inkling_dir_is_mtp_only(&self, model_path: &Path, config: &Value) -> Result<bool>;
     fn inkling_has_vision_weights(&self, model_path: &Path, config: &Value) -> Result<bool>;
     fn kimi_k3_has_vision_weights(&self, model_path: &Path, config: &Value) -> Result<bool>;
+    /// `false` only when the checkpoint's weight names are readable and none of
+    /// them sits under [`VLM_VISION_WEIGHT_PREFIXES`] (#1367). It can only
+    /// demote a config-declared VLM to its text route, so a probe that cannot
+    /// read the weights answers `true` and keeps the config decision.
+    fn vlm_has_vision_weights(&self, model_path: &Path) -> Result<bool>;
 }
 
 struct FullFilesystemDetectionProbes;
@@ -650,6 +750,10 @@ impl ModelDetectionProbes for FullFilesystemDetectionProbes {
 
     fn kimi_k3_has_vision_weights(&self, model_path: &Path, _config: &Value) -> Result<bool> {
         Ok(kimi_k3_has_vision_weights(model_path))
+    }
+
+    fn vlm_has_vision_weights(&self, model_path: &Path) -> Result<bool> {
+        Ok(checkpoint_weight_prefix_scan(model_path, VLM_VISION_WEIGHT_PREFIXES) != Some(false))
     }
 }
 
@@ -742,24 +846,30 @@ pub(crate) fn detect_model_type_with_probes<P: ModelDetectionProbes + ?Sized>(
         "qwen3" => Ok(ModelType::Qwen3),
         "qwen3_moe" => Ok(ModelType::Qwen3Moe),
         "qwen3_next" | "qwen3next" => Ok(ModelType::Qwen3Next),
-        "qwen3_5" => Ok(detect_text_or_vlm(
+        "qwen3_5" => detect_text_or_vlm_by_weights(
             v,
+            model_path,
+            probes,
             ModelType::Qwen35,
             ModelType::Qwen35VLM,
-        )),
-        "qwen3_5_moe" => Ok(detect_text_or_vlm(
+        ),
+        "qwen3_5_moe" => detect_text_or_vlm_by_weights(
             v,
+            model_path,
+            probes,
             ModelType::Qwen35Moe,
             ModelType::Qwen35MoeVLM,
-        )),
+        ),
         "qwen2_moe" => Ok(ModelType::Qwen2Moe),
         "gemma" => Ok(ModelType::Gemma),
         "gemma2" => Ok(ModelType::Gemma2),
-        "gemma3" | "gemma3_text" => Ok(detect_text_or_vlm(
+        "gemma3" | "gemma3_text" => detect_text_or_vlm_by_weights(
             v,
+            model_path,
+            probes,
             ModelType::Gemma3,
             ModelType::Gemma3VLM,
-        )),
+        ),
         "gemma4" | "gemma4_text" => Ok(if probes.gemma4_has_vision_weights(model_path, v)? {
             ModelType::Gemma4VLM
         } else {
@@ -857,6 +967,7 @@ pub(crate) fn detect_model_type_with_probes<P: ModelDetectionProbes + ?Sized>(
         "olmo3" => Ok(ModelType::Olmo3),
         "openelm" => Ok(ModelType::OpenElm),
         "gpt2" => Ok(ModelType::Gpt2),
+        "nanochat" => Ok(ModelType::NanoChat),
         "gpt_bigcode" => Ok(ModelType::GptBigCode),
         "gpt_neox" => Ok(ModelType::GptNeoX),
         "helium" => Ok(ModelType::Helium),
@@ -892,6 +1003,9 @@ pub(crate) fn detect_model_type_with_probes<P: ModelDetectionProbes + ?Sized>(
         }
         "plamo2" => Ok(ModelType::Plamo2),
         "granitemoehybrid" => Ok(ModelType::GraniteMoeHybrid),
+        // Nemotron VoiceChat nests a `nemotron_h` text_config; the top-level
+        // type must win before any text_config fallback routes it to NemotronH.
+        "nemotron_voicechat" => Ok(ModelType::NemotronVoiceChat),
         "nemotron_h" => Ok(ModelType::NemotronH),
         "nemotron_h_nano_omni" | "nemotronh_nano_omni_reasoning_v3" => {
             Ok(ModelType::NemotronHNanoOmniVLM)
@@ -943,6 +1057,12 @@ pub(crate) fn detect_model_type_with_probes<P: ModelDetectionProbes + ?Sized>(
         // (`llm_config.model_type` is `llama` for llm-jp-4-vl-9B-beta and
         // `qwen3` for Jagle-VL-2.2B). Both label themselves `llmjpvl`.
         "llmjpvl" => Ok(ModelType::LlmJpVLM),
+        // Mage-VL (#1365). A vision-stripped checkpoint keeps this type and
+        // the loader drops the tower via `vlm_has_vision` (the Qwen2-VL-family
+        // convention of #1367): the decoder config is nested under
+        // `text_config` with `language_model.*` keys, which the flat `qwen3`
+        // text route cannot read.
+        "mage_vl" => Ok(ModelType::MageVLM),
         // GOT-OCR 2.0 declares `model_type: "GOT"` in upper case; the
         // normalization above lowercases it before this match.
         "got" => Ok(ModelType::GotOcrVLM),
@@ -992,6 +1112,8 @@ pub(crate) fn detect_model_type_with_probes<P: ModelDetectionProbes + ?Sized>(
         "molmo_point" => Ok(ModelType::MolmoPointVLM),
         // Florence-2 (DaViT tower + BART encoder-decoder text stack).
         "florence2" => Ok(ModelType::Florence2VLM),
+        // Nemotron-Parse (C-RADIO ViT-H encoder + pre-norm mBART decoder).
+        "nemotron_parse" => Ok(ModelType::NemotronParseVLM),
         // Speech-to-text (encoder-decoder ASR).
         "whisper" => Ok(ModelType::Whisper),
         _ => Err(anyhow::anyhow!(

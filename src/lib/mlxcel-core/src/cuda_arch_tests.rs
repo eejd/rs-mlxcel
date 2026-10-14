@@ -27,8 +27,22 @@ use crate::cuda_arch::{
 };
 
 /// The two lists `.github/workflows/release.yml` builds, and the CI pin.
+///
+/// Blackwell is plain in both. MLX's hardware NVFP4/MXFP4 converters do need an
+/// architecture-specific target, but `src/lib/mlxcelverse/CMakeLists.txt` gives that
+/// to `fp_quantize.cu` alone rather than to the whole `mlx` target, so these
+/// lists stay plain and every other kernel keeps the code it had (issue #1934).
+/// Hopper's `90a` is unrelated: these converters need compute capability 10.0,
+/// so 9.0 cannot reach them however it is spelled. It is kept because it is
+/// what the release lists ship and what auto-detection mirrors, not because it
+/// gates a kernel at the current MLX pin, where the macro that once did was
+/// deleted upstream (issue #1943).
 const RELEASE_AARCH64: &str = "90a;100;121";
 const RELEASE_X86_64: &str = "80;86;89;90a;100;120";
+
+/// The Blackwell list every CUDA job in `.github/workflows/ci.yml` pins, and
+/// what a GB10 release build carries.
+const CI_BLACKWELL: &str = "121";
 
 /// Compute capabilities of the machines this project actually runs on.
 const V100: (u32, u32) = (7, 0);
@@ -113,8 +127,63 @@ fn parses_the_release_matrices_completely() {
     assert_eq!(x86_64.len(), 6);
     // Round-tripping through Display keeps the list readable in the error
     // message and proves nothing was silently reinterpreted.
-    let rendered: Vec<String> = x86_64.iter().map(ToString::to_string).collect();
-    assert_eq!(rendered.join(";"), RELEASE_X86_64);
+    for list in [RELEASE_X86_64, RELEASE_AARCH64, CI_BLACKWELL] {
+        let rendered: Vec<String> = parse_cuda_arch_list(list)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(rendered.join(";"), list);
+    }
+}
+
+/// What the release lists would have meant had Blackwell been named
+/// architecture-specific, which is the form issue #1934 measured and rejected.
+///
+/// Kept as a test rather than a comment because the coverage semantics are the
+/// reason the rejected form is not simply worse-but-equivalent: `121a` alone
+/// strands a later Blackwell revision, and `121a-real;121` does not. Neither is
+/// needed now that `fp_quantize.cu` carries the architecture-specific image on
+/// its own, but a future reader reaching for one of them should find the
+/// difference between them written down.
+#[test]
+fn the_rejected_architecture_specific_blackwell_forms_still_parse_as_documented() {
+    // The `a-real` half is what would have compiled MLX's hardware fp4
+    // converter, and it covers exactly its own target: a cubin, no PTX,
+    // nothing forward.
+    let arch_specific = parse_cuda_arch_entry("121a-real").expect("121a-real is a valid entry");
+    assert_eq!(arch_specific.variant, ArchVariant::ArchSpecific);
+    assert!(arch_specific.emits_cubin);
+    assert!(!arch_specific.emits_ptx);
+    assert_eq!(
+        entry_coverage(arch_specific, GB10),
+        Some(ArchCoverage::Cubin)
+    );
+    assert_eq!(entry_coverage(arch_specific, (13, 0)), None);
+
+    // A plain entry is what survives onto a device the cubin cannot serve, and
+    // it is what the release lists carry. The difference between the two
+    // rejected forms is exactly this: `121a-real;121` keeps it, `121a` does not.
+    assert_eq!(
+        arch_list_coverage(CI_BLACKWELL, GB10),
+        Some(ArchCoverage::Cubin)
+    );
+    assert_eq!(
+        arch_list_coverage(CI_BLACKWELL, (13, 0)),
+        Some(ArchCoverage::Ptx)
+    );
+    assert_eq!(
+        arch_list_coverage("121a-real;121", (13, 0)),
+        Some(ArchCoverage::Ptx)
+    );
+    assert_eq!(arch_list_coverage("121a", (13, 0)), None);
+
+    // Same shape on the x86_64 Blackwell entries: `100a-real` is pinned to 10.0
+    // while plain `100` still carries the major version forward by cubin.
+    assert_eq!(
+        arch_list_coverage("100a-real;100", (10, 3)),
+        Some(ArchCoverage::Cubin)
+    );
+    assert_eq!(arch_list_coverage("100a-real", (10, 3)), None);
 }
 
 #[test]
@@ -258,7 +327,16 @@ fn an_empty_or_unparseable_list_covers_nothing() {
 
 #[test]
 fn entry_display_round_trips_through_the_parser() {
-    for spelling in ["70", "90a", "100f", "80-real", "89-virtual", "121"] {
+    for spelling in [
+        "70",
+        "90a",
+        "100f",
+        "80-real",
+        "89-virtual",
+        "121",
+        "121a-real",
+        "120a-real",
+    ] {
         let entry = parse_cuda_arch_entry(spelling).expect("valid entry");
         assert_eq!(entry.to_string(), spelling);
         assert_eq!(parse_cuda_arch_entry(&entry.to_string()), Some(entry));
@@ -306,8 +384,15 @@ fn the_build_records_the_architecture_list_it_compiled_for() {
 
 #[test]
 fn the_capability_probe_agrees_with_the_backend() {
+    use crate::hardware::{GpuBackendKind, gpu_backend_kind};
+
     let capability = cuda_compute_capability();
-    if cfg!(feature = "cuda") {
+    // The premise is the resolved backend, not the `cuda` cargo feature. Those
+    // agreed while Metal and CUDA were the only GPU backends; ROCm broke it,
+    // because its `device_info()` publishes `compute_capability_major`/`minor`
+    // derived from the `gfx` target and the probe reported `(11, 5)` on an AMD
+    // device (issue #1805). A build whose feature is off can still have a GPU.
+    if gpu_backend_kind() == GpuBackendKind::Cuda {
         // A CUDA build on a host with no visible device legitimately reports
         // `None`; what must never happen is a nonsense pair.
         if let Some((major, minor)) = capability {
@@ -317,9 +402,33 @@ fn the_capability_probe_agrees_with_the_backend() {
             );
         }
     } else {
+        // Assert on the raw bridge probe as well as on the wrapper. Checking
+        // only the wrapper would restate the backend gate inside
+        // `cuda_compute_capability` and could never fail. What has to hold is
+        // the relation between the two, and it differs per backend: Metal and
+        // CPU-only publish no capability keys at all, so the bridge itself
+        // answers -1; ROCm publishes well-formed ones derived from the `gfx`
+        // target, so the bridge answers a real number and the gate is the only
+        // thing suppressing it. That second case is the #1805 regression.
+        let raw = crate::ffi::gpu_compute_capability(0);
+        if gpu_backend_kind() == GpuBackendKind::Rocm {
+            assert!(
+                raw >= 0,
+                "the ROCm backend publishes compute_capability keys, so the bridge should \
+                 still report {raw}; if this changed, the gate above is no longer what makes \
+                 the wrapper return None"
+            );
+        } else {
+            assert_eq!(
+                raw, -1,
+                "a backend with no compute-capability keys must answer -1 at the bridge"
+            );
+        }
         assert_eq!(
-            capability, None,
-            "a non-CUDA build has no compute capability to report"
+            capability,
+            None,
+            "only CUDA has a CUDA compute capability; backend is {:?} and the bridge said {raw}",
+            gpu_backend_kind()
         );
     }
     // The probe is cached, so a second call must not disagree with the first.
@@ -368,10 +477,14 @@ fn the_mismatch_message_names_both_sides_and_a_working_rebuild() {
 }
 
 #[test]
-fn the_suggested_rebuild_carries_the_hopper_suffix() {
-    // `90` and `90a` are not interchangeable: MLX only compiles its dedicated
-    // Hopper quantized kernel when the list says `90a`, so a suggestion that
-    // dropped the suffix would rebuild into a slower binary.
+fn the_suggested_rebuild_matches_the_shipped_spelling() {
+    // This message is the only place the project hands an operator an
+    // MLX_CUDA_ARCHITECTURES value to paste, so it has to name the spelling the
+    // release workflow builds and auto-detection produces. Hopper keeps `90a`,
+    // which is what `release.yml` ships. Blackwell stays plain: `121a` would
+    // compile every translation unit architecture-specific instead of letting
+    // the per-source injection give that image to `fp_quantize.cu` alone, and
+    // the CI guard rejects a workflow list spelled that way (#1934, #1943).
     let suggest = |device| {
         CudaArchMismatch {
             device,
@@ -382,5 +495,5 @@ fn the_suggested_rebuild_carries_the_hopper_suffix() {
     assert_eq!(suggest(V100), "70");
     assert_eq!(suggest(A100), "80");
     assert_eq!(suggest(H100), "90a");
-    assert_eq!(suggest(GB10), "121a");
+    assert_eq!(suggest(GB10), "121");
 }

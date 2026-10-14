@@ -230,8 +230,65 @@ fn run_step(
     (to_vec_f32(&out), to_vec_f32(&reference), stats)
 }
 
+/// A tile-padded prefill writes its pad rows and then trims them. The trim has
+/// to reach the pool: while it was a no-op, decode read the pad rows as context
+/// and rotated the next token at the padded position.
+#[test]
+fn trim_drops_padded_prefill_rows_from_a_pool_backed_cache() {
+    let (kv_heads, head_dim, real, padded) = (2, 64, 37, 64);
+    let (pool, states) = fresh_pool(1, kv_heads as usize, head_dim as usize);
+    let mut cache = KVCache::new_paged(pool.clone(), states[0].clone(), 0);
+    let mut rng = Rng::new(7);
+    let k = random_array(&mut rng, &[1, kv_heads, padded, head_dim]);
+    let v = random_array(&mut rng, &[1, kv_heads, padded, head_dim]);
+    let real_rows = |a: &MlxArray| {
+        to_vec_f32(&ffi::slice(
+            a,
+            &[0, 0, 0, 0],
+            &[1, kv_heads, real, head_dim],
+        ))
+    };
+    let (k_real, v_real) = (real_rows(&k), real_rows(&v));
+    cache.update(k, v);
+
+    assert_eq!(cache.trim(padded - real), padded - real);
+    assert_eq!(
+        cache.offset, real,
+        "the next RoPE position is the real length"
+    );
+    assert_eq!(states[0].borrow().layer(0).unwrap().len, real as usize);
+    assert_eq!(
+        pool.borrow().allocated_block_count(),
+        2,
+        "37 tokens span two 32-token blocks"
+    );
+
+    // The next token lands right after the real rows, and the window decode
+    // gathers is the real rows plus that token.
+    let k_next = random_array(&mut rng, &[1, kv_heads, 1, head_dim]);
+    let v_next = random_array(&mut rng, &[1, kv_heads, 1, head_dim]);
+    let (k_next_rows, v_next_rows) = (to_vec_f32(&k_next), to_vec_f32(&v_next));
+    let (k_seen, v_seen) = cache.update_and_fetch(k_next, v_next);
+    assert_eq!(
+        ffi::array_shape(&k_seen),
+        vec![1, kv_heads, real + 1, head_dim]
+    );
+    assert_eq!(real_rows(&k_seen), k_real);
+    assert_eq!(real_rows(&v_seen), v_real);
+    let last_row = |a: &MlxArray| {
+        to_vec_f32(&ffi::slice(
+            a,
+            &[0, 0, real, 0],
+            &[1, kv_heads, real + 1, head_dim],
+        ))
+    };
+    assert_eq!(last_row(&k_seen), k_next_rows);
+    assert_eq!(last_row(&v_seen), v_next_rows);
+}
+
 #[test]
 fn batched_decode_matches_the_gather_path_above_the_floor() {
+    crate::test_support::kernel_ports::require_paged_attention_port!();
     // 4 x 1024 = 4096 visible tokens, exactly the dispatch floor, so v2 runs.
     let (out, reference, stats) = run_step(&[1024, 1024, 1024, 1024], 8, 2, 64, 0xA11CE);
     assert!(
@@ -278,8 +335,9 @@ fn below_the_floor_the_batch_still_answers_correctly() {
 
 #[test]
 fn a_single_sequence_above_its_floor_takes_the_fused_path() {
-    // The single-sequence decode path (`decode_single_step` -> the model's
-    // one-sequence `forward`) reaches this entry point with a batch of one. Two
+    crate::test_support::kernel_ports::require_paged_attention_port!();
+    // The single-sequence decode path (`decode_single_step` -> `Engine::step`
+    // at B=1 -> the model's one-sequence `forward`) reaches this entry point with a batch of one. Two
     // of the five scenarios in the issue's benchmark matrix are that shape, so
     // a batch-1 launch above the single-request floor has to fuse.
     let (out, reference, stats) = run_step(&[4096], 8, 2, 64, 0x1EAF);
@@ -305,6 +363,7 @@ fn a_short_single_sequence_stays_on_gather() {
 
 #[test]
 fn a_batched_launch_just_under_a_nominal_1k_prompt_fuses() {
+    crate::test_support::kernel_ports::require_paged_attention_port!();
     // The exact shape the production benchmark delivered for its nominal 1K
     // scenario: 4 requests of 956 tokens. The first floor formulation summed to
     // 3824 and declined it; the two-regime floor requires 4 x 512 = 2048.
@@ -348,6 +407,7 @@ fn the_step_is_written_exactly_once() {
 
 #[test]
 fn a_steady_step_reuses_the_page_table() {
+    crate::test_support::kernel_ports::require_paged_attention_port!();
     let (pool, states) = fresh_pool(1, 2, 64);
     let mut rng = Rng::new(0x5EED);
     let mut caches: Vec<KVCache> = (0..4)
@@ -468,6 +528,7 @@ fn outcome_for(prompt_len: usize, slabbed: bool) -> PagedDecodeOutcome {
 
 #[test]
 fn a_multi_slab_layer_reports_the_knob_that_would_fix_it() {
+    crate::test_support::kernel_ports::require_paged_attention_port!();
     // The decline that silently disabled the whole fused path in the first #899
     // production benchmark. It has to name the slab counts and the knob, not
     // just return `None`.
@@ -489,6 +550,7 @@ fn a_multi_slab_layer_reports_the_knob_that_would_fix_it() {
 
 #[test]
 fn a_below_floor_launch_reports_both_numbers() {
+    crate::test_support::kernel_ports::require_paged_attention_port!();
     match outcome_for(64, true) {
         PagedDecodeOutcome::BelowFloor {
             batch,
@@ -505,6 +567,7 @@ fn a_below_floor_launch_reports_both_numbers() {
 
 #[test]
 fn a_fused_launch_reports_its_shape() {
+    crate::test_support::kernel_ports::require_paged_attention_port!();
     match outcome_for(8192, true) {
         PagedDecodeOutcome::Fused {
             batch,

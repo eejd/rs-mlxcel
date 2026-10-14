@@ -50,6 +50,13 @@ pub(crate) fn build_synthetic_wrapper_with_layer(layer_type: &str) -> super::Gem
     cache_isolation::build_wrapper_with_layer(layer_type)
 }
 
+/// Tiny weights with 31B capability metadata, for dispatch-only tests.
+/// Never run inference through this fixture: its dimensions intentionally
+/// describe the production capability without allocating production weights.
+pub(crate) fn build_synthetic_wrapper_for_linear_mtp_only() -> super::Gemma4Wrapper {
+    cache_isolation::build_linear_mtp_dispatch_wrapper()
+}
+
 // -----------------------------------------------------------------
 // per-`SequenceId` cache isolation tests for `Gemma4Wrapper`.
 //
@@ -245,6 +252,18 @@ mod cache_isolation {
         Gemma4Wrapper::new(Gemma4Model::from_weights(&weights, &args).unwrap())
     }
 
+    pub(super) fn build_linear_mtp_dispatch_wrapper() -> Gemma4Wrapper {
+        let args = make_test_gemma4_args_with_layer("sliding_attention");
+        let weights = make_test_gemma4_weight_map();
+        let mut model = Gemma4Model::from_weights(&weights, &args).unwrap();
+        model.config.num_attention_heads = 32;
+        model.config.num_key_value_heads = 16;
+        model.config.num_global_key_value_heads = Some(4);
+        model.config.head_dim = 256;
+        model.config.global_head_dim = Some(512);
+        Gemma4Wrapper::new(model)
+    }
+
     fn array_to_vec_f32(arr: &mlxcel_core::MlxArray) -> Vec<f32> {
         let arr_f32 = mlxcel_core::astype(arr, mlxcel_core::dtype::FLOAT32);
         mlxcel_core::eval(&arr_f32);
@@ -308,6 +327,82 @@ mod cache_isolation {
                 "{layer_type} window={window}: chunked prefill diverged from single-pass \
                  (max diff {max_diff}); single={s_vals:?} chunked={c_vals:?}"
             );
+        }
+    }
+
+    /// Issue #1972: every `forward_last_logits*` entry point projects only the
+    /// sampled row, and that row equals the same row of the full forward, at
+    /// the last and an interior position, for both attention families. Each
+    /// call gets a fresh wrapper because the wrapper owns its caches.
+    #[test]
+    fn gemma4_last_logits_match_the_sliced_full_forward() {
+        for layer_type in ["sliding_attention", "full_attention"] {
+            let prompt: Vec<i32> = (0..12).map(|i| (i * 3) % 7).collect();
+            let ids = mlxcel_core::from_slice_i32(&prompt, &[1, prompt.len() as i32]);
+            for pos in [prompt.len() - 1, prompt.len() / 2] {
+                let row = |logits: &mlxcel_core::MlxArray| {
+                    let shape = mlxcel_core::array_shape(logits);
+                    let r = mlxcel_core::slice(
+                        logits,
+                        &[0, pos as i32, 0],
+                        &[1, pos as i32 + 1, shape[2]],
+                    );
+                    array_to_vec_f32(r.as_ref().unwrap())
+                };
+                let max_diff = |a: &[f32], b: &[f32]| {
+                    assert_eq!(a.len(), b.len(), "{layer_type} pos {pos}: shape mismatch");
+                    a.iter()
+                        .zip(b)
+                        .map(|(x, y)| (x - y).abs())
+                        .fold(0.0f32, f32::max)
+                };
+
+                let model = build_wrapper_with_layer(layer_type);
+                let mut caches = model.make_caches();
+                let want = row(model.forward(&ids, &mut caches, None).as_ref().unwrap());
+
+                let model = build_wrapper_with_layer(layer_type);
+                let mut caches = model.make_caches();
+                let plain = model.forward_last_logits(&ids, &mut caches, None, pos);
+                assert_eq!(mlxcel_core::array_shape(&plain)[1], 1);
+                let d = max_diff(&array_to_vec_f32(plain.as_ref().unwrap()), &want);
+                assert!(d < 1e-4, "{layer_type} plain at {pos}: max |diff| {d}");
+
+                let model = build_wrapper_with_layer(layer_type);
+                let mut caches = model.make_caches();
+                let seq = model.forward_last_logits_with_sequence_id(
+                    &ids,
+                    Some(SequenceId::from_raw(21)),
+                    &mut caches,
+                    None,
+                    pos,
+                );
+                let d = max_diff(&array_to_vec_f32(seq.as_ref().unwrap()), &want);
+                assert!(
+                    d < 1e-4,
+                    "{layer_type} sequence id at {pos}: max |diff| {d}"
+                );
+
+                let model = build_wrapper_with_layer(layer_type);
+                let mut caches = model.make_caches();
+                let embeds = model.embed_tokens(&ids).unwrap();
+                let want_emb = row(model
+                    .forward_with_embeddings(&ids, Some(&embeds), &mut caches, None)
+                    .as_ref()
+                    .unwrap());
+                let model = build_wrapper_with_layer(layer_type);
+                let mut caches = model.make_caches();
+                let emb = model.forward_last_logits_with_embeddings_and_sequence_id(
+                    &ids,
+                    Some(&embeds),
+                    Some(SequenceId::from_raw(22)),
+                    &mut caches,
+                    None,
+                    pos,
+                );
+                let d = max_diff(&array_to_vec_f32(emb.as_ref().unwrap()), &want_emb);
+                assert!(d < 1e-4, "{layer_type} embeddings at {pos}: max |diff| {d}");
+            }
         }
     }
 
@@ -531,7 +626,7 @@ mod cache_isolation {
     /// end-to-end fix is reachable. After this PR the server scheduler
     /// reaches this same code path because
     /// `Gemma4VLModel::supports_batching() == true` and its
-    /// `forward_batched_with_context_and_ids` override delegates to
+    /// `forward_batched_with_ids` override delegates to
     /// the same helper.
     #[test]
     #[ignore = "requires serial MLX execution"]
@@ -574,7 +669,7 @@ mod cache_isolation {
 
         // Now drive the BATCHED decode through the dispatch helper —
         // this is the exact code path the scheduler now reaches via
-        // `execute_batched_decode -> forward_batched_with_context_and_ids`
+        // `execute_batched_decode -> forward_batched_with_ids`
         // -> `Gemma4VLModel`'s override -> this helper.
         let decode_batched = mlxcel_core::from_slice_i32(&[5, 7], &[2, 1]);
         let mut row_a_caches: Vec<mlxcel_core::layers::KVCache> = Vec::new();
@@ -587,7 +682,6 @@ mod cache_isolation {
             &decode_batched,
             Some(&seq_ids),
             batch_caches.as_mut_slice(),
-            None,
             None,
         );
         let shape = mlxcel_core::array_shape(&logits_batched);
@@ -1074,6 +1168,26 @@ mod snapshot_prompt_cache {
 
     #[test]
     #[ignore = "requires serial MLX execution"]
+    fn gemma31b_buffered_mtp_cache_cannot_donate_prompt_snapshot() {
+        let source = super::build_synthetic_wrapper();
+        let seq = SequenceId::from_raw(919);
+        prefill(&source, seq, &[1, 2, 3, 4, 5]);
+        let snapshot = source.snapshot_sequence_state(seq, 5).unwrap();
+
+        // Populate the dispatch-only geometry fixture from a valid tiny-model
+        // snapshot. No forward call uses its synthetic head configuration.
+        let wrapper = super::build_synthetic_wrapper_for_linear_mtp_only();
+        wrapper.restore_sequence_state(seq, &snapshot).unwrap();
+        assert!(wrapper.mtp_requires_linear_singleton());
+        assert!(wrapper.snapshot_sequence_state(seq, 5).is_some());
+
+        wrapper.enable_mtp_rotating_cache_buffer(Some(seq), 4);
+        assert!(wrapper.snapshot_sequence_state(seq, 5).is_none());
+        assert_eq!(wrapper.sequence_kv_offset(Some(seq)), 5);
+    }
+
+    #[test]
+    #[ignore = "requires serial MLX execution"]
     fn gemma4_reports_truncatable_only_while_the_sliding_layer_is_unwrapped() {
         let wrapper = super::build_synthetic_wrapper();
 
@@ -1483,6 +1597,41 @@ mod mtp_hooks {
         assert!(
             !kv.contains_key("full_attention"),
             "fixture has zero full_attention layers, so the full_attention entry must be absent"
+        );
+    }
+}
+
+#[test]
+fn linear_singleton_geometry_is_31b_everywhere_and_12b_on_cuda() {
+    let args = cache_isolation::make_test_gemma4_args_with_layer("sliding_attention");
+    let mut config = parse_text_config(args.text_config);
+    config.sliding_window = 1024;
+    let cuda = mlxcel_core::cuda_is_available();
+    for (heads, kv, global_kv, dim, global_dim, on_metal, on_cuda) in [
+        (32, 16, 4, 256, 512, true, true),  // measured 31B
+        (16, 8, 1, 256, 512, false, true),  // 12B: CUDA only (#2160)
+        (32, 8, 2, 256, 512, false, false), // different KV geometry
+        (16, 8, 2, 256, 512, false, false),
+        (16, 8, 1, 128, 512, false, false),
+        (32, 16, 4, 128, 512, false, false),
+        (32, 16, 4, 256, 256, false, false),
+    ] {
+        config.num_attention_heads = heads;
+        config.num_key_value_heads = kv;
+        config.num_global_key_value_heads = Some(global_kv);
+        config.head_dim = dim;
+        config.global_head_dim = Some(global_dim);
+        assert_eq!(config.mtp_requires_linear_singleton_on(false), on_metal);
+        assert_eq!(config.mtp_requires_linear_singleton_on(true), on_cuda);
+        let expected = if cuda { on_cuda } else { on_metal };
+        assert_eq!(config.mtp_requires_linear_singleton(), expected);
+        assert_eq!(
+            config.mtp_probe_prompt_lengths(),
+            if expected {
+                vec![8, 8, 8, 1056]
+            } else {
+                vec![8, 8, 8]
+            }
         );
     }
 }

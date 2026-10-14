@@ -2,7 +2,7 @@
 
 This document is the implementation contract for the first WebUI gate in epic #1834. It freezes the shared boundaries that backend, frontend, bundle and integration owners must use; it does not implement runtime routes or pages.
 
-The implemented static-bundle boundary and contributor commands are documented in [Developing the bundled WebUI](bundling.md) ([한국어](bundling.ko.md)); production startup and control adapters remain assigned to downstream issues.
+The implemented static-bundle boundary, production startup entry points, and contributor commands are documented in [Developing the bundled WebUI](bundling.md) ([한국어](bundling.ko.md)); page-level controls, chat, downloads, and rich metrics continue in downstream issues.
 
 ## Ownership and change rule
 
@@ -18,7 +18,7 @@ Do not add a second registry, a child-process supervisor, arbitrary path APIs, s
 
 ## URL and authentication model
 
-The shell is served at `{api_prefix}/webui/` by later bundle/startup issues. Redirect only the missing trailing slash and preserve `/`, `/health`, `/v1/health`, and every existing API path. `api_prefix` comes from the validated server config, never from browser input.
+The shell is served at `{api_prefix}/webui/` when the WebUI flag is enabled. Redirect only the missing trailing slash and preserve `/`, `/health`, `/v1/health`, and every existing API path. `api_prefix` comes from the validated server config, never from browser input.
 
 Every `/ui-api/v1` endpoint requires bearer authentication. In WebUI mode, shell/assets may be public but bootstrap, catalog, control, settings, runtime and events are administrator APIs. Loopback without a configured key may use a strong session-only terminal-presented key; non-loopback requires an explicit key and TLS or a documented loopback reverse proxy. No key goes in URLs, HTML, structured logs, diagnostics, IndexedDB, or SSE payloads.
 
@@ -40,7 +40,7 @@ Catalog metadata preserves three distinct facts: `metadata.model_type` is the ra
 | `GET /catalog` | Deterministic paged inventory. Query keys are `limit` (default 50, max 200), `cursor`, `q`, `source`, `task`, `lifecycle`, `support`, and `completeness`. Filtering never downloads or loads. |
 | `GET /catalog/{id}` | Reads one opaque ID. Unknown IDs are 404 structured errors. |
 | `POST /catalog/refresh` | Starts a bounded background rescan job. GET never mutates. |
-| `POST /model-actions` | Accepts load/unload with opaque `model_id`, `expected_revision`, printable `idempotency_key`, optional `load_profile`, and optional explicit `eviction_target_id`. `load_profile` is limited to existing startup-backed fields only: `ctx_size` (1..262144), `n_parallel` (1..32), and `kv_cache_mode` using the same spellings accepted by `--kv-cache-mode`; no sampling or reasoning fields are part of the next-load contract. `202` means accepted, not ready. |
+| `POST /model-actions` | Accepts load/unload with opaque `model_id`, `expected_revision`, printable `idempotency_key`, optional `load_profile`, and optional explicit `eviction_target_id` paired with `eviction_target_expected_revision`. Explicit eviction is authorized only for the exact victim revision the user confirmed; stale or unpaired victim fields are rejected before any victim unload starts. `load_profile` is limited to existing startup-backed fields only: `ctx_size` (1..262144), `n_parallel` (1..32), and `kv_cache_mode` using the same spellings accepted by `--kv-cache-mode`; no sampling or reasoning fields are part of the next-load contract. `202` means accepted, not ready. |
 | `POST /downloads` | Accepts only bounded public `owner/name` repository IDs plus optional bounded revision and printable idempotency key. Dot-only path segments, URL syntax, control characters and filesystem path spellings are rejected before any network or cache write. Repo metadata/revision is pinned before writing weights. |
 | `POST /model-removals` | Cache-only deletion after server checks; UI confirmation is additional, not security. Busy/loading/downloading/draining entries return 409. |
 | `GET /operations`, `GET /operations/{id}`, `POST /operations/{id}/cancel` | Bounded active and terminal operation records. `target` and terminal `result` are discriminated DTOs, not arbitrary metadata bags. Cancellation is terminal only after the worker stops; unsupported cancellation is a typed 422. |
@@ -72,7 +72,7 @@ Route owner: verify every response is produced from existing runtime truth, appl
 
 Client owner: verify generated DTO drift gate passes, all actions use expected revisions and idempotency keys, reset/gap/server-restart events force resnapshot, indeterminate progress is rendered honestly, and request-only settings never become persistent UI state.
 
-Integration owner: verify compatibility routes and UI routes use one coordinator, producer/consumer/fixtures land atomically, browser security checks cover mutation surfaces, screenshot/test IDs match `ux-contract.md`, and no downstream issue invents an API/state/UX decision already frozen here.
+Integration owner: verify compatibility routes and UI routes use one coordinator, producer/consumer/fixtures land atomically, browser security checks cover mutation surfaces, state coverage and test IDs match `ux-contract.md`, and no downstream issue invents an API/state/UX decision already frozen here.
 
 ## Running the contract gate
 
@@ -84,7 +84,7 @@ The verifier registers an explicit date-time checker and refuses schema formats 
 
 ## Catalog implementation boundary
 
-The metadata-only catalog adapter and its current integration limits are documented in [catalog.md](catalog.md) ([한국어](catalog.ko.md)). It projects the existing router/provider authority; production startup mounting remains a separate integration step.
+The metadata-only catalog adapter and its integration limits are documented in [catalog.md](catalog.md) ([한국어](catalog.ko.md)). It projects the existing router/provider authority, and production WebUI startup mounts the router and single-model adapters behind the shared security wrapper.
 
 ## Shared typed client and state authority
 
@@ -98,7 +98,7 @@ The reducer uses per-resource sequence fences: catalog snapshots, operation reco
 
 The provider and hooks are headless exports, not a mounted login screen or a production startup implementation. Import them from `webui/src/state`; the scaffold does not mount the provider yet. The validated `apiBase` is the prefix before `/ui-api/v1` (for example, `/inference`, not `/inference/ui-api/v1`). Omit it to use the document's `mlxcel-ui-api-base` meta value or same-origin `<base>` prefix; production shell integration owns supplying that value. Do not obtain it from a user-editable backend URL.
 
-Both model-action hooks accept the complete generated `ModelActionRequest`: callers must provide the matching `action`, opaque `model_id`, current `expected_revision`, and one idempotency key per user intent. These hooks resolve when submission is accepted, not when a model becomes ready; render completion from the shared operation and catalog state. Inference hooks resolve the opaque ID against the current catalog's `identity.inference_id`, force streaming and `autoload=false`, and forward SSE frames to `handlers.onFrame`; presentation of reasoning, content, tool calls and usage belongs to the Chat page. Passing an abort signal cancels that stream. Model selection and logout abort outstanding transports; login errors reject to the caller for an actionable login/schema-mismatch view.
+Both model-action hooks accept the complete generated `ModelActionRequest`: callers must provide the matching `action`, opaque `model_id`, current `expected_revision`, and one idempotency key per user intent; a capacity-recovery load that names `eviction_target_id` must also include that target's current `eviction_target_expected_revision`. These hooks resolve when submission is accepted, not when a model becomes ready; render completion from the shared operation and catalog state. Inference hooks resolve the opaque ID against the current catalog's `identity.inference_id`, force streaming and `autoload=false`, and forward SSE frames to `handlers.onFrame`; presentation of reasoning, content, tool calls and usage belongs to the Chat page. Passing an abort signal cancels that stream. Model selection and logout abort outstanding transports; login errors reject to the caller for an actionable login/schema-mismatch view.
 
 `useWebUi()` exposes nullable `lastUpdatedAt` and `lastSuccessfulAt`, typed `error`, per-resource fences and `pendingReconciliations` in addition to the page-facing fields above. `lastUpdatedAt` records state transitions, including errors. Use `lastSuccessfulAt` for the age of the last accepted, validated data snapshot/event: heartbeats, connection/error transitions and invalidation-only events do not advance it. Ordinary errors and same-instance gaps preserve the previous value, while logout or a server-instance replacement clears it. A null value means there has been no accepted data in this session/instance. Neither timestamp measures model latency; check `connection`, each resource snapshot sequence and individual metric availability before presenting data as current, and preserve required nulls and unavailable reasons. The synchronizer owns one non-overlapping snapshot refresh, one event connection, visibility-aware 2-second/30-second polling, and teardown. Pages must not start their own reconciliation timers or automatically retry a POST whose outcome is unknown.
 

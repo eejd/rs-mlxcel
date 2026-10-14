@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod added_tokens;
 pub mod fim;
 pub mod pieces;
 mod spm_proto;
@@ -409,6 +410,22 @@ impl MlxcelTokenizer {
         }
     }
 
+    /// Whether `id` names an entry of this vocabulary (#2127).
+    ///
+    /// This is a membership test, not a `< vocab_size()` comparison: the
+    /// HuggingFace `vocab_size()` counts entries rather than the largest id
+    /// plus one, and the other backends' id ranges can have holes, so an id
+    /// below the bound can still be unassigned and one above it can be an
+    /// added token. HuggingFace uses the same added-vocabulary-then-model
+    /// lookup `decode` performs, so added and special tokens count as valid.
+    pub fn contains_id(&self, id: u32) -> bool {
+        match self {
+            Self::HuggingFace(t) => t.id_to_token(id).is_some(),
+            Self::SentencePiece(t) => t.contains_id(id),
+            Self::Tiktoken(t) => t.contains_id(id),
+        }
+    }
+
     /// The number of ids this vocabulary can decode, i.e. the exclusive
     /// upper bound for iterating [`Self::token_piece_bytes`] (#1485).
     ///
@@ -665,6 +682,14 @@ impl MlxcelTokenizer {
 }
 
 impl SentencePieceTokenizer {
+    /// Whether `id` is a special token, an added token, or inside the
+    /// SentencePiece model's own id range (see `MlxcelTokenizer::contains_id`).
+    pub fn contains_id(&self, id: u32) -> bool {
+        self.id_to_special_token.contains_key(&id)
+            || self.added_token_contents.contains_key(&id)
+            || (id as usize) < self.processor.len()
+    }
+
     /// The exclusive id bound this wrapper can decode: the SentencePiece
     /// vocabulary size, extended past any added-token id living outside it
     /// (#1485; see `MlxcelTokenizer::vocab_size`).
@@ -1611,24 +1636,7 @@ fn read_added_tokens_sorted(model_path: &Path) -> Result<Vec<(u32, tokenizers::A
         .and_then(|v| v.as_object());
 
     if let Some(decoder) = decoder {
-        for (id, entry) in decoder {
-            let id: u32 = id
-                .parse()
-                .map_err(|e| anyhow::anyhow!("added_tokens_decoder key {:?}: {}", id, e))?;
-            let content = entry
-                .get("content")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("added_tokens_decoder[{id}] has no content"))?;
-            let flag = |name: &str, default: bool| {
-                entry.get(name).and_then(|v| v.as_bool()).unwrap_or(default)
-            };
-            let token = AddedToken::from(content.to_string(), flag("special", false))
-                .single_word(flag("single_word", false))
-                .lstrip(flag("lstrip", false))
-                .rstrip(flag("rstrip", false))
-                .normalized(flag("normalized", false));
-            out.push((id, token));
-        }
+        out = added_tokens::parse_added_tokens_decoder(decoder)?;
     } else if let Ok(raw) = std::fs::read_to_string(model_path.join("added_tokens.json")) {
         let map: HashMap<String, u32> = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("Failed to parse added_tokens.json: {}", e))?;
@@ -1848,6 +1856,21 @@ fn is_diffusion_gemma_model(model_path: &Path) -> bool {
     )
 }
 
+/// Drop the padding and truncation a `tokenizer.json` may carry.
+///
+/// `transformers`' fast tokenizers never apply them on a plain encode: the
+/// serialized values only seed defaults, and every call re-sets padding and
+/// truncation from its own (off by default) arguments. The `tokenizers` crate
+/// applies them on every `encode` instead. A checkpoint that serializes
+/// `padding: Fixed(9000)` (Nemotron-Parse does) would otherwise turn every
+/// prompt into 9000 ids, and a serialized `max_length` would silently cut
+/// long prompts.
+pub(crate) fn clear_serialized_padding_and_truncation(tokenizer: &mut tokenizers::Tokenizer) {
+    tokenizer.with_padding(None);
+    // Clearing truncation cannot fail: only a `Some` config is validated.
+    let _ = tokenizer.with_truncation(None);
+}
+
 pub fn load_tokenizer(model_path: &Path) -> Result<MlxcelTokenizer> {
     // Model-specific override: some official checkpoints ship a stale
     // tokenizer.json that does not match their weights (starmie-era
@@ -1875,6 +1898,10 @@ pub fn load_tokenizer(model_path: &Path) -> Result<MlxcelTokenizer> {
             tokenizers::Tokenizer::from_file(&tokenizer_json_path)
                 .map_err(|e| anyhow::anyhow!(e))?
         };
+        clear_serialized_padding_and_truncation(&mut tokenizer);
+        // Added tokens declared only in tokenizer_config.json (Granite Vision's
+        // `<image>`, issue #1683) are registered the way transformers does.
+        added_tokens::reconcile_config_added_tokens(&mut tokenizer, model_path);
         ensure_bos_post_processor(&mut tokenizer, model_path);
         return Ok(MlxcelTokenizer::HuggingFace(tokenizer));
     }
@@ -1940,6 +1967,9 @@ pub fn load_tokenizer(model_path: &Path) -> Result<MlxcelTokenizer> {
 }
 
 #[cfg(test)]
+mod contains_id_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         MlxcelTokenizer, build_qwen2_bpe_tokenizer, is_qwen2_slow_tokenizer_dir, load_tokenizer,
@@ -1947,6 +1977,29 @@ mod tests {
         remote_tokenizer_repo_for_model, remote_tokenizer_repo_for_model_type,
     };
     use tokenizers::{AddedToken, Tokenizer, models::bpe::BPE};
+
+    /// A `tokenizer.json` that serializes fixed padding and a max length
+    /// (Nemotron-Parse ships `padding: Fixed(9000)`) must encode like
+    /// `transformers` does: neither is applied to a plain encode.
+    #[test]
+    fn serialized_padding_and_truncation_are_not_applied_on_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let json = serde_json::json!({
+            "version": "1.0",
+            "truncation": {"direction": "Right", "max_length": 2, "strategy": "LongestFirst", "stride": 0},
+            "padding": {"strategy": {"Fixed": 16}, "direction": "Right", "pad_to_multiple_of": null,
+                        "pad_id": 0, "pad_type_id": 0, "pad_token": "<pad>"},
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null,
+            "decoder": null,
+            "model": {"type": "WordLevel", "vocab": {"<pad>": 0, "a": 1, "b": 2, "c": 3}, "unk_token": "<pad>"}
+        });
+        std::fs::write(dir.path().join("tokenizer.json"), json.to_string()).unwrap();
+        let tokenizer = load_tokenizer(dir.path()).expect("tokenizer loads");
+        assert_eq!(tokenizer.encode("a b c", false).unwrap(), vec![1, 2, 3]);
+    }
 
     /// Write a minimal Qwen2 slow-tokenizer directory: a byte-level `vocab.json`
     /// covering the ASCII letters plus a `Ġ` (space) marker, one merge, and two
@@ -2809,7 +2862,7 @@ mod tests {
     // shipped in `models/gemma-4-e4b-it-8bit/`. Skipped when the directory
     // is missing so the test suite stays portable; run on demand with
     // `cargo test -- --ignored` against a workspace that has the model
-    // downloaded (per `docs/testing.md`).
+    // downloaded (`mlxcel download mlx-community/gemma-4-e4b-it-8bit`).
 
     #[test]
     #[ignore = "requires models/gemma-4-e4b-it-8bit/; run with --ignored"]

@@ -57,6 +57,9 @@ use mlxcel_core::{MlxArray, UniquePtr};
 
 use crate::models::gemma4::{Cache, Gemma4SpeculativeSinks, Gemma4Wrapper, first_cache_offset};
 
+#[path = "gemma4_mtp_target_rows.rs"]
+mod rows;
+
 /// Materialize an integer argmax tensor into host token ids with one
 /// contiguous copy.
 ///
@@ -187,6 +190,40 @@ pub struct Gemma4MtpTargetAdapter<'a> {
     /// restored `offset`. `0` (the default) preserves the cold full-prompt
     /// prefill byte-for-byte.
     prefill_start_offset: usize,
+    /// Serving prefill geometry; zero keeps a single prompt forward.
+    prefill_chunk_size: usize,
+    /// Chat history boundary the classic scheduler splits its prefill at
+    /// (issue #1143); see [`mtp_prefill_ranges`].
+    prefill_boundary: Option<usize>,
+}
+
+/// Token ranges the row-wise MTP prefill forwards, in order.
+///
+/// Classic serving does not prefill a chat prompt in one forward when the
+/// prompt cache is on: its `PrefillPlan` first forwards `[start..boundary]`
+/// as one segment, then the suffix runs in `prefill_chunk_size` chunks from
+/// the boundary. These are that plan's ranges. KV built from a different
+/// partition differs in the last bit, so a verify that is byte-exact per
+/// block still drifts from classic decode once a flipped key matters (#2160,
+/// measured on one of three 256-token chat prompts per pair before this).
+/// `chunk_size == 0` means one forward for whatever follows the boundary.
+pub(crate) fn mtp_prefill_ranges(
+    start: usize,
+    len: usize,
+    chunk_size: usize,
+    boundary: Option<usize>,
+) -> Vec<std::ops::Range<usize>> {
+    // The classic partition itself (#2170): token input, chunkable, no tile
+    // padding (the row-wise forwards pad nothing).
+    let caps = mlxcel_core::prefill_plan::PrefillCaps {
+        supports_chunked_prefill: true,
+        supports_padded_prefill: false,
+        supports_maskless_padded_prefill: false,
+        align_prefill: false,
+        input: mlxcel_core::prefill_plan::PrefillInput::Tokens,
+    };
+    mlxcel_core::prefill_plan::PrefillPlan::with_prefix(len, start, boundary, chunk_size, caps)
+        .ranges()
 }
 
 impl<'a> Gemma4MtpTargetAdapter<'a> {
@@ -229,6 +266,7 @@ impl<'a> Gemma4MtpTargetAdapter<'a> {
         let verify_arr = mlxcel_core::from_slice_i32(verify_input, &[1, verify_input.len() as i32]);
         let mut sinks = Gemma4SpeculativeSinks::with_hidden_and_shared_kv();
         sinks.tree_positions = tree_positions;
+        sinks.mtp_verify = true;
         // One forward returns the full `[1, K, vocab]` verify logits: the LM
         // head projects all K positions in one batched call, and the argmax
         // walk reads them after one eval. The projection deliberately does
@@ -339,7 +377,26 @@ impl<'a> Gemma4MtpTargetAdapter<'a> {
             seq_id,
             rotating_buffer_size: mtp_rotating_buffer_size(block_size),
             prefill_start_offset: 0,
+            prefill_chunk_size: mlxcel_core::generate::prefill_chunk_len(),
+            prefill_boundary: None,
         }
+    }
+
+    /// Split the row-wise prefill at the chat history boundary the classic
+    /// scheduler would split at, so both build the prompt KV from the same
+    /// partition. Ignored outside the row-wise (linear singleton) prefill.
+    #[must_use]
+    pub fn with_prefill_boundary(mut self, boundary: Option<usize>) -> Self {
+        self.prefill_boundary = boundary;
+        self
+    }
+
+    /// Match the scheduler's classic prefill geometry on the corrected 31B
+    /// target. Other Gemma variants retain their existing prefill path.
+    #[must_use]
+    pub fn with_prefill_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.prefill_chunk_size = chunk_size;
+        self
     }
 
     /// Set the adopted prompt-cache prefix length (issue #518).
@@ -644,24 +701,45 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
         // defensive and never trims the last prompt position in practice.
         let offset = self.prefill_start_offset.min(prompt_tokens.len());
         let forward_tokens = &prompt_tokens[offset..];
-        let prompt_arr =
-            mlxcel_core::from_slice_i32(forward_tokens, &[1, forward_tokens.len() as i32]);
-
-        // Capture last-layer hidden + last full/SWA shared K/V slabs.
-        // Gemma 4 owns its own caches via `ModelOwnedSequenceState`;
-        // the wrapper resolves `seq_id` to the matching slot internally
-        // and the trait method does not take an external cache slice.
         let mut sinks = Gemma4SpeculativeSinks::with_hidden_and_shared_kv();
-        let logits = self.wrapper.forward_with_speculative_sinks(
-            &prompt_arr,
-            None,
-            None,
-            None,
-            self.seq_id,
-            None,
-            Some(&mut sinks),
-            None,
-        );
+        let logits = if self.wrapper.mtp_requires_linear_singleton() {
+            // Verify parity assumes equal prefix state. M=6449 prefill and
+            // thirteen M<=512 scheduler chunks do not produce identical KV,
+            // and neither does a chat prompt prefilled without the classic
+            // history-boundary split.
+            let ranges = mtp_prefill_ranges(
+                offset,
+                prompt_tokens.len(),
+                self.prefill_chunk_size,
+                self.prefill_boundary,
+            );
+            let mut chunks = ranges
+                .into_iter()
+                .map(|range| &prompt_tokens[range])
+                .peekable();
+            let mut last = None;
+            while let Some(chunk) = chunks.next() {
+                let input = mlxcel_core::from_slice_i32(chunk, &[1, chunk.len() as i32]);
+                let capture = chunks.peek().is_none().then_some(&mut sinks);
+                let logits = self.wrapper.prefill_mtp_chunk(&input, self.seq_id, capture);
+                mlxcel_core::eval(&logits);
+                last = Some(logits);
+            }
+            last.expect("MTP prefill requires an uncached suffix")
+        } else {
+            let prompt_arr =
+                mlxcel_core::from_slice_i32(forward_tokens, &[1, forward_tokens.len() as i32]);
+            self.wrapper.forward_with_speculative_sinks(
+                &prompt_arr,
+                None,
+                None,
+                None,
+                self.seq_id,
+                None,
+                Some(&mut sinks),
+                None,
+            )
+        };
         self.wrapper
             .enable_mtp_rotating_cache_buffer(self.seq_id, self.rotating_buffer_size);
 
@@ -778,6 +856,19 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
         logprobs_config: &mlxcel_core::sampling::LogprobsConfig,
     ) -> Result<VerifyForwardOutput, mlxcel_core::speculative::mtp::target::TreeVerifyUnsupported>
     {
+        if self.wrapper.mtp_requires_linear_singleton()
+            && tree
+                .depths()
+                .iter()
+                .enumerate()
+                .any(|(index, depth)| *depth != index as i32)
+        {
+            return Err(
+                mlxcel_core::speculative::mtp::target::TreeVerifyUnsupported {
+                    reason: "Gemma 4 row-wise exact verification requires a linear draft layout",
+                },
+            );
+        }
         let offset = self.wrapper.sequence_kv_offset(self.seq_id).max(0) as usize;
         let nodes = tree.len();
         // MLX additive masks are f32 with 0 to attend; the blocking value is
@@ -806,7 +897,8 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
     /// contiguous tail to select from. So this reads cache state rather than
     /// returning a constant, and the round loop has to ask each round.
     fn tree_round_is_available(&self) -> bool {
-        self.wrapper.can_gather_speculative_cache(self.seq_id)
+        !self.wrapper.mtp_requires_linear_singleton()
+            && self.wrapper.can_gather_speculative_cache(self.seq_id)
     }
 
     /// Roll the target cache back to a draft tree's accepted **path**.
@@ -1003,6 +1095,20 @@ impl<'a> Gemma4VLMtpTargetAdapter<'a> {
         self.inner = self.inner.with_prefill_start_offset(prefill_start_offset);
         self
     }
+
+    /// Forward the scheduler's classic prefill chunk size to the text target.
+    #[must_use]
+    pub fn with_prefill_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.inner = self.inner.with_prefill_chunk_size(chunk_size);
+        self
+    }
+
+    /// Forward the classic history-boundary split to the text target.
+    #[must_use]
+    pub fn with_prefill_boundary(mut self, boundary: Option<usize>) -> Self {
+        self.inner = self.inner.with_prefill_boundary(boundary);
+        self
+    }
 }
 
 impl<'a> MtpTarget for Gemma4VLMtpTargetAdapter<'a> {
@@ -1125,6 +1231,20 @@ impl<'a> Gemma4UnifiedMtpTargetAdapter<'a> {
     #[must_use]
     pub fn with_prefill_start_offset(mut self, prefill_start_offset: usize) -> Self {
         self.inner = self.inner.with_prefill_start_offset(prefill_start_offset);
+        self
+    }
+
+    /// Forward the scheduler's classic prefill chunk size to the text target.
+    #[must_use]
+    pub fn with_prefill_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.inner = self.inner.with_prefill_chunk_size(chunk_size);
+        self
+    }
+
+    /// Forward the classic history-boundary split to the text target.
+    #[must_use]
+    pub fn with_prefill_boundary(mut self, boundary: Option<usize>) -> Self {
+        self.inner = self.inner.with_prefill_boundary(boundary);
         self
     }
 }
@@ -1297,6 +1417,13 @@ pub struct Gemma4MtpBatchedTargetAdapter<'a> {
     /// each row's K/V into the prefix-valid layout and rotates queries in the
     /// row's shifted frame.
     left_padding: RefCell<Vec<usize>>,
+    /// Classic serving prefill chunk size, used by the per-row prefill on the
+    /// row-wise geometries (issue #2190); zero keeps one forward per segment.
+    /// Mirrors [`Gemma4MtpTargetAdapter`]'s field of the same name.
+    prefill_chunk_size: usize,
+    /// Per-row chat history boundary (issue #1143) for that prefill; `None`
+    /// rows, and rows past the end of this vector, have no boundary.
+    prefill_boundaries: Vec<Option<usize>>,
 }
 
 impl<'a> Gemma4MtpBatchedTargetAdapter<'a> {
@@ -1329,7 +1456,25 @@ impl<'a> Gemma4MtpBatchedTargetAdapter<'a> {
             rotating_buffer_size,
             positions: RefCell::new(vec![0; batch_size]),
             left_padding: RefCell::new(vec![0; batch_size]),
+            prefill_chunk_size: mlxcel_core::generate::prefill_chunk_len(),
+            prefill_boundaries: Vec::new(),
         }
+    }
+
+    /// Use the serving prefill chunk size for the per-row prefill the
+    /// row-wise geometries take (issue #2190). Zero means one forward.
+    #[must_use]
+    pub fn with_prefill_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.prefill_chunk_size = chunk_size;
+        self
+    }
+
+    /// Split each row's prefill at its classic history boundary (issue #1143),
+    /// as [`Gemma4MtpTargetAdapter::with_prefill_boundary`] does for B = 1.
+    #[must_use]
+    pub fn with_prefill_boundaries(mut self, boundaries: Vec<Option<usize>>) -> Self {
+        self.prefill_boundaries = boundaries;
+        self
     }
 
     /// Batch size accessor (test / diagnostic).
@@ -1634,7 +1779,9 @@ impl<'a> Gemma4MtpBatchedTargetAdapter<'a> {
         };
         // Prefill (offset 0) has no stale tail, so `per_row_valid_end` is None;
         // the verify forward is the sole producer of `Some` (issue #163).
-        self.batched_sink_forward_with_mask(input_arr, None, lp_ref, None)
+        let (logits, hidden, shared_kv, _) =
+            self.batched_sink_forward_with_mask(input_arr, None, lp_ref, None, false);
+        (logits, hidden, shared_kv)
     }
 
     /// Sink-aware batched forward with an optional explicit attention mask.
@@ -1660,18 +1807,28 @@ impl<'a> Gemma4MtpBatchedTargetAdapter<'a> {
     /// positions[r]`) so the offset-derived masks exclude the row's stale
     /// `[valid_end, offset)` rejected-draft / zeroed tail after divergent
     /// accepts. Both prefill paths pass `None` (offset 0 has no gap).
+    ///
+    /// `mtp_verify` marks a verify forward, exactly as the B = 1 adapter does
+    /// (issue #2190): on the row-wise geometries it routes B = 1 through the
+    /// linear verify layout and B > 1 through the per-batch-row verify.
+    /// Prefill passes `false`. The returned flag reports a per-row verify
+    /// that could not be decode-exact (see `Gemma4SpeculativeSinks`).
+    #[allow(clippy::type_complexity)]
     fn batched_sink_forward_with_mask(
         &self,
         input_arr: &MlxArray,
         mask: Option<&MlxArray>,
         left_padding: Option<&[i32]>,
         per_row_valid_end: Option<&[i32]>,
+        mtp_verify: bool,
     ) -> (
         UniquePtr<MlxArray>,
         UniquePtr<MlxArray>,
         Vec<UniquePtr<MlxArray>>,
+        bool,
     ) {
         let mut sinks = Gemma4SpeculativeSinks::with_hidden_and_shared_kv();
+        sinks.mtp_verify = mtp_verify;
         let logits = {
             let mut caches = self.caches.borrow_mut();
             self.wrapper.forward_with_speculative_sinks_explicit_cache(
@@ -1708,7 +1865,7 @@ impl<'a> Gemma4MtpBatchedTargetAdapter<'a> {
             shared_kv.push(mlxcel_core::copy(v_swa.as_ref().unwrap()));
         }
 
-        (logits, hidden_full, shared_kv)
+        (logits, hidden_full, shared_kv, sinks.row_verify_inexact)
     }
 
     fn enable_rotating_cache_buffer(&self) {
@@ -1873,7 +2030,7 @@ impl<'a> Gemma4MtpBatchedTargetAdapter<'a> {
             &left_padding_i32,
         );
 
-        let (logits, hidden_full, shared_kv) = self.batched_sink_forward_with_mask(
+        let (logits, hidden_full, shared_kv, _) = self.batched_sink_forward_with_mask(
             &prompt_arr,
             Some(mask.as_ref().unwrap()),
             // Prefill passes an explicit left-padding mask above, so the
@@ -1881,6 +2038,7 @@ impl<'a> Gemma4MtpBatchedTargetAdapter<'a> {
             None,
             // Prefill is at offset 0: no stale tail, so no per-row valid end.
             None,
+            false,
         );
         self.enable_rotating_cache_buffer();
 
@@ -2018,6 +2176,13 @@ impl<'a> MtpTarget for Gemma4MtpBatchedTargetAdapter<'a> {
         prompt_tokens_per_row: &[Vec<i32>],
         sampler: &SamplingConfig,
     ) -> Result<(Vec<i32>, MtpBatchedVerifyOutput), DrafterError> {
+        // The row-wise geometries (31B everywhere, 12B on CUDA) verify each
+        // row exactly as the B = 1 linear adapter does, which needs each row's
+        // prompt KV built the way classic serving builds it (issue #2190).
+        if self.wrapper.mtp_row_verify_enabled() {
+            return self.prefill_and_seed_rows(prompt_tokens_per_row, sampler);
+        }
+
         // Route by prompt-length uniformity. Equal-length rows take the
         // original rectangular [B, L] prefill (mask derived internally from
         // offset 0); variable-length rows take the left-padding path.
@@ -2109,8 +2274,20 @@ impl<'a> MtpTarget for Gemma4MtpBatchedTargetAdapter<'a> {
 
         // Sink-aware verify forward. The [B, ...] cache grows by `width`
         // entries per row; `verify_finalize_batched` trims it back.
-        let (logits, hidden_full, shared_kv) =
-            self.batched_sink_forward_with_mask(&verify_arr, None, lp_ref, Some(&valid_ends));
+        let (logits, hidden_full, shared_kv, row_verify_inexact) =
+            self.batched_sink_forward_with_mask(&verify_arr, None, lp_ref, Some(&valid_ends), true);
+        if row_verify_inexact {
+            // The shared sliding ring compacted against the shared offset and
+            // dropped keys a lagging row still needs. Refuse rather than emit
+            // tokens classic decode would not (issue #2190).
+            return Err(DrafterError::DraftFailed {
+                reason: format!(
+                    "Gemma4 batched MTP verify: a row lagging the shared cache offset lost \
+                     sliding keys to compaction (row valid ends {valid_ends:?}); the per-row \
+                     verify cannot stay decode-exact"
+                ),
+            });
+        }
 
         // issue #350: mask the model's output-illegal placeholder ids on the
         // [B, width, vocab] verify logits BEFORE the per-row argmax, so a
@@ -2317,6 +2494,20 @@ impl<'a> Gemma4VLMtpBatchedTargetAdapter<'a> {
         }
     }
 
+    /// See [`Gemma4MtpBatchedTargetAdapter::with_prefill_chunk_size`].
+    #[must_use]
+    pub fn with_prefill_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.inner = self.inner.with_prefill_chunk_size(chunk_size);
+        self
+    }
+
+    /// See [`Gemma4MtpBatchedTargetAdapter::with_prefill_boundaries`].
+    #[must_use]
+    pub fn with_prefill_boundaries(mut self, boundaries: Vec<Option<usize>>) -> Self {
+        self.inner = self.inner.with_prefill_boundaries(boundaries);
+        self
+    }
+
     /// Batch size accessor (test / diagnostic).
     pub fn batch_size(&self) -> usize {
         self.inner.batch_size()
@@ -2436,6 +2627,20 @@ impl<'a> Gemma4UnifiedMtpBatchedTargetAdapter<'a> {
                 block_size,
             ),
         }
+    }
+
+    /// See [`Gemma4MtpBatchedTargetAdapter::with_prefill_chunk_size`].
+    #[must_use]
+    pub fn with_prefill_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.inner = self.inner.with_prefill_chunk_size(chunk_size);
+        self
+    }
+
+    /// See [`Gemma4MtpBatchedTargetAdapter::with_prefill_boundaries`].
+    #[must_use]
+    pub fn with_prefill_boundaries(mut self, boundaries: Vec<Option<usize>>) -> Self {
+        self.inner = self.inner.with_prefill_boundaries(boundaries);
+        self
     }
 
     /// Batch size accessor (test / diagnostic).

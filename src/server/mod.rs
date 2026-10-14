@@ -21,6 +21,7 @@ pub mod audio_model;
 pub(crate) mod audio_worker;
 pub mod auth;
 pub mod batch;
+pub mod chat_front;
 mod chat_request;
 pub mod chat_template;
 pub mod chat_template_json;
@@ -34,15 +35,18 @@ pub(crate) mod diffusion_worker;
 pub(crate) mod dry_breakers;
 pub mod embedding_model;
 pub mod embedding_worker;
+pub mod engine_probe;
 pub(crate) mod florence2_worker;
 pub mod gbnf;
 pub mod gcp_compat;
 pub mod grammar;
 mod http_timeout;
+pub mod in_process;
 pub mod infill;
 pub mod kimi_k3_chat;
 pub mod kokoro_tts;
 mod listen;
+pub mod local_media;
 pub mod logging;
 mod media;
 mod media_net;
@@ -50,8 +54,13 @@ pub mod media_root;
 pub mod model_meta;
 pub mod model_provider;
 pub mod model_source;
+pub(crate) mod nemotron_parse_worker;
 pub mod prompt_cache;
 mod read_budget;
+pub mod realtime_engine;
+pub mod realtime_protocol;
+mod realtime_session;
+pub(crate) mod reasoning_echo;
 pub mod reasoning_format;
 mod request_options;
 pub mod rerank_model;
@@ -115,6 +124,10 @@ pub use cli_input::{
     env_fallback_settings_endpoint, env_fallback_ubatch_size, long_cli_flag_was_set,
     resolve_batch_kv_quant_config, resolve_compat_toggle, resolve_kv_cache_mode,
     resolve_n_parallel,
+};
+pub use config::{
+    DEFAULT_KV_ADMISSION_WATERMARK, MAX_KV_ADMISSION_WATERMARK, clamp_kv_admission_watermark,
+    parse_kv_admission_watermark,
 };
 pub use config::{
     DecodeStorageBackend, LiveSettings, PipelineParallelRuntimeConfig, PreemptionPolicy,

@@ -75,9 +75,19 @@
 //! path and is intended as an opt-in performance comparison, not the default
 //! compressed-only memory target.
 
+/// One attention entry per cache: storage decides the kernel (issue #2171,
+/// ADR 0008).
+mod attend;
 pub mod batch_quant;
+mod decode_undo;
+#[cfg(test)]
+#[path = "cache/decode_undo_tests.rs"]
+mod decode_undo_tests;
 mod detach;
 mod paged;
+#[cfg(test)]
+#[path = "cache/paged_append_need_tests.rs"]
+mod paged_append_need_tests;
 /// Whole-batch decode over pool-backed KV caches, the production paged decode
 /// path (issue #899).
 pub mod paged_batch_decode;
@@ -91,6 +101,13 @@ mod paged_pool_tests;
 #[cfg(test)]
 #[path = "cache/paged_turbo_tests.rs"]
 mod paged_turbo_tests;
+pub use decode_undo::{
+    DECODE_LOOKAHEAD_MAX_SPECULATIVE_APPENDS, DecodeLookaheadAppendScope, flush_decode_undo_rows,
+};
+mod prefill_rewind;
+#[cfg(test)]
+#[path = "cache/prefill_rewind_tests.rs"]
+mod prefill_rewind_tests;
 pub mod ring;
 /// Sparse attention expressed as a `page_size = 1` page table over a
 /// contiguous KV allocation (issue #904).
@@ -103,6 +120,7 @@ pub mod turbo;
 #[path = "cache/turbo_tests.rs"]
 mod turbo_tests;
 
+pub use attend::{KvAttention, attend_batched, attend_batched_rows};
 pub use batch_quant::{
     BatchKvQuantConfig, BatchQuantizedKVCache, BatchTurboQuantKVCache, DEFAULT_KV_GROUP_SIZE,
     KvQuantScheme,
@@ -145,6 +163,57 @@ pub struct PagedBlockContents {
 
 fn direct_prefill_cache_store_enabled() -> bool {
     std::env::var("MLXCEL_ENABLE_DIRECT_PREFILL_CACHE_STORE").is_ok()
+}
+
+/// `MLXCEL_KV_INPLACE_WRITE`: the FP16 decode row write goes in place
+/// (#1959) unless this is `0`, `false`, `off` or `no`.
+///
+/// `slice_update` copies the whole cache every decode step because the
+/// previous pipelined step's command buffer still references the buffer, so it
+/// is never donatable. Writing only the new row removes that copy: on
+/// command-r7b 4-bit, M1 Ultra, decode +2.5% at context 16, +4.1% at 512 and
+/// +8.2% at 2048.
+pub(crate) fn kv_inplace_write_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        !matches!(
+            std::env::var("MLXCEL_KV_INPLACE_WRITE")
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        )
+    })
+}
+
+/// See [`KVCache::inplace_marker`].
+struct InplaceWriteMarker {
+    keys: UniquePtr<MlxArray>,
+    values: UniquePtr<MlxArray>,
+    live_len: i32,
+}
+
+/// DIAGNOSTIC ONLY, output is wrong while it is set:
+/// `MLXCEL_DIAG_SKIP_DECODE_KV_WRITE` makes a single-token FP16 decode step
+/// skip writing its K/V row and attend over the cache as it stood, so a decode
+/// benchmark can read the upper bound of removing the per-step cache write.
+/// That write is costlier than one row: while the previous step is still in
+/// flight its command buffer holds the cache buffer, so `slice_update` cannot
+/// donate it and copies the whole cache every step. On command-r7b 4-bit,
+/// M1 Ultra, the bound is +4.4% decode at context 16, +8% at 512 and +11% at
+/// 2048. The cache never grows and positions do not advance, so generated text
+/// is meaningless; read throughput only. Prints one warning when first used.
+fn diag_skip_decode_kv_write() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        let on = std::env::var_os("MLXCEL_DIAG_SKIP_DECODE_KV_WRITE").is_some();
+        if on {
+            eprintln!(
+                "WARNING: MLXCEL_DIAG_SKIP_DECODE_KV_WRITE is set: decode steps do not write \
+                 the KV cache. Output is invalid; use for throughput diagnosis only."
+            );
+        }
+        on
+    })
 }
 
 /// Check that all `KVCache` entries in `caches` support cache trimming.
@@ -325,9 +394,12 @@ pub(crate) const TURBO_DEFAULT_SEED: u32 = 0x7B4_70404; // "TUR" 0x474 + B2 issu
 
 /// KV Cache for attention layers.
 ///
-/// Uses pre-allocated buffers with slice_update for O(1) per-token updates,
-/// matching Python mlx-lm's KVCache implementation. Buffers grow by `step`
-/// slots at a time (default 256) to amortize allocation cost.
+/// Uses pre-allocated buffers, matching Python mlx-lm's KVCache
+/// implementation. Buffers grow by `step` slots at a time (default 256) to
+/// amortize allocation cost. A single-token FP16 decode step writes its row in
+/// place when the cache provably owns every row it writes (#1959, see
+/// `inplace_marker`); every other write goes through `slice_update`, which
+/// copies the whole buffer whenever the previous pipelined step still holds it.
 ///
 /// When `mode` is `KVCacheMode::Int8`, keys and values are stored as INT8
 /// tensors with per-token scale factors. `update_and_fetch` always returns
@@ -460,6 +532,16 @@ pub struct KVCache {
     /// `Send` analysis in the introducing PR — `KVCache` is never required to
     /// be `Send`/`Sync`).
     pub(crate) paged_backing: Option<PagedBacking>,
+    /// Proof that the next single-row FP16 decode write may go in place
+    /// (#1959): second handles to the `keys` / `values` arrays this cache's
+    /// own last write produced, and the live length right after that write.
+    /// The in-place write is taken only when both handles are still the ones
+    /// installed (nothing outside `update_fp16` replaced them) and the new row
+    /// lands exactly at that length (no trim or rollback since). Then the row
+    /// was never valid for anyone, so another holder sharing the buffer (a
+    /// prompt-cache snapshot, a detached or restored cache) cannot see it
+    /// change. Holding the handles keeps their ids from being reused.
+    inplace_marker: Option<InplaceWriteMarker>,
 }
 
 /// Shared handle that makes one [`KVCache`] write/read through a pooled paged
@@ -520,6 +602,7 @@ impl KVCache {
             delegated_fp16_fast_path: turbo::delegated_fp16_fast_path_enabled(),
             delegated_fp16_sidecar_policy: turbo::delegated_fp16_sidecar_policy(),
             paged_backing: None,
+            inplace_marker: None,
         }
     }
 
@@ -568,6 +651,7 @@ impl KVCache {
             delegated_fp16_fast_path: turbo::delegated_fp16_fast_path_enabled(),
             delegated_fp16_sidecar_policy: turbo::delegated_fp16_sidecar_policy(),
             paged_backing: None,
+            inplace_marker: None,
         }
     }
 
@@ -610,14 +694,24 @@ impl KVCache {
     /// Whether this cache writes/reads through a shared [`PagedBlockPool`]
     /// (built via [`Self::new_paged`]) instead of its own dense buffers.
     ///
-    /// The batched-decode dispatch in each transformer model uses this to skip
-    /// the native dense-pointer paged kernel (which reads `keys`/`values`, both
-    /// `None` here) and fall through to the per-sequence `update_and_fetch`
-    /// loop, whose pool intercept transparently writes to the pool and gathers
-    /// the visible window. See the model `forward_split_attention` dispatch.
+    /// Attention dispatch reads this inside [`Self::attend`] and
+    /// [`attend_batched`] (#2171, ADR 0008); model forwards no longer do. The
+    /// remaining readers are storage bookkeeping: `CachePool` detach, adopt
+    /// and length sync, the MLA latent-cache guard, and the disaggregated
+    /// handoff.
     #[inline]
     pub fn is_paged_backed(&self) -> bool {
         self.paged_backing.is_some()
+    }
+
+    /// Whether this cache stores plain FP16 rows in its own dense buffers:
+    /// FP16 mode and no pool backing. The layout a model may stack or slice
+    /// across rows directly (`keys` / `values` are the whole state).
+    ///
+    /// Used by: `models::gemma4_verify_rows` (batched MTP verify stacking).
+    #[inline]
+    pub fn is_dense_fp16(&self) -> bool {
+        self.mode == KVCacheMode::Fp16 && self.paged_backing.is_none()
     }
 
     /// Override the Turbo4Delegated hot-tail fold threshold for this cache.
@@ -770,6 +864,21 @@ impl KVCache {
     /// Pre- callers (those that never trim) see this equal to
     /// `self.offset` because `live_start == 0`.
     #[inline]
+    /// The FP16 live window `[.., live_start..offset, ..]` as it stands, with
+    /// nothing written and `offset` unchanged. Only the
+    /// `MLXCEL_DIAG_SKIP_DECODE_KV_WRITE` diagnostic uses it.
+    fn live_window_without_write(&self) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        let live_len = self.buffer_idx();
+        let k = self.keys.as_ref().expect("live window needs keys");
+        let v = self.values.as_ref().expect("live window needs values");
+        let ks = ffi::array_shape(k);
+        let vs = ffi::array_shape(v);
+        (
+            ffi::slice(k, &[0, 0, 0, 0], &[ks[0], ks[1], live_len, ks[3]]),
+            ffi::slice(v, &[0, 0, 0, 0], &[vs[0], vs[1], live_len, vs[3]]),
+        )
+    }
+
     fn buffer_idx(&self) -> i32 {
         self.offset - self.live_start
     }
@@ -954,6 +1063,28 @@ impl KVCache {
         self.offset += new_seq_len;
         let live_len = self.buffer_idx();
 
+        // #1959: write a decode row in place when this cache provably owns
+        // every row at and past `prev` (see `inplace_marker`).
+        if new_seq_len == 1
+            && kv_inplace_write_enabled()
+            && self.inplace_write_is_private(prev)
+            && ffi::default_device_is_gpu()
+        {
+            let start = [0, 0, prev, 0];
+            self.keys = Some(ffi::inplace_slice_write(
+                self.keys.as_ref().unwrap(),
+                &new_keys,
+                &start,
+            ));
+            self.values = Some(ffi::inplace_slice_write(
+                self.values.as_ref().unwrap(),
+                &new_values,
+                &start,
+            ));
+            self.mark_own_write(live_len);
+            return;
+        }
+
         let k_shape = ffi::array_shape(self.keys.as_ref().unwrap());
         let v_shape = ffi::array_shape(self.values.as_ref().unwrap());
         self.keys = Some(ffi::slice_update(
@@ -968,6 +1099,35 @@ impl KVCache {
             &[0, 0, prev, 0],
             &[v_shape[0], v_shape[1], live_len, v_shape[3]],
         ));
+        // The copy produced buffers no one else has seen.
+        self.mark_own_write(live_len);
+    }
+
+    /// Whether the next FP16 decode row at `prev` may be written in place:
+    /// `keys` / `values` are still the arrays this cache's own last write
+    /// produced and nothing rolled the cache back since. See `inplace_marker`.
+    fn inplace_write_is_private(&self, prev: i32) -> bool {
+        match (&self.inplace_marker, &self.keys, &self.values) {
+            (Some(m), Some(k), Some(v)) => {
+                m.live_len == prev
+                    && ffi::array_same_handle(&m.keys, k)
+                    && ffi::array_same_handle(&m.values, v)
+            }
+            _ => false,
+        }
+    }
+
+    /// Record that `keys` / `values` were just produced by this cache's own
+    /// write, leaving `live_len` rows valid.
+    fn mark_own_write(&mut self, live_len: i32) {
+        self.inplace_marker = match (&self.keys, &self.values) {
+            (Some(k), Some(v)) => Some(InplaceWriteMarker {
+                keys: ffi::array_handle_clone(k),
+                values: ffi::array_handle_clone(v),
+                live_len,
+            }),
+            _ => None,
+        };
     }
 
     /// INT8 update path — quantizes incoming K/V tokens and accumulates into
@@ -2202,7 +2362,8 @@ impl KVCache {
     /// touched. This mirrors speculative decoding's "rewind one block" pattern
     /// from `update_turbo4_asym` and avoids paying for a re-quantize on the
     /// common short-rewind case.
-    /// Used by: speculative decoding cache rewinds
+    /// A pool-backed cache rewinds its block table in the shared pool instead.
+    /// Used by: speculative decoding cache rewinds, padded-prefill pad trims
     pub fn trim(&mut self, n: i32) -> i32 {
         // Clamp against the live window length, not the monotonic offset:
         // after a `trim_front`-induced live_start advance we must not roll
@@ -2215,12 +2376,23 @@ impl KVCache {
             return 0;
         }
         // Pool-backed caches keep no dense `keys`/`values` buffers (#121); the
-        // block table is the authoritative store and is trimmed through the
-        // pool API (`CachePool::trim_paged_tokens` / `rewind_paged_tokens`),
-        // never the dense buffer slicing below (which would `unwrap` a `None`
-        // buffer). Treat a dense-side trim as a no-op for them.
-        if self.paged_backing.is_some() {
-            return 0;
+        // block table is the authoritative store, so rewind it instead of the
+        // dense buffer slicing below (which would `unwrap` a `None` buffer).
+        // `offset` moves with it: it is the next RoPE position and has to agree
+        // with the pool's write position.
+        if let Some(backing) = self.paged_backing.as_ref() {
+            let trimmed = backing
+                .pool
+                .borrow_mut()
+                .rewind_tokens(
+                    &mut backing.state.borrow_mut(),
+                    backing.layer_idx,
+                    n as usize,
+                )
+                .expect("PagedBlockPool::rewind_tokens failed for pool-backed cache")
+                as i32;
+            self.offset -= trimmed;
+            return trimmed;
         }
         // Turbo4Delegated: hot-first trim. Tokens to remove from cold = max(0, n - hot_len).
         // We adjust cold_offset and offset, then fall through to the per-mode buffer slicing
@@ -2992,6 +3164,15 @@ impl KVCache {
         // double-write or allocate dense buffers. See `new_paged`.
         if self.paged_backing.is_some() {
             return self.update_and_fetch_paged(&new_keys, &new_values);
+        }
+
+        // Cached flag first, so the default path pays nothing for the check.
+        if diag_skip_decode_kv_write()
+            && self.mode == KVCacheMode::Fp16
+            && self.keys.is_some()
+            && ffi::array_shape(&new_keys)[2] == 1
+        {
+            return self.live_window_without_write();
         }
 
         self.update(new_keys, new_values);
@@ -4176,6 +4357,9 @@ pub struct RotatingKVCache {
     /// sliding window is full.
     pub buffer_size: i32,
     pub offset: i32,
+    /// Original (logical offset, next ring write slot) before buffering.
+    /// Used by: Gemma 4 31B verify to preserve classic attention reduction order.
+    speculative_ring_origin: Option<(i32, i32)>,
     /// Absolute logical position of `keys[..., 0, :]` when `buffer_size > 0`.
     start_position: i32,
     /// Current write position in the buffer (separate from offset to handle trim correctly)
@@ -4203,6 +4387,17 @@ pub struct RotatingKVCache {
     /// Deterministic seed for the Turbo4 sign vectors. Set at construction
     /// time so detach/adopt round-trip without recomputing rotations.
     pub(crate) turbo_seed: u32,
+    /// Same proof as [`KVCache::inplace_marker`], for the warmup phase
+    /// (#1959 follow-up): while `offset < max_size` each decode token lands on
+    /// a slot that was never valid, so it may be written in place when this
+    /// cache's own last write produced the current buffers. Steady-state
+    /// overwrites replace a slot that was valid a step ago and a snapshot may
+    /// still hold it, so they keep the copying `slice_update`.
+    inplace_marker: Option<InplaceWriteMarker>,
+    /// Rows and cursors of the newest single-token writes, for an exact
+    /// rewind after the ring wraps (issue #2159). `None` unless a caller
+    /// opted in through [`Self::set_decode_undo_depth`].
+    decode_undo: Option<decode_undo::DecodeUndoLog>,
 }
 
 /// Scalar state required to restore a [`RotatingKVCache`] snapshot.
@@ -4216,6 +4411,7 @@ pub struct RotatingKVCacheSnapshotState {
     pub max_size: i32,
     pub buffer_size: i32,
     pub offset: i32,
+    pub speculative_ring_origin: Option<(i32, i32)>,
     pub start_position: i32,
     pub idx: i32,
     pub step: i32,
@@ -4243,8 +4439,9 @@ impl RotatingKVCacheSnapshotState {
     ///   the physical layout, so `offset <= max_size` is required as well.
     ///
     /// Buffered speculative mode (`buffer_size > 0`) keeps its own compaction
-    /// invariants and is excluded outright; snapshots are captured outside
-    /// MTP, so this costs nothing in practice.
+    /// invariants and is excluded outright. Exact snapshots may retain that
+    /// state, but partial restore cannot treat its chronological buffer as an
+    /// unwrapped physical ring.
     pub fn is_unwrapped(&self) -> bool {
         self.buffer_size == 0 && self.idx == self.offset && self.offset <= self.max_size
     }
@@ -4307,6 +4504,7 @@ impl RotatingKVCache {
             max_size,
             buffer_size: 0,
             offset: 0,
+            speculative_ring_origin: None,
             start_position: 0,
             idx: 0,
             step: 256,
@@ -4318,6 +4516,8 @@ impl RotatingKVCache {
             v_rescale: None,
             turbo_params: None,
             turbo_seed,
+            inplace_marker: None,
+            decode_undo: None,
         }
     }
 
@@ -4358,7 +4558,10 @@ impl RotatingKVCache {
                 // if mis-configured. A future sub-issue can wire INT8 in.
                 self.update_and_fetch_fp16(new_keys, new_values)
             }
-            KVCacheMode::Turbo4Asym => self.update_and_fetch_turbo4_asym(new_keys, new_values),
+            KVCacheMode::Turbo4Asym => {
+                self.clear_decode_undo();
+                self.update_and_fetch_turbo4_asym(new_keys, new_values)
+            }
             KVCacheMode::Turbo4 => {
                 // Symmetric Turbo4 is not wired into RotatingKVCache
                 // by B9 / (RotatingKVCache currently supports only
@@ -4392,6 +4595,7 @@ impl RotatingKVCache {
         new_values: UniquePtr<MlxArray>,
     ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
         if self.buffer_size > 0 {
+            self.clear_decode_undo();
             return self.update_and_fetch_buffered_fp16(new_keys, new_values);
         }
 
@@ -4401,6 +4605,9 @@ impl RotatingKVCache {
         };
 
         if new_seq_len > 1 {
+            // A multi-token append rewrites the buffer layout, so no logged
+            // decode write describes the cache after it.
+            self.clear_decode_undo();
             return self.update_concat(new_keys, new_values, new_seq_len);
         }
 
@@ -4418,7 +4625,11 @@ impl RotatingKVCache {
     ///
     /// Used by: Gemma 4 MTP target caches near sliding-window rollover.
     pub fn enable_speculative_buffer(&mut self, buffer_size: i32) -> Result<(), String> {
+        self.clear_decode_undo();
         let buffer_size = buffer_size.max(0);
+        if buffer_size > 0 && self.max_size <= 0 {
+            return Err("RotatingKVCache speculative buffering requires a positive window".into());
+        }
         if buffer_size <= self.buffer_size && self.buffer_size > 0 {
             return Ok(());
         }
@@ -4428,6 +4639,19 @@ impl RotatingKVCache {
                  got {:?}",
                 self.mode
             ));
+        }
+
+        if self.buffer_size == 0 && buffer_size > 0 {
+            let oversized = self
+                .keys
+                .as_ref()
+                .is_some_and(|keys| ffi::array_shape(keys)[2] > self.max_size);
+            let cursor = if oversized {
+                0
+            } else {
+                self.idx.rem_euclid(self.max_size)
+            };
+            self.speculative_ring_origin = Some((self.offset, cursor));
         }
 
         if self.keys.is_none() {
@@ -4806,6 +5030,10 @@ impl RotatingKVCache {
             let shape = ffi::array_shape(keys);
             let buffer_size = shape[2];
             if buffer_size > self.max_size {
+                // Re-slicing an over-window buffer moves every slot; only a
+                // multi-token append (which already cleared the log) leaves
+                // one, but never keep an entry across a layout change.
+                self.clear_decode_undo();
                 let start = buffer_size - self.max_size;
                 let ks = ffi::array_shape(self.keys.as_ref().unwrap());
                 let vs = ffi::array_shape(self.values.as_ref().unwrap());
@@ -4896,23 +5124,57 @@ impl RotatingKVCache {
             }
         }
 
+        let idx_before = self.idx;
         if self.idx >= self.max_size {
             self.idx = 0;
         }
 
         let pos = self.idx;
-        let k_buffer = ffi::slice_update(
-            &k_buffer,
-            &new_keys,
-            &[0, 0, pos, 0],
-            &[batch, heads, pos + 1, head_dim],
-        );
-        let v_buffer = ffi::slice_update(
-            &v_buffer,
-            &new_values,
-            &[0, 0, pos, 0],
-            &[batch, heads, pos + 1, value_head_dim],
-        );
+        if self.decode_undo.is_some() {
+            self.record_decode_write(&k_buffer, &v_buffer, pos, self.offset, idx_before);
+        }
+        // Warmup slot that was never valid, in buffers this cache's own last
+        // write produced (a growth concat or trim above gives new handles and
+        // fails the check): write it in place (see `inplace_marker`).
+        let inplace = kv_inplace_write_enabled()
+            && self.offset < self.max_size
+            && pos == self.offset
+            && match &self.inplace_marker {
+                Some(m) => {
+                    m.live_len == pos
+                        && ffi::array_same_handle(&m.keys, &k_buffer)
+                        && ffi::array_same_handle(&m.values, &v_buffer)
+                }
+                None => false,
+            }
+            && ffi::default_device_is_gpu();
+        let (k_buffer, v_buffer) = if inplace {
+            let start = [0, 0, pos, 0];
+            (
+                ffi::inplace_slice_write(&k_buffer, &new_keys, &start),
+                ffi::inplace_slice_write(&v_buffer, &new_values, &start),
+            )
+        } else {
+            (
+                ffi::slice_update(
+                    &k_buffer,
+                    &new_keys,
+                    &[0, 0, pos, 0],
+                    &[batch, heads, pos + 1, head_dim],
+                ),
+                ffi::slice_update(
+                    &v_buffer,
+                    &new_values,
+                    &[0, 0, pos, 0],
+                    &[batch, heads, pos + 1, value_head_dim],
+                ),
+            )
+        };
+        self.inplace_marker = Some(InplaceWriteMarker {
+            keys: ffi::array_handle_clone(&k_buffer),
+            values: ffi::array_handle_clone(&v_buffer),
+            live_len: pos + 1,
+        });
 
         self.offset += 1;
         self.idx += 1;
@@ -5296,6 +5558,17 @@ impl RotatingKVCache {
         }
     }
 
+    /// Next write slot of the ordinary unbuffered M=1 reference cache.
+    /// Logical offset makes append, tail rollback and buffer compaction share
+    /// one derivation; the anchor survives scheduler slices and snapshots.
+    /// Used by: Gemma 4 31B MTP attention.
+    pub fn speculative_ring_cursor(&self) -> Option<i32> {
+        self.speculative_ring_origin.map(|(offset, cursor)| {
+            (i64::from(cursor) + i64::from(self.offset) - i64::from(offset))
+                .rem_euclid(i64::from(self.max_size)) as i32
+        })
+    }
+
     /// Internal write position in the ring buffer.
     ///
     /// Mirrors Python `mlx_lm.models.cache.RotatingKVCache._idx`. Used by the
@@ -5316,6 +5589,7 @@ impl RotatingKVCache {
             max_size: self.max_size,
             buffer_size: self.buffer_size,
             offset: self.offset,
+            speculative_ring_origin: self.speculative_ring_origin,
             start_position: self.start_position,
             idx: self.idx,
             step: self.step,
@@ -5367,6 +5641,16 @@ impl RotatingKVCache {
                 state.offset, state.start_position, state.idx
             ));
         }
+        if let Some((origin, cursor)) = state.speculative_ring_origin
+            && (origin < 0 || origin > state.offset || cursor < 0 || cursor >= state.max_size)
+        {
+            return Err("RotatingKVCache snapshot has an invalid speculative ring origin".into());
+        }
+        if state.buffer_size > 0
+            && state.start_position.checked_add(state.idx) != Some(state.offset)
+        {
+            return Err("RotatingKVCache buffered snapshot has inconsistent logical bounds".into());
+        }
         if state.step <= 0 {
             return Err(format!(
                 "RotatingKVCache::restore_fp16_snapshot_state requires positive step; got {}",
@@ -5376,11 +5660,22 @@ impl RotatingKVCache {
 
         if let Some(keys_ref) = keys.as_ref().and_then(|a| a.as_ref()) {
             let k_shape = ffi::array_shape(keys_ref);
-            if k_shape.len() < 3 {
+            if k_shape.len() != 4 {
                 return Err(format!(
                     "RotatingKVCache::restore_fp16_snapshot_state expected rank-4 keys, got shape {:?}",
                     k_shape
                 ));
+            }
+            let values_ref = values
+                .as_ref()
+                .and_then(|array| array.as_ref())
+                .ok_or_else(|| "RotatingKVCache snapshot has a null value buffer".to_string())?;
+            let v_shape = ffi::array_shape(values_ref);
+            if v_shape.len() != 4
+                || k_shape[..3] != v_shape[..3]
+                || ffi::array_dtype(keys_ref) != ffi::array_dtype(values_ref)
+            {
+                return Err("RotatingKVCache snapshot K/V shapes or dtypes disagree".into());
             }
             let physical_len = k_shape[2];
             // The write position has to land inside the buffer it is being
@@ -5402,10 +5697,15 @@ impl RotatingKVCache {
             }
         }
 
+        if state.buffer_size > 0 && state.speculative_ring_origin.is_none() {
+            return Err("RotatingKVCache buffered snapshot lacks its reference ring origin".into());
+        }
+        self.clear_decode_undo();
         self.keys = keys;
         self.values = values;
         self.max_size = state.max_size;
         self.buffer_size = state.buffer_size;
+        self.speculative_ring_origin = state.speculative_ring_origin;
         self.offset = state.offset;
         self.start_position = state.start_position;
         self.idx = state.idx;
@@ -5452,6 +5752,15 @@ impl RotatingKVCache {
     }
 
     pub fn trim(&mut self, n: i32) -> i32 {
+        // A plain trim does not restore overwritten rows, so the logged
+        // writes stop describing the cache (use `rewind_decode_writes`).
+        self.clear_decode_undo();
+        self.trim_cursors(n)
+    }
+
+    /// Cursor rewind shared by [`Self::trim`] and
+    /// [`Self::rewind_decode_writes`]; leaves the undo log alone.
+    fn trim_cursors(&mut self, n: i32) -> i32 {
         let n = if self.buffer_size > 0 {
             n.min(self.idx).min(self.offset)
         } else {
@@ -5462,6 +5771,16 @@ impl RotatingKVCache {
         }
         self.offset -= n;
         self.idx -= n;
+        // Truncating an unwrapped prompt snapshot can move before the
+        // original anchor; re-anchor without changing the derived cursor.
+        if self
+            .speculative_ring_origin
+            .is_some_and(|(origin, _)| origin > self.offset)
+        {
+            self.speculative_ring_origin = self
+                .speculative_ring_cursor()
+                .map(|cursor| (self.offset, cursor));
+        }
         n
     }
 
@@ -5486,6 +5805,7 @@ impl RotatingKVCache {
     /// slot `0`.
     pub fn gather_within_tail(&mut self, tail_len: i32, kept: &[i32]) -> Result<(), String> {
         const WHO: &str = "RotatingKVCache::gather_within_tail";
+        self.clear_decode_undo();
         if !self.tail_is_in_logical_order() {
             return Err(format!(
                 "{WHO}: the ring has wrapped, so the tail is not contiguous and a selection \
@@ -6010,139 +6330,6 @@ impl BatchedAttentionMetadata {
         self.kv_lens = new_kv_lens;
         self.window_sizes = new_window_sizes;
         Ok(())
-    }
-}
-
-/// Decode-only paged attention metadata derived from per-sequence KV lengths.
-///
-/// The current dense-compat kernel treats `block_tables` as logical block
-/// indices (`0..num_blocks`) for each sequence. A future physical paged-KV
-/// backend can reuse the same shape while replacing these entries with actual
-/// physical block identifiers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PagedDecodeMetadata {
-    pub block_size: i32,
-    pub kv_lens: Vec<i32>,
-    pub block_table_offsets: Vec<i32>,
-    pub block_tables: Vec<i32>,
-}
-
-/// Decode-only paged attention metadata for ring-buffer-backed rotating caches.
-///
-/// `logical_starts[i]` identifies the physical buffer index of the oldest
-/// visible token for sequence `i`, allowing native paged decode kernels to
-/// gather wrapped sliding-window buffers without first materializing a dense
-/// linearized copy in Rust.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RotatingPagedDecodeMetadata {
-    pub block_size: i32,
-    pub kv_lens: Vec<i32>,
-    pub logical_starts: Vec<i32>,
-}
-
-impl RotatingPagedDecodeMetadata {
-    pub fn from_parts(
-        kv_lens: &[i32],
-        logical_starts: &[i32],
-        block_size: i32,
-    ) -> Result<Self, String> {
-        if block_size <= 0 {
-            return Err(format!(
-                "rotating paged decode metadata requires block_size > 0, got {block_size}"
-            ));
-        }
-        if kv_lens.len() != logical_starts.len() {
-            return Err(format!(
-                "rotating paged decode metadata length mismatch: {} kv_lens vs {} logical_starts",
-                kv_lens.len(),
-                logical_starts.len()
-            ));
-        }
-        for (&kv_len, &logical_start) in kv_lens.iter().zip(logical_starts.iter()) {
-            if kv_len < 0 {
-                return Err(format!(
-                    "rotating paged decode metadata requires non-negative kv lengths, got {kv_len}"
-                ));
-            }
-            if logical_start < 0 {
-                return Err(format!(
-                    "rotating paged decode metadata requires non-negative logical starts, got {logical_start}"
-                ));
-            }
-            if kv_len > 0 && logical_start >= kv_len {
-                return Err(format!(
-                    "rotating paged decode metadata requires logical_start < kv_len when kv_len > 0, got logical_start={logical_start}, kv_len={kv_len}"
-                ));
-            }
-        }
-
-        Ok(Self {
-            block_size,
-            kv_lens: kv_lens.to_vec(),
-            logical_starts: logical_starts.to_vec(),
-        })
-    }
-
-    pub fn len(&self) -> usize {
-        self.kv_lens.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.kv_lens.is_empty()
-    }
-}
-
-impl PagedDecodeMetadata {
-    pub fn from_attention_metadata(
-        metadata: &BatchedAttentionMetadata,
-        block_size: i32,
-    ) -> Result<Self, String> {
-        Self::from_visible_lengths(&metadata.kv_lens, block_size)
-    }
-
-    pub fn from_visible_lengths(kv_lens: &[i32], block_size: i32) -> Result<Self, String> {
-        if block_size <= 0 {
-            return Err(format!(
-                "paged decode metadata requires block_size > 0, got {block_size}"
-            ));
-        }
-
-        let mut block_table_offsets = Vec::with_capacity(kv_lens.len() + 1);
-        let mut block_tables = Vec::new();
-        block_table_offsets.push(0);
-
-        for &kv_len in kv_lens {
-            if kv_len < 0 {
-                return Err(format!(
-                    "paged decode metadata requires non-negative kv lengths, got {kv_len}"
-                ));
-            }
-
-            let block_count = if kv_len == 0 {
-                0
-            } else {
-                (kv_len + block_size - 1) / block_size
-            };
-            for logical_block in 0..block_count {
-                block_tables.push(logical_block);
-            }
-            block_table_offsets.push(block_tables.len() as i32);
-        }
-
-        Ok(Self {
-            block_size,
-            kv_lens: kv_lens.to_vec(),
-            block_table_offsets,
-            block_tables,
-        })
-    }
-
-    pub fn len(&self) -> usize {
-        self.kv_lens.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.kv_lens.is_empty()
     }
 }
 
@@ -6757,8 +6944,9 @@ impl CachePool {
         self.paged_slab_blocks
     }
 
-    /// Blocks still **acquirable** before the paged budget is hit
-    /// (`budget − live`), or `None` when unbounded / no paged pool. `Some(0)`
+    /// Blocks still **acquirable** before the paged budget is hit, counted
+    /// per layer (see [`PagedBlockPool::free_block_budget`]), or `None` when
+    /// unbounded / no paged pool. `Some(0)`
     /// means every budgeted block is in use; the admission gate must reclaim
     /// (evict cold prefixes, then preempt) or defer. Eviction raises this even
     /// though allocated rows are retained, because freed blocks are reusable.
@@ -6766,6 +6954,32 @@ impl CachePool {
         self.paged_pool
             .as_ref()
             .and_then(|pool| pool.borrow().free_block_budget())
+    }
+
+    /// Pool blocks appending `token_count` tokens to every layer of sequence
+    /// `id` would acquire (see [`PagedBlockPool::blocks_to_append`]). `0` for a
+    /// dense or model-owned sequence, an unknown id, or when no paged pool
+    /// exists. The scheduler uses it to reserve decode budget (issue #1982).
+    pub fn paged_blocks_to_append(&self, id: SequenceId, token_count: usize) -> usize {
+        let Some(pool) = self.paged_pool.as_ref() else {
+            return 0;
+        };
+        let Some(state) = self.active.get(&id).and_then(|seq| seq.paged.as_ref()) else {
+            return 0;
+        };
+        pool.borrow().blocks_to_append(&state.borrow(), token_count)
+    }
+
+    /// Pool blocks a prefill growing every layer of sequence `id` to
+    /// `total_len` positions would acquire (see
+    /// [`PagedBlockPool::blocks_to_reach`]). A sequence that adopted a cached
+    /// prefix is charged only for its suffix. `None` when `id` has no paged
+    /// state or no paged pool exists, so callers can fall back to a
+    /// whole-prompt estimate (issue #2088).
+    pub fn paged_blocks_to_reach(&self, id: SequenceId, total_len: usize) -> Option<usize> {
+        let pool = self.paged_pool.as_ref()?;
+        let state = self.active.get(&id).and_then(|seq| seq.paged.as_ref())?;
+        Some(pool.borrow().blocks_to_reach(&state.borrow(), total_len))
     }
 
     /// Read-only access to the underlying [`PagedBlockPool`].
@@ -7242,6 +7456,7 @@ mod rotating_truncation_tests {
         RotatingKVCacheSnapshotState {
             max_size,
             buffer_size: 0,
+            speculative_ring_origin: None,
             offset,
             start_position: 0,
             idx,
@@ -7361,6 +7576,205 @@ mod rotating_truncation_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn f32_rows(arr: &MlxArray) -> Vec<f32> {
+        let a = ffi::astype(arr, dtype::FLOAT32);
+        ffi::eval(&a);
+        ffi::array_to_raw_bytes(&a)
+            .chunks_exact(4)
+            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    fn row(v: f32) -> UniquePtr<MlxArray> {
+        ffi::from_slice_f32(&[v], &[1, 1, 1, 1])
+    }
+
+    /// The in-place proof holds after the cache's own writes and fails once
+    /// anything else replaces the buffer or rolls the cache back (#1959).
+    #[test]
+    fn inplace_write_marker_tracks_own_writes_replacement_and_rollback() {
+        let mut cache = KVCache::new();
+        cache.update_and_fetch(
+            ffi::from_slice_f32(&[1.0, 2.0], &[1, 1, 2, 1]),
+            ffi::from_slice_f32(&[1.0, 2.0], &[1, 1, 2, 1]),
+        );
+        assert!(cache.inplace_write_is_private(2), "own prefill write");
+        cache.update_and_fetch(row(3.0), row(3.0));
+        assert!(cache.inplace_write_is_private(3), "own decode write");
+        assert!(
+            !cache.inplace_write_is_private(2),
+            "not at the recorded length"
+        );
+
+        // A buffer installed from outside (a restore) is not provably private.
+        let k = ffi::copy(cache.keys.as_ref().unwrap());
+        cache.keys = Some(k);
+        assert!(!cache.inplace_write_is_private(3), "replaced keys");
+        cache.update_and_fetch(row(4.0), row(4.0));
+        assert!(
+            cache.inplace_write_is_private(4),
+            "the copying write re-owns"
+        );
+
+        cache.trim(2);
+        assert!(
+            !cache.inplace_write_is_private(cache.buffer_idx()),
+            "after trim"
+        );
+    }
+
+    /// A snapshot sharing the cache buffer keeps its valid rows while the
+    /// cache keeps decoding in place, and a cache restored from that snapshot
+    /// writes into its own copy, leaving both the snapshot and the original
+    /// untouched (#1959, cache poisoning).
+    #[test]
+    fn inplace_writes_never_change_rows_a_shared_snapshot_holds() {
+        if !ffi::default_device_is_gpu() {
+            return;
+        }
+        let mut a = KVCache::new();
+        a.update_and_fetch(
+            ffi::from_slice_f32(&[1.0, 2.0], &[1, 1, 2, 1]),
+            ffi::from_slice_f32(&[10.0, 20.0], &[1, 1, 2, 1]),
+        );
+        a.update_and_fetch(row(3.0), row(30.0));
+        // Snapshot: second handles to A's current buffers, valid length 3.
+        let snap_k = ffi::array_handle_clone(a.keys.as_ref().unwrap());
+        let snap_v = ffi::array_handle_clone(a.values.as_ref().unwrap());
+        ffi::eval(&snap_k);
+        ffi::eval(&snap_v);
+        let snap_prefix = |arr: &MlxArray| f32_rows(arr)[..3].to_vec();
+        let before_k = snap_prefix(&snap_k);
+        let before_v = snap_prefix(&snap_v);
+        assert_eq!(before_k, vec![1.0, 2.0, 3.0]);
+
+        // A keeps decoding in place.
+        for t in 4..8 {
+            let (k, _) = a.update_and_fetch(row(t as f32), row(10.0 * t as f32));
+            ffi::eval(&k);
+        }
+        assert_eq!(snap_prefix(&snap_k), before_k, "snapshot keys unchanged");
+        assert_eq!(snap_prefix(&snap_v), before_v, "snapshot values unchanged");
+
+        // B restores the snapshot and decodes its own continuation.
+        let mut b = KVCache::new();
+        b.keys = Some(ffi::array_handle_clone(&snap_k));
+        b.values = Some(ffi::array_handle_clone(&snap_v));
+        b.offset = 3;
+        let (bk, _) = b.update_and_fetch(row(-1.0), row(-10.0));
+        assert_eq!(f32_rows(&bk), vec![1.0, 2.0, 3.0, -1.0]);
+        assert_eq!(
+            snap_prefix(&snap_k),
+            before_k,
+            "restore did not write the snapshot"
+        );
+        let (ak, _) = a.update_and_fetch(row(8.0), row(80.0));
+        assert_eq!(
+            f32_rows(&ak),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            "the original never sees the restored cache's rows"
+        );
+    }
+
+    /// A rotating cache writes warmup rows in place without touching the
+    /// rows a shared snapshot holds, and once the ring wraps it copies instead
+    /// of overwriting a slot the snapshot still considers valid (#1959
+    /// follow-up).
+    #[test]
+    fn rotating_inplace_warmup_and_wrap_keep_shared_snapshots_intact() {
+        if !ffi::default_device_is_gpu() {
+            return;
+        }
+        let mut c = RotatingKVCache::new(4);
+        for t in 1..=2 {
+            let (k, _) = c.update_and_fetch(row(t as f32), row(10.0 * t as f32));
+            ffi::eval(&k);
+        }
+        let warm_k = ffi::array_handle_clone(c.keys.as_ref().unwrap());
+        ffi::eval(&warm_k);
+        let warm_before = f32_rows(&warm_k)[..2].to_vec();
+        // Warmup continues (slots 2 and 3 were never valid), then the ring wraps.
+        for t in 3..=4 {
+            let (k, _) = c.update_and_fetch(row(t as f32), row(10.0 * t as f32));
+            ffi::eval(&k);
+        }
+        assert_eq!(
+            f32_rows(&warm_k)[..2].to_vec(),
+            warm_before,
+            "warmup rows kept"
+        );
+
+        let full_k = ffi::array_handle_clone(c.keys.as_ref().unwrap());
+        ffi::eval(&full_k);
+        let full_before = f32_rows(&full_k);
+        assert_eq!(full_before, vec![1.0, 2.0, 3.0, 4.0]);
+        // Steady state overwrites slot 0 (token 1): must not reach the snapshot.
+        let (k, _) = c.update_and_fetch(row(5.0), row(50.0));
+        assert_eq!(f32_rows(&k), vec![5.0, 2.0, 3.0, 4.0]);
+        assert_eq!(f32_rows(&full_k), full_before, "wrapped overwrite copied");
+    }
+
+    /// A prompt-cache snapshot taken in steady state keeps its rows when the
+    /// next token overwrites a ring slot (#2052). The snapshot is what
+    /// `ModelStateSnapshot::push_tensor` captures: a lazy copy of the live
+    /// keys array, not yet evaluated when the next write runs. A backend
+    /// that donates the keys buffer to that write while the copy still
+    /// references the array (ROCm before #2052) writes the new token into
+    /// the snapshot.
+    #[test]
+    fn rotating_steady_state_snapshot_survives_the_next_wrap_write() {
+        if !ffi::default_device_is_gpu() {
+            return;
+        }
+        let mut c = RotatingKVCache::new(4);
+        // Token 5 is the first steady-state write; it leaves the keys in a
+        // buffer nothing else shares.
+        for t in 1..=5 {
+            let (k, _) = c.update_and_fetch(row(t as f32), row(10.0 * t as f32));
+            ffi::eval(&k);
+        }
+        let mut snap = crate::generate::ModelStateSnapshot::new("test", 5);
+        snap.push_tensor("k", c.keys.as_ref().unwrap());
+        snap.push_tensor("v", c.values.as_ref().unwrap());
+        // Token 6 overwrites slot 1 (token 2), which the snapshot still holds.
+        let (k, v) = c.update_and_fetch(row(6.0), row(60.0));
+        assert_eq!(f32_rows(&k), vec![5.0, 6.0, 3.0, 4.0]);
+        assert_eq!(f32_rows(&v), vec![50.0, 60.0, 30.0, 40.0]);
+        assert_eq!(
+            f32_rows(snap.tensor("k").unwrap()),
+            vec![5.0, 2.0, 3.0, 4.0],
+            "snapshot keys kept token 2"
+        );
+        assert_eq!(
+            f32_rows(snap.tensor("v").unwrap()),
+            vec![50.0, 20.0, 30.0, 40.0],
+            "snapshot values kept token 2"
+        );
+    }
+
+    /// The `MLXCEL_DIAG_SKIP_DECODE_KV_WRITE` path returns exactly the live
+    /// window a normal fetch of the same cache would, and writes nothing.
+    #[test]
+    fn live_window_without_write_matches_the_cache_and_leaves_it_unchanged() {
+        let to_f32 = |arr: &MlxArray| {
+            ffi::eval(arr);
+            ffi::array_to_raw_bytes(arr)
+                .chunks_exact(4)
+                .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>()
+        };
+        let mut cache = KVCache::new();
+        let (k, v) = cache.update_and_fetch(
+            ffi::from_slice_f32(&[1.0, 2.0, 3.0], &[1, 1, 3, 1]),
+            ffi::from_slice_f32(&[10.0, 20.0, 30.0], &[1, 1, 3, 1]),
+        );
+        let (wk, wv) = cache.live_window_without_write();
+        assert_eq!(cache.offset, 3, "nothing is written or advanced");
+        assert_eq!(ffi::array_shape(&wk), vec![1, 1, 3, 1]);
+        assert_eq!(to_f32(&wk), to_f32(&k));
+        assert_eq!(to_f32(&wv), to_f32(&v));
+    }
 
     #[test]
     fn kv_cache_trim_clears_storage_when_fully_rewound() {
@@ -9458,35 +9872,6 @@ mod tests {
         assert!(BatchedAttentionMetadata::from_kv_caches(&caches, &[1], &[0, 1]).is_err());
     }
 
-    #[test]
-    fn paged_decode_metadata_builds_logical_block_tables() {
-        let metadata = BatchedAttentionMetadata {
-            rope_offsets: vec![0, 4],
-            query_lens: vec![1, 1],
-            kv_lens: vec![3, 5],
-            window_sizes: vec![0, 0],
-        };
-
-        let paged = PagedDecodeMetadata::from_attention_metadata(&metadata, 2).unwrap();
-
-        assert_eq!(paged.block_size, 2);
-        assert_eq!(paged.kv_lens, vec![3, 5]);
-        assert_eq!(paged.block_table_offsets, vec![0, 2, 5]);
-        assert_eq!(paged.block_tables, vec![0, 1, 0, 1, 2]);
-    }
-
-    #[test]
-    fn paged_decode_metadata_rejects_invalid_block_size() {
-        let metadata = BatchedAttentionMetadata {
-            rope_offsets: vec![0],
-            query_lens: vec![1],
-            kv_lens: vec![1],
-            window_sizes: vec![0],
-        };
-
-        assert!(PagedDecodeMetadata::from_attention_metadata(&metadata, 0).is_err());
-    }
-
     // -----------------------------------------------------------------
     // regression coverage — TurboQuant continuous-batching
     // batch-grow / batch-shrink mid-decode.
@@ -9869,3 +10254,7 @@ mod tests {
         metadata.assert_consistent().unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "cache/rotating_ring_tests.rs"]
+mod rotating_ring_tests;

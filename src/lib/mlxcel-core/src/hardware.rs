@@ -120,10 +120,237 @@ impl std::fmt::Display for AppleSiliconGen {
     }
 }
 
+/// Which vendor made the GPU this process will run on.
+///
+/// Kept separate from [`AppleSiliconGen`] on purpose. That enum answers "which
+/// Apple Silicon generation", and twelve call sites across the VLM loaders,
+/// `models/sanitize.rs` and `drafter/dflash/drafter.rs` read its `Unknown`
+/// variant as "this is not Apple Silicon" in order to gate a bf16 to f16 weight
+/// conversion. Adding a vendor variant there would flip all eleven to true on
+/// that vendor and silently enable the conversion, which is the same shape of
+/// defect issue #1803 removed one layer down, where `!metal::is_available()`
+/// was read as "CUDA" because only two backends existed.
+///
+/// `#[non_exhaustive]` so a future vendor does not break a downstream `match`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuVendor {
+    Apple,
+    Nvidia,
+    Amd,
+    /// No GPU, or one this build does not identify.
+    Unknown,
+}
+
+/// Which GPU backend MLX resolved for this process.
+///
+/// The Rust view of `mlxcel::GpuKernelBackend` (issue #1803). Read this rather
+/// than inferring the backend from which `device_info()` keys are present: the
+/// ROCm backend publishes `compute_capability_major`/`minor` from the `gfx`
+/// target, so key presence says "AMD looks like CUDA", which is the misreport
+/// this type exists to stop.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuBackendKind {
+    /// No GPU backend, or one this build does not know.
+    None,
+    Metal,
+    Cuda,
+    Rocm,
+}
+
+impl GpuBackendKind {
+    /// Every variant, in declaration order.
+    ///
+    /// Crates downstream of this one cannot `match` exhaustively on a
+    /// `#[non_exhaustive]` enum, so adding a variant gives them no compile
+    /// error. They walk this list in a test instead: the WebUI catalog checks
+    /// that every kind reads its own registry column (issue #1886). The const
+    /// block below fails the build when a variant is missing from the list.
+    pub const ALL: [GpuBackendKind; 4] = [
+        GpuBackendKind::None,
+        GpuBackendKind::Metal,
+        GpuBackendKind::Cuda,
+        GpuBackendKind::Rocm,
+    ];
+}
+
+// Compile-time guard for `GpuBackendKind::ALL`. The match has no wildcard, so a
+// new variant fails to compile here until it has an arm, and each arm reads its
+// own variant's slot of `ALL`. The arm for a fifth variant reads `ALL[4]`,
+// which fails to compile (`unconditional_panic`) until `ALL` gains that entry.
+// The loop then rejects a list that is out of order, repeats a variant, or has
+// an arm reading another variant's slot.
+const _: () = {
+    const fn slot(kind: GpuBackendKind) -> GpuBackendKind {
+        match kind {
+            GpuBackendKind::None => GpuBackendKind::ALL[0],
+            GpuBackendKind::Metal => GpuBackendKind::ALL[1],
+            GpuBackendKind::Cuda => GpuBackendKind::ALL[2],
+            GpuBackendKind::Rocm => GpuBackendKind::ALL[3],
+        }
+    }
+    let mut position = 0;
+    while position < GpuBackendKind::ALL.len() {
+        let kind = GpuBackendKind::ALL[position];
+        assert!(
+            kind as usize == position && slot(kind) as usize == position,
+            "GpuBackendKind::ALL must list every variant once, in declaration order"
+        );
+        position += 1;
+    }
+};
+
+/// The GPU backend MLX resolved, probed once per process.
+#[must_use]
+pub fn gpu_backend_kind() -> GpuBackendKind {
+    static KIND: OnceLock<GpuBackendKind> = OnceLock::new();
+    *KIND.get_or_init(|| match crate::ffi::gpu_backend_kind() {
+        1 => GpuBackendKind::Metal,
+        2 => GpuBackendKind::Cuda,
+        3 => GpuBackendKind::Rocm,
+        // 0 is `None`; anything else is a bridge the Rust side does not know
+        // yet, which is also "no backend I can report on".
+        _ => GpuBackendKind::None,
+    })
+}
+
+/// A quantization mode, as MLX names it.
+///
+/// The closed set MLX's `string_to_quantization_mode` parses; the string form
+/// is [`QuantMode::as_str`], which matches
+/// [`crate::layers::SUPPORTED_QUANTIZATION_MODES`] entry for entry (a test
+/// holds the two together).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuantMode {
+    Affine,
+    Mxfp4,
+    Mxfp8,
+    Nvfp4,
+}
+
+impl QuantMode {
+    /// Every mode, in the order of `SUPPORTED_QUANTIZATION_MODES`.
+    pub const ALL: [QuantMode; 4] = [
+        QuantMode::Affine,
+        QuantMode::Mxfp4,
+        QuantMode::Mxfp8,
+        QuantMode::Nvfp4,
+    ];
+
+    /// The mode string MLX parses (`"affine"`, `"mxfp4"`, `"mxfp8"`, `"nvfp4"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            QuantMode::Affine => "affine",
+            QuantMode::Mxfp4 => "mxfp4",
+            QuantMode::Mxfp8 => "mxfp8",
+            QuantMode::Nvfp4 => "nvfp4",
+        }
+    }
+
+    /// Parse an MLX mode string. Exact comparison, like
+    /// [`crate::layers::validate_quantization_mode`]: `None` for anything MLX
+    /// itself would not parse.
+    #[must_use]
+    pub fn from_mlx_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == name)
+    }
+}
+
+impl std::fmt::Display for QuantMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Whether a backend can run a [`QuantMode`], and if not, what to do about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantModeSupport {
+    /// The backend has kernels for this mode; load it as the checkpoint ships.
+    Native,
+    /// No kernels for this mode, but a load-time conversion to the named mode
+    /// (which is `Native` on the same backend) keeps the model runnable.
+    ConvertTo(QuantMode),
+    /// No kernels and no conversion: the load must fail with a message.
+    Unsupported,
+}
+
+impl GpuBackendKind {
+    /// Human-readable backend name for load messages.
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            GpuBackendKind::None => "CPU (no GPU backend)",
+            GpuBackendKind::Metal => "Metal",
+            GpuBackendKind::Cuda => "CUDA",
+            GpuBackendKind::Rocm => "ROCm",
+        }
+    }
+
+    /// The backend quantization capability table (issue #1806).
+    ///
+    /// This is the one place that answers "can this backend run mode M
+    /// natively?". Load-time policy consults it through
+    /// [`quant_mode_support`] (the NVFP4 repack route in the binary crate's
+    /// `models/sanitize.rs`, and the per-layer guard in
+    /// [`crate::layers`]); nothing else may key a quantization decision on a
+    /// build feature.
+    ///
+    /// Rows, and the evidence behind each:
+    ///
+    /// - Metal, CUDA: every mode native. This is the behavior before the table
+    ///   existed, and it must not change.
+    /// - `None` (a CPU-only build, or ROCm with no visible device): every mode
+    ///   native, because MLX's CPU backend implements all four
+    ///   (`mlx/backend/cpu/quantized.cpp` handles the group-16 E4M3 scale that
+    ///   NVFP4 needs). Also unchanged.
+    /// - ROCm: affine native. mxfp8 and mxfp4 native after the scale-type and
+    ///   `gather_qmm` fixes in `overlays/rocm/LOCAL_FIXES.md` (items 8, 10, 11),
+    ///   measured against a dequantized f32 reference and on
+    ///   gpt-oss-20b-MXFP4-Q4 (lablup/mlxcel#1818). For mxfp4 the committed
+    ///   evidence is `tests/rocm_mxfp4_quant.rs` (#1808): GPU `quantize`,
+    ///   `quantized_matmul` and `gather_qmm` against CPU references, each
+    ///   seen to fail with its overlay fix reverted while #1808 was worked.
+    ///   For mxfp8 it is `models::switch_layers::mxfp_tests` in the `mlxcel`
+    ///   crate (#1807): `gather_qmm` sorted and unsorted and
+    ///   `quantized_matmul` against a host-decoded reference, the gather cases
+    ///   seen to fail with item 10 reverted, plus a vendor FP8 block
+    ///   checkpoint requantized to mxfp8 at load and traced against the CPU
+    ///   device (`docs/benchmark_results/rocm-fp8-block-gfx1151-2026-09-30.md`).
+    ///   NVFP4 converts to affine: the ROCm qmv dispatch implements group
+    ///   sizes 32, 64 and 128 only and throws for NVFP4's 16, and there is no
+    ///   E4M3 block-scale path.
+    #[must_use]
+    pub const fn quant_mode_support(self, mode: QuantMode) -> QuantModeSupport {
+        match (self, mode) {
+            (GpuBackendKind::Rocm, QuantMode::Nvfp4) => {
+                QuantModeSupport::ConvertTo(QuantMode::Affine)
+            }
+            (GpuBackendKind::Rocm, QuantMode::Affine | QuantMode::Mxfp4 | QuantMode::Mxfp8) => {
+                QuantModeSupport::Native
+            }
+            (GpuBackendKind::None | GpuBackendKind::Metal | GpuBackendKind::Cuda, _) => {
+                QuantModeSupport::Native
+            }
+        }
+    }
+}
+
+/// [`GpuBackendKind::quant_mode_support`] for the backend MLX resolved in this
+/// process.
+#[must_use]
+pub fn quant_mode_support(mode: QuantMode) -> QuantModeSupport {
+    gpu_backend_kind().quant_mode_support(mode)
+}
+
 /// Hardware capabilities detected at runtime.
 #[derive(Debug, Clone)]
 pub struct HardwareCapabilities {
-    /// Apple Silicon chip generation.
+    /// Which vendor made the GPU. Ask [`HardwareCapabilities::is_apple_silicon`]
+    /// rather than comparing `silicon_gen` when the question is "is this Apple".
+    pub vendor: GpuVendor,
+    /// Apple Silicon chip generation. `Unknown` on every non-Apple vendor.
     pub silicon_gen: AppleSiliconGen,
     /// Number of GPU cores (performance cluster logical CPUs as a proxy).
     pub gpu_core_count: u32,
@@ -136,12 +363,40 @@ pub struct HardwareCapabilities {
     /// Approximate memory bandwidth in GB/s (estimated from chip generation).
     pub memory_bandwidth_gbps: f64,
     /// Unified memory size in GB.
+    ///
+    /// Apple only. Left at 0 on every other vendor on purpose: it is the third
+    /// step of `resolve_available_memory`, and filling it from device memory
+    /// would change what that walk returns on CUDA and ROCm. Read
+    /// [`HardwareCapabilities::device_memory_bytes`] for device memory.
     pub unified_memory_gb: u32,
+    /// Device name as the backend reports it ("AMD Radeon Graphics", "NVIDIA
+    /// GB10"), or empty when the backend publishes none.
+    pub device_name: String,
+    /// Architecture string as the running backend spells it, or `None` when
+    /// this build did not probe one.
+    ///
+    /// `None` on macOS even though Metal publishes an architecture: detection
+    /// runs before MLX's environment defaults are applied there, so it reads
+    /// sysctl rather than initialising the device. Read `silicon_gen` for the
+    /// Apple generation.
+    ///
+    /// Each backend has its own vocabulary and they are not comparable:
+    /// `gfx1151` on ROCm, `sm_89` on CUDA, an Apple GPU family string on
+    /// Metal. Treating this as a `gfx` target is exactly the cross-vendor
+    /// confusion #1805 exists to remove, so code that means the HIP target
+    /// reads [`crate::rocm_arch::device_gfx_target`], which is `None` off
+    /// ROCm and normalized. This field is for reporting.
+    pub device_architecture: Option<String>,
+    /// Total device memory in bytes, or 0 when the backend does not publish
+    /// it. On a UMA host, Apple or an AMD carve-out, this is the unified pool
+    /// rather than a separate VRAM figure.
+    pub device_memory_bytes: u64,
 }
 
 impl Default for HardwareCapabilities {
     fn default() -> Self {
         Self {
+            vendor: GpuVendor::Unknown,
             silicon_gen: AppleSiliconGen::Unknown,
             gpu_core_count: 0,
             has_neural_accelerator: false,
@@ -149,7 +404,25 @@ impl Default for HardwareCapabilities {
             macos_supports_na: false,
             memory_bandwidth_gbps: 0.0,
             unified_memory_gb: 0,
+            device_name: String::new(),
+            device_architecture: None,
+            device_memory_bytes: 0,
         }
+    }
+}
+
+impl HardwareCapabilities {
+    /// True when this is Apple Silicon.
+    ///
+    /// This is the predicate twelve call sites use to decide whether to convert
+    /// bf16 weights to f16 (the VLM loaders, `models/sanitize.rs` and
+    /// `drafter/dflash/drafter.rs`). It reads `silicon_gen` rather than
+    /// `vendor` so that adding a vendor cannot change what those sites do:
+    /// a new vendor leaves `silicon_gen` at `Unknown` and the answer stays
+    /// false. `gpu_vendor_does_not_imply_apple_silicon` pins that.
+    #[must_use]
+    pub fn is_apple_silicon(&self) -> bool {
+        self.silicon_gen != AppleSiliconGen::Unknown
     }
 }
 
@@ -242,6 +515,179 @@ pub fn apply_metal_ops_per_buffer_default() {
     }
 }
 
+/// The per-command-buffer input budget to use during decode steps on an Apple
+/// Silicon class, or `None` to leave decode on MLX's device default.
+///
+/// MLX commits a Metal command buffer when either its op count passes
+/// `MLX_MAX_OPS_PER_BUFFER` or its input budget passes `MLX_MAX_MB_PER_BUFFER`
+/// (`command_buffer_needs_commit` in `mlx/backend/metal/device.cpp`). The budget
+/// is not bytes: MLX sums `array::data_size()`, an element count, over the
+/// distinct input arrays and compares `count >> 20` against the cap, which it
+/// defaults to 40-50 per device class. Once [`metal_ops_per_buffer_default`]
+/// lifts the op cap to 1000, the input budget is the one that binds during
+/// decode, because every token reads the whole weight set: a 4-bit 7B model
+/// packs its weights into about 1.1G `u32` elements, so the default 50 commits a
+/// buffer every one to two layers (about 23 per token on command-r7b), and each
+/// commit leaves the GPU idle for tens of microseconds before the next buffer
+/// starts. A bf16 checkpoint counts eight times as many elements per layer and
+/// commits more often still.
+///
+/// Measured on M1 Ultra, 500-token prompt, 128 generated tokens, three
+/// interleaved runs per cell, decode at MLX's default versus 1000: command-r7b
+/// 4-bit +7%, Llama 3.1 8B 4-bit +5.6%, Qwen2.5 7B 4-bit +8%, Gemma 3n E4B +3%,
+/// Granite 4.0 H Tiny +10%, Qwen3-30B-A3B +20%, Mixtral 8x7B +21%, Llama 3.1
+/// 8B bf16 +17%, Gemma 3 4B flat. See
+/// docs/benchmark_results/metal-mb-per-buffer-m1ultra-2026-09-21.md.
+///
+/// The value applies to decode only. The same budget during prefill keeps a
+/// whole prompt's activations alive until the buffer completes: at 1000 the
+/// peak for a 2048-token prompt went from 6.0 to 12.6 GB on Qwen2.5 7B and from
+/// 19.8 to 36.2 GB on Qwen3-30B-A3B, and prefill throughput lost up to 2.7%.
+/// [`crate::DecodeCommandBufferBudget`] applies it around pipelined decode only
+/// (the generate loops and the server's lookahead decode) and leaves prefill
+/// and synchronous decode steps on the device default: a step that encodes
+/// and then waits loses its CPU-encode / GPU-execute overlap in one large
+/// buffer.
+///
+/// Gated like [`metal_ops_per_buffer_default`]: the input budget only binds
+/// once the op cap is raised, which happens only on M1 through M4. M5+ was not
+/// measured and keeps MLX's default in both phases.
+#[must_use]
+pub fn metal_decode_mb_per_buffer_default(
+    r#gen: AppleSiliconGen,
+    has_neural_accelerator: bool,
+) -> Option<u32> {
+    metal_ops_per_buffer_default(r#gen, has_neural_accelerator).map(|_| 1000)
+}
+
+/// Environment variable that sets the decode-step input budget explicitly.
+/// `0`, `off`, `false` or `no` disables the decode switch; a positive integer
+/// replaces the hardware default. Ignored when `MLX_MAX_MB_PER_BUFFER` is set.
+pub const DECODE_MB_PER_BUFFER_ENV: &str = "MLXCEL_DECODE_MB_PER_BUFFER";
+
+/// Resolve the decode-step input budget from the two environment variables
+/// and the hardware default. Pure, so the precedence is unit-testable.
+///
+/// An operator-set `MLX_MAX_MB_PER_BUFFER` wins over everything: it pins the
+/// budget for prefill and decode alike, and a decode-only switch on top of it
+/// would silently override the value the operator chose. Otherwise
+/// `MLXCEL_DECODE_MB_PER_BUFFER` decides, and an unparseable value falls back
+/// to the hardware default.
+#[must_use]
+pub fn resolve_decode_mb_per_buffer(
+    mlx_max_mb_per_buffer: Option<&str>,
+    decode_override: Option<&str>,
+    hardware_default: Option<u32>,
+) -> Option<u32> {
+    if mlx_max_mb_per_buffer.is_some() {
+        return None;
+    }
+    let Some(value) = decode_override.map(str::trim).filter(|v| !v.is_empty()) else {
+        return hardware_default;
+    };
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "0" | "off" | "false" | "no"
+    ) {
+        return None;
+    }
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|n| *n > 0)
+        .or(hardware_default)
+}
+
+/// The decode-step input budget for this process, resolved once. See
+/// [`metal_decode_mb_per_buffer_default`] and [`resolve_decode_mb_per_buffer`].
+#[must_use]
+pub fn decode_mb_per_buffer() -> Option<u32> {
+    static CACHED: OnceLock<Option<u32>> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let hw = get_hardware();
+        resolve_decode_mb_per_buffer(
+            std::env::var("MLX_MAX_MB_PER_BUFFER").ok().as_deref(),
+            std::env::var(DECODE_MB_PER_BUFFER_ENV).ok().as_deref(),
+            metal_decode_mb_per_buffer_default(hw.silicon_gen, hw.has_neural_accelerator),
+        )
+    })
+}
+
+/// Lowest input row count at which an affine projection whose scales share the
+/// input's dtype (f16 or bf16) runs as `dequantize` + dense matmul instead of
+/// `quantized_matmul`, on the Apple generations where that was measured to be
+/// no slower (issues #1994, #2001). bf16-scale models at 1024 / 2048 rows:
+/// Qwen3 1.7B +15.1% / +18.0%, Qwen3-30B-A3B +5.5% / +4.4%, Gemma 4 12B +3.0% /
+/// +3.2%, Gemma 4 E4B +0.9% / +1.9%, Gemma 3 4B +0.5% / +0.8%.
+///
+/// Measured on M1 Ultra through `mlxcel-bench-decode` (prefill change, dense
+/// path on vs off, one binary): at 1024 rows Llama 3.1 8B +10.0%, command-r7b
+/// +7.7%, Phi-3 mini +10.2%, Qwen2.5 7B +1.5%, Gemma 2 2B +0.6%, Mixtral 8x7B
+/// +0.6%; at 2048 rows +13.5%, +10.2%, +12.5%, +3.9%, +1.0%, +1.2%. Below 1024
+/// the models split: at 512 rows Llama, command-r and Phi-3 gain 4 to 6% while
+/// Qwen2.5 loses 3.1% and Gemma 2 1.3%, and at 384 rows Qwen2.5 loses 11%. 1024
+/// is the lowest row count with no measured regression; a per-shape threshold
+/// could recover the 512 to 768 gains later. Prefill peak memory grows 0.1 to
+/// 0.6 GB. See docs/benchmark_results/prefill-dense-gemm-m1ultra-2026-09-27.md.
+pub const PREFILL_DENSE_GEMM_MIN_ROWS: i64 = 1024;
+
+/// Environment variable that sets the dense-GEMM prefill row threshold on any
+/// backend. `0`, `off`, `false` or `no` disables it; a positive integer
+/// replaces the hardware default.
+pub const PREFILL_DENSE_GEMM_ENV: &str = "MLXCEL_PREFILL_DEQUANT_MIN_M";
+
+/// Hardware default for [`PREFILL_DENSE_GEMM_MIN_ROWS`]: on for M1 only.
+///
+/// Measured on M1 Ultra (the gain above) and M5 Max, where the dense path is
+/// slower at every size tried: Llama 3.1 8B -12.1% / -3.7% / -0.9% at 512 /
+/// 1024 / 2048 rows, Qwen2.5 7B -14.4% / -2.8% / +0.3%, Phi-3 mini -13.8% /
+/// -2.5% / -0.2%, with +0.5 to 0.8 GB of peak memory, so M5 stays off. M2
+/// through M4 differ in GPU microarchitecture and were not measured, and later
+/// or non-Apple devices report `Unknown`; they keep `quantized_matmul` until a
+/// measurement adds them here. On ROCm there is nothing to add: the dense path
+/// is only eligible where `quantized_matmul` already runs the same dequantize +
+/// hipBLASLt GEMM (#2081), which it does with a cached dequantized weight.
+#[must_use]
+pub fn prefill_dense_gemm_min_rows_default(r#gen: AppleSiliconGen) -> Option<i64> {
+    (r#gen == AppleSiliconGen::M1).then_some(PREFILL_DENSE_GEMM_MIN_ROWS)
+}
+
+/// Resolve the dense-GEMM prefill row threshold from
+/// [`PREFILL_DENSE_GEMM_ENV`] and the hardware default. Pure, so the
+/// precedence is unit-testable. An unparseable value keeps the default.
+#[must_use]
+pub fn resolve_prefill_dense_gemm_min_rows(
+    env_value: Option<&str>,
+    hardware_default: Option<i64>,
+) -> Option<i64> {
+    let Some(value) = env_value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return hardware_default;
+    };
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "0" | "off" | "false" | "no"
+    ) {
+        return None;
+    }
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .or(hardware_default)
+}
+
+/// The dense-GEMM prefill row threshold for this process, resolved once.
+#[must_use]
+pub fn prefill_dense_gemm_min_rows() -> Option<i64> {
+    static CACHED: OnceLock<Option<i64>> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        resolve_prefill_dense_gemm_min_rows(
+            std::env::var(PREFILL_DENSE_GEMM_ENV).ok().as_deref(),
+            prefill_dense_gemm_min_rows_default(get_hardware().silicon_gen),
+        )
+    })
+}
+
 /// The `MLX_CUDA_GRAPH_CACHE_SIZE` default to apply on a CUDA build, or `None`
 /// off CUDA.
 ///
@@ -270,7 +716,7 @@ pub fn apply_metal_ops_per_buffer_default() {
 /// only buys a proportionally larger lifetime budget, so it is a delay, not a
 /// fix. Removal condition: once an upstream fix lands that stops punishing a
 /// large lifetime working set (a windowed miss rate, or a non-fatal report) and
-/// the MLX pin in `src/lib/mlx-cpp/CMakeLists.txt` moves past it, this default
+/// the MLX pin in `src/lib/mlxcelverse/CMakeLists.txt` moves past it, this default
 /// can be lowered back toward MLX's own 400 or dropped entirely.
 #[must_use]
 pub fn cuda_graph_cache_default() -> Option<u32> {
@@ -369,7 +815,40 @@ pub fn detect_hardware() -> HardwareCapabilities {
 
     #[cfg(not(target_os = "macos"))]
     {
-        HardwareCapabilities::default()
+        detect_hardware_gpu()
+    }
+}
+
+/// Detection off macOS, where the vendor comes from the resolved MLX backend
+/// and the device strings come from `device_info()`.
+///
+/// Everything Apple-specific stays at its default: `silicon_gen` `Unknown`, no
+/// Neural Accelerator, and `unified_memory_gb` 0 so `resolve_available_memory`
+/// keeps the order it had on CUDA before this function existed. What it adds
+/// is the vendor tag plus the three device strings the ROCm backend publishes
+/// and nothing previously read (issue #1805).
+#[cfg(not(target_os = "macos"))]
+fn detect_hardware_gpu() -> HardwareCapabilities {
+    let backend = gpu_backend_kind();
+    let vendor = match backend {
+        GpuBackendKind::Metal => GpuVendor::Apple,
+        GpuBackendKind::Cuda => GpuVendor::Nvidia,
+        GpuBackendKind::Rocm => GpuVendor::Amd,
+        GpuBackendKind::None => GpuVendor::Unknown,
+    };
+    if vendor == GpuVendor::Unknown {
+        // No device to describe; asking for its name would just return "".
+        return HardwareCapabilities::default();
+    }
+    let architecture = crate::ffi::gpu_architecture(0);
+    HardwareCapabilities {
+        vendor,
+        device_name: crate::ffi::gpu_device_name(0),
+        // Empty means no device at index 0. `None` says that; "" would read as
+        // an architecture named nothing at every consumer.
+        device_architecture: (!architecture.is_empty()).then_some(architecture),
+        device_memory_bytes: crate::ffi::gpu_total_memory(0) as u64,
+        ..HardwareCapabilities::default()
     }
 }
 
@@ -513,6 +992,10 @@ fn detect_hardware_macos() -> HardwareCapabilities {
     let memory_bandwidth_gbps = estimate_bandwidth(silicon_gen, unified_memory_gb);
 
     HardwareCapabilities {
+        // macOS only ever runs the Metal backend here, so the vendor is not a
+        // probe result. `silicon_gen` still carries the generation, and
+        // `is_apple_silicon()` still reads that field rather than this one.
+        vendor: GpuVendor::Apple,
         silicon_gen,
         gpu_core_count,
         has_neural_accelerator,
@@ -520,6 +1003,16 @@ fn detect_hardware_macos() -> HardwareCapabilities {
         macos_supports_na,
         memory_bandwidth_gbps,
         unified_memory_gb,
+        // Both of these come from sysctl rather than from MLX `device_info()`,
+        // because this function runs at the top of `main`, before the
+        // environment defaults MLX reads are applied, and probing the device
+        // here would move device initialisation ahead of them. On a SoC the
+        // chip brand is the device name a reader wants anyway, and the
+        // architecture is left unreported rather than guessed.
+        device_name: brand,
+        device_architecture: None,
+        // Unified memory: on Apple Silicon the GPU pool is host RAM.
+        device_memory_bytes: mem_bytes,
     }
 }
 
@@ -964,6 +1457,123 @@ mod tests {
     }
 
     #[test]
+    fn decode_mb_per_buffer_default_follows_the_ops_default_gate() {
+        // The input budget only binds once the op cap is raised, so the two
+        // defaults must apply on exactly the same hardware. Decoupling them
+        // would either leave M1-M4 decode committing a buffer every layer or
+        // raise the budget where nothing was measured (M5+, non-Apple).
+        for (r#gen, na) in [
+            (AppleSiliconGen::M1, false),
+            (AppleSiliconGen::M2, false),
+            (AppleSiliconGen::M3, false),
+            (AppleSiliconGen::M4, false),
+            (AppleSiliconGen::M5, true),
+            (AppleSiliconGen::Unknown, false),
+        ] {
+            let ops = metal_ops_per_buffer_default(r#gen, na);
+            let mb = metal_decode_mb_per_buffer_default(r#gen, na);
+            assert_eq!(ops.is_some(), mb.is_some(), "{gen:?} na={na}");
+        }
+        assert_eq!(
+            metal_decode_mb_per_buffer_default(AppleSiliconGen::M1, false),
+            Some(1000)
+        );
+    }
+
+    #[test]
+    fn operator_mlx_max_mb_per_buffer_disables_the_decode_switch() {
+        // An explicit MLX_MAX_MB_PER_BUFFER pins both phases; the decode switch
+        // must not override it, whatever MLXCEL_DECODE_MB_PER_BUFFER says.
+        assert_eq!(
+            resolve_decode_mb_per_buffer(Some("50"), None, Some(1000)),
+            None
+        );
+        assert_eq!(
+            resolve_decode_mb_per_buffer(Some("50"), Some("2000"), Some(1000)),
+            None
+        );
+    }
+
+    #[test]
+    fn prefill_dense_gemm_default_is_m1_only() {
+        assert_eq!(
+            prefill_dense_gemm_min_rows_default(AppleSiliconGen::M1),
+            Some(PREFILL_DENSE_GEMM_MIN_ROWS)
+        );
+        for other in [
+            AppleSiliconGen::M2,
+            AppleSiliconGen::M3,
+            AppleSiliconGen::M4,
+            AppleSiliconGen::M5,
+            AppleSiliconGen::Unknown,
+        ] {
+            assert_eq!(
+                prefill_dense_gemm_min_rows_default(other),
+                None,
+                "{other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefill_dense_gemm_env_overrides_and_disables() {
+        let d = Some(PREFILL_DENSE_GEMM_MIN_ROWS);
+        assert_eq!(resolve_prefill_dense_gemm_min_rows(None, d), d);
+        assert_eq!(resolve_prefill_dense_gemm_min_rows(Some(""), d), d);
+        assert_eq!(
+            resolve_prefill_dense_gemm_min_rows(Some("512"), d),
+            Some(512)
+        );
+        assert_eq!(
+            resolve_prefill_dense_gemm_min_rows(Some("512"), None),
+            Some(512)
+        );
+        for off in ["0", "off", "FALSE", "no"] {
+            assert_eq!(
+                resolve_prefill_dense_gemm_min_rows(Some(off), d),
+                None,
+                "{off}"
+            );
+        }
+        assert_eq!(resolve_prefill_dense_gemm_min_rows(Some("junk"), d), d);
+        assert_eq!(resolve_prefill_dense_gemm_min_rows(Some("-3"), None), None);
+    }
+
+    #[test]
+    fn decode_mb_per_buffer_env_overrides_and_disables() {
+        assert_eq!(
+            resolve_decode_mb_per_buffer(None, None, Some(1000)),
+            Some(1000)
+        );
+        assert_eq!(resolve_decode_mb_per_buffer(None, None, None), None);
+        assert_eq!(
+            resolve_decode_mb_per_buffer(None, Some("400"), Some(1000)),
+            Some(400)
+        );
+        // An explicit value applies even where the hardware default is off.
+        assert_eq!(
+            resolve_decode_mb_per_buffer(None, Some("400"), None),
+            Some(400)
+        );
+        for off in ["0", "off", "OFF", "false", "no", " 0 "] {
+            assert_eq!(
+                resolve_decode_mb_per_buffer(None, Some(off), Some(1000)),
+                None,
+                "{off}"
+            );
+        }
+        // Unparseable or empty falls back to the hardware default.
+        assert_eq!(
+            resolve_decode_mb_per_buffer(None, Some("lots"), Some(1000)),
+            Some(1000)
+        );
+        assert_eq!(
+            resolve_decode_mb_per_buffer(None, Some(""), Some(1000)),
+            Some(1000)
+        );
+    }
+
+    #[test]
     fn cuda_sdpa_cache_default_matches_build_feature() {
         #[cfg(feature = "cuda")]
         assert_eq!(cuda_sdpa_cache_default(), Some(2000));
@@ -1041,6 +1651,7 @@ mod tests {
             macos_supports_na,
             memory_bandwidth_gbps: 150.0,
             unified_memory_gb: memory_gb,
+            ..Default::default()
         }
     }
 
@@ -1301,5 +1912,192 @@ mod tests {
             "Expected INT4 for 128K context on tight memory, got: {:?}",
             rec_128k
         );
+    }
+
+    /// No vendor other than Apple may make `is_apple_silicon()` true.
+    ///
+    /// That predicate gates a bf16 to f16 weight conversion at eleven call
+    /// sites (the VLM loaders, `models/sanitize.rs`,
+    /// `drafter/dflash/drafter.rs`). If a vendor ever answers true here, those
+    /// sites start converting weights on hardware where bf16 is native, the
+    /// output changes, and nothing else fails: the code compiles, and the gate
+    /// stays green wherever that vendor's checkpoints are absent. Hence a test
+    /// rather than a comment.
+    #[test]
+    fn gpu_vendor_does_not_imply_apple_silicon() {
+        for vendor in [GpuVendor::Nvidia, GpuVendor::Amd, GpuVendor::Unknown] {
+            let hw = HardwareCapabilities {
+                vendor,
+                ..Default::default()
+            };
+            assert!(
+                !hw.is_apple_silicon(),
+                "{vendor:?} must not be reported as Apple Silicon; \
+                 is_apple_silicon() gates the bf16 to f16 weight conversion"
+            );
+        }
+        // The Apple arm is decided by `silicon_gen`, not by the vendor tag, so
+        // an Apple tag with no generation is still not Apple Silicon.
+        let tagged_but_ungenerationed = HardwareCapabilities {
+            vendor: GpuVendor::Apple,
+            ..Default::default()
+        };
+        assert!(!tagged_but_ungenerationed.is_apple_silicon());
+        let real_apple = HardwareCapabilities {
+            vendor: GpuVendor::Apple,
+            silicon_gen: AppleSiliconGen::M1,
+            ..Default::default()
+        };
+        assert!(real_apple.is_apple_silicon());
+    }
+
+    #[test]
+    fn the_detected_vendor_agrees_with_the_resolved_backend() {
+        // The vendor is read off the backend MLX resolved, not guessed from
+        // which `device_info()` keys are present. Those two can disagree: the
+        // ROCm backend publishes `compute_capability_major`/`minor`, so key
+        // presence alone says "AMD is CUDA" (issue #1805).
+        let hw = get_hardware();
+        let expected = match gpu_backend_kind() {
+            GpuBackendKind::Metal => GpuVendor::Apple,
+            GpuBackendKind::Cuda => GpuVendor::Nvidia,
+            GpuBackendKind::Rocm => GpuVendor::Amd,
+            GpuBackendKind::None => GpuVendor::Unknown,
+        };
+        assert_eq!(
+            hw.vendor,
+            expected,
+            "backend {:?} must report vendor {expected:?}",
+            gpu_backend_kind()
+        );
+    }
+
+    #[test]
+    fn the_architecture_string_is_never_empty_and_never_a_gfx_claim() {
+        // Every backend publishes an `architecture`, each in its own
+        // vocabulary: `gfx1151`, `sm_89`, an Apple GPU family string. The
+        // field carries whichever one this backend speaks, and "" is never a
+        // value, only `None`.
+        let hw = get_hardware();
+        if let Some(arch) = hw.device_architecture.as_deref() {
+            assert!(!arch.is_empty(), "an empty architecture must be None");
+        }
+        // Only ROCm has a gfx target. A CUDA host reporting `sm_89` here must
+        // not make `device_gfx_target()` answer, which is the misreading that
+        // sent AMD down the CUDA path in the first place.
+        if gpu_backend_kind() != GpuBackendKind::Rocm {
+            assert_eq!(
+                crate::rocm_arch::device_gfx_target(),
+                None,
+                "only ROCm has a gfx target, whatever `architecture` says"
+            );
+        }
+    }
+
+    #[test]
+    fn unified_memory_stays_apple_only() {
+        // `resolve_available_memory` reads this field at step 3. Filling it
+        // from device memory off Apple would change what that walk returns on
+        // CUDA and ROCm, which #1805 put out of scope; `device_memory_bytes`
+        // is the field that carries device memory instead.
+        let hw = get_hardware();
+        if hw.vendor != GpuVendor::Apple {
+            assert_eq!(
+                hw.unified_memory_gb, 0,
+                "unified_memory_gb must stay 0 off Apple; read device_memory_bytes instead"
+            );
+        }
+    }
+
+    // --- Quantization capability table (issue #1806) ---
+
+    #[test]
+    fn quant_mode_names_match_the_mlx_mode_allowlist() {
+        let names: Vec<&str> = QuantMode::ALL.iter().map(|m| m.as_str()).collect();
+        assert_eq!(names, crate::layers::SUPPORTED_QUANTIZATION_MODES);
+        for mode in QuantMode::ALL {
+            assert_eq!(QuantMode::from_mlx_name(mode.as_str()), Some(mode));
+            assert_eq!(mode.to_string(), mode.as_str());
+        }
+        // Exact, like MLX's own parser.
+        assert_eq!(QuantMode::from_mlx_name("NVFP4"), None);
+        assert_eq!(QuantMode::from_mlx_name(" affine"), None);
+        assert_eq!(QuantMode::from_mlx_name(""), None);
+    }
+
+    /// Metal, CUDA and the no-GPU column must report every mode native: that is
+    /// the behavior before the table existed, and the table must not change it.
+    #[test]
+    fn quant_table_keeps_metal_cuda_and_cpu_native() {
+        for backend in [
+            GpuBackendKind::None,
+            GpuBackendKind::Metal,
+            GpuBackendKind::Cuda,
+        ] {
+            for mode in QuantMode::ALL {
+                assert_eq!(
+                    backend.quant_mode_support(mode),
+                    QuantModeSupport::Native,
+                    "{backend:?} {mode}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quant_table_rocm_row() {
+        let rocm = GpuBackendKind::Rocm;
+        assert_eq!(
+            rocm.quant_mode_support(QuantMode::Affine),
+            QuantModeSupport::Native
+        );
+        assert_eq!(
+            rocm.quant_mode_support(QuantMode::Mxfp8),
+            QuantModeSupport::Native
+        );
+        assert_eq!(
+            rocm.quant_mode_support(QuantMode::Mxfp4),
+            QuantModeSupport::Native
+        );
+        assert_eq!(
+            rocm.quant_mode_support(QuantMode::Nvfp4),
+            QuantModeSupport::ConvertTo(QuantMode::Affine)
+        );
+    }
+
+    /// Structural rules over the whole table, walking `GpuBackendKind::ALL` so
+    /// a new backend kind is covered the moment it exists: affine is native
+    /// everywhere (it is every conversion's last resort), and a conversion
+    /// target is itself native on the same backend, so no conversion chains.
+    #[test]
+    fn quant_table_conversions_land_on_native_modes() {
+        for backend in GpuBackendKind::ALL {
+            assert_eq!(
+                backend.quant_mode_support(QuantMode::Affine),
+                QuantModeSupport::Native,
+                "{backend:?} must run affine natively"
+            );
+            assert!(!backend.display_name().is_empty());
+            for mode in QuantMode::ALL {
+                if let QuantModeSupport::ConvertTo(target) = backend.quant_mode_support(mode) {
+                    assert_ne!(target, mode, "{backend:?} {mode} converts to itself");
+                    assert_eq!(
+                        backend.quant_mode_support(target),
+                        QuantModeSupport::Native,
+                        "{backend:?} {mode} converts to {target}, which is not native there"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quant_mode_support_reads_the_running_backend() {
+        for mode in QuantMode::ALL {
+            assert_eq!(
+                quant_mode_support(mode),
+                gpu_backend_kind().quant_mode_support(mode)
+            );
+        }
     }
 }

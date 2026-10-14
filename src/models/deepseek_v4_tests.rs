@@ -885,6 +885,92 @@ fn pooling_cache_eval_state_is_safe_and_neutral_in_every_state() {
 }
 
 #[test]
+fn pooling_cache_remainder_survives_an_overlapping_tail_write() {
+    // A prompt-mode call that both completes a window across the previous
+    // remainder AND leaves a new remainder reads the old remainder rows out of
+    // `buf_kv` (lazily, through `r_kv`) and writes the new tail over the same
+    // rows with `slice_update`. `eval_state` forces the buffer first, so the
+    // update runs while `r_kv` still has to read the old rows. A backend that
+    // writes the update into the old buffer in place (ROCm before #2052)
+    // hands `r_kv` the new tail instead of the remainder it captured.
+    // 2 tokens of width 2 leave remainder 2 at ratio 4; 7 more make 9: two
+    // full windows (rows 0..8) and a new remainder of 1 written at row 0.
+    // Hold the default device so a concurrent CPU-guarded test cannot move
+    // this one off the GPU.
+    let _lock = mlxcel_core::streams::lock_default_device();
+    let vals: Vec<f32> = (0..18).map(|v| v as f32).collect();
+    let mut cache = PoolingCache::new(4);
+    let head = mlxcel_core::from_slice_f32(&vals[..4], &[1, 2, 2]);
+    let _ = cache.accumulate_windows(&head, &head, 0);
+    cache.eval_state();
+    assert_eq!(cache.remainder, 2);
+
+    let tail = mlxcel_core::from_slice_f32(&vals[4..], &[1, 7, 2]);
+    let (r_kv, r_gate, base) = cache.accumulate_windows(&tail, &tail, 2);
+    assert_eq!(base, 0);
+    assert_eq!(cache.remainder, 1);
+    // The model's order: the cache barrier runs before anything reads the
+    // windows this call returned.
+    cache.eval_state();
+    assert_close(
+        &array_to_vec_f32(&r_kv),
+        &vals[..16],
+        1e-6,
+        "completed windows keep the remainder rows they were built from",
+    );
+    assert_close(
+        &array_to_vec_f32(&r_gate),
+        &vals[..16],
+        1e-6,
+        "completed gate windows keep the remainder rows they were built from",
+    );
+}
+
+#[test]
+fn tiny_model_chunked_prefill_with_pool_remainder_matches_cpu() {
+    // Model-level form of the test above. A 14 + 4 split leaves a ratio-4
+    // remainder of 2 after the first chunk, and the second chunk completes a
+    // window across it while leaving a new remainder of 2, so the tail write
+    // overlaps the rows the completed window reads. On ROCm before #2052 the
+    // GPU wrote that tail into the buffer the window was still reading and
+    // the logits moved. The split also crosses a window boundary, so it is
+    // compared with the same split on the CPU stream rather than with a
+    // single pass (see `tiny_model_chunked_prefill_matches_single_pass`).
+    let _lock = mlxcel_core::streams::lock_default_device();
+    let args = tiny_args();
+    let weights = tiny_weight_map(&args);
+    let model = DeepSeekV4Model::from_weights(&weights, &args).expect("tiny model builds");
+    let prompt: Vec<i32> = (0..18).map(|v| (v * 3 + 1) % 31).collect();
+
+    let run = || {
+        let mut caches = model.make_internal_caches();
+        let chunk_a = mlxcel_core::from_slice_i32(&prompt[..14], &[1, 14]);
+        let _ = model.forward_with_caches(&chunk_a, &mut caches);
+        let chunk_b = mlxcel_core::from_slice_i32(&prompt[14..], &[1, 4]);
+        let out = model.forward_with_caches(&chunk_b, &mut caches);
+        array_to_vec_f32(&mlxcel_core::utils::slice_axis(&out, 1, 3, 4))
+    };
+    let on_default = run();
+    let on_cpu = {
+        let _guard = mlxcel_core::streams::DefaultDeviceGuard::cpu();
+        run()
+    };
+    assert!(
+        on_cpu.iter().all(|x| x.is_finite()),
+        "CPU logits must be finite"
+    );
+    // On gfx1151 the fixed build agrees with the CPU within 1e-5 relative;
+    // the old donation moved the first logit by about 9e-3 relative. 3e-3
+    // leaves room for CUDA's default TF32 matmuls.
+    assert_close(
+        &on_default,
+        &on_cpu,
+        3e-3,
+        "chunked prefill, default device vs CPU",
+    );
+}
+
+#[test]
 fn pool_visibility_counts_match_reference_make_mask() {
     // Query at absolute position offset + j sees pooled rows
     // < (offset + 1 + j) / ratio.
@@ -1894,4 +1980,62 @@ fn use_hierarchy_gates_on_size_and_honours_the_flat_override() {
         !use_hierarchy(i32::MAX, 4, 4096, 512, false),
         "an i32-overflowing block span must not open the gate"
     );
+}
+
+/// Issue #1859: `LimitedSwitchGlu::forward` now shares the `uint32` expert ids
+/// across all three projections and the broadcast `lhs_indices` across
+/// `gate_proj` and `up_proj`, matching `SwitchGLU::forward` (#1713). It must
+/// remain bit-identical to the per-call gather form across decode and prefill
+/// shapes while eliminating two redundant `AsType(uint32)` nodes per layer when
+/// handed `int32` router indices.
+#[test]
+fn limited_switch_glu_shares_gather_indices_and_is_bit_identical_to_per_call_form() {
+    let args = tiny_args();
+    let weights = tiny_weight_map(&args);
+    let moe = DeepseekV4MoE::from_weights(&weights, &args, "model.layers.1.ffn", 1).expect("moe");
+    let hidden = args.hidden_size as i32;
+    let experts = args.n_routed_experts as i32;
+    let top_k = args.num_experts_per_tok as i32;
+
+    let per_call_reference = |x: &MlxArray, indices: &MlxArray| {
+        let x_exp = mlxcel_core::expand_dims(x, -2);
+        let x_exp = mlxcel_core::expand_dims(&x_exp, -3);
+        let gate = moe.switch_mlp.gate_proj.forward(&x_exp, indices, false);
+        let up = moe.switch_mlp.up_proj.forward(&x_exp, indices, false);
+        let h = limited_swiglu(&gate, &up, moe.switch_mlp.limit);
+        let out = moe.switch_mlp.down_proj.forward(&h, indices, false);
+        mlxcel_core::squeeze_axis(&out, -2)
+    };
+
+    for (b, l) in [(1, 1), (1, 3), (2, 2)] {
+        let x = mlxcel_core::from_slice_f32(&noise((b * l * hidden) as usize, 91), &[b, l, hidden]);
+        let ids: Vec<i32> = (0..b * l * top_k).map(|i| (i * 3 + 1) % experts).collect();
+        let ids_i32 = mlxcel_core::from_slice_i32(&ids, &[b, l, top_k]);
+        let ids_u32: Vec<u32> = ids.iter().map(|&e| e as u32).collect();
+        let ids_u32 = mlxcel_core::from_slice_u32(&ids_u32, &[b, l, top_k]);
+
+        // Unevaluated AsType count on int32 router indices: sharing the uint32
+        // rhs cast across gate/up/down drops two AsType nodes per layer.
+        let actual_i32 = moe.switch_mlp.forward(&x, &ids_i32);
+        let expected_i32 = per_call_reference(&x, &ids_i32);
+        let actual_astype = mlxcel_core::count_astype_nodes_pair(&actual_i32, &actual_i32);
+        let expected_astype = mlxcel_core::count_astype_nodes_pair(&expected_i32, &expected_i32);
+        assert_eq!(
+            actual_astype + 2,
+            expected_astype,
+            "sharing gather indices must eliminate 2 AsType(uint32) nodes per MoE layer \
+             (b={b}, l={l})"
+        );
+        assert!(
+            mlxcel_core::item_bool(&mlxcel_core::array_equal(&actual_i32, &expected_i32, false)),
+            "LimitedSwitchGlu::forward diverged from per-call reference on int32 ids (b={b}, l={l})"
+        );
+
+        let actual_u32 = moe.switch_mlp.forward(&x, &ids_u32);
+        let expected_u32 = per_call_reference(&x, &ids_u32);
+        assert!(
+            mlxcel_core::item_bool(&mlxcel_core::array_equal(&actual_u32, &expected_u32, false)),
+            "LimitedSwitchGlu::forward diverged from per-call reference on uint32 ids (b={b}, l={l})"
+        );
+    }
 }

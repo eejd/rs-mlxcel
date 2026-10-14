@@ -17,6 +17,7 @@
 //! contract (missing / unknown / not-loaded model), the router `/props`
 //! block, and authorization on the management routes.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -75,13 +76,14 @@ fn add_catalog_model(root: &std::path::Path, name: &str, model_type: &str) {
 struct InstantDownloader;
 
 impl RouterDownloader for InstantDownloader {
-    fn validate(&self, _repo_id: &str) -> anyhow::Result<()> {
+    fn validate(&self, _repo_id: &str, _revision: Option<&str>) -> anyhow::Result<()> {
         Ok(())
     }
 
     fn download(
         &self,
         repo_id: &str,
+        _revision: Option<&str>,
         dest_root: &Path,
         hooks: DownloadHooks,
     ) -> anyhow::Result<()> {
@@ -114,6 +116,8 @@ fn router_state_from(
     RouterServerState {
         pool,
         config: Arc::new(config),
+        #[cfg(feature = "webui")]
+        startup: Arc::new(ServerStartupConfig::default()),
         #[cfg(feature = "webui")]
         catalog_cache: Arc::new(crate::server::webui::catalog::CatalogProjectionCache::new()),
     }
@@ -193,6 +197,63 @@ async fn send(
     (status, json)
 }
 
+#[cfg(feature = "webui")]
+fn restore_env_var(key: &str, value: Option<std::ffi::OsString>) {
+    // SAFETY: callers hold `crate::test_support::env_lock::env_lock()` for the
+    // full mutation window.
+    unsafe {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
+    }
+}
+
+#[cfg(feature = "webui")]
+fn resolved_models_root_for_bootstrap_test(
+    models_dir: Option<&Path>,
+    cache_dir: Option<&Path>,
+) -> PathBuf {
+    let _guard = crate::test_support::env_lock::env_lock();
+    let old_models_dir = std::env::var_os("MLXCEL_MODELS_DIR");
+    let old_cache_dir = std::env::var_os("MLXCEL_CACHE_DIR");
+    // SAFETY: serialized through the crate-wide env lock.
+    unsafe {
+        std::env::remove_var("MLXCEL_MODELS_DIR");
+        std::env::remove_var("MLXCEL_CACHE_DIR");
+        if let Some(path) = models_dir {
+            std::env::set_var("MLXCEL_MODELS_DIR", path);
+        }
+        if let Some(path) = cache_dir {
+            std::env::set_var("MLXCEL_CACHE_DIR", path);
+        }
+    }
+    let root = crate::downloader::models_root(None).expect("test model store root");
+    restore_env_var("MLXCEL_MODELS_DIR", old_models_dir);
+    restore_env_var("MLXCEL_CACHE_DIR", old_cache_dir);
+    root
+}
+
+#[cfg(feature = "webui")]
+fn assert_bootstrap_reports_cache_authority(body: &serde_json::Value) {
+    assert_eq!(body["server"]["mode"], "model_free", "{body}");
+    assert_eq!(body["actions"]["load"]["state"], "enabled", "{body}");
+    assert_eq!(body["actions"]["unload"]["state"], "enabled", "{body}");
+    for name in ["download", "cache_delete"] {
+        assert_eq!(body["actions"][name]["state"], "enabled", "{body}");
+        assert!(body["actions"][name]["reason"].is_null(), "{body}");
+    }
+    let roots = body["roots"].as_array().expect("roots array");
+    assert!(
+        roots.iter().any(|root| root["kind"] == "cache"
+            && root["display_name"] == "mlxcel managed cache"
+            && root["writable"] == true),
+        "bootstrap roots must expose the actual configured pool cache: {body}"
+    );
+}
+
+#[allow(clippy::duplicate_mod)]
 #[path = "router_contract_test_support.rs"]
 mod contract;
 #[cfg(feature = "webui")]
@@ -553,6 +614,68 @@ async fn base_router_does_not_mount_webui_adapters() {
         body["error"]["message"],
         "model name is missing from the request"
     );
+}
+
+#[cfg(feature = "webui")]
+#[tokio::test]
+async fn ui_bootstrap_reports_default_cache_root_from_pool_authority() {
+    let cache_home = temp_models_dir("ui-bootstrap-default-cache-home");
+    let cache_root = resolved_models_root_for_bootstrap_test(None, Some(&cache_home));
+    assert_eq!(cache_root, cache_home.join("models"));
+
+    let state = router_state_from(
+        RouterSources {
+            models_dir: None,
+            cache: Some(CacheSource::new(cache_root, Arc::new(InstantDownloader))),
+            presets: Default::default(),
+        },
+        keyed_config(),
+        true,
+    );
+    let app = create_router_app_with_authenticated_ui(state);
+    let (status, body) = send(
+        app,
+        Method::GET,
+        "/ui-api/v1/bootstrap",
+        "",
+        Some(ROUTER_KEY),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_bootstrap_reports_cache_authority(&body);
+}
+
+#[cfg(feature = "webui")]
+#[tokio::test]
+async fn ui_bootstrap_reports_env_models_root_from_pool_authority() {
+    let env_root = temp_models_dir("ui-bootstrap-env-models-root");
+    let decoy_cache_home = temp_models_dir("ui-bootstrap-env-decoy-cache-home");
+    let cache_root =
+        resolved_models_root_for_bootstrap_test(Some(&env_root), Some(&decoy_cache_home));
+    assert_eq!(cache_root, env_root);
+
+    let state = router_state_from(
+        RouterSources {
+            models_dir: None,
+            cache: Some(CacheSource::new(cache_root, Arc::new(InstantDownloader))),
+            presets: Default::default(),
+        },
+        keyed_config(),
+        true,
+    );
+    let app = create_router_app_with_authenticated_ui(state);
+    let (status, body) = send(
+        app,
+        Method::GET,
+        "/ui-api/v1/bootstrap",
+        "",
+        Some(ROUTER_KEY),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_bootstrap_reports_cache_authority(&body);
 }
 
 #[tokio::test]
@@ -921,6 +1044,7 @@ async fn ui_operations_routes_list_get_and_report_cancel_unsupported() {
                 model_id: entry.ui_model_id.clone(),
                 requested_revision: Some(entry.lifecycle_revision()),
                 eviction_target_id: Some(eviction_entry.ui_model_id.clone()),
+                eviction_target_expected_revision: Some(eviction_entry.lifecycle_revision()),
             },
             Some("route-ops-0001"),
             "route:ops:1".to_string(),
@@ -984,6 +1108,87 @@ async fn ui_operations_routes_list_get_and_report_cancel_unsupported() {
 }
 
 #[tokio::test]
+async fn ui_download_route_replays_same_idempotency_key() {
+    let root = temp_models_dir("ui-download-route");
+    let cache_root = temp_models_dir("ui-download-route-cache");
+    let state = router_state_from(
+        RouterSources {
+            models_dir: Some(root),
+            cache: Some(CacheSource::new(cache_root, Arc::new(InstantDownloader))),
+            presets: Default::default(),
+        },
+        keyed_config(),
+        true,
+    );
+    let app = create_router_app_with_authenticated_ui(state);
+    let body = serde_json::json!({
+        "repo_id": "mlx-community/replay-http",
+        "idempotency_key": "download-route-replay-0001"
+    })
+    .to_string();
+
+    let (first_status, first) = send(
+        app.clone(),
+        Method::POST,
+        "/ui-api/v1/downloads",
+        &body,
+        Some(ROUTER_KEY),
+    )
+    .await;
+    assert_eq!(first_status, StatusCode::ACCEPTED, "{first}");
+    contract::assert_operation_accepted(&first);
+    assert_eq!(first["idempotent_replay"], false);
+
+    let (second_status, second) = send(
+        app,
+        Method::POST,
+        "/ui-api/v1/downloads",
+        &body,
+        Some(ROUTER_KEY),
+    )
+    .await;
+    assert_eq!(second_status, StatusCode::ACCEPTED, "{second}");
+    assert_eq!(second["operation_id"], first["operation_id"]);
+    assert_eq!(second["idempotent_replay"], true);
+}
+
+#[tokio::test]
+async fn ui_model_removal_route_matches_operation_accepted_fixture() {
+    let root = temp_models_dir("ui-removal-route");
+    let cache_root = temp_models_dir("ui-removal-route-cache");
+    add_fake_model(&cache_root.join("mlx-community"), "remove-route");
+    let state = router_state_from(
+        RouterSources {
+            models_dir: Some(root),
+            cache: Some(CacheSource::new(cache_root, Arc::new(InstantDownloader))),
+            presets: Default::default(),
+        },
+        keyed_config(),
+        true,
+    );
+    let entry = state
+        .pool
+        .get("mlx-community/remove-route")
+        .expect("cache entry");
+    let body = serde_json::json!({
+        "model_id": entry.ui_model_id,
+        "expected_revision": entry.lifecycle_revision(),
+        "idempotency_key": "removal-route-0001"
+    });
+    let app = create_router_app_with_authenticated_ui(state);
+    let (status, response) = send(
+        app,
+        Method::POST,
+        "/ui-api/v1/model-removals",
+        &body.to_string(),
+        Some(ROUTER_KEY),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+    contract::assert_operation_accepted(&response);
+}
+
+#[tokio::test]
 async fn ui_model_action_route_validates_profile_fields_and_idempotency() {
     let root = temp_models_dir("ui-action-profile");
     add_fake_model(&root, "alpha");
@@ -1003,6 +1208,7 @@ async fn ui_model_action_route_validates_profile_fields_and_idempotency() {
         "action": "load",
         "expected_revision": entry.lifecycle_revision(),
         "idempotency_key": "profile-load-0001",
+        "eviction_target_expected_revision": entry.lifecycle_revision(),
         "load_profile": {
             "ctx_size": 8192,
             "n_parallel": 4,
@@ -1018,11 +1224,58 @@ async fn ui_model_action_route_validates_profile_fields_and_idempotency() {
         Some(ROUTER_KEY),
     )
     .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
-    assert_eq!(
-        response["error"]["field_errors"][0]["field"],
-        "load_profile"
+    assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+    contract::assert_operation_accepted(&response);
+}
+
+#[tokio::test]
+async fn ui_model_action_route_rejects_unsupported_load_profile_with_canonical_error() {
+    let root = temp_models_dir("ui-action-unsupported-profile");
+    add_fake_model(&root, "alpha");
+    let state = router_state_from(
+        RouterSources {
+            models_dir: Some(root),
+            cache: None,
+            presets: Default::default(),
+        },
+        keyed_config(),
+        true,
     );
+    let entry = state.pool.get("alpha").expect("entry");
+    let revision = entry.lifecycle_revision();
+    let app = create_router_app_with_authenticated_ui(state);
+    let body = serde_json::json!({"model_id": entry.ui_model_id, "action":"load", "expected_revision":revision, "idempotency_key":"unsupported-profile-0001", "load_profile":{"ctx_size":1}});
+    let (status, mut response) = send(
+        app,
+        Method::POST,
+        "/ui-api/v1/model-actions",
+        &body.to_string(),
+        Some(ROUTER_KEY),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+    assert!(
+        response["request_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert!(
+        response["error"]["operation_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    response["request_id"] = serde_json::json!("req_profile_invalid_example");
+    response["error"]["operation_id"] = serde_json::json!("op_profile_invalid_example");
+    let mut expected: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/webui/examples/error.load-profile-unsupported.json"
+    ))
+    .expect("fixture");
+    expected
+        .as_object_mut()
+        .expect("object")
+        .remove("$schemaName");
+    assert_eq!(response, expected);
+    assert_eq!(entry.lifecycle_revision(), revision);
 }
 
 #[tokio::test]
@@ -1095,9 +1348,41 @@ async fn ui_model_action_route_rejects_contract_invalid_fields() {
                 "action": "load",
                 "expected_revision": revision,
                 "idempotency_key": "valid-key-0003",
-                "eviction_target_id": "mdl_short"
+                "eviction_target_id": "mdl_short",
+                "eviction_target_expected_revision": revision
             }),
             "eviction_target_id",
+        ),
+        (
+            serde_json::json!({
+                "model_id": model_id.clone(),
+                "action": "load",
+                "expected_revision": revision,
+                "idempotency_key": "valid-key-0006",
+                "eviction_target_id": model_id.clone()
+            }),
+            "eviction_target_expected_revision",
+        ),
+        (
+            serde_json::json!({
+                "model_id": model_id.clone(),
+                "action": "load",
+                "expected_revision": revision,
+                "idempotency_key": "valid-key-0007",
+                "eviction_target_expected_revision": revision
+            }),
+            "eviction_target_expected_revision",
+        ),
+        (
+            serde_json::json!({
+                "model_id": model_id.clone(),
+                "action": "load",
+                "expected_revision": revision,
+                "idempotency_key": "valid-key-0008",
+                "eviction_target_id": model_id.clone(),
+                "eviction_target_expected_revision": 0
+            }),
+            "eviction_target_expected_revision",
         ),
         (
             serde_json::json!({
@@ -1195,6 +1480,72 @@ async fn ui_operations_routes_reject_invalid_filters_and_ids() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
     assert_eq!(response["error"]["field_errors"][0]["field"], "id");
+}
+
+#[tokio::test]
+async fn ui_runtime_uses_selected_entry_effective_config() {
+    let root = temp_models_dir("ui-runtime-entry-config");
+    add_fake_model(&root, "alpha");
+    add_fake_model(&root, "beta");
+    let presets = crate::server::router_presets::RouterPresets {
+        models: BTreeMap::from([
+            (
+                "alpha".to_string(),
+                crate::server::router_presets::PresetSection {
+                    ctx_size: Some(1024),
+                    n_parallel: Some(1),
+                    ..Default::default()
+                },
+            ),
+            (
+                "beta".to_string(),
+                crate::server::router_presets::PresetSection {
+                    ctx_size: Some(8192),
+                    n_parallel: Some(4),
+                    ..Default::default()
+                },
+            ),
+        ]),
+        ..Default::default()
+    };
+    let state = router_state_from(
+        RouterSources {
+            models_dir: Some(root),
+            cache: None,
+            presets,
+        },
+        keyed_config(),
+        true,
+    );
+    let alpha_id = state.pool.get("alpha").expect("alpha").ui_model_id.clone();
+    let beta_id = state.pool.get("beta").expect("beta").ui_model_id.clone();
+    let app = create_router_app_with_authenticated_ui(state);
+
+    let (status, alpha) = send(
+        app.clone(),
+        Method::GET,
+        &format!("/ui-api/v1/runtime?model_id={alpha_id}&autoload=false"),
+        "",
+        Some(ROUTER_KEY),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{alpha}");
+    let (status, beta) = send(
+        app,
+        Method::GET,
+        &format!("/ui-api/v1/runtime?model_id={beta_id}&autoload=false"),
+        "",
+        Some(ROUTER_KEY),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{beta}");
+
+    assert_eq!(alpha["settings"]["scope"], "server_startup");
+    assert_eq!(beta["settings"]["scope"], "server_startup");
+    assert_eq!(alpha["settings"]["effective"]["ctx_size"], 1024.0);
+    assert_eq!(alpha["settings"]["effective"]["n_parallel"], 1.0);
+    assert_eq!(beta["settings"]["effective"]["ctx_size"], 2048.0);
+    assert_eq!(beta["settings"]["effective"]["n_parallel"], 4.0);
 }
 
 #[tokio::test]
@@ -1327,8 +1678,10 @@ async fn ui_events_replay_from_paired_sequence_cursor() {
     );
     let coordinator = state.pool.lifecycle_coordinator();
     let server_instance = coordinator.server_instance_id().to_string();
-    let lifecycle = ModelLifecycle::new(DownloadState::Complete).snapshot();
-    coordinator.publish_model_revision("mdl_route_sequence", 1, lifecycle);
+    let model_id = state.pool.get("alpha").expect("alpha").ui_model_id.clone();
+    let lifecycle = ModelLifecycle::new(DownloadState::Complete);
+    lifecycle.mark_loading();
+    coordinator.publish_model_revision(&model_id, 1, lifecycle.snapshot());
     let app = create_router_app_with_authenticated_ui(state);
 
     let replay = first_sse_chunk_uri(
@@ -1338,7 +1691,7 @@ async fn ui_events_replay_from_paired_sequence_cursor() {
     )
     .await;
     assert!(replay.contains("event: model_revision"), "{replay}");
-    assert!(replay.contains("\"sequence\":1"), "{replay}");
+    contract::assert_model_revision_event(&replay, &server_instance, &model_id);
 }
 
 #[tokio::test]
@@ -1389,5 +1742,56 @@ async fn ui_events_reject_invalid_paired_replay_cursors() {
             response["error"]["field_errors"][0]["code"], field_code,
             "{uri}: {response}"
         );
+    }
+}
+
+#[test]
+fn explicit_model_store_root_requires_readable_directory_but_default_absent_is_ok() {
+    let _guard = crate::test_support::env_lock::env_lock();
+    // SAFETY: serialized through the crate-wide env lock.
+    unsafe {
+        std::env::remove_var("MLXCEL_MODELS_DIR");
+    }
+    super::validate_explicit_model_store_root(&ServerStartupConfig::default())
+        .expect("default absent model store root should not create or require a cache directory");
+
+    let missing = temp_models_dir("missing-root-parent").join("missing");
+    let err = super::validate_explicit_model_store_root(&ServerStartupConfig {
+        model_store_root: Some(missing.clone()),
+        ..Default::default()
+    })
+    .expect_err("explicit missing CLI root must fail");
+    assert!(err.to_string().contains("--model-store-root"));
+    assert!(err.to_string().contains("readable directory"));
+
+    let file_parent = temp_models_dir("file-root-parent");
+    let file = file_parent.join("not-dir");
+    std::fs::write(&file, b"not a directory").unwrap();
+    let err = super::validate_explicit_model_store_root(&ServerStartupConfig {
+        model_store_root: Some(file.clone()),
+        ..Default::default()
+    })
+    .expect_err("explicit file CLI root must fail");
+    assert!(err.to_string().contains("--model-store-root"));
+    assert!(err.to_string().contains("readable directory"));
+
+    // SAFETY: serialized through the crate-wide env lock.
+    unsafe {
+        std::env::set_var("MLXCEL_MODELS_DIR", &file);
+    }
+    let err = super::validate_explicit_model_store_root(&ServerStartupConfig::default())
+        .expect_err("explicit env file root must fail");
+    assert!(err.to_string().contains("MLXCEL_MODELS_DIR"));
+
+    let good_cli = temp_models_dir("good-cli-root");
+    super::validate_explicit_model_store_root(&ServerStartupConfig {
+        model_store_root: Some(good_cli),
+        ..Default::default()
+    })
+    .expect("CLI root should override bad MLXCEL_MODELS_DIR and pass when readable");
+
+    // SAFETY: serialized through the crate-wide env lock.
+    unsafe {
+        std::env::remove_var("MLXCEL_MODELS_DIR");
     }
 }

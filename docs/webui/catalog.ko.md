@@ -4,13 +4,13 @@
 
 ## 범위와 책임
 
-이슈 #1840은 기존 `RouterPool`의 메타데이터 전용 카탈로그 투영과 목록·상세·새로고침 어댑터를 추가합니다. 별도 모델 레지스트리를 만들거나 새 provider를 시작하지 않습니다. `create_router_app_with_authenticated_ui`는 통합 테스트와 향후 안전한 시작 경로를 위해 필수 API 키 인증 뒤에 어댑터를 노출합니다. 일반 `create_router_app`에는 아직 마운트하지 않습니다. 프로덕션 `--webui` 시작과 브라우저 보안 통합은 각각 #1838과 #1837의 범위이며, 아래 API 경로가 프로덕션 플래그의 제공을 뜻하지는 않습니다.
+이슈 #1840은 기존 `RouterPool`의 메타데이터 전용 카탈로그 투영과 목록·상세·새로고침 어댑터를 추가합니다. 별도 모델 레지스트리를 만들거나 새 provider를 시작하지 않습니다. `create_router_app_with_authenticated_ui`는 통합 테스트를 위해 필수 API 키 인증 뒤에 어댑터를 노출하며, #1838은 같은 typed API를 WebUI 보안 래퍼 뒤의 프로덕션 `--webui` 시작 경로에 마운트합니다. 일반 `create_router_app`은 WebUI가 꺼져 있을 때 관리 UI 라우트를 계속 마운트하지 않습니다.
 
 탐색의 소유자는 여전히 라우터입니다. 관리형 캐시, 명시적인 `--models-dir`, 프리셋은 기존 충돌 우선순위(캐시 < 모델 디렉터리 < 프리셋), 별칭, 숨김 정책을 유지합니다. 저장소의 모델은 `--models-dir models/mlx`로 명시적으로 선택합니다. 카탈로그는 현재 작업 디렉터리에 따라 달라지는 기본값이나 파일시스템 선택기를 추가하지 않습니다. 목록 조회는 발견된 항목을 투영하며 체크포인트 다운로드, tokenizer 열기, provider 생성, 가중치 로드를 하지 않습니다.
 
 ## 투영 데이터 사용
 
-아래 어댑터 경로는 향후 검증된 서버 API 접두사를 기준으로 합니다. 전체 DTO는 [API 스키마](api.yaml)와 [생성된 TypeScript 선언](generated/ui-api.d.ts)을 확인하십시오.
+아래 어댑터 경로는 검증된 서버 API 접두사를 기준으로 합니다. 전체 DTO는 [API 스키마](api.yaml)와 [생성된 TypeScript 선언](generated/ui-api.d.ts)을 확인하십시오.
 
 | 요청 | 동작 |
 |---|---|
@@ -20,17 +20,19 @@
 
 목록은 `limit`(기본 50, 최대 200), 반환받은 `cursor`, `q`(최대 128바이트), `source`, `task`, `lifecycle`, `support`, `completeness`를 받습니다. 커서는 최대 512바이트이며 투영 대상은 1,000개 항목으로 제한됩니다. 페이지 순서는 인벤토리가 변하지 않을 때 결정적이며 동시 새로고침을 가로지르는 트랜잭션 스냅샷은 아닙니다. `server_instance_id`와 `snapshot_sequence`를 보관하고 상태 변경 시 [architecture.md](architecture.md)의 재스냅샷 규칙을 따릅니다.
 
-카탈로그 작업과 선택에는 `identity.id`, 추론 요청에는 `identity.inference_id`를 사용합니다. 표시 이름은 어느 쪽의 식별자도 아닙니다. 콘텐츠 fingerprint는 메타데이터를 처음 투영하거나 명시적으로 새로고침할 때 관찰한 제한된 파일시스템 메타데이터를 나타내며, 가중치 내용의 암호학적 검증값도 아니고 매 polling마다 다시 계산하는 값도 아닙니다. revision과 lifecycle은 브라우저가 관리하는 별도 상태 머신이 아니라 풀에서 가져옵니다.
+카탈로그 작업과 선택에는 `identity.id`, 추론 요청에는 `identity.inference_id`를 사용합니다. `identity.display_name`은 사람이 읽기 좋게 바꾼 이름이 아니라 문자를 바꾸지 않은 추론 ID입니다(models-dir 항목은 디렉터리 이름, 캐시 항목은 전체 `owner/name`, preset 항목은 전체 preset 이름, single-model 모드는 제공 ID의 마지막 `/` 구간). 그래도 이 값은 표시용 레이블일 뿐입니다. 두 소스가 같은 이름을 노출할 수 있으므로 작업과 선택에는 `identity.id`를 사용합니다. 콘텐츠 fingerprint는 메타데이터를 처음 투영하거나 명시적으로 새로고침할 때 관찰한 제한된 파일시스템 메타데이터를 나타내며, 가중치 내용의 암호학적 검증값도 아니고 매 polling마다 다시 계산하는 값도 아닙니다. revision과 lifecycle은 브라우저가 관리하는 별도 상태 머신이 아니라 풀에서 가져옵니다.
 
 다음 사실을 하나의 “작동함” 배지로 합치지 마십시오.
 
 - `complete`는 로컬 체크포인트 파일 구성을 나타내며 로드 성공이나 텐서 무결성 검증이 아닙니다.
 - `metadata.support.architecturally_supported`는 공유 모델 감지와 아키텍처 레지스트리에서 도출하며 공급업체 제목의 일치 여부가 아닙니다.
-- `runnable_on_backend`는 컴파일된 백엔드에 대한 레지스트리 지원 상태이며 실제 추론 측정 결과가 아닙니다.
+- `runnable_on_backend`는 런타임에 결정된 GPU 백엔드(Metal, CUDA 또는 ROCm)에 대한 레지스트리 지원 상태이며 실제 추론 측정 결과가 아닙니다. GPU 백엔드가 결정되지 않은 프로세스는 어떤 아키텍처도 실행 가능하다고 보고하지 않습니다.
 - `tested_checkpoint`는 현재 명시적인 사유와 함께 false입니다. 카탈로그에는 체크포인트별 검증 증거 데이터베이스가 없습니다.
 - `lifecycle.state`는 현재 provider 수명주기를 나타냅니다. 로드 전 capability가 있다고 `ready`인 것은 아닙니다.
 
 `metadata.model_type`은 `config.json`의 원본 문자열을 제한 안에서 그대로 보존한 값이며 대소문자를 유지합니다. 값이 없거나 문자열이 아니거나 너무 길거나 읽을 수 없으면 잘라내지 않고 사유가 있는 `null`을 반환합니다. `metadata.declared_architectures`도 같은 무절단 규칙을 적용한 원본 `architectures` 배열입니다. `metadata.architecture`는 이 원본 필드의 단순 복사본이 아니라 공유 로더 감지 권한이 해석한 mlxcel 레지스트리 식별자입니다. 카탈로그는 그 권한에 제한된 probe를 제공합니다. 변형 구분에 가중치 헤더가 필요하고 제한된 sidecar 증거가 없으면 사유와 함께 unknown으로 남깁니다. 관련 Gemma 4, Inkling, Kimi K3 변형을 임의로 텍스트 모델이라고 추정하지 않는 것도 이 원칙에 포함됩니다.
+
+`metadata.dtype`은 `config.json`에 선언된 가중치 dtype입니다. `torch_dtype`을 먼저 읽고, 없으면 최신 export가 쓰는 `dtype`을 읽으며, 최상위에서 찾지 못하면 `text_config` 아래에서 찾습니다. 값은 짧은 소문자 이름으로 정규화됩니다(`bfloat16`은 `bf16`, `float16`은 `fp16`, `float32`는 `fp32`, `float64`는 `fp64`가 되고 `torch.` 접두사는 제거됩니다). `float8_e4m3fn`, `float8_e4m3fnuz`, `float8_e5m2`, `float8_e5m2fnuz`, `int8`, `uint8`은 그대로 보고합니다. 그 밖의 값은 키가 없거나 문자열이 아니거나 `auto`인 경우와 마찬가지로 별도 사유 없이 `null`입니다. 이 값은 양자화 방식이 표시될 자리에 나타나므로, 다운로드한 config가 임의의 단어를 그 자리에 넣을 수 없어야 하기 때문입니다. 양자화된 체크포인트도 이 값을 보고하며, 이때는 양자화되지 않은 텐서의 dtype을 뜻합니다. 그래서 라이브러리는 `metadata.quantization`을 알 수 있으면 그것을 보여 주고, 양자화되지 않은 체크포인트에서는 `metadata.dtype`으로 대신합니다.
 
 Capability에는 적용 단계와 사용할 수 없는 사유가 있습니다. 이미지 입력은 준비된 기존 provider에서 확인하며 메타데이터만으로 이미지 전송을 활성화하지 않습니다. 비채팅 출력 task는 채팅과 구분합니다. 알 수 없는 파라미터 수와 메모리 추정값은 0이 아니라 사유가 있는 `null`입니다. 디스크 바이트는 파일 크기이며 프로세스 RSS나 allocator 메모리가 아닙니다.
 
@@ -42,7 +44,7 @@ Config와 분류 sidecar는 256 KiB, SafeTensors index JSON은 512 KiB 읽기 �
 
 작업이 활성 상태인 동안 서버 인스턴스마다 하나의 새로고침만 실행권을 가집니다. 동시 요청은 별도 재탐색을 시작하지 않고 같은 작업을 재사용하며 완료 후의 요청은 새 작업을 시작할 수 있습니다. `changed_entries`는 항목 signature를 비교하여 개수가 같아도 추가·삭제·감지된 변경을 포함합니다. 클라이언트에 전달하는 새로고침 오류는 경로를 숨기고 진단 상세는 서버 로그에 남깁니다.
 
-제거 가능 여부는 안내 정보이지 파일 삭제 권한이 아닙니다. 관리형 캐시만 제거 대상이 될 수 있으며 busy 항목은 사용할 수 없습니다. 실제 제거와 작업 경계의 검사는 #1841 범위입니다. 단일 모델 모드는 cache-aware `single_model_entry_from_state_with_cache(&CatalogProjectionCache, &AppState)` handoff로 기존 provider와 실제 추론 ID를 설명하고 별도 provider를 등록하지 않으며, 캐시된 정적 메타데이터 위에 최신 provider/lifecycle 상태를 투영하고 읽기 전용 제거 사유를 반환합니다. 프로덕션에서 이 accessor를 연결하는 작업은 #1838 범위입니다.
+제거 가능 여부는 안내 정보이지 파일 삭제 권한이 아닙니다. 관리형 캐시만 제거 대상이 될 수 있으며 busy 항목은 사용할 수 없습니다. 실제 제거와 작업 경계의 검사는 #1841 범위입니다. 단일 모델 모드는 cache-aware `single_model_entry_from_state_with_cache(&CatalogProjectionCache, &AppState)` handoff로 기존 provider와 실제 추론 ID를 설명하고 별도 provider를 등록하지 않으며, 캐시된 정적 메타데이터 위에 최신 provider/lifecycle 상태를 투영하고 읽기 전용 제거 사유를 반환합니다. #1838은 앱별 캐시와 blocking offload를 통해 이 accessor를 프로덕션에 마운트합니다.
 
 ## 회귀 테스트 범위
 
@@ -50,4 +52,4 @@ Config와 분류 sidecar는 256 KiB, SafeTensors index JSON은 512 KiB 읽기 �
 
 최종 통합 게이트는 `808994e353fdab5563966e751ca2c71515d08595`에서 실행했습니다. 카탈로그 library 32개 + CLI 1개, 보안 26개, discovery 2개와 workspace all-target clippy, 계약 fixture 40개, 구조 검사, fmt·diff 검사가 통과했습니다. 공유 detection/loader 경로는 그대로입니다. 두 독립 리뷰어는 이 revision의 라우터·단일 모델 캐시 경계 전체를 승인했습니다.
 
-`single_model_entry_from_state_with_cache`는 동기 helper입니다. #1838 시작 경로는 앱별 `Arc<CatalogProjectionCache>` 하나를 계속 유지하고 `tokio::task::spawn_blocking` 안에서 호출해야 합니다. 폴링마다 캐시를 새로 만들거나 HTTP handler에서 캐시 없는 편의 accessor를 호출하면 안 됩니다. 캐시 helper·provider 전환은 이 이슈에서 검증하며, 단일 모델 프로덕션 route의 offload·응답성 검증은 #1838 범위입니다. 라우터 HTTP adapter는 이미 메타데이터 획득을 offload합니다.
+`single_model_entry_from_state_with_cache`는 동기 helper입니다. 프로덕션 단일 모델 WebUI 라우트는 앱별 `Arc<CatalogProjectionCache>` 하나를 유지하고 `tokio::task::spawn_blocking` 안에서 이 helper를 호출합니다. 폴링마다 캐시를 새로 만들거나 HTTP handler에서 캐시 없는 편의 accessor를 호출하면 안 됩니다. 캐시 helper·provider 전환은 이 이슈에서 검증하며, #1838은 프로덕션 offload 경로의 실제 마운트 라우트 테스트를 추가합니다. 라우터 HTTP adapter는 이미 메타데이터 획득을 offload합니다.

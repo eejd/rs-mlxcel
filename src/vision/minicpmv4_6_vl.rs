@@ -25,7 +25,6 @@ use crate::LanguageModel;
 use crate::vision::merge::InputEmbeddings;
 use crate::vision::{encoders, processors};
 use mlxcel_core::cache::SequenceId;
-use mlxcel_core::generate::DecodeBatchContext;
 use mlxcel_core::layers::KVCache;
 use mlxcel_core::{MlxArray, UniquePtr};
 
@@ -278,6 +277,39 @@ impl LanguageModel for MiniCPMV46VLModel {
         mlxcel_core::generate::LanguageModel::supports_batching(&self.text_model)
     }
 
+    // The Qwen 3.5 backbone reuses prompts only through model-state
+    // snapshots (its GatedDeltaNet state cannot come from the KV trie).
+    // Without these three forwards the wrapper answered the trait defaults,
+    // so the scheduler never stored a snapshot and every turn of a
+    // conversation re-prefilled from zero. Mirrors `Qwen35VLModel`.
+    fn supports_snapshot_reuse(&self) -> bool {
+        mlxcel_core::generate::LanguageModel::supports_snapshot_reuse(&self.text_model)
+    }
+
+    fn snapshot_sequence_state(
+        &self,
+        seq_id: SequenceId,
+        token_len: usize,
+    ) -> Option<mlxcel_core::generate::ModelStateSnapshot> {
+        mlxcel_core::generate::LanguageModel::snapshot_sequence_state(
+            &self.text_model,
+            seq_id,
+            token_len,
+        )
+    }
+
+    fn restore_sequence_state(
+        &self,
+        seq_id: SequenceId,
+        snapshot: &mlxcel_core::generate::ModelStateSnapshot,
+    ) -> Result<(), String> {
+        mlxcel_core::generate::LanguageModel::restore_sequence_state(
+            &self.text_model,
+            seq_id,
+            snapshot,
+        )
+    }
+
     fn supports_batched_prefill(&self) -> bool {
         mlxcel_core::generate::LanguageModel::supports_batched_prefill(&self.text_model)
     }
@@ -286,21 +318,19 @@ impl LanguageModel for MiniCPMV46VLModel {
         mlxcel_core::generate::LanguageModel::supports_paged_decode_backend(&self.text_model)
     }
 
-    fn forward_batched_with_context_and_ids(
+    fn forward_batched_with_ids(
         &self,
         input_ids: &MlxArray,
         seq_ids: Option<&[SequenceId]>,
         batch_caches: &mut [&mut [KVCache]],
         mask: Option<&MlxArray>,
-        context: Option<&DecodeBatchContext>,
     ) -> UniquePtr<MlxArray> {
-        mlxcel_core::generate::LanguageModel::forward_batched_with_context_and_ids(
+        mlxcel_core::generate::LanguageModel::forward_batched_with_ids(
             &self.text_model,
             input_ids,
             seq_ids,
             batch_caches,
             mask,
-            context,
         )
     }
 

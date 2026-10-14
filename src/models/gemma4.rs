@@ -24,6 +24,15 @@
 //! - Dense + MoE feed-forward paths
 //! - Final logit softcapping
 
+#[path = "gemma4_probe.rs"]
+mod probe_trace;
+#[path = "gemma4_attention.rs"]
+mod verify_attention;
+#[path = "gemma4_verify_rows.rs"]
+mod verify_rows;
+
+pub(crate) use verify_rows::stack_prefilled_rows;
+
 use crate::distributed::pipeline::LayerFilter;
 use crate::distributed::pipeline::StageExecutionOutput;
 use crate::distributed::pipeline::partial_loading::filter_weight_map;
@@ -259,6 +268,39 @@ pub struct TextConfig {
 }
 
 impl TextConfig {
+    /// Whether MTP verify must reproduce classic decode one query row at a
+    /// time, which restricts it to B=1 linear blocks on rotating-buffered
+    /// caches. True for the 31B geometry everywhere, and for the 12B geometry
+    /// on CUDA, where an M=4 verify block leaves the single-query
+    /// `sdpa_vector` kernel classic decode uses at head_dim 256 (issue #2160).
+    pub(crate) fn mtp_requires_linear_singleton(&self) -> bool {
+        self.mtp_requires_linear_singleton_on(mlxcel_core::cuda_is_available())
+    }
+
+    /// [`Self::mtp_requires_linear_singleton`] with the backend made explicit,
+    /// so both answers are testable on one host. The 12B arm stays off on
+    /// Metal, whose 12B verify behavior is #1986's subject.
+    pub(crate) fn mtp_requires_linear_singleton_on(&self, cuda: bool) -> bool {
+        let geometry = |heads, kv_heads, global_kv_heads| {
+            self.num_attention_heads == heads
+                && self.num_key_value_heads == kv_heads
+                && self.num_global_key_value_heads == Some(global_kv_heads)
+                && self.head_dim == 256
+                && self.global_head_dim == Some(512)
+        };
+        geometry(32, 16, 4) || (cuda && geometry(16, 8, 1))
+    }
+
+    pub(crate) fn mtp_probe_prompt_lengths(&self) -> Vec<usize> {
+        // Preserve the original three short draws for other Gemma variants.
+        // The long buffered draw validates the measured 31B correction.
+        let mut lengths = vec![8; 3];
+        if self.mtp_requires_linear_singleton() {
+            lengths.push(self.sliding_window.saturating_add(32).min(1536));
+        }
+        lengths
+    }
+
     fn group_size(&self) -> i32 {
         self.quantization
             .as_ref()
@@ -656,7 +698,11 @@ impl SwitchGeGLU {
         let x_flat = mlxcel_core::reshape(x, &[din]);
         let idx_flat = mlxcel_core::reshape(indices, &[k]);
         let sc_flat = mlxcel_core::reshape(scores, &[k]);
-        Some(mlxcel_core::fused_moe_geglu_kernel(
+        // The launcher refuses on a backend with no kernel port (issue #1885),
+        // and `None` is exactly this function's contract for "the fast path
+        // does not apply", so the caller takes the graph path. Deliberately not
+        // `expect`: a direct call on such a backend is legitimate.
+        mlxcel_core::fused_moe_geglu_kernel(
             &x_flat,
             &idx_flat,
             gate.weight.as_ref().unwrap(),
@@ -675,7 +721,8 @@ impl SwitchGeGLU {
             gate.bits,
             down.bits,
             gate.group_size,
-        ))
+        )
+        .ok()
     }
 
     fn from_weights(
@@ -1090,6 +1137,9 @@ enum AttentionProjection {
 }
 
 pub(crate) trait CacheInterface {
+    fn speculative_ring_cursor(&self) -> Option<i32> {
+        None
+    }
     fn offset(&self) -> i32;
     fn set_offset(&mut self, offset: i32);
     fn update_and_fetch(
@@ -1118,6 +1168,9 @@ impl CacheInterface for KVCache {
 }
 
 impl CacheInterface for RotatingKVCache {
+    fn speculative_ring_cursor(&self) -> Option<i32> {
+        self.speculative_ring_cursor()
+    }
     fn offset(&self) -> i32 {
         self.offset
     }
@@ -1644,6 +1697,15 @@ pub struct Attention {
     pub(crate) store_full_length_kv: bool,
     pub(crate) use_k_eq_v: bool,
     pub(crate) window_size: i32,
+    /// MTP verify issues each query row as its own maskless M=1 attention
+    /// over the key prefix classic decode would see. Set from
+    /// [`TextConfig::mtp_requires_linear_singleton`], the same predicate that
+    /// restricts serving to B=1 linear verify on buffered caches.
+    pub(crate) mtp_row_verify: bool,
+    /// Row-wise verify also rotates Q and K one row at a time, so each row
+    /// takes the RoPE kernel decode takes. CUDA only: there MLX's `L = 1`
+    /// and `L > 1` RoPE kernels differ in the last bit (#2160).
+    pub(crate) mtp_row_rope: bool,
 }
 
 impl Attention {
@@ -1854,6 +1916,7 @@ impl Attention {
         out.expect("compiled_q_path_proportional_per_position requires at least one position")
     }
 
+    // Used by: Gemma 4 decoder, DiffusionGemma, tensor-parallel Gemma 4.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward(
         &self,
@@ -1867,10 +1930,40 @@ impl Attention {
         UniquePtr<MlxArray>,
         Option<(UniquePtr<MlxArray>, UniquePtr<MlxArray>)>,
     ) {
+        self.forward_mtp(
+            x,
+            mask,
+            cache,
+            shared_kv,
+            divergent_rows,
+            tree_positions,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_mtp(
+        &self,
+        x: &MlxArray,
+        mask: Option<&MlxArray>,
+        cache: &mut dyn CacheInterface,
+        shared_kv: Option<(&MlxArray, &MlxArray)>,
+        divergent_rows: Option<&DivergentVerifyRows<'_>>,
+        tree_positions: Option<&[i32]>,
+        mtp_verify: bool,
+    ) -> (
+        UniquePtr<MlxArray>,
+        Option<(UniquePtr<MlxArray>, UniquePtr<MlxArray>)>,
+    ) {
         let shape = mlxcel_core::array_shape(x);
         let b = shape[0];
         let l = shape[1];
         let offset = cache.offset();
+        let ring_cursor = if mtp_verify {
+            cache.speculative_ring_cursor()
+        } else {
+            None
+        };
         let rope_offsets: Option<&[i32]> = divergent_rows.map(|ctx| ctx.ve);
 
         let q_proj_out = match &self.projection {
@@ -1894,7 +1987,15 @@ impl Attention {
         // op-at-a-time chain otherwise), just sliced per row, so lockstep
         // rows stay bitwise-identical to the uniform rounds and near-tie
         // argmaxes cannot flip from a kernel-path change.
-        let queries = if let Some(positions) = tree_positions {
+        let row_rope = mtp_verify
+            && self.mtp_row_rope
+            && b == 1
+            && l > 1
+            && tree_positions.is_none()
+            && rope_offsets.is_none();
+        let queries = if row_rope {
+            self.head_rows_like_decode(&q_proj_out, &self.q_norm, self.n_heads, offset)
+        } else if let Some(positions) = tree_positions {
             // Draft-tree verify: each node rotates at its own depth. Runs of
             // consecutive positions go through the same kernels the uniform
             // path uses, so a linear tree is one call and is bit-identical
@@ -1971,12 +2072,21 @@ impl Attention {
         if self.is_kv_shared_layer
             && let Some((keys, values)) = shared_kv
         {
-            let attn_out = self.attend(&queries, keys, values, mask);
+            let attn_out = self.attend(&queries, keys, values, mask, mtp_verify, ring_cursor);
             return (self.project_output(&attn_out, b, l), None);
         }
 
-        let (keys, values) = self.project_kv(x, b, l, offset, cache, rope_offsets, tree_positions);
-        let attn_out = self.attend(&queries, &keys, &values, mask);
+        let (keys, values) = self.project_kv(
+            x,
+            b,
+            l,
+            offset,
+            cache,
+            rope_offsets,
+            tree_positions,
+            row_rope,
+        );
+        let attn_out = self.attend(&queries, &keys, &values, mask, mtp_verify, ring_cursor);
         let stored = if self.store_full_length_kv {
             Some((keys, values))
         } else {
@@ -1992,21 +2102,48 @@ impl Attention {
         keys: &MlxArray,
         values: &MlxArray,
         mask: Option<&MlxArray>,
+        mtp_verify: bool,
+        ring_cursor: Option<i32>,
     ) -> UniquePtr<MlxArray> {
         let query_len = mlxcel_core::array_shape(queries)[2];
         let local_mask = trim_mask_to_keys(mask, keys, query_len);
-
-        // When mask was discarded (undersized) or originally None,
-        // use causal attention if possible.
-        if local_mask.is_none() {
-            return mlxcel_core::causal_attention(
+        // Row-wise MTP verify (31B everywhere, 12B on CUDA; see
+        // `TextConfig::mtp_requires_linear_singleton`). A batched M=K block
+        // and classic M=1 decode select different kernels or reductions:
+        // unfused full attention at head_dim 512 picks different matmul
+        // reductions for M=K and M=1 (first measured at layer 41 on the 31B
+        // QAT checkpoint), and on CUDA only M<4 reaches the fused
+        // `sdpa_vector` kernel classic decode uses at head_dim 256 (#2160).
+        // Keep projections batched, but reproduce each decode query's shape,
+        // visible key prefix and maskless dispatch. An all-zero mask still
+        // selects different reductions.
+        if mtp_verify
+            && self.mtp_row_verify
+            && let Some(rows) = verify_attention::attend_verify_rows(
                 queries,
                 keys,
                 values,
                 self.scale,
-                0.0,
                 self.window_size,
-            );
+                ring_cursor,
+            )
+        {
+            return rows;
+        }
+
+        // When mask was discarded (undersized) or originally None,
+        // use causal attention if possible. A multi-token query whose keys all
+        // fit inside a sliding layer's window sees a plain causal mask, so it
+        // takes the maskless causal mode (window 0) instead of building a
+        // windowed mask array inside `causal_attention`.
+        if local_mask.is_none() {
+            let key_len = mlxcel_core::array_shape(keys)[2];
+            let window = if query_len > 1 && self.window_size > 0 && key_len <= self.window_size {
+                0
+            } else {
+                self.window_size
+            };
+            return mlxcel_core::causal_attention(queries, keys, values, self.scale, 0.0, window);
         }
 
         let mask_ptr = local_mask
@@ -2033,6 +2170,7 @@ impl Attention {
         self.o_proj.forward(&attn_out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn project_kv(
         &self,
         x: &MlxArray,
@@ -2042,6 +2180,7 @@ impl Attention {
         cache: &mut dyn CacheInterface,
         rope_offsets: Option<&[i32]>,
         tree_positions: Option<&[i32]>,
+        row_rope: bool,
     ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
         let (raw_keys, raw_values) = match &self.projection {
             AttentionProjection::Fused(proj) => {
@@ -2078,7 +2217,9 @@ impl Attention {
             .k_norm
             .as_ref()
             .expect("k_norm must be Some for non-KV-shared layers");
-        let keys = if let Some(positions) = tree_positions {
+        let keys = if row_rope {
+            self.head_rows_like_decode(&raw_keys, k_norm, self.n_kv_heads, offset)
+        } else if let Some(positions) = tree_positions {
             if let Some(ref freqs) = self.proportional_rope_freqs {
                 let rotated_dims = 2 * ((self.proportional_partial_rotary_factor as f64
                     * self.head_dim as f64
@@ -2490,6 +2631,9 @@ impl Attention {
             } else {
                 0
             },
+            mtp_row_verify: config.mtp_requires_linear_singleton(),
+            mtp_row_rope: config.mtp_requires_linear_singleton()
+                && mlxcel_core::cuda_is_available(),
         })
     }
 }
@@ -2580,12 +2724,22 @@ fn trim_mask_to_keys(
         // with the layer window is the correct, pre-#885 behaviour for that
         // chronological buffered layout. Panicking here (the #891 regression)
         // crashed the server worker on that legitimate path.
-        tracing::warn!(
-            mask_len,
-            key_len,
-            query_len,
-            "trim_mask_to_keys: mask shorter than key length, discarding caller mask"
-        );
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                mask_len,
+                key_len,
+                query_len,
+                "trim_mask_to_keys: mask shorter than key length, discarding caller mask; subsequent occurrences logged at DEBUG"
+            );
+        } else {
+            tracing::debug!(
+                mask_len,
+                key_len,
+                query_len,
+                "trim_mask_to_keys: mask shorter than key length, discarding caller mask"
+            );
+        }
         None
     }
 }
@@ -2665,6 +2819,8 @@ impl DecoderLayer {
             false,
             None,
             None,
+            false,
+            false,
         )
     }
 
@@ -2680,6 +2836,8 @@ impl DecoderLayer {
         profile_subops: bool,
         divergent_rows: Option<&DivergentVerifyRows<'_>>,
         tree_positions: Option<&[i32]>,
+        mtp_verify: bool,
+        capture_probe: bool,
     ) -> (
         UniquePtr<MlxArray>,
         Option<(UniquePtr<MlxArray>, UniquePtr<MlxArray>)>,
@@ -2692,21 +2850,52 @@ impl DecoderLayer {
         // residual is only *read* by the final `add`.
         let h_attn = self.input_layernorm.forward(x);
         timer.tick("input_layernorm", &h_attn);
-        let (h_attn, stored_kv) = self.self_attn.forward(
+        let (h_attn, stored_kv) = self.self_attn.forward_mtp(
             &h_attn,
             mask,
             cache,
             shared_kv,
             divergent_rows,
             tree_positions,
+            mtp_verify,
         );
         timer.tick("self_attn", &h_attn);
-        let h_attn = self.post_attention_layernorm.forward(&h_attn);
+        if capture_probe {
+            probe_trace::capture(layer_idx, &self.layer_type, "attention output", &h_attn);
+        }
+        let h = self.finish_layer(
+            x,
+            &h_attn,
+            per_layer_input,
+            &mut timer,
+            capture_probe,
+            layer_idx,
+        );
+        (h, stored_kv)
+    }
+
+    /// Everything after self-attention: post-attention norm and residual, the
+    /// feed-forward branch, the optional per-layer input gate and the layer
+    /// scalar. Shared by the ordinary forward and the per-batch-row verify
+    /// forward (issue #2190), which calls it once per row.
+    fn finish_layer(
+        &self,
+        x: &MlxArray,
+        h_attn: &MlxArray,
+        per_layer_input: Option<&MlxArray>,
+        timer: &mut SubopTimer,
+        capture_probe: bool,
+        layer_idx: usize,
+    ) -> UniquePtr<MlxArray> {
+        let h_attn = self.post_attention_layernorm.forward(h_attn);
         timer.tick("post_attention_layernorm", &h_attn);
         let after_attn = mlxcel_core::add(x, &h_attn);
         timer.tick("attn_residual_add", &after_attn);
 
-        let ffn_out = self.ffn_branch(&after_attn, &mut timer);
+        let ffn_out = self.ffn_branch(&after_attn, timer);
+        if capture_probe {
+            probe_trace::capture(layer_idx, &self.layer_type, "MLP output", &ffn_out);
+        }
 
         let ffn_out = self.post_feedforward_layernorm.forward(&ffn_out);
         timer.tick("post_ffn_ln", &ffn_out);
@@ -2776,7 +2965,10 @@ impl DecoderLayer {
 
         let h = mlxcel_core::multiply(&h, &self.layer_scalar);
         timer.tick("layer_scalar", &h);
-        (h, stored_kv)
+        if capture_probe {
+            probe_trace::capture(layer_idx, &self.layer_type, "layer output", &h);
+        }
+        h
     }
 
     /// Shared feed-forward stage: dense MLP branch plus (when present) the
@@ -3064,6 +3256,16 @@ pub struct Gemma4SpeculativeSinks {
     /// itself, which is what every non-tree caller wants and what a linear
     /// tree resolves to anyway (issue #1204).
     pub tree_positions: Option<Vec<i32>>,
+    /// Explicit verify-only numerical parity path. Prefill and classic decode
+    /// leave this false, including chunked prefills with nonzero cache offsets.
+    pub mtp_verify: bool,
+    /// Output: set by a per-batch-row verify forward (issue #2190) when a row
+    /// that lags the shared cache offset needed sliding keys the shared ring
+    /// had already compacted away, so that row's result is not decode-exact.
+    pub row_verify_inexact: bool,
+    /// Startup exactness diagnostics only; ordinary forwards leave this false.
+    #[doc(hidden)]
+    pub capture_probe: bool,
 }
 
 impl Gemma4SpeculativeSinks {
@@ -3075,6 +3277,9 @@ impl Gemma4SpeculativeSinks {
             hidden_sink: Some(Vec::new()),
             shared_kv_sink: None,
             tree_positions: None,
+            mtp_verify: false,
+            row_verify_inexact: false,
+            capture_probe: false,
         }
     }
 
@@ -3086,6 +3291,9 @@ impl Gemma4SpeculativeSinks {
             hidden_sink: None,
             shared_kv_sink: Some(HashMap::new()),
             tree_positions: None,
+            mtp_verify: false,
+            row_verify_inexact: false,
+            capture_probe: false,
         }
     }
 
@@ -3097,11 +3305,69 @@ impl Gemma4SpeculativeSinks {
             hidden_sink: Some(Vec::new()),
             shared_kv_sink: Some(HashMap::new()),
             tree_positions: None,
+            mtp_verify: false,
+            row_verify_inexact: false,
+            capture_probe: false,
         }
     }
 }
 
+/// Test-only record of `sinks.mtp_verify` per sink-aware forward, so a lib
+/// test can assert which forwards a target adapter marks as verify forwards
+/// without a checkpoint whose geometry takes the row-wise path (issue #2190).
+#[cfg(test)]
+pub(crate) mod mtp_verify_log {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LOG: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn record(mtp_verify: bool) {
+        LOG.with(|log| log.borrow_mut().push(mtp_verify));
+    }
+
+    /// Drain the flags recorded on this thread since the last call.
+    pub(crate) fn take() -> Vec<bool> {
+        LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
+    }
+}
+
 impl Gemma4TextModel {
+    /// Whether this forward is a B > 1 MTP verify that must run per batch
+    /// row (issue #2190).
+    ///
+    /// The row-wise geometries (`mtp_row_verify`, set from
+    /// [`TextConfig::mtp_requires_linear_singleton`]) match classic decode
+    /// only when every verify row goes through exactly the B = 1 calls: a
+    /// `[B, K]` block puts `B * K` rows into each quantized matmul, which
+    /// leaves the per-row-exact qmv window at `B * K >= 8`, and the compiled
+    /// GeGLU gate counts the same rows. Linear chains only (no tree
+    /// positions, no caller mask) and no resident left padding, whose padded
+    /// RoPE frame cannot match a standalone row. B = 1 keeps the existing
+    /// linear verify layout.
+    pub(crate) fn batch_row_verify(
+        &self,
+        b: i32,
+        mask: Option<&MlxArray>,
+        sinks: Option<&Gemma4SpeculativeSinks>,
+        left_padding: Option<&[i32]>,
+    ) -> bool {
+        b > 1
+            && mask.is_none()
+            && sinks.is_some_and(|s| s.mtp_verify && s.tree_positions.is_none())
+            && !left_padding.is_some_and(|lp| lp.iter().any(|&p| p > 0))
+            && !mtp_divergent_fix_disabled()
+            && self.mtp_row_verify_enabled()
+    }
+
+    /// Whether the layers take the row-wise MTP verify path.
+    pub(crate) fn mtp_row_verify_enabled(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|layer| layer.self_attn.mtp_row_verify)
+    }
+
     pub fn forward(
         &self,
         input_ids: &MlxArray,
@@ -3176,6 +3442,10 @@ impl Gemma4TextModel {
         left_padding: Option<&[i32]>,
         per_row_valid_end: Option<&[i32]>,
     ) -> UniquePtr<MlxArray> {
+        #[cfg(test)]
+        if let Some(s) = sinks.as_deref() {
+            mtp_verify_log::record(s.mtp_verify);
+        }
         // When `input_embeddings` is supplied (e.g. from the VLM path where
         // vision/audio features have already been merged into the embedding
         // stream), the caller is responsible for applying the
@@ -3232,7 +3502,20 @@ impl Gemma4TextModel {
         // row, always true until the first divergent accept) skip this branch
         // entirely and stay byte-identical to the pre-#203 path.
         let global_offset_pre = first_present_cache_offset(caches);
+        // Per-batch-row verify (issue #2190): on the row-wise geometries a
+        // B > 1 verify runs every row through the B = 1 linear verify's
+        // kernels and physically drops each row's stale gap, so the divergent
+        // mask machinery below is not used. `row_offsets[r]` is the row's
+        // logical valid end, which is its RoPE offset.
+        let row_offsets: Option<Vec<i32>> = self
+            .batch_row_verify(b, mask, sinks.as_deref(), left_padding)
+            .then(|| {
+                per_row_valid_end
+                    .map(<[i32]>::to_vec)
+                    .unwrap_or_else(|| vec![global_offset_pre; b as usize])
+            });
         let divergent_verify = mask.is_none()
+            && row_offsets.is_none()
             && !mtp_divergent_fix_disabled()
             && per_row_valid_end
                 .map(|ve| ve.iter().any(|&v| v != global_offset_pre))
@@ -3398,6 +3681,26 @@ impl Gemma4TextModel {
             // padding / vision-overlay shape keep the dense masks below,
             // byte-identical to the previous behavior.
             (None, None)
+        } else if l > 1 && bidirectional_block_ids.is_none() && per_row_valid_end.is_none() {
+            // Text-only prefill / verify with no padding: both masks would be
+            // plain bottom-right causal while every live key is inside the
+            // window, so leave them `None` and let `attend` take MLX's
+            // maskless causal SDPA (mlx-lm passes `"causal"` for `N <=
+            // window`). Full-attention layers always qualify; sliding layers
+            // until the live keys outgrow the window, after which they keep
+            // the dense sliding mask built as in the branch below.
+            let sliding_live_len = first_cache_live_len(caches, "sliding_attention");
+            let window = self.config.sliding_window as i32;
+            let sliding_mask = if sliding_live_len + l <= window {
+                None
+            } else {
+                Some(create_sliding_window_prefill_mask(
+                    l,
+                    sliding_live_len,
+                    window,
+                ))
+            };
+            (None, sliding_mask)
         } else if l > 1 {
             // Non-ragged prefill / multi-token verify: derive both masks from
             // the cache's live window (`live_len`), not the monotonic
@@ -3572,17 +3875,40 @@ impl Gemma4TextModel {
             } else {
                 None
             };
-            let (next_h, stored_kv) = layer.forward_with_profile(
-                &h,
-                local_mask,
-                cache,
-                layer_input.as_ref().map(|arr| arr.as_ref().unwrap()),
-                shared_kv,
-                i,
-                profile_subops,
-                divergent_rows.as_ref(),
-                tree_positions.as_deref(),
-            );
+            let (next_h, stored_kv) = if let Some(offsets) = row_offsets.as_deref() {
+                let (next_h, stored_kv, inexact) = layer.forward_verify_rows(
+                    &h,
+                    cache,
+                    layer_input.as_ref().map(|arr| arr.as_ref().unwrap()),
+                    shared_kv,
+                    offsets,
+                    i,
+                );
+                if inexact && let Some(s) = sinks.as_mut() {
+                    s.row_verify_inexact = true;
+                }
+                (next_h, stored_kv)
+            } else {
+                layer.forward_with_profile(
+                    &h,
+                    local_mask,
+                    cache,
+                    layer_input.as_ref().map(|arr| arr.as_ref().unwrap()),
+                    shared_kv,
+                    i,
+                    profile_subops,
+                    divergent_rows.as_ref(),
+                    tree_positions.as_deref(),
+                    sinks.as_ref().is_some_and(|s| s.mtp_verify)
+                        && (mask.is_none() || tree_positions.is_some())
+                        && verify_attention::linear_verify_layout(
+                            b,
+                            tree_positions.as_deref(),
+                            has_padding || divergent_verify,
+                        ),
+                    sinks.as_ref().is_some_and(|s| s.capture_probe),
+                )
+            };
             h = next_h;
             if let Some(start) = layer_build_start {
                 eprintln!(
@@ -3658,7 +3984,11 @@ impl Gemma4TextModel {
         if skip_final_norm {
             h
         } else {
-            self.norm.forward(&h)
+            let normalized = self.norm.forward(&h);
+            if sinks.as_ref().is_some_and(|s| s.capture_probe) {
+                probe_trace::capture(n_layers, "final", "final norm", &normalized);
+            }
+            normalized
         }
     }
 
@@ -3998,8 +4328,7 @@ const SUPPORTED_QUANT_SCHEMES: [&str; 4] = mlxcel_core::layers::SUPPORTED_QUANTI
 /// f32 prefill masks. Above this, the mask pair is left `None` and `attend`
 /// routes through `causal_attention`'s causal / sliding-window flag paths,
 /// avoiding the O(L^2) retained masks entirely (issue #672). 4096 keeps every
-/// dense mask under ~64 MiB and, like the LM-head gate in
-/// `forward_last_logits`, leaves short-context behavior byte-identical.
+/// dense mask under ~64 MiB and leaves short-context behavior byte-identical.
 const DENSE_PREFILL_MASK_MAX_TOKENS: i32 = 4096;
 
 /// Validate that a model's declared quantization scheme is one mlxcel supports,
@@ -4156,7 +4485,7 @@ impl Gemma4Model {
             )
         };
         if is_quantized {
-            super::sanitize::sanitize_gemma4_nvfp4_weights(&mut weights, Some(&config_value));
+            super::sanitize::sanitize_gemma4_nvfp4_weights(&mut weights, Some(&config_value))?;
         }
         // Strip k_proj/v_proj/k_norm entries for KV-shared layers so the
         // model constructor does not attempt to allocate them.  This applies
@@ -4230,17 +4559,47 @@ impl Gemma4Model {
         let hidden =
             self.text_model
                 .forward(input_ids, input_embeddings, caches, mask, per_layer_inputs);
-        let shape = mlxcel_core::array_shape(&hidden);
-        let last = mlxcel_core::slice(
-            &hidden,
-            &[0, last_pos as i32, 0],
-            &[shape[0], last_pos as i32 + 1, shape[2]],
-        );
+        self.logits_at(&hidden, last_pos)
+    }
+
+    /// Tied LM head plus the optional final-logit softcap, applied to the
+    /// `last_pos` row of `hidden` only. Both are per-position operations, so
+    /// the row equals the same row of the full-sequence logits.
+    fn logits_at(&self, hidden: &MlxArray, last_pos: usize) -> UniquePtr<MlxArray> {
+        let last = mlxcel_core::generate::logits_at_position(hidden, last_pos);
         let mut logits = self.text_model.embed_tokens.as_linear(&last);
         if let Some(cap) = self.config.final_logit_softcapping {
             logits = mlxcel_core::compiled_softcap(&logits, cap);
         }
         logits
+    }
+
+    /// [`Self::forward_unified_with_caches_and_embeddings`] variant that
+    /// projects only the `last_pos` hidden row through the LM head.
+    fn forward_unified_last_with_caches_and_embeddings(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        caches: &mut [Cache],
+        mask: Option<&MlxArray>,
+        per_layer_inputs: Option<&MlxArray>,
+        bidirectional_block_ids: Option<&MlxArray>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        let hidden = self.text_model.forward_with_speculative_sinks(
+            input_ids,
+            input_embeddings,
+            caches,
+            mask,
+            per_layer_inputs,
+            None,
+            None,
+            false,
+            bidirectional_block_ids,
+            None,
+            None,
+        );
+        self.logits_at(&hidden, last_pos)
     }
 
     /// Gemma 4 Unified forward with the optional blockwise bidirectional
@@ -4299,6 +4658,10 @@ impl Gemma4Model {
         left_padding: Option<&[i32]>,
         per_row_valid_end: Option<&[i32]>,
     ) -> UniquePtr<MlxArray> {
+        let batch = mlxcel_core::array_shape(input_embeddings.unwrap_or(input_ids))[0];
+        let row_verify =
+            self.text_model
+                .batch_row_verify(batch, mask, sinks.as_deref(), left_padding);
         let hidden = self.text_model.forward_with_speculative_sinks(
             input_ids,
             input_embeddings,
@@ -4312,11 +4675,33 @@ impl Gemma4Model {
             left_padding,
             per_row_valid_end,
         );
-        let mut logits = self.text_model.embed_tokens.as_linear(&hidden);
+        // A per-batch-row verify also projects each row through the LM head
+        // on its own, so the head's matmul sees the B = 1 row count.
+        let mut logits = if row_verify {
+            verify_rows::per_row(&hidden, |row| self.text_model.embed_tokens.as_linear(row))
+        } else {
+            self.text_model.embed_tokens.as_linear(&hidden)
+        };
         if let Some(cap) = self.config.final_logit_softcapping {
             logits = mlxcel_core::compiled_softcap(&logits, cap);
         }
         logits
+    }
+
+    /// Prefill one chunk into `caches` and project only its last row through
+    /// the LM head, the classic serving prefill shape. Shared by the B = 1 and
+    /// batched MTP prefills on the row-wise geometries.
+    fn prefill_last_logits_with_sinks(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [Cache],
+        sinks: Option<&mut Gemma4SpeculativeSinks>,
+    ) -> UniquePtr<MlxArray> {
+        let hidden = self.text_model.forward_with_speculative_sinks(
+            input_ids, None, caches, None, None, None, sinks, false, None, None, None,
+        );
+        let last = mlxcel_core::array_shape(input_ids)[1] as usize - 1;
+        self.logits_at(&hidden, last)
     }
 
     /// Apply the Gemma 4 final norm to a pre-norm decoder hidden state.
@@ -4379,7 +4764,7 @@ impl Gemma4StageModel {
             )
         };
         if is_quantized {
-            super::sanitize::sanitize_gemma4_nvfp4_weights(&mut weights, Some(&config_value));
+            super::sanitize::sanitize_gemma4_nvfp4_weights(&mut weights, Some(&config_value))?;
         }
         // Strip k_proj/v_proj/k_norm entries for KV-shared layers so the
         // model constructor does not attempt to allocate them.  Required on
@@ -4878,17 +5263,25 @@ impl Gemma4Wrapper {
             .make_caches_with_modes(&self.kv_cache_layer_modes)
     }
 
-    /// Reset the wrapper's fallback cache slot (the `internal` slot used
-    /// by the CLI / single-row VLM-prefill path) to a fresh, empty set
-    /// of caches. Per-sequence cache slots in
-    /// [`ModelOwnedSequenceState`] are unaffected — those are owned by
-    /// the scheduler and dropped via `release_sequence_state_by_id`.
+    /// Reset the wrapper's fallback cache slot (the `internal` slot a
+    /// forward without a sequence id uses) to a fresh, empty set of caches.
+    /// Per-sequence cache slots in [`ModelOwnedSequenceState`] are
+    /// unaffected: the engine owns them and drops them via
+    /// `release_sequence_state_by_id`.
     ///
-    /// Used by: legacy CLI generate path (`mlxcel generate`) when starting
-    /// a fresh request that does not flow through the server scheduler.
+    /// Used by: `set_kv_cache_layer_modes` (rebuild under the new modes) and
+    /// `reset_runtime_state` (bare single-row runs outside an engine
+    /// sequence).
     pub fn reset_caches(&self) {
         self.sequence_state
             .replace_internal(self.make_configured_caches());
+    }
+
+    /// Row-wise exact verify (31B everywhere, 12B on CUDA) is validated only
+    /// for B=1 linear verify.
+    /// Used by: MTP scheduler dispatch and direct tree-target capability checks.
+    pub fn mtp_requires_linear_singleton(&self) -> bool {
+        self.model.config.mtp_requires_linear_singleton()
     }
 
     /// Whether MTP may engage on this loaded checkpoint at `block_size`,
@@ -4936,10 +5329,25 @@ impl Gemma4Wrapper {
     /// `M = K` versus `M = 1` dispatch of the head projection as well as
     /// the decoder layers, exactly as the Qwen probe does.
     pub fn probe_block_chain_exactness(&self, block_size: usize) -> BlockChainExactness {
-        // Mirrors `PROBE_PROMPT_LEN` / `PROBE_DRAWS` in `models::qwen3_5`.
-        const PROBE_PROMPT_LEN: usize = 8;
-        const PROBE_DRAWS: usize = 3;
+        let verdict = self.probe_block_chain_exactness_impl(block_size, false);
+        if verdict.is_equal() || matches!(verdict, BlockChainExactness::NotRun(_)) {
+            return verdict;
+        }
+        // Capture only a failed startup probe, never a serving forward. The
+        // ordinary probe remains unsynchronized between sub-operations.
+        let localized = self.probe_block_chain_exactness_impl(block_size, true);
+        if matches!(localized, BlockChainExactness::Localized { .. }) {
+            localized
+        } else {
+            verdict
+        }
+    }
 
+    fn probe_block_chain_exactness_impl(
+        &self,
+        block_size: usize,
+        trace: bool,
+    ) -> BlockChainExactness {
         if block_size < 2 {
             return BlockChainExactness::NotRun("block width below 2 drafts nothing");
         }
@@ -4956,7 +5364,16 @@ impl Gemma4Wrapper {
             mlxcel_core::array_to_raw_bytes(&row)
         };
 
-        for draw in 0..PROBE_DRAWS {
+        // The short draws catch projection dispatch changes. One draw past
+        // the standard sliding window also tests real buffered verify keys;
+        // a short-only pass does not establish long-context parity (#1983).
+        for (draw, prompt_len) in self
+            .model
+            .config
+            .mtp_probe_prompt_lengths()
+            .into_iter()
+            .enumerate()
+        {
             // Synthetic ids, varied per draw: dispatch depends only on shape
             // and `M`, but whether a last-ulp kernel difference lands on a
             // differing byte depends on the values (see the false-pass note
@@ -4965,7 +5382,7 @@ impl Gemma4Wrapper {
             let wrap = |i: usize, stride: usize, offset: usize| {
                 ((i * stride + offset + salt) % vocab) as i32
             };
-            let prompt: Vec<i32> = (0..PROBE_PROMPT_LEN).map(|i| wrap(i, 7, 1)).collect();
+            let prompt: Vec<i32> = (0..prompt_len).map(|i| wrap(i, 7, 1)).collect();
             let block: Vec<i32> = (0..block_size).map(|i| wrap(i, 13, 3)).collect();
 
             // Chain arm: prefill, then one token at a time — the shape
@@ -4979,15 +5396,39 @@ impl Gemma4Wrapper {
                 None,
             );
             let mut chain_positions: Vec<Vec<u8>> = Vec::with_capacity(block_size);
+            let mut chain_trace = Vec::with_capacity(block_size);
             for token in &block {
-                let out = self.model.forward_with_caches_and_embeddings(
-                    &as_input(&[*token]),
-                    None,
-                    &mut chain_caches,
-                    None,
-                    None,
-                );
+                let mut run = || {
+                    let mut sinks = Gemma4SpeculativeSinks {
+                        capture_probe: trace,
+                        ..Default::default()
+                    };
+                    let out = self.model.forward_with_caches_and_speculative_sinks(
+                        &as_input(&[*token]),
+                        None,
+                        &mut chain_caches,
+                        None,
+                        None,
+                        None,
+                        Some(&mut sinks),
+                        None,
+                        None,
+                    );
+                    probe_trace::capture(
+                        self.model.config.num_hidden_layers,
+                        "final",
+                        "LM head",
+                        &out,
+                    );
+                    out
+                };
+                let (out, stages) = if trace {
+                    probe_trace::with_capture(run)
+                } else {
+                    (run(), Vec::new())
+                };
                 chain_positions.push(position_bytes(&out, 0));
+                chain_trace.push(stages);
             }
 
             // Block arm: fresh caches, same prefill, the whole block at once.
@@ -4999,19 +5440,64 @@ impl Gemma4Wrapper {
                 None,
                 None,
             );
-            let out = self.model.forward_with_caches_and_embeddings(
-                &as_input(&block),
-                None,
-                &mut block_caches,
-                None,
-                None,
-            );
+            for cache in block_caches
+                .iter_mut()
+                .filter(|_| self.mtp_requires_linear_singleton())
+            {
+                if cache
+                    .enable_mtp_rotating_buffer(super::gemma4_mtp_target::mtp_rotating_buffer_size(
+                        block_size,
+                    ))
+                    .is_err()
+                {
+                    return BlockChainExactness::NotRun("rotating verify buffer unavailable");
+                }
+            }
+            let mut run = || {
+                let mut sinks = Gemma4SpeculativeSinks {
+                    mtp_verify: true,
+                    capture_probe: trace,
+                    ..Default::default()
+                };
+                let out = self.model.forward_with_caches_and_speculative_sinks(
+                    &as_input(&block),
+                    None,
+                    &mut block_caches,
+                    None,
+                    None,
+                    None,
+                    Some(&mut sinks),
+                    None,
+                    None,
+                );
+                probe_trace::capture(
+                    self.model.config.num_hidden_layers,
+                    "final",
+                    "LM head",
+                    &out,
+                );
+                out
+            };
+            let (out, block_trace) = if trace {
+                probe_trace::with_capture(run)
+            } else {
+                (run(), Vec::new())
+            };
             let block_positions: Vec<Vec<u8>> = (0..block_size)
                 .map(|i| position_bytes(&out, i as i32))
                 .collect();
 
             let verdict = compare_block_against_chain(&block_positions, &chain_positions);
             if !verdict.is_equal() {
+                if trace
+                    && let Some(location) =
+                        probe_trace::first_divergence(&block_trace, &chain_trace)
+                {
+                    return BlockChainExactness::Localized {
+                        verdict: Box::new(verdict),
+                        location,
+                    };
+                }
                 return verdict;
             }
         }
@@ -5073,6 +5559,68 @@ impl Gemma4Wrapper {
                     sequence_caches,
                     mask,
                     per_layer_inputs,
+                )
+            },
+        )
+    }
+
+    /// [`Self::forward_with_inputs_and_sequence_id`] variant that projects
+    /// only the `last_pos` hidden row through the LM head, for prefill
+    /// callers that sample a single position.
+    ///
+    /// Used by: the three `forward_last_logits*` overrides on this wrapper and
+    /// [`crate::vision::Gemma4VLModel`]'s embeddings prefill.
+    pub(crate) fn last_logits_with_inputs_and_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        per_layer_inputs: Option<&MlxArray>,
+        mask: Option<&MlxArray>,
+        seq_id: Option<SequenceId>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        self.sequence_state.with_or_create_sequence_state(
+            seq_id,
+            || self.make_configured_caches(),
+            |sequence_caches| {
+                self.model.forward_last_with_caches_and_embeddings(
+                    input_ids,
+                    input_embeddings,
+                    sequence_caches,
+                    mask,
+                    per_layer_inputs,
+                    last_pos,
+                )
+            },
+        )
+    }
+
+    /// [`Self::forward_unified_with_inputs_and_sequence_id`] variant that
+    /// projects only the `last_pos` hidden row through the LM head.
+    ///
+    /// Used by: [`crate::vision::Gemma4UnifiedModel`]'s embeddings prefill.
+    pub(crate) fn unified_last_logits_with_inputs_and_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        per_layer_inputs: Option<&MlxArray>,
+        mask: Option<&MlxArray>,
+        seq_id: Option<SequenceId>,
+        bidirectional_block_ids: Option<&MlxArray>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        self.sequence_state.with_or_create_sequence_state(
+            seq_id,
+            || self.make_configured_caches(),
+            |sequence_caches| {
+                self.model.forward_unified_last_with_caches_and_embeddings(
+                    input_ids,
+                    input_embeddings,
+                    sequence_caches,
+                    mask,
+                    per_layer_inputs,
+                    bidirectional_block_ids,
+                    last_pos,
                 )
             },
         )
@@ -5247,6 +5795,62 @@ impl Gemma4Wrapper {
                 )
             },
         )
+    }
+
+    /// Prefill one scheduler-sized chunk and project only its last row, exactly
+    /// like classic serving, while retaining the final chunk's assistant seed.
+    /// Used by: Gemma4MtpTargetAdapter for the corrected 31B geometry.
+    pub(crate) fn prefill_mtp_chunk(
+        &self,
+        input_ids: &MlxArray,
+        seq_id: Option<SequenceId>,
+        sinks: Option<&mut Gemma4SpeculativeSinks>,
+    ) -> UniquePtr<MlxArray> {
+        self.sequence_state.with_or_create_sequence_state(
+            seq_id,
+            || self.make_configured_caches(),
+            |caches| {
+                self.model
+                    .prefill_last_logits_with_sinks(input_ids, caches, sinks)
+            },
+        )
+    }
+
+    /// [`Self::prefill_mtp_chunk`] against a caller-owned cache vector.
+    /// Used by: `Gemma4MtpBatchedTargetAdapter` per-row prefill on the
+    /// row-wise geometries (issue #2190).
+    pub(crate) fn prefill_mtp_chunk_explicit_cache(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [Cache],
+        sinks: Option<&mut Gemma4SpeculativeSinks>,
+    ) -> UniquePtr<MlxArray> {
+        self.model
+            .prefill_last_logits_with_sinks(input_ids, caches, sinks)
+    }
+
+    /// Turn on the row-wise MTP verify flags a production 31B (or CUDA 12B)
+    /// geometry sets at load, so a tiny fixture exercises that path.
+    #[cfg(test)]
+    pub(crate) fn force_mtp_row_verify_for_test(&mut self) {
+        for layer in &mut self.model.text_model.layers {
+            layer.self_attn.mtp_row_verify = true;
+            layer.self_attn.mtp_row_rope = true;
+        }
+    }
+
+    /// Whether every speculative cache this wrapper builds is dense FP16, the
+    /// only layout the batched MTP per-row prefill can stack (issue #2190).
+    pub(crate) fn speculative_caches_are_dense_fp16(&self) -> bool {
+        verify_rows::caches_are_dense_fp16(&self.make_configured_caches())
+    }
+
+    /// Whether the layers run MTP verify row by row, which is
+    /// [`Self::mtp_requires_linear_singleton`] as the layers recorded it at
+    /// load time. The batched MTP adapter keys its exact prefill and verify
+    /// on this.
+    pub(crate) fn mtp_row_verify_enabled(&self) -> bool {
+        self.model.text_model.mtp_row_verify_enabled()
     }
 
     /// Sink-aware forward against a **caller-owned** `[B, ...]` cache
@@ -5672,16 +6276,14 @@ impl LanguageModel for Gemma4Wrapper {
         )
     }
 
-    /// Long-prefill override: project only the last real position through the
+    /// Prefill override: project only the last real position through the
     /// 262k-vocab LM head instead of materializing `[1, seq_len, vocab]`
-    /// logits plus a `final_logit_softcapping` copy (issue #672).
+    /// logits plus a `final_logit_softcapping` copy (issues #672, #1972).
     ///
-    /// Short prefills keep the full-logits path: the LM head then runs the
-    /// same batched kernel as before this override existed, so short-context
-    /// greedy output stays byte-identical. The threshold only trades memory
-    /// (full logits are ~0.5 GiB per 1k tokens) against that guarantee; at
-    /// long lengths the single-row projection is mathematically the same
-    /// `hidden[last] @ W` row, merely computed by the single-row kernel.
+    /// Applies at every prompt length. Before #1972 prompts up to 4096 tokens
+    /// kept the full-logits path so the first token came from the batched
+    /// head kernel; the single-row kernel computes the same `hidden[last] @ W`
+    /// row, and greedy output was verified identical on E4B and 12B.
     fn forward_last_logits(
         &self,
         input_ids: &MlxArray,
@@ -5689,30 +6291,36 @@ impl LanguageModel for Gemma4Wrapper {
         mask: Option<&MlxArray>,
         last_pos: usize,
     ) -> UniquePtr<MlxArray> {
-        const FULL_LOGITS_MAX_PREFILL: i32 = 4096;
-        let seq_len = mlxcel_core::array_shape(input_ids)[1];
-        if seq_len <= FULL_LOGITS_MAX_PREFILL {
-            let logits = self.forward(input_ids, _caches, mask);
-            let shape = mlxcel_core::array_shape(&logits);
-            return mlxcel_core::slice(
-                &logits,
-                &[0, last_pos as i32, 0],
-                &[shape[0], last_pos as i32 + 1, shape[2]],
-            );
-        }
-        self.sequence_state.with_or_create_sequence_state(
+        self.forward_last_logits_with_sequence_id(input_ids, None, _caches, mask, last_pos)
+    }
+
+    fn forward_last_logits_with_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        seq_id: Option<SequenceId>,
+        _caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        self.last_logits_with_inputs_and_sequence_id(input_ids, None, None, mask, seq_id, last_pos)
+    }
+
+    fn forward_last_logits_with_embeddings_and_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        seq_id: Option<SequenceId>,
+        _caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        self.last_logits_with_inputs_and_sequence_id(
+            input_ids,
+            input_embeddings,
             None,
-            || self.make_configured_caches(),
-            |sequence_caches| {
-                self.model.forward_last_with_caches_and_embeddings(
-                    input_ids,
-                    None,
-                    sequence_caches,
-                    mask,
-                    None,
-                    last_pos,
-                )
-            },
+            mask,
+            seq_id,
+            last_pos,
         )
     }
 
@@ -5782,7 +6390,8 @@ impl LanguageModel for Gemma4Wrapper {
     }
 
     fn reset_runtime_state(&self) {
-        // Used by: CxxGenerator single-row generation paths. Gemma 4 owns
+        // Used by: bare single-row runs outside an engine sequence (the engine
+        // resets through prepare_sequence_state / release_sequence_state_by_id). Gemma 4 owns
         // its fallback cache slot inside `ModelOwnedSequenceState`; reset it
         // for fresh CLI / benchmark runs without touching scheduler-owned
         // per-sequence entries.
@@ -5804,6 +6413,19 @@ impl LanguageModel for Gemma4Wrapper {
     ) -> Option<ModelStateSnapshot> {
         self.sequence_state
             .with_sequence_state_ref(seq_id, |state| {
+                // Buffered MTP caches store chronological keys, while ordinary
+                // decoding reduces over physical ring order. Restoring this
+                // state into classic decode or suffix prefill would bypass the
+                // verify-only layout correction. In-flight slice parking keeps
+                // live per-sequence state; low-level detach/restore retains
+                // the ring-origin metadata.
+                if self.mtp_requires_linear_singleton()
+                    && state.iter().any(
+                        |cache| matches!(cache, Cache::Rotating(cache) if cache.buffer_size > 0),
+                    )
+                {
+                    return None;
+                }
                 let mut snapshot = ModelStateSnapshot::new("gemma4", token_len);
                 for (idx, cache) in state.iter().enumerate() {
                     if let Err(error) = cache.snapshot_into(&mut snapshot, &format!("layer{idx}")) {
@@ -5910,7 +6532,7 @@ impl LanguageModel for Gemma4Wrapper {
 
     /// Gemma 4 supports batched decode now that
     /// [`ModelOwnedSequenceState`] isolates per-`SequenceId` cache state.
-    /// The vision wrapper's `forward_batched_with_context_and_ids`
+    /// The vision wrapper's `forward_batched_with_ids`
     /// override (in `vision::Gemma4VLModel`) routes each row through
     /// [`Self::forward_with_sequence_id`] which resolves to a distinct
     /// per-sequence `Vec<Cache>` — no shared-RefCell leakage across rows.
@@ -5934,9 +6556,9 @@ impl LanguageModel for Gemma4Wrapper {
         // a padded chunk back out of the `CachePool`'s caches, and a
         // `model_owned` family has none there, so the pad positions would
         // stay in this model's own caches and push `offset` past the real
-        // token count. See `Gemma3Wrapper::supports_padded_prefill`
-        // (`src/models/gemma3.rs`) for the full statement and the
-        // sequence-aware trim hook that would lift it (issue #1335).
+        // token count (issue #1335). Lifting it means implementing
+        // `LanguageModel::trim_state` for both targets the way `Gemma3Wrapper`
+        // does (issue #1755).
         false
     }
 }
@@ -6464,6 +7086,54 @@ mod gemma4_unified_mask_tests {
             trim_mask_to_keys(Some(&short), &keys, 3).is_none(),
             "a too-short mask on a multi-token chunk is discarded, not a panic"
         );
+    }
+
+    /// Uniform attention to identity-valued keys exposes the effective mask:
+    /// output column k is nonzero exactly when key k is visible. Use the
+    /// uncompacted chronological buffer past the sliding window, including
+    /// future draft slots, and compare each row with the single-token chain.
+    #[test]
+    fn trimmed_verify_mask_matches_chain_over_buffered_keys() {
+        const WINDOW: i32 = 8;
+        const LIVE: i32 = 11;
+        const WIDTH: i32 = 4;
+        const DIM: i32 = 16;
+        let total = LIVE + WIDTH;
+        let q = mlxcel_core::zeros(&[1, 1, WIDTH, DIM], mlxcel_core::dtype::FLOAT32);
+        let k = mlxcel_core::zeros(&[1, 1, total, DIM], mlxcel_core::dtype::FLOAT32);
+        let mut identity = vec![0.0f32; (total * DIM) as usize];
+        for key in 0..total {
+            identity[(key * DIM + key) as usize] = 1.0;
+        }
+        let v = mlxcel_core::from_slice_f32(&identity, &[1, 1, total, DIM]);
+        let short = create_sliding_window_prefill_mask(WIDTH, LIVE, WINDOW);
+        assert!(trim_mask_to_keys(Some(&short), &k, WIDTH).is_none());
+        let block = mlxcel_core::causal_attention(&q, &k, &v, 1.0, 0.0, WINDOW);
+        let full_mask =
+            mlxcel_core::utils::create_causal_mask_with_window_full(WIDTH, LIVE, Some(WINDOW));
+        let bytes = mlxcel_core::array_to_raw_bytes(&full_mask);
+        let values: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        for row in 0..WIDTH {
+            let end = LIVE + row + 1;
+            for key in 0..total {
+                let visible = key < end && key >= end - WINDOW;
+                assert_eq!(values[(row * total + key) as usize] == 0.0, visible);
+            }
+            let query = slice_axis(&q, 2, row, row + 1);
+            let keys = slice_axis(&k, 2, 0, end);
+            let vals = slice_axis(&v, 2, 0, end);
+            let chain = mlxcel_core::causal_attention(&query, &keys, &vals, 1.0, 0.0, WINDOW);
+            let block_row = slice_axis(&block, 2, row, row + 1);
+            let diff = mlxcel_core::abs(&mlxcel_core::subtract(&block_row, &chain));
+            let total_diff = mlxcel_core::sum_all(&diff);
+            assert!(
+                mlxcel_core::item_f32(&total_diff) < 1e-6,
+                "verify row {row} must use the chain's causal and sliding-window mask"
+            );
+        }
     }
 
     /// A too-short mask on single-token DECODE (`query_len == 1`) is still

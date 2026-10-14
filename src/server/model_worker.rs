@@ -41,9 +41,7 @@ use crate::tokenizer::MlxcelTokenizer;
 use crate::vision::feature_cache::ModelVisionCaches;
 use crate::vision::merge::InputEmbeddings;
 use crate::vision::processors::ImageProcessor;
-use crate::vlm_runtime::{
-    prepare_and_compute_vlm_embeddings_with_budget, prepare_and_compute_vlm_embeddings_with_cache,
-};
+use crate::vlm_runtime::{prepare_vlm_embeddings_with_budget, prepare_vlm_embeddings_with_cache};
 use crate::worker_failfast::run_core_thread_or_abort;
 
 use super::{GenerationResult, ModelRequest, StopKind};
@@ -61,7 +59,7 @@ pub(crate) struct WorkerSchedulerConfig {
     pub lora_runtime: Option<Arc<crate::lora::RuntimeLoraSet>>,
     pub max_batch_size: usize,
     pub max_queue_depth: usize,
-    pub prefill_chunk_size: usize,
+    pub prefill_chunk_policy: mlxcel_core::prefill_plan::PrefillChunkPolicy,
     /// #1011: explicit `--prefill-grant-interval` value bounding how long a
     /// parked chunked prefill yields to a live decode batch. `None` keeps the
     /// `MLXCEL_PREFILL_GRANT_INTERVAL` override or the shipped default;
@@ -154,6 +152,11 @@ pub(crate) struct WorkerSchedulerConfig {
     /// the scheduler's pool through
     /// [`crate::server::batch::BatchScheduler::with_paged_block_budget`].
     pub kv_cache_budget: Option<crate::memory_estimate::PagedBudgetDirective>,
+    /// paged KV admission watermark (issue #2088, `--kv-admission-watermark`):
+    /// the fraction of the block budget a prefill admission keeps free while
+    /// rows decode. Installed through
+    /// [`crate::server::batch::BatchScheduler::with_paged_admission_watermark`].
+    pub kv_admission_watermark: f64,
     /// experimental VLM prompt-prefix cache toggle (#124 step c,
     /// `--enable-vlm-prefix-cache`).
     ///
@@ -454,6 +457,16 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                         );
                         return;
                     }
+                    // Nemotron-Parse (issue #1369): the same seq2seq split as
+                    // Florence-2, on its own batch-1 page-parsing loop.
+                    LoadedModel::NemotronParseVLM(parse_model) => {
+                        single_stream_queue_admission.store(true, Ordering::Release);
+                        crate::server::nemotron_parse_worker::run_nemotron_parse_worker_loop(
+                            &parse_model,
+                            request_rx,
+                        );
+                        return;
+                    }
                     other => other,
                 };
 
@@ -505,8 +518,12 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                     }
                 }
 
-                let chunk_info = if sched_config.prefill_chunk_size > 0 {
-                    format!(", prefill_chunk_size={}", sched_config.prefill_chunk_size)
+                let chunk_info = if sched_config.prefill_chunk_policy.alone > 0 {
+                    format!(
+                        ", prefill_chunk_size={}, prefill_chunk_size_contended={}",
+                        sched_config.prefill_chunk_policy.alone,
+                        sched_config.prefill_chunk_policy.contended
+                    )
                 } else {
                     String::new()
                 };
@@ -714,12 +731,13 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                     sched_config.max_queue_depth,
                     batch_metrics.clone(),
                     batch_observability.clone(),
-                    sched_config.prefill_chunk_size,
+                    sched_config.prefill_chunk_policy.alone,
                     sched_config.enable_preemption,
                     sched_config.preemption_policy,
                     sched_config.max_batch_prefill,
                     sched_config.decode_storage_backend,
                 )
+                .with_prefill_chunk_policy(sched_config.prefill_chunk_policy)
                 .with_vision_cache_size(sched_config.vision_cache_size)
                 // per-batch runtime-LoRA scale application (#1439).
                 .with_lora_runtime(sched_config.lora_runtime.clone())
@@ -749,6 +767,8 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                 .with_context_retention(sched_config.context_retention)
                 // install the resolved paged KV block budget (epic #116 #122 b3).
                 .with_paged_block_budget(paged_block_budget)
+                // keep decode headroom at admission under that budget (#2088).
+                .with_paged_admission_watermark(sched_config.kv_admission_watermark)
                 // install the resolved paged KV slab size (#899).
                 .with_paged_slab_blocks(paged_slab_blocks)
                 // experimental VLM prompt-prefix cache sharing (#124 step c).
@@ -765,6 +785,17 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                     model_path
                         .file_name()
                         .map(|name| name.to_string_lossy().into_owned()),
+                );
+                scheduler.set_request_memory_worker_path(
+                    crate::server::model_provider::request_memory_worker_path_supported(
+                        sched_config.pipeline_parallel_runtime.is_some(),
+                        sched_config.tensor_parallel.tp_size,
+                        sched_config.serving_mode,
+                        !matches!(
+                            sched_config.speculative_dispatch,
+                            crate::server::SpeculativeDispatch::Disabled
+                        ),
+                    ),
                 );
 
                 // The request that woke this worker from idle sleep is prefilled by
@@ -1095,7 +1126,8 @@ pub(crate) fn resolve_worker_token_bias(
 /// - No prefill chunking interleaving occurs.
 /// - Log output clearly indicates the sequential execution mode.
 ///
-/// The CLI `generate` command is unaffected and uses `CxxGenerator` directly.
+/// The CLI `generate` command runs the engine's raw-completion client
+/// (`mlxcel_core::engine::DirectEngine`) on the same engine, with no scheduler.
 pub(crate) fn spawn_legacy_model_worker(
     model_path: PathBuf,
     adapter_path: Option<PathBuf>,
@@ -1252,6 +1284,14 @@ pub(crate) fn spawn_legacy_model_worker(
                     );
                     return;
                 }
+                LoadedModel::NemotronParseVLM(parse_model) => {
+                    single_stream_queue_admission.store(true, Ordering::Release);
+                    crate::server::nemotron_parse_worker::run_nemotron_parse_worker_loop(
+                        &parse_model,
+                        request_rx,
+                    );
+                    return;
+                }
                 other => other,
             };
 
@@ -1304,8 +1344,19 @@ pub(crate) fn spawn_legacy_model_worker(
                 1, // max_batch_prefill = 1 → sequential prefill
                 crate::server::DecodeStorageBackend::Dense,
             )
+            .with_prefill_chunk_policy(mlxcel_core::prefill_plan::PrefillChunkPolicy::resolve(
+                Some(0),
+            ))
             .with_xtc_newline_token_ids(xtc_newline_token_ids)
             .with_reasoning_budget(reasoning_budget, thinking_ids);
+            scheduler.set_request_memory_worker_path(
+                crate::server::model_provider::request_memory_worker_path_supported(
+                    false,
+                    tensor_parallel.tp_size,
+                    crate::distributed::disaggregated::ServingMode::Hybrid,
+                    false,
+                ),
+            );
             scheduler.serve();
         })
     })
@@ -1583,7 +1634,7 @@ pub(crate) fn prepare_request_vlm_embeddings(
     }
 
     // video inputs route to the Gemma 4 video embedding path,
-    // mirroring the CLI dispatch in `commands/generate_vlm.rs::compute_vlm_embeddings`.
+    // the dispatch `mlxcel generate` also reaches through `local_media` (#2173).
     // A request that carries both video and audio is merged only by Gemma 4
     // Unified (issue #1349); for every other family this branch is the backstop
     // behind `media_capability_rejection`. It is a backstop and not the only
@@ -1633,6 +1684,7 @@ pub(crate) fn prepare_request_vlm_embeddings(
             prompt_tokens,
             images,
             audio,
+            None,
             cancelled,
             observability,
         )? {
@@ -1739,7 +1791,7 @@ pub(crate) fn prepare_request_vlm_embeddings(
                     ))
                 })
                 .collect();
-            prepare_and_compute_vlm_embeddings_with_cache(
+            prepare_vlm_embeddings_with_cache(
                 model,
                 prompt_tokens,
                 prompt,
@@ -1757,7 +1809,7 @@ pub(crate) fn prepare_request_vlm_embeddings(
                 },
             )?
         } else {
-            prepare_and_compute_vlm_embeddings_with_budget(
+            prepare_vlm_embeddings_with_budget(
                 model,
                 prompt_tokens,
                 prompt,
@@ -1818,13 +1870,23 @@ pub(crate) fn prepare_request_vlm_embeddings(
 
 /// Process every server `input_audio` clip through Inkling's bounded host WAV
 /// pipeline, compact valid dMel rows, and optional image-first HMLP merge.
-fn prepare_inkling_audio_embeddings(
+///
+/// `cli_layout` is `None` for a server request: its prompt carries the
+/// ordered media markers the chat route renders, so it is re-tokenized into
+/// one placeholder per clip and merged with the `Ordered` layout. `mlxcel
+/// generate` renders its own prompt without those markers and passes the
+/// layout its prompt form needs instead (`Structured` after its chat
+/// template, `Plain` under `--no-chat-template`); the prompt tokens are then
+/// used as they are (issue #2173, the layouts the CLI used before).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_inkling_audio_embeddings(
     model: &LoadedModel,
     tokenizer: &MlxcelTokenizer,
     prompt: &str,
     prompt_tokens: &mut Vec<i32>,
     images: &[Vec<u8>],
     audio_data: &[Vec<u8>],
+    cli_layout: Option<crate::vlm_runtime::InklingAudioPromptLayout>,
     cancelled: &AtomicBool,
     observability: &BatchObservability,
 ) -> Result<Option<InputEmbeddings>> {
@@ -1860,25 +1922,35 @@ fn prepare_inkling_audio_embeddings(
         inkling.audio_token_id(),
     )
     .map_err(|error| audio_feature_error(error.to_string(), cancelled, observability))?;
-    let prompt_ids = crate::vlm_runtime::resolve_inkling_prompt_token_ids(tokenizer)
-        .map_err(|error| audio_feature_error(error.to_string(), cancelled, observability))?;
-    *prompt_tokens = tokenize_inkling_ordered_media_prompt(
-        prompt,
-        tokenizer.prompt_carries_bos(prompt),
-        prompt_ids,
-        token_ids,
-        inkling.image_token_id(),
-        inkling.audio_token_id(),
-        images.len(),
-        audio_data.len(),
-        |text, add_special| {
-            tokenizer
-                .encode(text, add_special)
-                .map(|tokens| tokens.into_iter().map(|token| token as i32).collect())
-                .map_err(|error| anyhow!("Failed to tokenize ordered Inkling prompt: {error}"))
-        },
-    )
-    .map_err(|error| audio_feature_error(error.to_string(), cancelled, observability))?;
+    let layout = match cli_layout {
+        Some(layout) => layout,
+        None => {
+            let prompt_ids = crate::vlm_runtime::resolve_inkling_prompt_token_ids(tokenizer)
+                .map_err(|error| {
+                    audio_feature_error(error.to_string(), cancelled, observability)
+                })?;
+            *prompt_tokens = tokenize_inkling_ordered_media_prompt(
+                prompt,
+                tokenizer.prompt_carries_bos(prompt),
+                prompt_ids,
+                token_ids,
+                inkling.image_token_id(),
+                inkling.audio_token_id(),
+                images.len(),
+                audio_data.len(),
+                |text, add_special| {
+                    tokenizer
+                        .encode(text, add_special)
+                        .map(|tokens| tokens.into_iter().map(|token| token as i32).collect())
+                        .map_err(|error| {
+                            anyhow!("Failed to tokenize ordered Inkling prompt: {error}")
+                        })
+                },
+            )
+            .map_err(|error| audio_feature_error(error.to_string(), cancelled, observability))?;
+            crate::vlm_runtime::InklingAudioPromptLayout::Ordered
+        }
+    };
     let decoded_images = if images.is_empty() {
         Vec::new()
     } else {
@@ -1890,7 +1962,7 @@ fn prepare_inkling_audio_embeddings(
         &decoded_images,
         &dmel,
         token_ids,
-        crate::vlm_runtime::InklingAudioPromptLayout::Ordered,
+        layout,
     )
     .map_err(|error| audio_feature_error(error.to_string(), cancelled, observability))?;
     tracing::info!(
@@ -3018,7 +3090,8 @@ fn prepare_nemotron_h_nano_omni_audio_embeddings(
 /// whose startup media support advertises video):
 /// * The model is one of the video-capable VLM families below.
 /// * The video paths have already been canonicalised and validated against
-///   `MLXCEL_VIDEO_DIR_ALLOWLIST` by [`crate::server::media::extract_chat_video_paths`].
+///   `MLXCEL_VIDEO_DIR_ALLOWLIST` by
+///   [`crate::server::media::extract_chat_video_paths_with_allowlist`].
 ///
 /// Defence-in-depth: this function still rejects non-video models with a clean
 /// error so a future caller that bypasses the route guard cannot silently
@@ -3034,7 +3107,17 @@ fn prepare_request_video_embeddings(
     use crate::multimodal::video;
 
     if let LoadedModel::InklingVLM(inkling) = model {
-        return prepare_inkling_video_embeddings(inkling, tokenizer, prompt_tokens, images, videos);
+        let prompt_layout = crate::vlm_runtime::InklingVideoPromptLayout::Structured(
+            crate::vlm_runtime::resolve_inkling_prompt_token_ids(tokenizer)?,
+        );
+        return prepare_inkling_video_embeddings(
+            inkling,
+            tokenizer,
+            prompt_tokens,
+            images,
+            videos,
+            prompt_layout,
+        );
     }
 
     // Encoder-free Gemma 4 Unified routes to its own video path (issue #164):
@@ -3197,12 +3280,17 @@ fn prepare_request_video_embeddings(
 /// Resolve server `video_url` inputs into Inkling's adjacent-frame temporal
 /// slots. The fd-backed decode boundary is identical to the other server video
 /// families, so canonical-path validation cannot be raced after admission.
-fn prepare_inkling_video_embeddings(
+///
+/// `prompt_layout` is `Structured` for every chat-rendered prompt (the server
+/// and `mlxcel generate`'s template render) and `Plain` for `mlxcel generate
+/// --no-chat-template`, whose prompt has no message parts (issue #2173).
+pub(crate) fn prepare_inkling_video_embeddings(
     inkling: &crate::vision::InklingVlModel,
     tokenizer: &MlxcelTokenizer,
     prompt_tokens: &mut Vec<i32>,
     images: &[Vec<u8>],
     videos: &[crate::server::media::ResolvedVideo],
+    prompt_layout: crate::vlm_runtime::InklingVideoPromptLayout,
 ) -> Result<Option<InputEmbeddings>> {
     use crate::multimodal::video;
 
@@ -3245,9 +3333,6 @@ fn prepare_inkling_video_embeddings(
     } else {
         decode_request_images(images)?
     };
-    let prompt_layout = crate::vlm_runtime::InklingVideoPromptLayout::Structured(
-        crate::vlm_runtime::resolve_inkling_prompt_token_ids(tokenizer)?,
-    );
     let (embeddings, stats) = crate::vlm_runtime::compute_inkling_video_embeddings(
         inkling,
         prompt_tokens,

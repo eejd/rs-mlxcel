@@ -86,6 +86,8 @@ mod llava;
 mod llmjp_vl;
 #[path = "vlm_locateanything.rs"]
 mod locateanything;
+#[path = "vlm_mage_vl.rs"]
+mod mage_vl;
 #[path = "vlm_minimax_m3_vl.rs"]
 mod minimax_m3_vl;
 #[path = "vlm_mllama.rs"]
@@ -94,6 +96,8 @@ mod mllama;
 mod muse_glimmer;
 #[path = "vlm_nemotron_h_nano_omni.rs"]
 mod nemotron_h_nano_omni;
+#[path = "vlm_nemotron_parse.rs"]
+mod nemotron_parse;
 #[path = "vlm_paddleocr.rs"]
 mod paddleocr;
 #[path = "vlm_pixtral.rs"]
@@ -139,12 +143,14 @@ pub(crate) use llava::load_llava_iree_host_preprocessor;
 pub(crate) use llava::{load_llava_bunny_vlm, load_llava_host_preprocessor, load_llava_vlm};
 pub(crate) use llmjp_vl::load_llmjp_vl;
 pub(crate) use locateanything::load_locateanything_vlm;
+pub(crate) use mage_vl::load_mage_vl;
 pub(crate) use minimax_m3_vl::load_minimax_m3_vl;
 pub(crate) use mllama::load_mllama_vlm;
 pub(crate) use muse_glimmer::{
     ensure_supported_muse_weight_map, load_muse_glimmer_vlm, normalize_muse_glimmer_weights,
 };
 pub(crate) use nemotron_h_nano_omni::load_nemotron_h_nano_omni_vlm;
+pub(crate) use nemotron_parse::load_nemotron_parse_vlm;
 pub(crate) use paddleocr::load_paddleocr_vl;
 pub(crate) use pixtral::{load_mistral3_vlm, load_pixtral_vlm};
 #[cfg(feature = "xla-iree")]
@@ -868,3 +874,7 @@ fn remap_qwen3_vl_weights(raw_weights: WeightMap, moe_experts: bool) -> WeightMa
 #[cfg(test)]
 #[path = "vlm_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "vlm_qwen_text_only_tests.rs"]
+mod qwen_text_only_tests;

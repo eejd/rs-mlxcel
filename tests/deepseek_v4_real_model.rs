@@ -47,12 +47,12 @@ mod common;
 
 use common::repo_model_dir;
 
-use mlxcel::{CxxGenerator, LanguageModel, SamplingConfig, initialize_runtime, load_model};
+use mlxcel::{LanguageModel, MlxInferenceSession, SamplingConfig, initialize_runtime, load_model};
 
 const MODEL_DIR: &str = "deepseek-v4-flash-4bit";
 
 #[test]
-#[ignore]
+#[ignore = "real-model heavy (~151 GB checkpoint on disk; needs a high-memory Apple Silicon host)"]
 fn deepseek_v4_real_model_loads_and_generates_coherently() {
     let model_dir = repo_model_dir(MODEL_DIR);
     if !model_dir.join("config.json").exists() {
@@ -79,7 +79,7 @@ fn deepseek_v4_real_model_loads_and_generates_coherently() {
         .collect();
     assert!(!prompt_ids.is_empty());
 
-    let mut generator = CxxGenerator::new(model.num_layers());
+    let mut generator = MlxInferenceSession::new(model.num_layers());
     let tokens = generator.generate(&model, &prompt_ids, 24, &SamplingConfig::greedy());
     assert!(
         !tokens.is_empty(),
@@ -108,7 +108,7 @@ fn deepseek_v4_real_model_loads_and_generates_coherently() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "real-model heavy (~151 GB checkpoint on disk; needs a high-memory Apple Silicon host)"]
 fn deepseek_v4_real_model_decode_crosses_pooling_windows() {
     // A longer decode than one compress window (ratio 4) plus one full
     // simple window boundary region, so decode-mode pooling emission and the
@@ -130,7 +130,7 @@ fn deepseek_v4_real_model_decode_crosses_pooling_windows() {
         .map(|&id| id as i32)
         .collect();
 
-    let mut generator = CxxGenerator::new(model.num_layers());
+    let mut generator = MlxInferenceSession::new(model.num_layers());
     let tokens = generator.generate(&model, &prompt_ids, 48, &SamplingConfig::greedy());
     let gen_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
     let text = tokenizer.decode(&gen_u32, true).expect("decode generation");
@@ -142,7 +142,7 @@ fn deepseek_v4_real_model_decode_crosses_pooling_windows() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "real-model heavy (~151 GB checkpoint on disk; needs a high-memory Apple Silicon host)"]
 fn deepseek_v4_real_model_long_context_hits_sparse_and_compressed_paths() {
     // The sparse split-softmax and the batched/decode HiSA selection only
     // run once a ratio-4 layer's pooled count exceeds index_topk (512), i.e.
@@ -196,7 +196,7 @@ fn deepseek_v4_real_model_long_context_hits_sparse_and_compressed_paths() {
         prompt_ids.len()
     );
 
-    let mut generator = CxxGenerator::new(model.num_layers());
+    let mut generator = MlxInferenceSession::new(model.num_layers());
     let tokens = generator.generate(&model, &prompt_ids, 12, &SamplingConfig::greedy());
     assert!(
         !tokens.is_empty(),
@@ -233,7 +233,7 @@ fn deepseek_v4_real_model_long_context_hits_sparse_and_compressed_paths() {
 /// world knowledge. Making the answer purely synthetic would test retrieval
 /// harder and be far less stable on a base checkpoint at this length.
 #[test]
-#[ignore]
+#[ignore = "real-model heavy (~151 GB checkpoint on disk; needs a high-memory Apple Silicon host)"]
 fn deepseek_v4_real_model_long_context_engages_hisa_hierarchy() {
     let model_dir = repo_model_dir(MODEL_DIR);
     if !model_dir.join("config.json").exists() {
@@ -310,7 +310,7 @@ fn deepseek_v4_real_model_long_context_engages_hisa_hierarchy() {
         args.index_topk
     );
 
-    let mut generator = CxxGenerator::new(model.num_layers());
+    let mut generator = MlxInferenceSession::new(model.num_layers());
     let tokens = generator.generate(&model, &prompt_ids, 12, &SamplingConfig::greedy());
     assert!(
         !tokens.is_empty(),
@@ -359,7 +359,7 @@ fn deepseek_v4_real_model_long_context_engages_hisa_hierarchy() {
 /// crash or a degenerate output in any band shows up.
 ///
 #[test]
-#[ignore]
+#[ignore = "real-model heavy (~151 GB checkpoint on disk; needs a high-memory Apple Silicon host)"]
 fn deepseek_v4_real_model_hisa_decode_cost_scaling() {
     let model_dir = repo_model_dir(MODEL_DIR);
     if !model_dir.join("config.json").exists() {
@@ -422,7 +422,7 @@ fn deepseek_v4_real_model_hisa_decode_cost_scaling() {
     // first and can make t(long) - t(short) negative.
     {
         let warm = build(512);
-        let mut g = CxxGenerator::new(model.num_layers());
+        let mut g = MlxInferenceSession::new(model.num_layers());
         let _ = g.generate(&model, &warm, 4, &SamplingConfig::greedy());
     }
 
@@ -433,7 +433,7 @@ fn deepseek_v4_real_model_hisa_decode_cost_scaling() {
         let ids = build(target);
         let pooled = ids.len() / ratio;
         let run = |steps: usize| -> (f64, usize) {
-            let mut generator = CxxGenerator::new(model.num_layers());
+            let mut generator = MlxInferenceSession::new(model.num_layers());
             let start = std::time::Instant::now();
             let tokens = generator.generate(&model, &ids, steps, &SamplingConfig::greedy());
             (start.elapsed().as_secs_f64() * 1000.0, tokens.len())

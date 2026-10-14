@@ -1,42 +1,56 @@
 {
   "budgets": {
-    "embedded_asset_bytes": 227718,
+    "embedded_asset_bytes": 855324,
     "embedded_asset_limit_bytes": 5242880,
-    "initial_js_gzip_bytes": 68364,
+    "initial_js_gzip_bytes": 181473,
     "initial_js_gzip_limit_bytes": 204800,
-    "total_js_gzip_bytes": 68364,
+    "total_js_gzip_bytes": 182086,
     "total_js_gzip_limit_bytes": 716800
   },
   "files": [
     {
-      "bytes": 3060,
-      "gzip_bytes": 1219,
-      "path": "assets/index-B6h4yhGE.css",
-      "sha256": "c9715c14abe5c5ae79472b17e2b0c5bfd7a975302d8facdcbab7f7b220e82be7"
+      "bytes": 951,
+      "gzip_bytes": 613,
+      "path": "assets/code-highlight-Dfvzh9FE.js",
+      "sha256": "b847dff5824cf8e3557a8e5505910991cbd58b0683ae04deff021b888a99ccba"
     },
     {
-      "bytes": 221241,
-      "gzip_bytes": 68364,
-      "path": "assets/index-NOolWPsA.js",
-      "sha256": "3083d3c7d951b35c5d907a769a149bed7c4274361f79b74f68ae98f5e6a9daec"
+      "bytes": 137465,
+      "gzip_bytes": 21825,
+      "path": "assets/index-B5U0RsHg.css",
+      "sha256": "23836a64534b2144f66f05ce625ed90a96fc57f0e56375556887e327c4c79510"
     },
     {
-      "bytes": 453,
-      "gzip_bytes": 288,
+      "bytes": 698956,
+      "gzip_bytes": 180484,
+      "path": "assets/index-DHDb0T8Z.js",
+      "sha256": "555f07899b2ca6041a72b302107c419f3c7ec5fc6b992ca6fab86b1848b58f92"
+    },
+    {
+      "bytes": 503,
+      "gzip_bytes": 304,
       "path": "index.html",
-      "sha256": "a5342854553d9927384eb78704fcdaf0da9cade7aedbe145a408b50eebfe7025"
+      "sha256": "beed570f02d5548f90b049bed5d365ab68f2c0ce8935d45688f473dc189a39bf"
     },
     {
-      "bytes": 1336,
-      "gzip_bytes": 807,
+      "bytes": 2129,
+      "gzip_bytes": 989,
+      "path": "theme-bootstrap.js",
+      "sha256": "731929d04a3407095caf1e6ee8cf6c6c1c8ddc31e592b45931322e94a9352b49"
+    },
+    {
+      "bytes": 13233,
+      "gzip_bytes": 4828,
       "path": "third-party-licenses.txt",
-      "sha256": "2012717fe75dbab3697e3aca9517561572ac2ec45c859d8e5746d3cbb007ce27"
+      "sha256": "98527167553e5b383153c3ea4301d9cf53b391877abaf2cae8c19a7a71bef7e0"
     }
   ],
   "node_version": "v26.5.1",
   "package_manager": "pnpm@11.18.0",
   "packages": {
+    "@axe-core/playwright": "4.10.2",
     "@eslint/js": "10.0.1",
+    "@lablup/ui-common": "0.1.0-alpha.19",
     "@playwright/test": "1.63.0",
     "@types/node": "22.20.2",
     "@types/react": "19.3.0",
@@ -53,5 +67,5 @@
   },
   "pnpm_version": "11.18.0",
   "schema_version": 1,
-  "source_digest_sha256": "0d333fc69a1f8df13f3b4907b7ce9acab0612788d6000fd1cffc1807af19f10f"
+  "source_digest_sha256": "1ebf0921089e00db6bf288cdd66fb2ba6265f9ee43a4224a07d483f1201d79c8"
 }

@@ -39,7 +39,7 @@
 
 use super::{
     Attention, FUSED_CAUSAL_PREFILL_ENV, FUSED_QKV_SPLIT_ROPE_ENV, FUSED_ROPE_APPEND_ENV,
-    FUSED_ROPE_ENV_VARS, Llama3Model, ModelArgs,
+    FUSED_ROPE_ENV_VARS, Llama3Model, ModelArgs, fused_rope_append_explicitly_requested,
 };
 use crate::models::rope_utils::{RopeScalingKind, RopeScalingSpec};
 use crate::test_support::env_lock::env_lock;
@@ -386,6 +386,26 @@ fn the_fused_rope_env_vars_are_the_ones_the_code_actually_reads() {
     assert_eq!(FUSED_ROPE_APPEND_ENV, FUSED_ROPE_ENV_VARS[2]);
 }
 
+#[test]
+fn the_rope_append_bypass_notice_needs_an_explicit_truthy_value() {
+    // #2145: `MLXCEL_FUSED_ROPE_APPEND` defaults to on in a `rocm` build, so the
+    // bypass notice must not treat the default as a request. Unset is the case
+    // every default ROCm Llama 3.1 run hits; it must stay silent on every build.
+    assert!(!fused_rope_append_explicitly_requested(None));
+    for v in ["", "maybe", "2", "0", "false", "off", "no"] {
+        assert!(
+            !fused_rope_append_explicitly_requested(Some(v)),
+            "{v:?} is not a request for the fused RoPE + append launcher"
+        );
+    }
+    for v in ["1", "true", "on", "yes", " ON "] {
+        assert!(
+            fused_rope_append_explicitly_requested(Some(v)),
+            "{v:?} explicitly requests the fused RoPE + append launcher"
+        );
+    }
+}
+
 /// A genuinely quantized attention block, which is the only shape that can
 /// reach either fused launcher, built with the given rotation convention.
 fn quantized_attention(rope_traditional: bool) -> Attention {
@@ -594,8 +614,8 @@ fn diagnostics_name_the_checkpoint_when_the_loader_knows_it() {
         "the architecture is the default"
     );
 
-    args.set_checkpoint_label(std::path::Path::new("models/internvl3-1b"));
-    assert_eq!(args.model_label(), "internvl3-1b");
+    args.set_checkpoint_label(std::path::Path::new("models/internvl3-1b-4bit"));
+    assert_eq!(args.model_label(), "internvl3-1b-4bit");
 
     // A path with no final component leaves the architecture in place rather
     // than producing an empty label.
@@ -961,4 +981,53 @@ fn a_yarn_scaling_block_actually_changes_the_logits() {
         gap > 1e-3,
         "a yarn block must change the rotation (gap {gap})"
     );
+}
+
+/// Every last-logits entry point returns the full forward's row at
+/// `last_pos` while projecting only that row through the LM head, for the
+/// final position and an interior one (a padded prefill), and the caches still
+/// advance for decode.
+#[test]
+fn last_logits_match_the_sliced_full_forward() {
+    let args = parse_llama_config("");
+    let weights = tiny_weights(&args);
+    let model = Llama3Model::from_weights(&weights, &args).unwrap();
+    let vocab = args.vocab_size as i32;
+    let seq = [1i32, 2, 3, 4, 5, 6, 7];
+    let ids = mlxcel_core::from_slice_i32(&seq, &[1, seq.len() as i32]);
+
+    let mut caches = model.make_caches();
+    let full = model.forward(&ids, &mut caches, None);
+
+    for last_pos in [seq.len() - 1, 2] {
+        let p = last_pos as i32;
+        let expected = mlxcel_core::slice(&full, &[0, p, 0], &[1, p + 1, vocab]);
+
+        let mut c1 = model.make_caches();
+        let a = model.forward_last_logits(&ids, &mut c1, None, last_pos);
+        let mut c2 = model.make_caches();
+        let b = model.forward_last_logits_with_sequence_id(
+            &ids,
+            Some(mlxcel_core::cache::SequenceId::from_raw(3)),
+            &mut c2,
+            None,
+            last_pos,
+        );
+        let embeds = model.embed_tokens(&ids).expect("llama exposes embeddings");
+        let mut c3 = model.make_caches();
+        let c = model.forward_last_logits_with_embeddings_and_sequence_id(
+            &ids,
+            Some(&embeds),
+            None,
+            &mut c3,
+            None,
+            last_pos,
+        );
+        for (label, got) in [("plain", &a), ("sequence_id", &b), ("embeddings", &c)] {
+            assert_eq!(mlxcel_core::array_shape(got), vec![1, 1, vocab], "{label}");
+            let gap = max_abs_diff(&expected, got);
+            assert!(gap < 1e-4, "{label} at {last_pos}: max |diff| {gap}");
+        }
+        assert_eq!(c1[0].offset, seq.len() as i32, "caches advance");
+    }
 }

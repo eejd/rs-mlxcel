@@ -50,12 +50,44 @@ use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
 use std::path::Path;
 
-/// Prompt length the exactness probe prefills before comparing arms.
+/// Prompt length the exactness probe prefills before comparing arms, unless
+/// `MLXCEL_MTP_PROBE_PROMPT_LEN` overrides it.
 ///
-/// Long enough that the attention layers hold a real KV prefix rather
-/// than the empty-cache special case, short enough that the probe stays
-/// a fraction of a second on a 27B target.
-const PROBE_PROMPT_LEN: usize = 8;
+/// Long enough that the attention layers hold a real KV prefix rather than the
+/// empty-cache special case, short enough that the probe stays a fraction of a
+/// second on a 27B target.
+///
+/// Issue #1935 swept this over 8, 32, 64, 128, 256 and 512 on
+/// `qwen3.5-4b-4bit`, looking for a length at which the probe would notice the
+/// divergence a served burst has at verify widths 2 and 4. There is none: the
+/// verdict is byte-identity at every length. What the probe misses is not a
+/// short prefix but its own shape, one block immediately after a clean
+/// prefill, and on that checkpoint the difference does not begin until several
+/// dozen tokens past the prompt (position 194 at a 158-token prompt, 326 at a
+/// 256-token one, in both cases whatever the accept pattern). The knob is kept
+/// because that sweep is worth being able to repeat; the default is unchanged.
+/// Since #2191 the CUDA probe prefills [`CUDA_PROBE_PROMPT_LEN`] tokens and adds
+/// a long draw ([`PROBE_LONG_WALK`] tokens past the prompt) that does catch it.
+///
+/// See `docs/benchmark_results/dflash-width-2-4-residual-qwen35-gb10-2026-09-21.md`.
+const DEFAULT_PROBE_PROMPT_LEN: usize = 8;
+
+/// The probe's prompt length for this process.
+///
+/// `MLXCEL_MTP_PROBE_PROMPT_LEN` moves it without a rebuild, which is what the
+/// #1935 record's length sweep uses and what an operator whose checkpoint makes
+/// the default prefill too slow at startup can reach for. Values below 2 are
+/// ignored: the probe needs a prefix to attend to.
+fn probe_prompt_len() -> usize {
+    static RESOLVED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        std::env::var("MLXCEL_MTP_PROBE_PROMPT_LEN")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 2)
+            .unwrap_or(DEFAULT_PROBE_PROMPT_LEN)
+    })
+}
 
 /// Independent synthetic inputs the exactness probe compares before it
 /// is allowed to report equality.
@@ -67,6 +99,33 @@ const PROBE_PROMPT_LEN: usize = 8;
 /// guard against is a false *pass*, and each one costs about a second on
 /// a 27B target at worker startup.
 const PROBE_DRAWS: usize = 3;
+
+/// Tokens past the prompt the CUDA-only long draw walks blocks and the chain
+/// over. On `qwen3.5-4b-4bit` with the #2191 fix reverted the first differing
+/// row of a served transcript sits 133 tokens past its prompt, and a
+/// synthetic walk has to be long enough that a rare per-element rounding
+/// difference reaches a byte with near certainty.
+const PROBE_LONG_WALK: usize = 128;
+
+/// Prompt length every CUDA probe draw prefills, short draws and the long
+/// one, unless `MLXCEL_MTP_PROBE_PROMPT_LEN` asks for more. Close to the
+/// 158-token prompt the hazard was measured at, and the cheapest
+/// configuration measured in MLX CUDA graph-cache misses: each KV length the
+/// probe visits can capture new graph topologies, and those misses count
+/// toward the fatal lifetime limit #818 guards against, so the short draws
+/// and the walk share one length range instead of adding a second one at
+/// 8 tokens (#2191).
+const CUDA_PROBE_PROMPT_LEN: usize = 160;
+
+/// [`probe_prompt_len`] raised to [`CUDA_PROBE_PROMPT_LEN`] on CUDA.
+/// Metal keeps its prompt length, and so its probe cost.
+fn probe_prompt_len_for_host() -> usize {
+    if mlxcel_core::cuda_is_available() {
+        probe_prompt_len().max(CUDA_PROBE_PROMPT_LEN)
+    } else {
+        probe_prompt_len()
+    }
+}
 
 // Configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -179,15 +238,6 @@ pub enum Qwen35UnsupportedConfig {
     )]
     MropeInterleavedWrongType(String),
 
-    /// Top-level `language_model_only` is `true` on a VLM wrapper config.
-    #[error(
-        "Qwen3.5-family config declares language_model_only=true, which mlxcel does not \
-         implement. The Qwen3.5 VLM loader always builds the vision tower from the checkpoint's \
-         model.visual.* weights, which a vision-stripped build does not ship. Upstream has the \
-         same gap (Blaizzy/mlx-vlm#1812)."
-    )]
-    LanguageModelOnly,
-
     /// Top-level `language_model_only` is present but is not a JSON boolean.
     #[error(
         "Qwen3.5-family config declares language_model_only={0}, which is not a JSON boolean. \
@@ -225,9 +275,9 @@ const MAX_ERROR_VALUE_CHARS: usize = 64;
 ///
 /// `full_config` is the whole `config.json`, not `text_config`:
 /// `language_model_only` lives at the top level next to `vision_config`.
-/// Only the VLM loader calls this. On the text-only path a vision-stripped
-/// checkpoint is exactly what the caller asked for, so the flag is not an
-/// error there.
+/// Only the VLM loader calls this. `language_model_only: true` is accepted
+/// (detection sends such configs to the text loader, #1367); only a
+/// non-boolean value is refused.
 ///
 /// A present-but-wrong-typed value (the JSON string `"true"`, the number `1`,
 /// an object, ...) is rejected rather than read as absent via `.as_bool()`:
@@ -238,8 +288,9 @@ pub fn validate_qwen35_wrapper_config(
 ) -> Result<(), Qwen35UnsupportedConfig> {
     if let Some(value) = full_config.get("language_model_only") {
         match value.as_bool() {
-            Some(true) => return Err(Qwen35UnsupportedConfig::LanguageModelOnly),
-            Some(false) => {}
+            // `true` is a supported vision-stripped build (#1367): detection
+            // routes it to the text loader, so it is not an error here.
+            Some(true | false) => {}
             None => {
                 return Err(Qwen35UnsupportedConfig::LanguageModelOnlyWrongType(
                     truncate_for_error(&value.to_string(), MAX_ERROR_VALUE_CHARS),
@@ -1244,6 +1295,10 @@ impl Qwen35DecoderLayer {
             Qwen35MLPVariant::Dense(mlp) => mlp.forward(&self.post_attention_layernorm.forward(&h)),
             Qwen35MLPVariant::MoE(moe) => moe.forward(&self.post_attention_layernorm.forward(&h)),
         };
+        #[cfg(test)]
+        if !self.is_linear {
+            super::qwen3_next::verify_rope::capture::record("mlp", &mlp_out);
+        }
         mlxcel_core::add(&h, &mlp_out)
     }
 
@@ -1527,6 +1582,40 @@ impl Qwen35Model {
         mtp_exactness_gate(key, || self.probe_block_chain_exactness(block_size))
     }
 
+    /// Whether the **DFlash** burst may engage at `block_size` verify rows on
+    /// this host (issue #1935).
+    ///
+    /// Deliberately not [`Self::mtp_exactness_allows`]: that gate's first
+    /// precondition is `metal_is_available()`, because Qwen 3.5 MTP's
+    /// byte-identity rests on the Metal chain-parity gated-delta kernel. The
+    /// DFlash burst runs on CUDA too, where that precondition would decline
+    /// every burst without measuring one, so this entry point is the measured
+    /// half alone: [`Self::probe_block_chain_exactness`], memoized per
+    /// (model, width) per process by
+    /// [`mtp_exactness_gate`](crate::models::speculative_exactness::mtp_exactness_gate),
+    /// which also owns the decline log line, the `qmv_wide` retry and the
+    /// `MLXCEL_MTP_ALLOW_INEXACT` override.
+    ///
+    /// What this catches on GB10 with `qwen3.5-4b-4bit`: at widths 2 and 4 the
+    /// verify block is byte-identical to the chain and the burst engages, and
+    /// at 8 and 16 it is not (229971 of 496640 logit bytes differ at block
+    /// position 0), which is the `M * B >= 8` switch from `qmv` to
+    /// `qmm_sm80` in MLX's CUDA quantized dispatch. That is a real numerical
+    /// difference between two kernels rather than a defect, so the burst
+    /// declines there instead of serving text that differs from classic
+    /// decode.
+    ///
+    /// Used by: `DFlashTargetModel::exactness_allows` for `Qwen35Model` and
+    /// `Qwen35VLModel`, which the server burst gate reads.
+    pub fn dflash_exactness_allows(&self, block_size: usize) -> bool {
+        let key = ProbeKey {
+            block_size: block_size as u32,
+            hidden_size: self.config.hidden_size as u32,
+            num_hidden_layers: self.config.num_hidden_layers as u32,
+        };
+        mtp_exactness_gate(key, || self.probe_block_chain_exactness(block_size))
+    }
+
     /// Measure, on this loaded checkpoint, whether a `T = block_size`
     /// verify block produces byte-identical logits to `block_size`
     /// consecutive single-token decode steps.
@@ -1583,6 +1672,17 @@ impl Qwen35Model {
                 return verdict;
             }
         }
+        // On CUDA a verify block can match the chain right after prefill and
+        // still part from it dozens of tokens later: a block-only kernel
+        // difference that rounds one bf16 element differently at some
+        // positions and not others lands in the KV cache and stays there
+        // (#1935, #2191). One block right after a clean prefill read `Equal`
+        // at widths 2 and 4 at every prompt length from 8 to 512 while the
+        // served path diverged, so CUDA also walks blocks and the chain
+        // together well past the prompt. Metal keeps the short draws only.
+        if mlxcel_core::cuda_is_available() {
+            return self.probe_long_walk(block_size, vocab);
+        }
         BlockChainExactness::Equal
     }
 
@@ -1597,7 +1697,9 @@ impl Qwen35Model {
         let salt = draw * 977 + 1;
         let wrap =
             |i: usize, stride: usize, offset: usize| ((i * stride + offset + salt) % vocab) as i32;
-        let prompt: Vec<i32> = (0..PROBE_PROMPT_LEN).map(|i| wrap(i, 7, 1)).collect();
+        let prompt: Vec<i32> = (0..probe_prompt_len_for_host())
+            .map(|i| wrap(i, 7, 1))
+            .collect();
         let block: Vec<i32> = (0..block_size).map(|i| wrap(i, 13, 3)).collect();
 
         let as_input =
@@ -1627,6 +1729,74 @@ impl Qwen35Model {
             .collect();
 
         compare_block_against_chain(&block_positions, &chain_positions)
+    }
+
+    /// The probe's long draw: a prefill, then [`PROBE_LONG_WALK`] synthetic
+    /// tokens fed both as full-accept verify blocks of `block_size` and one
+    /// token at a time, every block row compared in logit bytes against the
+    /// chain step for the same token. Mirrors Gemma 4's long buffered draw
+    /// (`Gemma4TextConfig::mtp_probe_prompt_lengths`). Rows are compared as
+    /// each block lands, so memory stays at one block of logits.
+    fn probe_long_walk(&self, block_size: usize, vocab: usize) -> BlockChainExactness {
+        let wrap = |i: usize, stride: usize, offset: usize| ((i * stride + offset) % vocab) as i32;
+        let prompt: Vec<i32> = (0..probe_prompt_len_for_host())
+            .map(|i| wrap(i, 7, 5))
+            .collect();
+        let walk: Vec<i32> = (0..PROBE_LONG_WALK).map(|i| wrap(i, 31, 11)).collect();
+        let as_input =
+            |tokens: &[i32]| mlxcel_core::from_slice_i32(tokens, &[1, tokens.len() as i32]);
+        let position_bytes = |logits: &MlxArray, index: i32| -> Vec<u8> {
+            let shape = mlxcel_core::array_shape(logits);
+            let row = mlxcel_core::slice(logits, &[0, index, 0], &[shape[0], index + 1, shape[2]]);
+            mlxcel_core::array_to_raw_bytes(&row)
+        };
+
+        let mut chain_caches = self.make_internal_caches();
+        let _ = self.forward_speculative(&as_input(&prompt), &mut chain_caches, &[]);
+        let mut block_caches = self.make_internal_caches();
+        let _ = self.forward_speculative(&as_input(&prompt), &mut block_caches, &[]);
+
+        for (start, block) in walk.chunks(block_size).enumerate() {
+            let out = self.forward_speculative(&as_input(block), &mut block_caches, &[]);
+            let block_positions: Vec<Vec<u8>> = (0..block.len())
+                .map(|i| position_bytes(&out.logits, i as i32))
+                .collect();
+            let chain_positions: Vec<Vec<u8>> = block
+                .iter()
+                .map(|token| {
+                    let step =
+                        self.forward_speculative(&as_input(&[*token]), &mut chain_caches, &[]);
+                    position_bytes(&step.logits, 0)
+                })
+                .collect();
+            match compare_block_against_chain(&block_positions, &chain_positions) {
+                BlockChainExactness::Diverges {
+                    position,
+                    differing_bytes,
+                    total_bytes,
+                } => {
+                    return BlockChainExactness::Diverges {
+                        position: start * block_size + position,
+                        differing_bytes,
+                        total_bytes,
+                    };
+                }
+                BlockChainExactness::Equal => {}
+                other => return other,
+            }
+        }
+        BlockChainExactness::Equal
+    }
+
+    /// Turn the CUDA per-row verify RoPE on or off on every full-attention
+    /// layer, so a test can show what the probe sees with the fix reverted.
+    #[cfg(test)]
+    pub(crate) fn set_verify_rope_rows_for_test(&mut self, on: bool) {
+        for layer in &mut self.layers {
+            if let Qwen35AttentionVariant::FullAttention(ref mut attn) = layer.attention {
+                attn.verify_rope_rows = on;
+            }
+        }
     }
 
     fn visible_len(cache: &Qwen3NextCache) -> usize {
@@ -1825,7 +1995,7 @@ impl Qwen35Model {
     pub fn load<P: AsRef<Path>>(model_dir: P) -> Result<(Self, Qwen35Config), String> {
         let model_dir = model_dir.as_ref();
 
-        println!("[Qwen3.5] Loading config...");
+        tracing::info!("[Qwen3.5] Loading config...");
         let config_path = model_dir.join("config.json");
         let config_str = std::fs::read_to_string(&config_path)
             .map_err(|e| format!("Failed to read config.json: {}", e))?;
@@ -1861,7 +2031,7 @@ impl Qwen35Model {
             .map_err(|e| format!("Failed to parse config: {}", e))?;
         config.validate_supported().map_err(|e| e.to_string())?;
 
-        println!(
+        tracing::info!(
             "[Qwen3.5] Config loaded: {} layers ({} full attention, {} linear attention)",
             config.num_hidden_layers,
             (0..config.num_hidden_layers)
@@ -1872,7 +2042,7 @@ impl Qwen35Model {
                 .count(),
         );
 
-        println!("[Qwen3.5] Loading weights...");
+        tracing::info!("[Qwen3.5] Loading weights...");
         let weights = crate::models::load_text_weights(model_dir, None)?;
 
         // Reconstruct block-scaled FP8 tensors before any other sanitization:
@@ -1880,7 +2050,6 @@ impl Qwen35Model {
         // replaces `<name>.weight` with a packed plane plus `<name>.scales`.
         let weights = match fp8_block {
             Some(detected) => {
-                println!("[Qwen3.5] Requantizing fine-grained FP8 weights to mxfp8...");
                 crate::models::requantize_block_fp8_weights(weights, detected.block_rows)?
             }
             None => weights,
@@ -1889,10 +2058,10 @@ impl Qwen35Model {
         // Strip language_model. prefix and sanitize
         let weights = sanitize_moe_weights(weights, &config);
 
-        println!("[Qwen3.5] Building model...");
+        tracing::info!("[Qwen3.5] Building model...");
         let model = Self::from_weights(&weights, &config)?;
 
-        println!("[Qwen3.5] Model loaded successfully");
+        tracing::info!("[Qwen3.5] Model loaded successfully");
         Ok((model, config))
     }
 
@@ -2162,6 +2331,105 @@ impl Qwen35Model {
             logits,
             hidden_states,
             gdn_states,
+        }
+    }
+
+    /// Prefill `input_ids` through the **standard batched-attention** forward
+    /// while capturing the per-layer hidden states a DFlash drafter is seeded
+    /// from (issue #1935).
+    ///
+    /// This is deliberately NOT [`Self::forward_speculative`], for the reason
+    /// [`Self::forward_prefill_with_last_hidden`] already states for the MTP
+    /// path: `forward_speculative` sends every full-attention layer through
+    /// `attend_per_position`, which is byte-aligned with single-token *decode*
+    /// and is not the *prefill* computation classic decode runs. The classic
+    /// path samples its first token from the batched causal prefill logits and
+    /// carries that prefill's KV and gated-delta state into every token after
+    /// it, so a burst that prefills the per-position way starts from a
+    /// different state and its greedy output drifts away from classic decode
+    /// within a few tokens, at every verify width alike. Measured on GB10 with
+    /// `qwen3.5-4b-4bit`: the two prefills' last-row logits differ in 173206 of
+    /// 496640 bytes and the served completions part company at generated token
+    /// 9. The MTP path took this fix; the DFlash path did not, which is what
+    /// issue #1935 reported.
+    ///
+    /// GDN rollback snapshots are deliberately not captured: a prefill is never
+    /// rolled back, and they are prompt-sized rather than block-sized, which is
+    /// the memory argument `SpeculativeTarget::prefill_forward_with_capture_layers`
+    /// exists for. The returned `gdn_states` is therefore empty, and
+    /// `rollback_partial` must never be called against this output.
+    ///
+    /// Keep the loop in lockstep with [`Self::forward_internal`] (mask
+    /// construction, layer dispatch, final norm, LM head); the capture is the
+    /// only addition.
+    ///
+    /// Used by: `SpeculativeTarget::prefill_forward_with_capture_layers` for
+    /// `Qwen35Model` and `Qwen35VLModel`, which is the DFlash burst's first
+    /// call on both the B = 1 and B > 1 arms.
+    pub fn forward_prefill_with_capture_layers(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [Qwen3NextCache],
+        capture_layer_ids: &[usize],
+    ) -> VerifyOutput {
+        let mut h = self.embed_tokens.forward(input_ids);
+
+        let shape = mlxcel_core::array_shape(&h);
+        let seq_len = shape[1];
+
+        let fa_idx = self.config.full_attention_interval - 1;
+        let fa_mask = if seq_len > 1 {
+            let offset = if fa_idx < caches.len() {
+                caches[fa_idx].offset()
+            } else {
+                0
+            };
+            Some(create_causal_mask(seq_len, offset))
+        } else {
+            None
+        };
+
+        let mut hidden_slots: Vec<Option<UniquePtr<MlxArray>>> =
+            (0..capture_layer_ids.len()).map(|_| None).collect();
+
+        for (i, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate() {
+            let mask = if layer.is_linear {
+                None
+            } else {
+                fa_mask.as_deref()
+            };
+            h = layer.forward(&h, mask, cache, None);
+
+            for (slot_idx, &want_idx) in capture_layer_ids.iter().enumerate() {
+                if want_idx == i {
+                    hidden_slots[slot_idx] = Some(mlxcel_core::copy(&h));
+                }
+            }
+        }
+
+        let hidden_states: Vec<UniquePtr<MlxArray>> = hidden_slots
+            .into_iter()
+            .map(|opt| {
+                opt.unwrap_or_else(|| {
+                    mlxcel_core::zeros(
+                        &[shape[0], seq_len, self.config.hidden_size as i32],
+                        mlxcel_core::array_dtype(&h),
+                    )
+                })
+            })
+            .collect();
+
+        let h = self.norm.forward(&h);
+        let logits = if let Some(ref lm_head) = self.lm_head {
+            lm_head.forward(&h)
+        } else {
+            self.embed_tokens.as_linear(&h)
+        };
+
+        VerifyOutput {
+            logits,
+            hidden_states,
+            gdn_states: Vec::new(),
         }
     }
 
@@ -2587,6 +2855,32 @@ impl mlxcel_core::drafter::dflash::SpeculativeTarget for Qwen35Model {
             capture_layer_ids
         };
         self.forward_speculative(verify_input, caches, capture_layer_ids)
+    }
+
+    /// The burst's prompt prefill, which is NOT a verify block and must not
+    /// be computed like one (issue #1935).
+    ///
+    /// The trait default routes here to `verify_forward_with_capture_layers`,
+    /// which sends every full-attention layer through `attend_per_position`.
+    /// That is right for a verify block, whose rows have to match what
+    /// single-token decode would produce, and wrong for the prompt, which
+    /// classic decode runs as one batched causal attention. Prefilling the
+    /// per-position way leaves the burst holding different KV and gated-delta
+    /// state than classic decode, and its greedy output then drifts at every
+    /// verify width alike. See
+    /// [`Qwen35Model::forward_prefill_with_capture_layers`].
+    fn prefill_forward_with_capture_layers(
+        &self,
+        verify_input: &MlxArray,
+        caches: &mut [Self::Cache],
+        capture_layer_ids: &[usize],
+    ) -> Self::VerifyOut {
+        let capture_layer_ids = if capture_layer_ids.is_empty() {
+            mlxcel_core::drafter::dflash::config::DEFAULT_TARGET_LAYER_IDS
+        } else {
+            capture_layer_ids
+        };
+        self.forward_prefill_with_capture_layers(verify_input, caches, capture_layer_ids)
     }
 
     fn rollback_partial(
@@ -3355,7 +3649,8 @@ impl LanguageModel for Qwen35Model {
     }
 
     fn reset_runtime_state(&self) {
-        // Used by: CxxGenerator single-row generation paths. Qwen 3.5 Next
+        // Used by: bare single-row runs outside an engine sequence (the engine
+        // resets through prepare_sequence_state / release_sequence_state_by_id). Qwen 3.5 Next
         // owns mixed attention / GatedDelta cache state in
         // `ModelOwnedSequenceState`; reset the fallback cache slot for fresh
         // CLI / benchmark runs without touching scheduler-owned sequence
@@ -3451,16 +3746,15 @@ impl LanguageModel for Qwen35Model {
         batch_caches: &mut [&mut [KVCache]],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        self.forward_batched_with_context_and_ids(input_ids, None, batch_caches, mask, None)
+        self.forward_batched_with_ids(input_ids, None, batch_caches, mask)
     }
 
-    fn forward_batched_with_context_and_ids(
+    fn forward_batched_with_ids(
         &self,
         input_ids: &MlxArray,
         seq_ids: Option<&[SequenceId]>,
         batch_caches: &mut [&mut [KVCache]],
         mask: Option<&MlxArray>,
-        _context: Option<&mlxcel_core::generate::DecodeBatchContext>,
     ) -> UniquePtr<MlxArray> {
         let shape = mlxcel_core::array_shape(input_ids);
         if batch_caches.len() <= 1 || shape[1] <= 1 {
@@ -3909,3 +4203,11 @@ mod chain_parity_gate_tests {
         assert!(!qwen35_config_supports_chain_parity_kernel(&config));
     }
 }
+
+#[cfg(test)]
+#[path = "qwen3_5_dflash_probe_tests.rs"]
+mod qwen3_5_dflash_probe_tests;
+
+#[cfg(test)]
+#[path = "qwen3_5_rope_attribution_tests.rs"]
+mod qwen3_5_rope_attribution_tests;

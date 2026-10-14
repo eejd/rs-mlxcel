@@ -314,6 +314,10 @@ fn try_load_vlm_model_from_dir(
         ModelType::Moondream3VLM => Some(load_moondream3_vlm(model_path)?),
         ModelType::Moondream2VLM => Some(load_moondream2_vlm(model_path)?),
         ModelType::Florence2VLM => Some(load_florence2_vlm(model_path)?),
+        ModelType::NemotronParseVLM => Some(load_nemotron_parse_vlm(model_path)?),
+        ModelType::NemotronVoiceChat => Some(LoadedModel::NemotronVoiceChat(
+            crate::models::NemotronVoiceChatModel::load(model_path)?,
+        )),
         ModelType::Gemma3nVLM => Some(load_gemma3n_vlm(model_path)?),
         ModelType::Phi4MMVLM => Some(load_phi4mm_vlm(model_path)?),
         ModelType::Phi4SigLipVLM => Some(load_phi4_siglip_vlm(model_path)?),
@@ -327,6 +331,7 @@ fn try_load_vlm_model_from_dir(
         ModelType::KimiVL | ModelType::KimiK25 => Some(load_kimi_vl_vlm(model_path)?),
         ModelType::KimiK3VLM => Some(load_kimi_k3_vlm(model_path)?),
         ModelType::LlmJpVLM => Some(load_llmjp_vl(model_path)?),
+        ModelType::MageVLM => Some(load_mage_vl(model_path)?),
         ModelType::GotOcrVLM => Some(load_got_ocr_vlm(model_path)?),
         ModelType::LocateAnythingVLM => Some(load_locateanything_vlm(model_path)?),
         ModelType::SmolVLM => Some(load_smolvlm_vlm(model_path)?),
@@ -512,7 +517,7 @@ pub fn context_window_from_config(config: &serde_json::Value) -> Option<usize> {
 /// DeepSeek-V2 (and DeepSeek-VL2, whose language tower is the same MLA
 /// backbone) sat on this lever from #829 to #831, attributed to the same class
 /// of hazard. That attribution was wrong: the collapse was the broken RMSNorm
-/// overlay mlxcel carried at `patches/mlx/backend/cuda/rms_norm.cu`, whose
+/// overlay mlxcel carried at `overlays/cuda/mlx/backend/cuda/rms_norm.cu`, whose
 /// two-stage reduction read past its shared scratch on the `kv_a_layernorm`
 /// axis (`kv_lora_rank == 512` at bf16), making the applied normalizer depend
 /// on residual shared memory at single-row decode. Deleting the overlay (#831)

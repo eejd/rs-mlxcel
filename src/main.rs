@@ -60,6 +60,11 @@ Environment Variables:
                            unset, auto-defaults to 1000 on pre-M5 Apple Silicon (M1-M4),
                              MLX default on M5+ and non-Apple (hardware-gated, #353)
                            explicit value always wins (manual override / sweeps)
+  MLXCEL_DECODE_MB_PER_BUFFER Metal command-buffer input budget, decode steps only
+                           unset, 1000 on pre-M5 Apple Silicon (M1-M4), off elsewhere;
+                             prefill keeps MLX's default to bound peak memory
+                           \"0\"/\"off\", disable; a positive value replaces the default
+                           ignored when MLX_MAX_MB_PER_BUFFER is set (pins both phases)
   MLX_CUDA_GRAPH_CACHE_SIZE CUDA graph-cache LRU capacity (CUDA only)
                            unset, auto-defaults to 2000 on CUDA builds (MLX default 400
                              aborts long-lived shape-diverse decode, #818)
@@ -110,19 +115,61 @@ enum Commands {
     #[command(verbatim_doc_comment)]
     Run(commands::RunArgs),
 
-    /// Generate text from a prompt
-    #[command(visible_alias = "gen")]
+    /// Generate text from a prompt and print the completion.
+    ///
+    /// With `-p/--prompt`, produces a single completion and exits, the
+    /// same behavior `mlxcel run -p` gives. Without `-p`, it drops into
+    /// the same interactive multi-turn chat REPL `mlxcel run` opens.
+    ///
+    /// Examples:
+    ///
+    ///     mlxcel generate -m models/llama-3.2-1b-instruct-4bit -p "Hello"
+    ///     mlxcel generate -m mlx-community/Qwen3-4B-4bit -p "Write a haiku" -n 128 --temp 0.7
+    #[command(verbatim_doc_comment, visible_alias = "gen")]
     Generate(GenerateArgs),
 
-    /// Start an OpenAI/llama-server compatible HTTP server
+    /// Start an OpenAI/llama-server compatible HTTP server.
+    ///
+    /// Serves the OpenAI-compatible chat, completions, embeddings, and
+    /// rerank endpoints (family-dependent) and accepts the same CLI flags
+    /// and `LLAMA_ARG_*` environment variables as `llama-server`, so
+    /// existing deployment scripts keep working. See below for multi-node
+    /// distributed setup and model-store resolution details.
+    ///
+    /// Examples:
+    ///
+    ///     mlxcel serve -m models/llama-3.2-1b-instruct-4bit
+    ///     mlxcel serve -m models/llama-3.2-1b-instruct-4bit --host 0.0.0.0 --port 8080
+    #[command(verbatim_doc_comment)]
     Serve(ServeArgs),
 
-    /// List downloaded models in the local store
-    #[command(visible_alias = "ls")]
+    /// List downloaded models in the local store.
+    ///
+    /// Enumerates models downloaded into the global store (or
+    /// `--models-dir`), mirroring `ollama list`. The default table shows
+    /// NAME / SIZE / MODIFIED; the supported model-architecture catalog
+    /// lives under the separate `mlxcel arch` verb.
+    ///
+    /// Examples:
+    ///
+    ///     mlxcel list
+    ///     mlxcel list -v
+    ///     mlxcel list --json
+    ///     mlxcel list --sort modified
+    #[command(verbatim_doc_comment, visible_alias = "ls")]
     List(ListArgs),
 
-    /// List supported model architectures
-    #[command(visible_alias = "supported")]
+    /// List supported model architectures.
+    ///
+    /// Reports the model-architecture catalog this build actually knows
+    /// how to load: the authoritative answer to "is this checkpoint
+    /// supported?" for the current binary.
+    ///
+    /// Examples:
+    ///
+    ///     mlxcel arch
+    ///     mlxcel arch --json
+    #[command(verbatim_doc_comment, visible_alias = "supported")]
     Arch(ArchArgs),
 
     /// Print a pre-load memory budget for a model without running generation.
@@ -134,13 +181,20 @@ enum Commands {
     ///
     /// Examples:
     ///
-    ///     mlxcel inspect models/llama-3.2-1b-4bit
-    ///     mlxcel inspect models/llama-3.2-1b-4bit --max-tokens 32768
-    ///     mlxcel inspect models/llama-3.2-1b-4bit --cache-type-k int8 --cache-type-v int8
+    ///     mlxcel inspect -m models/llama-3.2-1b-instruct-4bit
+    ///     mlxcel inspect -m models/llama-3.2-1b-instruct-4bit --max-tokens 32768
+    ///     mlxcel inspect -m models/llama-3.2-1b-instruct-4bit --cache-type-k int8 --cache-type-v int8
     #[command(verbatim_doc_comment)]
     Inspect(InspectArgs),
 
-    /// Download a HuggingFace model repository snapshot
+    /// Download a HuggingFace model repository snapshot.
+    ///
+    /// Fetches an `owner/name` repo-id into the global mlxcel store (or a
+    /// custom destination via `--local-dir`/`--models-dir`), reusing an
+    /// existing HuggingFace cache copy when one is already present instead
+    /// of re-fetching it. See the Examples section below for revision,
+    /// token, and file-filtering invocations.
+    #[command(verbatim_doc_comment)]
     Download(DownloadArgs),
 
     /// Detect objects in an image with an RT-DETRv2 model.
@@ -170,7 +224,7 @@ enum Commands {
     /// Examples:
     ///
     ///     mlxcel embed -m sentence-transformers/all-MiniLM-L6-v2 -p "The weather is lovely" -p "It is sunny"
-    ///     mlxcel embed -m models/Qwen3-Embedding-0.6B -p "query" --instruction "Retrieve passages" --dimensions 256 --json
+    ///     mlxcel embed -m models/qwen3-embedding-0.6b -p "query" --instruction "Retrieve passages" --dimensions 256 --json
     #[command(verbatim_doc_comment)]
     Embed(commands::EmbedArgs),
 
@@ -214,10 +268,10 @@ enum Commands {
     ///
     /// Examples:
     ///
-    ///     mlxcel tune                                   # every op the backend supports
-    ///     mlxcel tune --op paged-decode-splits          # one op
-    ///     mlxcel tune -m models/llama-3.2-1b-4bit       # head geometry from a checkpoint
-    ///     mlxcel tune --dry-run                         # print the matrix, profile nothing
+    ///     mlxcel tune                                        # every op the backend supports
+    ///     mlxcel tune --op paged-decode-splits               # one op
+    ///     mlxcel tune -m models/llama-3.2-1b-instruct-4bit   # head geometry from a checkpoint
+    ///     mlxcel tune --dry-run                              # print the matrix, profile nothing
     ///
     /// Then run with `MLXCEL_AUTOTUNE=cache` to consume the tuned tactics, or
     /// `MLXCEL_AUTOTUNE=1` to additionally tune unseen shapes on first use.
@@ -316,6 +370,116 @@ pub(crate) struct RmArgs {
     pub(crate) revision: Option<String>,
 }
 
+/// Prompt-lookup (n-gram) speculative decoding options
+#[derive(Args, Debug, Clone)]
+#[command(next_help_heading = "Prompt Lookup Options")]
+pub(crate) struct PromptLookupOptions {
+    /// Speculate with prompt lookup: propose the tokens that followed an
+    /// earlier occurrence of the sequence's last few tokens, and verify them
+    /// in one target forward. No draft model is needed. Pays off on replies
+    /// that copy the prompt (edits, rewrites, reformatting); on other replies
+    /// proposals are shortened or paused so decoding stays near plain speed.
+    /// Text-only, attention-cache models.
+    #[arg(long, conflicts_with = "draft_model")]
+    pub(crate) prompt_lookup: bool,
+
+    /// Longest suffix n-gram matched against the context
+    #[arg(
+        long,
+        requires = "prompt_lookup",
+        default_value_t = mlxcel::PromptLookupConfig::default().ngram_max,
+        value_name = "N"
+    )]
+    pub(crate) prompt_lookup_ngram_max: usize,
+
+    /// Shortest suffix n-gram matched against the context
+    #[arg(
+        long,
+        requires = "prompt_lookup",
+        default_value_t = mlxcel::PromptLookupConfig::default().ngram_min,
+        value_name = "N"
+    )]
+    pub(crate) prompt_lookup_ngram_min: usize,
+
+    /// Maximum tokens proposed per round (the verify block is one wider)
+    #[arg(
+        long,
+        requires = "prompt_lookup",
+        default_value_t = mlxcel::PromptLookupConfig::default().max_draft,
+        value_name = "N"
+    )]
+    pub(crate) prompt_lookup_max_draft: usize,
+
+    /// Propose up to the maximum every round, instead of shortening or pausing
+    /// proposals while they stop landing (for A/B measurement)
+    #[arg(long, requires = "prompt_lookup")]
+    pub(crate) prompt_lookup_no_adaptive: bool,
+
+    /// How proposals are shortened and resumed: `gated` (narrow or full
+    /// blocks, resume only after a looked-up proposal comes true unverified;
+    /// tuned on CUDA), `graded` (block follows recent acceptance, probe again
+    /// after a short pause; tuned on Apple Silicon), or `auto` (`gated` on
+    /// CUDA builds, `graded` otherwise)
+    #[arg(
+        long,
+        value_enum,
+        requires = "prompt_lookup",
+        default_value_t = PromptLookupPolicyArg::Auto,
+        value_name = "POLICY"
+    )]
+    pub(crate) prompt_lookup_policy: PromptLookupPolicyArg,
+}
+
+/// `--prompt-lookup-policy` values; see [`mlxcel::DraftPolicy`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum PromptLookupPolicyArg {
+    /// The build's default: `gated` on CUDA, `graded` elsewhere.
+    #[default]
+    Auto,
+    /// Block follows recent acceptance; probe again after a short pause.
+    Graded,
+    /// Narrow or full blocks; resume only after an unverified proposal came
+    /// true.
+    Gated,
+}
+
+impl PromptLookupPolicyArg {
+    fn resolve(self) -> mlxcel::DraftPolicy {
+        match self {
+            Self::Auto => mlxcel::DraftPolicy::default_for_backend(),
+            Self::Graded => mlxcel::DraftPolicy::Graded,
+            Self::Gated => mlxcel::DraftPolicy::Gated,
+        }
+    }
+}
+
+impl Default for PromptLookupOptions {
+    fn default() -> Self {
+        let config = mlxcel::PromptLookupConfig::default();
+        Self {
+            prompt_lookup: false,
+            prompt_lookup_ngram_max: config.ngram_max,
+            prompt_lookup_ngram_min: config.ngram_min,
+            prompt_lookup_max_draft: config.max_draft,
+            prompt_lookup_no_adaptive: !config.adaptive,
+            prompt_lookup_policy: PromptLookupPolicyArg::Auto,
+        }
+    }
+}
+
+impl PromptLookupOptions {
+    pub(crate) fn config(&self) -> mlxcel::PromptLookupConfig {
+        mlxcel::PromptLookupConfig {
+            ngram_max: self.prompt_lookup_ngram_max,
+            ngram_min: self.prompt_lookup_ngram_min,
+            max_draft: self.prompt_lookup_max_draft,
+            adaptive: !self.prompt_lookup_no_adaptive,
+            policy: self.prompt_lookup_policy.resolve(),
+            ..mlxcel::PromptLookupConfig::default()
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 pub(crate) struct GenerateArgs {
     #[command(flatten)]
@@ -343,6 +507,9 @@ pub(crate) struct GenerateArgs {
     /// [`SpeculativeArgs`] for the rationale.
     #[command(flatten)]
     pub(crate) speculative: SpeculativeArgs,
+
+    #[command(flatten)]
+    pub(crate) prompt_lookup: PromptLookupOptions,
 
     // Axis A weight-load surgery configuration.
     // The closed-repo references stay in this non-doc comment so the
@@ -469,7 +636,8 @@ pub(crate) struct GenerationOptions {
     /// Audio file path for audio-language models (e.g. Gemma4 with audio).
     /// May be combined with `--video` on `gemma4_unified` checkpoints, which
     /// merge video frames and audio into one prompt; other families reject
-    /// that combination.
+    /// that combination. Nemotron VoiceChat checkpoints require it: the WAV
+    /// is the user's side of the duplex timeline and `-p` is the system prompt.
     #[arg(long, value_name = "PATH")]
     pub(crate) audio: Option<PathBuf>,
 
@@ -505,11 +673,30 @@ pub(crate) struct GenerationOptions {
     pub(crate) video_max_frames: usize,
 
     /// Write synthesized speech for the generated answer to this WAV path
-    /// (24 kHz mono PCM16). Qwen3-Omni models only; the talker + code2wav
-    /// speech stack is loaded lazily after text generation completes.
-    /// Text-only prompts for now (no --image / --audio / --video).
+    /// (mono PCM16). Qwen3-Omni: 24 kHz, the talker + code2wav speech stack
+    /// is loaded lazily after text generation completes, text-only prompts
+    /// for now (no --image / --audio / --video). Nemotron VoiceChat: 22.05 kHz
+    /// assistant speech for the whole `--audio` timeline.
     #[arg(long, value_name = "PATH")]
     pub(crate) output_audio: Option<PathBuf>,
+
+    /// Seconds of silence appended to the `--audio` input so a Nemotron
+    /// VoiceChat model can finish answering after the user stops speaking.
+    /// Ignored by every other family.
+    #[arg(long, value_name = "SECONDS", default_value_t = 3.0)]
+    pub(crate) extra_decoding_seconds: f32,
+
+    /// Nemotron VoiceChat: drive the cache-aware online session in 80 ms
+    /// frames instead of the offline timeline, printing text and transcript
+    /// deltas as each frame produces them. Combine with `--profile` for the
+    /// per-stage latency summary.
+    #[arg(long, default_value_t = false)]
+    pub(crate) stream: bool,
+
+    /// Nemotron VoiceChat `--stream`: stop with an error once the session
+    /// has consumed this many seconds of audio.
+    #[arg(long, value_name = "SECONDS")]
+    pub(crate) max_streaming_seconds: Option<f32>,
 
     /// Speaker voice for `--output-audio` (Qwen3-Omni talker; the released
     /// checkpoints ship ethan, chelsie, and aiden).
@@ -760,6 +947,11 @@ pub(crate) struct SamplingOptions {
         value_parser = parse_typical_p
     )]
     pub(crate) typical_p: f32,
+
+    /// Hyperparameter-free p-less sampling: keep tokens whose probability is
+    /// at least the sum of squared probabilities of the tempered distribution
+    #[arg(long = "p-less")]
+    pub(crate) p_less: bool,
 
     /// Repetition penalty multiplier
     #[arg(long, default_value_t = 1.0, value_name = "FLOAT")]
@@ -1050,17 +1242,17 @@ Remote Pipeline Parallel Example (TCP):
          examples/distributed/generated_pipeline_remote_2node_tcp.toml
 
   2. Start stage-1 on machine B:
-       mlxcel serve -m models/llama-3.2-1b-4bit \\
+       mlxcel serve -m models/llama-3.2-1b-instruct-4bit \\
          --distributed-config examples/distributed/generated_pipeline_remote_2node_tcp.toml \\
          --node-id stage-1 --host 0.0.0.0 --port 18081 --no-warmup
 
   3. Start stage-0 on machine A:
-       mlxcel serve -m models/llama-3.2-1b-4bit \\
+       mlxcel serve -m models/llama-3.2-1b-instruct-4bit \\
          --distributed-config examples/distributed/generated_pipeline_remote_2node_tcp.toml \\
          --node-id stage-0 --host 0.0.0.0 --port 18081 --no-warmup
 
   4. Start the coordinator on machine A:
-       mlxcel serve -m models/llama-3.2-1b-4bit --alias llama-remote-pp \\
+       mlxcel serve -m models/llama-3.2-1b-instruct-4bit --alias llama-remote-pp \\
          --distributed-config examples/distributed/generated_pipeline_remote_2node_tcp.toml \\
          --node-id coordinator --host 0.0.0.0 --port 18080 \\
          --parallel 2 --max-batch-size 2 --pp-micro-batch-size 2 \\
@@ -1362,6 +1554,16 @@ pub(crate) struct ServeArgs {
     )]
     draft_max: usize,
 
+    /// Largest active decode batch at which a prompt-lookup sequence runs
+    /// its own verify round (`--draft-kind prompt-lookup`). Each proposing
+    /// row costs one verify forward on top of the batched step, so on ticks
+    /// with more concurrent rows every row takes the plain batched step and
+    /// the drafter keeps observing the emitted tokens until the batch
+    /// shrinks. Must be at least 1. Defaults to 2, the largest batch at which
+    /// the GB10 concurrency measurement showed no aggregate loss.
+    #[arg(long, value_name = "N", default_value_t = mlxcel::server::speculative_dispatch::DEFAULT_PROMPT_LOOKUP_MAX_BATCH)]
+    prompt_lookup_max_batch: usize,
+
     /// Maximum concurrent decode sequences; explicit value keeps split --ctx-size windows
     #[arg(long, value_name = "N")]
     max_batch_size: Option<usize>,
@@ -1461,13 +1663,14 @@ pub(crate) struct ServeArgs {
     )]
     rerank_batch_size: usize,
 
-    /// Prefill chunk size in tokens (0 = disabled, default: 512)
+    /// Prefill chunk size in tokens (0 = disabled).
     ///
-    /// When set, long prompts are broken into chunks of this size and
-    /// decode steps are interleaved between chunks to prevent latency
-    /// spikes for active sequences.
-    #[arg(long, default_value_t = 512)]
-    prefill_chunk_size: usize,
+    /// Long prompts are broken into chunks of this size and decode steps are
+    /// interleaved between chunks to prevent latency spikes for active
+    /// sequences. [default: 2048 when no other sequence is decoding, 512 when
+    /// one is; MLXCEL_PREFILL_CHUNK overrides]
+    #[arg(long)]
+    prefill_chunk_size: Option<usize>,
 
     /// Decode ticks a parked chunked prefill yields before it is granted one
     /// (#1011).
@@ -1487,7 +1690,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "N")]
     prefill_grant_interval: Option<usize>,
 
-    /// Prefill batch size [llama-server alias for --prefill-chunk-size] [default: 512]
+    /// Prefill batch size [llama-server alias for --prefill-chunk-size]
     #[arg(
         short = 'b',
         long = "batch-size",
@@ -1561,7 +1764,7 @@ pub(crate) struct ServeArgs {
     /// mask, an O(B*L^2) transient. This caps the drained window by total
     /// padded tokens (rows * L); rows past the budget prefill via the chunked
     /// single-sequence path. Unset derives `max_batch_prefill *
-    /// prefill_chunk_size * 2` (2 * 4 * 512 = 4096). `0` disables the cap. Env
+    /// min(prefill_chunk_size, 512) * 2` (2 * 4 * 512 = 4096). `0` disables the cap. Env
     /// `MLXCEL_MAX_BATCH_PREFILL_TOKENS` overrides both.
     #[arg(long)]
     max_batch_prefill_tokens: Option<usize>,
@@ -1602,6 +1805,27 @@ pub(crate) struct ServeArgs {
         value_parser = parse_kv_cache_budget
     )]
     kv_cache_budget: Option<mlxcel::memory_estimate::PagedBudgetDirective>,
+
+    /// Fraction of the paged KV block budget a prefill admission keeps free
+    /// for running rows to keep decoding (issue #2088), in `0.0..=0.5`.
+    ///
+    /// Under a tight `--kv-cache-budget`, admitting a request into exactly the
+    /// free blocks leaves the decoding rows no room to grow, so the next decode
+    /// ticks preempt them and they re-prefill from scratch. With a watermark,
+    /// admission waits until the free blocks cover the request plus this share
+    /// of the budget, evicting cold prompt-cache prefixes (and, for a
+    /// higher-priority request, preempting strictly lower-priority rows) to
+    /// make that room. It applies only
+    /// while rows are decoding, so a request that fits the budget is never
+    /// refused. `0` disables it. Ignored without a block budget. Defaults to
+    /// 0.01. Also reads `MLXCEL_KV_ADMISSION_WATERMARK`.
+    #[arg(
+        long = "kv-admission-watermark",
+        env = "MLXCEL_KV_ADMISSION_WATERMARK",
+        value_name = "FRACTION",
+        value_parser = mlxcel::server::parse_kv_admission_watermark
+    )]
+    kv_admission_watermark: Option<f64>,
 
     /// Maximum number of responses persisted by the OpenAI
     /// `/v1/responses` store (in-memory). `0` disables persistence
@@ -3020,6 +3244,7 @@ const FAMILY_ORDER: &[&str] = &[
     "BitNet",
     "Speech-to-text",
     "Text-to-speech",
+    "Speech",
     "Embedding",
     "Reranker",
     "Diffusion",

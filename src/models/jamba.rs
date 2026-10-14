@@ -470,11 +470,18 @@ impl JambaAttention {
             (keys, values)
         };
 
-        let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
-        let output = unsafe {
-            mlxcel_core::layers::attention_from_ptr(
-                &queries, &keys, &values, self.scale, mask_ptr, 0.0, 0,
-            )
+        // A multi-token forward with no mask is a causal prefill; the
+        // unmasked `attention_from_ptr` path is not causal, so take MLX's
+        // maskless causal SDPA mode explicitly.
+        let output = if mask.is_none() && seq_len > 1 {
+            mlxcel_core::causal_attention(&queries, &keys, &values, self.scale, 0.0, 0)
+        } else {
+            let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
+            unsafe {
+                mlxcel_core::layers::attention_from_ptr(
+                    &queries, &keys, &values, self.scale, mask_ptr, 0.0, 0,
+                )
+            }
         };
 
         // Transpose back and reshape
@@ -483,6 +490,14 @@ impl JambaAttention {
 
         self.o_proj.forward(&output)
     }
+}
+
+// Timesteps walked by the per-step graph scan on this thread (tests only).
+// Issue #1981: on a backend with a fused-scan port the prefill must not take
+// that loop, which issues several small ops per timestep per Mamba layer.
+#[cfg(test)]
+thread_local! {
+    pub(super) static GRAPH_SCAN_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 // Jamba Mamba Mixer.
@@ -546,6 +561,51 @@ impl JambaMambaMixer {
         // delta = softplus(dt_proj(delta))
         let delta = mlxcel_core::softplus(&self.dt_proj.forward(&delta));
 
+        // Fused selective scan: one kernel walks every timestep of the layer,
+        // for prefill and decode alike so the two stay numerically consistent.
+        // On Metal (issue #2005) and ROCm (issue #2069) it carries the state
+        // in float32 registers; on CUDA (issue #1981) it rounds each step
+        // exactly as the graph scan below does, so output is unchanged there.
+        // The graph scan remains for mixed-dtype inputs on CUDA, the CPU and
+        // `MLXCEL_MAMBA1_SCAN_KERNEL=0`.
+        if mlxcel_core::mamba1_scan_kernel_accepts(x, &delta, &b, &c, a, &self.d_param) {
+            let zeros;
+            let state_in = match state {
+                Some(s) => s,
+                None => {
+                    zeros = mlxcel_core::zeros(
+                        &[
+                            batch,
+                            self.intermediate_size as i32,
+                            self.ssm_state_size as i32,
+                        ],
+                        mlxcel_core::dtype::FLOAT32,
+                    );
+                    zeros.as_ref().unwrap()
+                }
+            };
+            let mut y = UniquePtr::null();
+            let mut state_out = UniquePtr::null();
+            mlxcel_core::mamba1_selective_scan(
+                x,
+                &delta,
+                &b,
+                &c,
+                a,
+                &self.d_param,
+                state_in,
+                &mut y,
+                &mut state_out,
+            )
+            .expect(
+                "mamba1_scan_kernel_accepts() checked the port, so the launcher must not refuse",
+            );
+            return (y, state_out);
+        }
+
+        #[cfg(test)]
+        GRAPH_SCAN_STEPS.with(|n| n.set(n.get() + seq_len as usize));
+
         // new_state = (delta * x)[..., None] * B[..., None, :]
         let delta_x = mlxcel_core::multiply(&delta, x);
         let delta_x_exp = mlxcel_core::reshape(
@@ -584,45 +644,40 @@ impl JambaMambaMixer {
             return (y, updated_t);
         }
 
-        // Sequential scan through timesteps (runs regardless of initial state)
-        // Python: for t in range(T): if state: new_state[:,t] = state*dtA[:,t] + new_state[:,t]; state = new_state[:,t]
+        // Sequential scan through timesteps. Each step reads the output row
+        // `y_t = state_t @ C_t` right away, the same per-step product the
+        // single-token branch above computes, and the rows are stacked once at
+        // the end. Materializing every `[B, D, N]` state and concatenating it
+        // one step at a time (as this used to) re-copied the growing tensor on
+        // every step, which made prefill quadratic in the prompt length.
         let mut current_state = state.map(mlxcel_core::copy);
-        let mut updated_states: Vec<UniquePtr<MlxArray>> = Vec::new();
+        let mut y_steps: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(seq_len as usize);
 
         for t in 0..seq_len {
-            let new_state_t = slice_axis(&new_state, 1, t, t + 1);
-            let new_state_t = mlxcel_core::squeeze_axis(&new_state_t, 1);
-            let dt_a_t = slice_axis(&dt_a, 1, t, t + 1);
-            let dt_a_t = mlxcel_core::squeeze_axis(&dt_a_t, 1);
-
+            let new_state_t = mlxcel_core::squeeze_axis(&slice_axis(&new_state, 1, t, t + 1), 1);
             let updated_t = if let Some(ref prev) = current_state {
                 // new_state[:, t] = state * dtA[:, t] + new_state[:, t]
+                let dt_a_t = mlxcel_core::squeeze_axis(&slice_axis(&dt_a, 1, t, t + 1), 1);
                 let prev_contrib = mlxcel_core::multiply(prev, &dt_a_t);
                 mlxcel_core::add(&prev_contrib, &new_state_t)
             } else {
                 new_state_t
             };
 
-            // state = new_state[:, t]
-            current_state = Some(mlxcel_core::copy(&updated_t));
-            updated_states.push(mlxcel_core::expand_dims(&updated_t, 1));
+            let c_t = mlxcel_core::squeeze_axis(&slice_axis(&c, 1, t, t + 1), 1);
+            let c_exp = mlxcel_core::reshape(&c_t, &[batch, self.ssm_state_size as i32, 1]);
+            y_steps.push(mlxcel_core::squeeze_axis(
+                &mlxcel_core::matmul(&updated_t, &c_exp),
+                -1,
+            ));
+            current_state = Some(updated_t);
         }
 
-        // Stack all updated states
-        let final_new_state = if updated_states.len() == 1 {
-            mlxcel_core::copy(updated_states[0].as_ref().unwrap())
-        } else {
-            let mut result = mlxcel_core::copy(updated_states[0].as_ref().unwrap());
-            for st in updated_states.iter().skip(1) {
-                result = concatenate(&result, st.as_ref().unwrap(), 1);
-            }
-            result
-        };
-
-        // y = (new_state @ C[..., None]).squeeze(-1)
-        let c_exp = mlxcel_core::reshape(&c, &[batch, seq_len, self.ssm_state_size as i32, 1]);
-        let y = mlxcel_core::matmul(&final_new_state, &c_exp);
-        let y = mlxcel_core::squeeze_axis(&y, -1);
+        let y_ptrs: Vec<*const MlxArray> = y_steps
+            .iter()
+            .map(|arr| arr.as_ref().unwrap() as *const MlxArray)
+            .collect();
+        let y = mlxcel_core::stack(&y_ptrs, 1);
 
         // y = y + D * x
         let d_reshaped =
@@ -766,7 +821,6 @@ struct JambaModelBackbone {
     layers: Vec<JambaDecoderLayer>,
     final_layernorm: RMSNorm,
     layers_block_type: Vec<String>,
-    attn_idx: usize,
 }
 
 impl JambaModelBackbone {
@@ -777,26 +831,11 @@ impl JambaModelBackbone {
     ) -> UniquePtr<MlxArray> {
         let mut h = self.embed_tokens.forward(inputs);
 
-        // Create attention mask
-        let mask = {
-            let shape = mlxcel_core::array_shape(&h);
-            let seq_len = shape[1];
-            if seq_len > 1 {
-                let offset = caches
-                    .as_ref()
-                    .map(|c| {
-                        if self.attn_idx < c.len() {
-                            c[self.attn_idx].offset()
-                        } else {
-                            0
-                        }
-                    })
-                    .unwrap_or(0);
-                Some(create_causal_mask(seq_len, offset))
-            } else {
-                None
-            }
-        };
+        // No attention mask: the prefill mask would be plain bottom-right
+        // causal (full attention, no window), so the attention layers take
+        // MLX's maskless causal SDPA for multi-token inputs instead of reading
+        // an `[L, L + offset]` array, as mlx-lm passes `"causal"`.
+        let mask: Option<UniquePtr<MlxArray>> = None;
 
         if let Some(cache_slice) = caches {
             for (layer, cache) in self.layers.iter().zip(cache_slice.iter_mut()) {
@@ -860,10 +899,29 @@ impl JambaModel {
         caches: Option<&mut [JambaLayerCache]>,
     ) -> UniquePtr<MlxArray> {
         let out = self.model.forward(inputs, caches);
+        self.logits_from_hidden(&out)
+    }
+
+    /// Logits `[B, 1, vocab]` for position `last_pos` only: the backbone's
+    /// final-normed hidden state is sliced before the LM head, which acts per
+    /// position.
+    pub fn last_logits_with_caches(
+        &self,
+        inputs: &MlxArray,
+        caches: Option<&mut [JambaLayerCache]>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        let out = self.model.forward(inputs, caches);
+        let row = mlxcel_core::generate::logits_at_position(&out, last_pos);
+        self.logits_from_hidden(&row)
+    }
+
+    /// LM head (or the tied embedding) over normalized hidden states.
+    fn logits_from_hidden(&self, h: &MlxArray) -> UniquePtr<MlxArray> {
         if let Some(ref head) = self.lm_head {
-            head.forward(&out)
+            head.forward(h)
         } else {
-            self.model.embed_tokens.as_linear(&out)
+            self.model.embed_tokens.as_linear(h)
         }
     }
 
@@ -954,13 +1012,13 @@ impl JambaModel {
         let path = Path::new(model_path);
 
         // Load config
-        println!("[Jamba] Loading config...");
+        tracing::info!("[Jamba] Loading config...");
         let config_path = path.join("config.json");
         let config_str = std::fs::read_to_string(&config_path)?;
         let config_str = super::sanitize_config_json(&config_str);
         let mut config: JambaConfig = serde_json::from_str(&config_str)?;
         config.post_init();
-        println!(
+        tracing::info!(
             "[Jamba] Config loaded: {} layers ({} attention, {} mamba)",
             config.num_hidden_layers,
             config
@@ -976,17 +1034,17 @@ impl JambaModel {
         );
 
         // Load weights
-        println!("[Jamba] Loading weights from safetensors...");
+        tracing::info!("[Jamba] Loading weights from safetensors...");
         let weights = crate::models::load_text_weights(path, None)?;
 
         // Process weights
         let weights = Self::sanitize_weights(weights, &config);
 
         // Build model
-        println!("[Jamba] Building model...");
+        tracing::info!("[Jamba] Building model...");
         let model = Self::from_weights(config.clone(), weights)?;
 
-        println!("[Jamba] Model loaded successfully");
+        tracing::info!("[Jamba] Model loaded successfully");
         Ok((model, config))
     }
 
@@ -1028,12 +1086,6 @@ impl JambaModel {
         mut weights: WeightMap,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let layers_block_type = config.get_layers_block_type();
-
-        // Find first attention layer index
-        let attn_idx = layers_block_type
-            .iter()
-            .position(|t| t == "attention")
-            .unwrap_or(0);
 
         // Get quantization parameters
         let group_size = config.group_size();
@@ -1266,7 +1318,6 @@ impl JambaModel {
             layers,
             final_layernorm,
             layers_block_type,
-            attn_idx,
         };
 
         Ok(Self {
@@ -1347,6 +1398,49 @@ impl LanguageModel for JambaModel {
             || JambaModel::make_caches(self),
             |internal| self.forward_with_caches(input_ids, Some(internal)),
         )
+    }
+
+    // The last-logits entry points mirror `forward` and
+    // `forward_with_sequence_id` (same sequence state) and slice before the
+    // head. The embeddings variant follows the trait defaults, which route an
+    // embeddings forward to plain `forward` for this model.
+    fn forward_last_logits(
+        &self,
+        input_ids: &MlxArray,
+        _caches: &mut [KVCache],
+        _mask: Option<&MlxArray>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        self.sequence_state.with_sequence_state(None, |internal| {
+            self.last_logits_with_caches(input_ids, Some(internal), last_pos)
+        })
+    }
+
+    fn forward_last_logits_with_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        seq_id: Option<mlxcel_core::cache::SequenceId>,
+        _caches: &mut [KVCache],
+        _mask: Option<&MlxArray>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        self.sequence_state.with_or_create_sequence_state(
+            seq_id,
+            || JambaModel::make_caches(self),
+            |internal| self.last_logits_with_caches(input_ids, Some(internal), last_pos),
+        )
+    }
+
+    fn forward_last_logits_with_embeddings_and_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        _input_embeddings: Option<&MlxArray>,
+        _seq_id: Option<mlxcel_core::cache::SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_last_logits(input_ids, caches, mask, last_pos)
     }
 
     fn supports_snapshot_reuse(&self) -> bool {

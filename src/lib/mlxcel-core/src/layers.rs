@@ -126,6 +126,19 @@ impl QuantizedWeight {
         }
     }
 
+    /// Whether this is an affine 1-bit triple (issue #1370).
+    ///
+    /// MLX has no kernel at this width. The bridge primitives
+    /// (`quantized_matmul`, `quantized_linear_forward`, `dequantize`,
+    /// `quantized_embedding`) route such a triple to mlxcel's own 1-bit
+    /// kernels, but the fused C++ helpers that call MLX's `quantized_matmul`
+    /// internally do not, so every accessor that feeds one of them answers
+    /// `None` for a 1-bit weight and the caller takes its graph fallback.
+    #[must_use]
+    pub fn is_one_bit(&self) -> bool {
+        self.bits == 1 && self.mode == "affine"
+    }
+
     /// Get raw pointer to the optional NVFP4 `weight_scale_2` sidecar (null if
     /// absent). Used by the fused compiled paths that fold the per-projection
     /// global scale in place of `apply_global_scale` (issue #698).
@@ -335,6 +348,8 @@ impl QuantizedEmbedding {
         // it, because `infer_quantization_mode` derives the mode from exactly
         // this predicate.
         validate_quantization_biases(mode, biases.is_some())
+            .map_err(|e| format!("{e} (prefix: {prefix})"))?;
+        validate_one_bit_layout(layout.bits, layout.group_size, mode, biases.is_some())
             .map_err(|e| format!("{e} (prefix: {prefix})"))?;
 
         Ok(Self {
@@ -678,16 +693,140 @@ fn fused_qk_norm_enabled_from(value: Option<&str>) -> bool {
     }
 }
 
+// ── Dense-GEMM prefill (issues #1994, #2001, #2081) ──────────────────────────
+
+/// Whether [`UnifiedLinear`] should run this quantized projection as
+/// `dequantize` + dense matmul (issues #1994, #2001, #2081): an affine weight
+/// whose scales share the input's dtype (f16 or bf16), a 2-D weight, at least
+/// `min_rows` input rows (the product of every axis but the last, so a server
+/// batch counts all of its rows), more than 512 output tiles of 32 x 32, and a
+/// backend whose `quantized_matmul` runs the same GEMM for this shape
+/// ([`ffi::quantized_matmul_matches_dense_gemm`]). The dense path is an
+/// optimization, so wherever it runs it must return the bytes
+/// `quantized_matmul` would have.
+///
+/// With matching dtypes the dequantized weight equals what `quantized_matmul`
+/// reconstructs in registers, so on Metal the two differ only if they tile the
+/// output differently. Above 512 tiles they do not: an in-tree sweep over f16
+/// and bf16, M 1024 and 2048, K 2048 to 4096 and N 256 to 4096 found identical
+/// bytes in every such cell, and differences only at or below 512 tiles (for
+/// example M 1024 with N 512 or narrower), where `qmm_splitk` targets about 512
+/// threadgroups. Those narrow projections stay on `quantized_matmul`. On Metal
+/// and CUDA the backend check always passes, so the tile count is the rule.
+///
+/// On ROCm the tile count says nothing: which kernel `quantized_matmul` runs
+/// depends on dtype, rows and device, and only one of its routes matches the
+/// dense path. Measured on gfx1151 (#2081), bf16, x `[1, 1024, 2048]` against
+/// a 4-bit g64 `[1024, 2048]` weight: the fused `qmm_wmma_dense_kernel`
+/// accumulates through rocWMMA 16 x 16 x 16 tiles in its own K order, and
+/// 499 of 1,048,576 outputs differed from `dequantize` + hipBLASLt (465 by
+/// 1 ULP, 10 by 2, 24 by more, all on outputs below 0.01 in magnitude where
+/// cancellation inflates the ULP distance). f16 matched because its
+/// `quantized_matmul` also dequantizes and calls hipBLASLt. The ROCm overlay
+/// now hands a bf16 GEMM of 128 rows or more on RDNA 3.5 to that same
+/// dequantize + hipBLASLt route, which was faster there on every shape
+/// measured (1.0x to 3.1x at 128 rows, up to 5.1x at 2048; LOCAL_FIXES
+/// item 29), so bf16 matches at those shapes too. The shapes that
+/// still take the WMMA kernel, the fp8 path or qmv (fewer rows, other devices,
+/// the `MLX_ROCM_*` overrides, a batch axis above 1) fail the backend check and
+/// stay on `quantized_matmul`. See
+/// `docs/benchmark_results/rocm-bf16-qmm-route-gfx1151-2026-09-30.md`.
+pub(crate) fn prefill_dense_gemm_eligible(
+    x: &MlxArray,
+    weight: &QuantizedWeight,
+    min_rows: i64,
+) -> bool {
+    let x_dtype = ffi::array_dtype(x);
+    let w_shape = ffi::array_shape(&weight.weight);
+    if weight.mode != "affine"
+        || !(x_dtype == crate::dtype::FLOAT16 || x_dtype == crate::dtype::BFLOAT16)
+        || ffi::array_dtype(&weight.scales) != x_dtype
+        || w_shape.len() != 2
+    {
+        return false;
+    }
+    let shape = ffi::array_shape(x);
+    let rows: i64 = shape[..shape.len().saturating_sub(1)]
+        .iter()
+        .map(|&d| d as i64)
+        .product();
+    let tiles = ((rows + 31) / 32) * ((w_shape[0] as i64 + 31) / 32);
+    if rows < min_rows || tiles <= DENSE_GEMM_MIN_OUTPUT_TILES {
+        return false;
+    }
+    // SAFETY: every reference is a live array owned by `x` or `weight`, and
+    // `biases_ptr` is either null or points into `weight`, which outlives the
+    // call; the bridge only reads shapes and dtypes.
+    unsafe {
+        ffi::quantized_matmul_matches_dense_gemm(
+            x,
+            &weight.weight,
+            &weight.scales,
+            weight.biases_ptr(),
+            weight.group_size,
+            weight.bits,
+        )
+    }
+}
+
+/// Output-tile count (32 x 32 tiles of the `[rows, N]` result) at or below
+/// which the dense path is not byte-identical to `quantized_matmul`; see
+/// [`prefill_dense_gemm_eligible`].
+const DENSE_GEMM_MIN_OUTPUT_TILES: i64 = 512;
+
+/// `x @ dequantize(W)^T (+ bias)` for a projection that
+/// [`prefill_dense_gemm_eligible`] accepts at the process threshold
+/// ([`crate::hardware::prefill_dense_gemm_min_rows`]); `None` otherwise.
+fn prefill_dense_gemm_forward(
+    x: &MlxArray,
+    weight: &QuantizedWeight,
+    bias: Option<&UniquePtr<MlxArray>>,
+) -> Option<UniquePtr<MlxArray>> {
+    let min_rows = crate::hardware::prefill_dense_gemm_min_rows()?;
+    if !prefill_dense_gemm_eligible(x, weight, min_rows) {
+        return None;
+    }
+    Some(dense_gemm(x, weight, bias))
+}
+
+fn dense_gemm(
+    x: &MlxArray,
+    weight: &QuantizedWeight,
+    bias: Option<&UniquePtr<MlxArray>>,
+) -> UniquePtr<MlxArray> {
+    let dense = unsafe {
+        ffi::dequantize(
+            &weight.weight,
+            &weight.scales,
+            weight.biases_ptr(),
+            weight.group_size,
+            weight.bits,
+            &weight.mode,
+        )
+    };
+    let y = ffi::matmul(x, &ffi::transpose(&dense));
+    match bias {
+        Some(b) => ffi::add(&y, b),
+        None => y,
+    }
+}
+
 // ── Fused residual-add + RMSNorm (issue #905) ────────────────────────────────
 
 /// Default for the fused residual-add + RMSNorm decode path.
 ///
 /// **This is the one place to flip if the measurement does not justify the
-/// fusion.** `MLXCEL_FUSED_ADD_RMSNORM=0` disables it at runtime without a
-/// rebuild; setting this constant to `false` makes off the default and
-/// `MLXCEL_FUSED_ADD_RMSNORM=1` the opt-in.
+/// fusion.** The default is per build: off on Metal and CUDA builds, on in a
+/// `rocm` build. `MLXCEL_FUSED_ADD_RMSNORM=0` disables it at runtime without a
+/// rebuild and `MLXCEL_FUSED_ADD_RMSNORM=1` enables it, on every backend.
 ///
-/// Default-OFF: measured, and the measurement did not justify wiring it on.
+/// The feature flag is the backend here, the same way PR #2098 set the ROCm
+/// `MLXCEL_FUSED_MOE_SGY` default under `MLXCEL_BRIDGE_ROCM_BACKEND`: a `rocm`
+/// build compiles no Metal or CUDA backend, so no runtime backend comparison is
+/// needed (and `scripts/ci/check_kernel_port_dispatch.py` rejects one).
+///
+/// Metal and CUDA: default-OFF. Measured, and the measurement did not justify
+/// wiring it on.
 ///
 /// Op-level microbench on Apple M1 Ultra (Metal, f16, hidden {2048, 4096,
 /// 8192} x batch {1, 4, 8}, three repetitions) put the fused path at roughly
@@ -701,23 +840,47 @@ fn fused_qk_norm_enabled_from(value: Option<&str>) -> bool {
 /// Issue #905's measure-then-keep policy says a fusion lands unwired unless
 /// the microbench shows a win, so the kernel ships available but off, matching
 /// how `MLXCEL_FUSED_QK_NORM` (#326) shipped after the same outcome. Set
-/// `MLXCEL_FUSED_ADD_RMSNORM=1` to opt in. Flip this constant to `true` if a
-/// quiet host, a harness that amortizes dispatch cost, or another backend
-/// demonstrates a win. See
-/// `docs/benchmark_results/fused-norm-rope-m1ultra-2026-07-31.md`.
-pub(crate) const FUSED_ADD_RMSNORM_DEFAULT: bool = false;
+/// `MLXCEL_FUSED_ADD_RMSNORM=1` to opt in.
+///
+/// The production decode path confirms it (M1 Ultra, `mlxcel-bench-decode`
+/// pp512/tg128, off/on alternated four times each, fused kernel proven to run
+/// only in the on arm): Llama 3.1 8B decode 113.18 vs 113.01 tok/s (-0.15%),
+/// Qwen2.5 7B 115.38 vs 115.34, prefill unchanged, greedy identical. One add
+/// and one RMSNorm per serial block join do not move decode; the Cohere2
+/// fusion that gained (+1.1 to 2.7%) merged two adds and a LayerNorm in a
+/// parallel block. Flip this constant only on a backend that measures a win.
+/// See `docs/benchmark_results/fused-norm-rope-m1ultra-2026-07-31.md` and
+/// `docs/benchmark_results/fused-add-rmsnorm-decode-m1ultra-2026-09-27.md`.
+///
+/// ROCm: default-ON (#2145). The HIP port (#2063, PR #2107) is byte-identical
+/// to the ROCm graph it replaces (every on/off logit-trace pair identical), and
+/// on gfx1151 it was never slower in a median: Llama 3.1 8B decode 37.85 tok/s
+/// off and 37.95 on (medians of five), Qwen2.5 7B +1.5% alone and +1.7% with
+/// the RoPE fusion. The gains sit inside run-to-run drift, but the change costs
+/// no accuracy, so the maintainer turned both fusions on for ROCm. See
+/// `docs/benchmark_results/rocm-fused-norm-rope-gfx1151-2026-10-05.md`, which
+/// also has the re-measurement of the default-on build.
+pub(crate) const FUSED_ADD_RMSNORM_DEFAULT: bool = cfg!(feature = "rocm");
 
 /// Default for the fused q/k RoPE + KV-append-layout decode path. Same
-/// flip-here contract and the same measured outcome as
-/// [`FUSED_ADD_RMSNORM_DEFAULT`], so it also ships opt-in via
-/// `MLXCEL_FUSED_ROPE_APPEND=1`.
+/// flip-here contract and the same per-build default as
+/// [`FUSED_ADD_RMSNORM_DEFAULT`]: off on Metal and CUDA (opt in with
+/// `MLXCEL_FUSED_ROPE_APPEND=1`), on in a `rocm` build (opt out with `=0`).
 ///
-/// One cell was consistently below parity rather than merely noisy: hidden
-/// 8192 at batch 1 measured 0.94x, 0.90x and 0.89x across three repetitions.
-/// That is the single reproducible signal in the sweep and it points the wrong
-/// way, which is the stronger reason to leave this unwired until a backend or
-/// shape is found where it wins.
-pub(crate) const FUSED_ROPE_APPEND_DEFAULT: bool = false;
+/// Metal: one cell was consistently below parity rather than merely noisy:
+/// hidden 8192 at batch 1 measured 0.94x, 0.90x and 0.89x across three
+/// repetitions. That is the single reproducible signal in the sweep and it
+/// points the wrong way, which is the stronger reason to leave this unwired
+/// there until a shape is found where it wins.
+///
+/// ROCm (#2145): the HIP port (#2063) is byte-identical to the graph, and on
+/// gfx1151 Qwen2.5 7B decode gained 0.6% with this kernel alone and 1.7% with
+/// both fusions (medians of seven), inside the drift between runs but never
+/// slower, so it is on by default with the norm fusion. Llama 3.1's
+/// `rope_scaling` frequency table still routes around it (see
+/// `report_fused_rope_bypass_once` in `src/models/llama3.rs`). Same results
+/// page as [`FUSED_ADD_RMSNORM_DEFAULT`].
+pub(crate) const FUSED_ROPE_APPEND_DEFAULT: bool = cfg!(feature = "rocm");
 
 /// Whether the fused residual-add + RMSNorm path (#905) is enabled.
 ///
@@ -729,7 +892,9 @@ pub(crate) const FUSED_ROPE_APPEND_DEFAULT: bool = false;
 /// over long generation. The two differ only by the rounding of the residual
 /// sum feeding the sum of squares (see `fused_norm.cpp`), which is far below
 /// the argmax-flip scale, but a near-tie argmax can still land on the other
-/// side. That is a tie-break difference, not a regression.
+/// side. That is a tie-break difference, not a regression. The ROCm HIP port
+/// (#2063) measured byte-identical to the ROCm graph instead: every on/off
+/// logit-trace pair in its results page matched.
 pub fn fused_add_rmsnorm_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -755,13 +920,22 @@ pub fn fused_rope_append_enabled() -> bool {
 /// value takes `default` rather than silently disabling: a typo in a deployment
 /// script should not quietly change the decode graph.
 fn fused_flag_enabled_from(value: Option<&str>, default: bool) -> bool {
-    match value {
-        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "0" | "false" | "off" | "no" => false,
-            "1" | "true" | "on" | "yes" => true,
-            _ => default,
-        },
-        None => default,
+    fused_flag_explicit_value(value).unwrap_or(default)
+}
+
+/// The explicit setting a #905 kill-switch value spells, if any: `Some(false)`
+/// for `0`/`false`/`off`/`no`, `Some(true)` for `1`/`true`/`on`/`yes`
+/// (case-insensitive, trimmed), and `None` when the variable is unset or the
+/// value is unrecognised, which is when the compiled-in default applies.
+///
+/// Public so a caller can tell "the user asked for this" apart from "the build
+/// defaults to this": the Llama 3.1 RoPE bypass notice (#2145) must fire only
+/// for the former, now that the ROCm default is on.
+pub fn fused_flag_explicit_value(value: Option<&str>) -> Option<bool> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => Some(false),
+        "1" | "true" | "on" | "yes" => Some(true),
+        _ => None,
     }
 }
 
@@ -863,7 +1037,8 @@ pub fn fused_add_rms_norm<N: FusedAddRmsNormSpec + ?Sized>(
             norm.norm_weight_bias(),
             &mut normed,
             &mut new_residual,
-        );
+        )
+        .expect("fused_add_rms_norm_eligible() checked the port, so the launcher must not refuse");
         return (normed, new_residual);
     }
     graph_add_rms_norm(norm, delta, residual)
@@ -884,22 +1059,46 @@ pub fn graph_add_rms_norm<N: FusedAddRmsNormSpec + ?Sized>(
     (normed, new_residual)
 }
 
-/// Whether this backend has a fused-add-RMSNorm kernel, asked once.
+/// Whether the fused-add-RMSNorm kernel can run now: the default device is the
+/// GPU and the backend has a port (Metal, CUDA, ROCm since #2063).
 ///
-/// The FFI answer reaches `metal::is_available()` / `cu::is_available()` in
+/// The port half is asked once. The FFI answer reaches the backend probes in
 /// C++, and the backend cannot change mid-process, so re-asking at every
 /// residual join of every layer of every token would be pure overhead on the
-/// path the fusion exists to make cheaper.
+/// path the fusion exists to make cheaper. The device half is not cached: a
+/// custom kernel throws on the CPU stream, and `MLXCEL_DEVICE=cpu` or a
+/// `DefaultDeviceGuard` moves the default device, so it is read on every call
+/// (one FFI read of MLX's default device). The C++ predicate checks the device
+/// too, and another thread can move it between the two reads, so only a `true`
+/// answer is cached: a `false` taken in that window would otherwise switch the
+/// fusion off for the rest of the process.
 fn fused_add_rms_norm_backend_available() -> bool {
-    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(ffi::fused_add_rms_norm_available)
+    static PORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    gpu_port_available(&PORTED, ffi::fused_add_rms_norm_available)
 }
 
-/// Whether this backend has a fused RoPE + append kernel, asked once. Same
-/// reasoning as [`fused_add_rms_norm_backend_available`].
+/// Whether the fused RoPE + append kernel can run now. Same split between a
+/// cached port check and a per-call device check as
+/// [`fused_add_rms_norm_backend_available`].
 fn fused_rope_append_backend_available() -> bool {
-    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(ffi::fused_rope_qk_append_available)
+    static PORTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    gpu_port_available(&PORTED, ffi::fused_rope_qk_append_available)
+}
+
+/// The GPU-default check, then `predicate`, which is asked until it first
+/// answers `true` and not after.
+fn gpu_port_available(ported: &std::sync::OnceLock<()>, predicate: fn() -> bool) -> bool {
+    if !ffi::default_device_is_gpu() {
+        return false;
+    }
+    if ported.get().is_some() {
+        return true;
+    }
+    let available = predicate();
+    if available {
+        let _ = ported.set(());
+    }
+    available
 }
 
 /// Whether the fused kernel can serve this call.
@@ -908,8 +1107,15 @@ fn fused_rope_append_backend_available() -> bool {
 /// and an exception crossing the cxx boundary is not recoverable, so the
 /// eligibility test lives here and the fused branch is only taken when the
 /// launcher cannot throw: matching shapes and dtypes, a 1-D weight whose length
-/// is the trailing dimension, and a backend that has a custom-kernel JIT at all
-/// (false on a CPU-only build).
+/// is the trailing dimension, and a backend that has a port of this kernel on
+/// the current default device (false on a CPU-only build and on the CPU device
+/// of a GPU build).
+///
+/// One class is no longer in that list. A backend with no port used to reach
+/// the Metal arm and abort; issue #1885 made the launcher refuse and its bridge
+/// declaration `Result`, so that case is recoverable. The check stays here
+/// anyway, because deciding before building the call is cheaper than letting
+/// the launcher refuse, and because the other classes still cannot be.
 fn fused_add_rms_norm_eligible(delta: &MlxArray, residual: &MlxArray, weight: &MlxArray) -> bool {
     if !fused_add_rms_norm_backend_available() || ffi::array_ndim(weight) != 1 {
         return false;
@@ -918,7 +1124,11 @@ fn fused_add_rms_norm_eligible(delta: &MlxArray, residual: &MlxArray, weight: &M
     let Some(&trailing) = d_shape.last() else {
         return false;
     };
-    ffi::array_shape(weight)[0] == trailing
+    // An empty input would launch a zero-size grid, and a zero-width row would
+    // divide by zero in the launcher; the graph handles both.
+    trailing > 0
+        && d_shape.iter().all(|&d| d > 0)
+        && ffi::array_shape(weight)[0] == trailing
         && ffi::array_shape(residual) == d_shape
         && ffi::array_dtype(delta) == ffi::array_dtype(residual)
 }
@@ -928,7 +1138,7 @@ fn fused_add_rms_norm_eligible(delta: &MlxArray, residual: &MlxArray, weight: &M
 /// The kernel emits the K/V append payload in the layout its destination
 /// consumes, so the cache append stays an O(new tokens) donated `slice_update`
 /// instead of the O(capacity) slab copy an in-kernel write would force. See
-/// `src/lib/mlx-cpp/turbo/fused_rope_append.h` for why the write itself cannot
+/// `src/lib/mlxcelverse/kernels/fused_rope_append.h` for why the write itself cannot
 /// be fused under MLX's custom-kernel contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FusedRopeDestLayout {
@@ -975,6 +1185,84 @@ impl LayerNorm {
 
         unsafe { ffi::fast_layer_norm(x, weight_ptr, bias_ptr, self.eps) }
     }
+}
+
+/// Largest normalized dimension MLX's single-row `layer_norm` kernel handles
+/// (`looped_limit` in `mlx/backend/metal/normalization.cpp`). The Metal kernel
+/// copies that kernel, so it covers the same range. The ROCm port (#2069) keeps
+/// its row in registers sized from this bound (28 floats per thread).
+const FUSED_ADD3_LAYER_NORM_MAX_DIM: i32 = 6656;
+
+fn fused_add3_layer_norm_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("MLXCEL_FUSED_ADD_NORM").as_deref(),
+            Ok("0" | "off" | "false" | "no")
+        )
+    })
+}
+
+/// Residual add fused with the LayerNorm that consumes it: returns
+/// `(x_new, norm(x_new))` with `x_new = (a + b) + x`.
+///
+/// A parallel-residual block ends in `(attn + mlp) + x` and the next block
+/// starts with a LayerNorm of that sum. Unfused that is a compiled add kernel
+/// and a norm kernel, two dependent dispatches (two barrier levels) per layer
+/// boundary on the decode critical path. On Metal and ROCm (#2069) this runs one
+/// kernel whose outputs are byte-identical to that backend's pair; elsewhere,
+/// or when the shapes and dtypes fall outside what the kernel covers, it runs
+/// the pair itself.
+/// `MLXCEL_FUSED_ADD_NORM=0` forces the unfused pair.
+///
+/// Used by: Cohere2
+pub fn residual_add3_layer_norm(
+    a: &MlxArray,
+    b: &MlxArray,
+    x: &MlxArray,
+    norm: &LayerNorm,
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    let shape = ffi::array_shape(x);
+    let dtype = ffi::array_dtype(x);
+    let dim = shape.last().copied().unwrap_or(0);
+    let weight = norm.weight.as_ref().unwrap();
+    let fusable = fused_add3_layer_norm_enabled()
+        && ffi::fused_add3_layer_norm_available()
+        && dim > 0
+        && dim <= FUSED_ADD3_LAYER_NORM_MAX_DIM
+        && matches!(
+            dtype,
+            crate::dtype::FLOAT16 | crate::dtype::BFLOAT16 | crate::dtype::FLOAT32
+        )
+        && ffi::array_shape(a) == shape
+        && ffi::array_shape(b) == shape
+        && ffi::array_dtype(a) == dtype
+        && ffi::array_dtype(b) == dtype
+        && ffi::array_dtype(weight) == dtype
+        && ffi::array_shape(weight) == [dim]
+        && norm.bias.as_ref().is_none_or(|bias| {
+            let bias = bias.as_ref().unwrap();
+            ffi::array_dtype(bias) == dtype && ffi::array_shape(bias) == [dim]
+        });
+    if !fusable {
+        let x_new = ffi::compiled_add3(a, b, x);
+        let h = norm.forward(&x_new);
+        return (x_new, h);
+    }
+    let bias_ptr = norm
+        .bias
+        .as_ref()
+        .map(|bias| bias.as_ref().unwrap() as *const MlxArray)
+        .unwrap_or(std::ptr::null());
+    let mut x_new = UniquePtr::null();
+    let mut h = UniquePtr::null();
+    // SAFETY: `bias_ptr` is null or points at `norm.bias`, which outlives the call.
+    unsafe {
+        ffi::fused_add3_layer_norm(a, b, x, weight, bias_ptr, norm.eps, &mut x_new, &mut h).expect(
+            "the caller checked fused_add3_layer_norm_available(), so the launcher must not refuse",
+        );
+    }
+    (x_new, h)
 }
 
 /// Named LoRA weights for runtime on-the-fly application.
@@ -1185,7 +1473,7 @@ impl Linear {
 /// (e.g. Qwen3.5/3.6 MoE router gates).
 ///
 /// Returns an error only when the inferred bits are not in
-/// [`SUPPORTED_AFFINE_BITS`] — in that case `group_size` itself is likely
+/// [`LOADABLE_AFFINE_BITS`] — in that case `group_size` itself is likely
 /// wrong.
 fn infer_quantization_bits(
     weight_shape: &[i32],
@@ -1225,8 +1513,8 @@ fn infer_quantization_bits(
     if inferred_bits == caller_bits {
         return Ok(caller_bits);
     }
-    if !SUPPORTED_AFFINE_BITS.contains(&inferred_bits) {
-        let accepted = SUPPORTED_AFFINE_BITS
+    if !LOADABLE_AFFINE_BITS.contains(&inferred_bits) {
+        let accepted = LOADABLE_AFFINE_BITS
             .iter()
             .map(i32::to_string)
             .collect::<Vec<_>>()
@@ -1463,6 +1751,54 @@ pub const SUPPORTED_AFFINE_BITS: [i32; 6] = [2, 3, 4, 5, 6, 8];
 /// Used by: [`validate_affine_quantization_group_size`]
 pub const SUPPORTED_AFFINE_GROUP_SIZES: [i32; 3] = [32, 64, 128];
 
+/// Affine widths a loaded checkpoint may use: MLX's own set plus 1 bit, which
+/// mlxcel runs with its own kernels (issue #1370).
+///
+/// Kept apart from [`SUPPORTED_AFFINE_BITS`] because that constant answers a
+/// producer's question ("what can MLX's affine quantize kernel emit"), which
+/// 1 bit is not: `split-mtp` and gemma4's per-module override validation read
+/// it and must keep refusing a width nothing in the tree can produce.
+///
+/// Used by: [`infer_quantization_bits`]
+pub const LOADABLE_AFFINE_BITS: [i32; 7] = [1, 2, 3, 4, 5, 6, 8];
+
+/// Reject a 1-bit layout mlxcel's 1-bit kernels cannot run (issue #1370).
+///
+/// Called with the reconciled `bits` / `group_size`, after
+/// [`reconcile_quantization_layout`], by every loader that stores a dense
+/// quantized projection or embedding. A no-op for any other width.
+///
+/// 1-bit is affine-only: MLX defines no 1-bit block-float mode, and a 1-bit
+/// plane without `.biases` would otherwise be classified `mxfp4` by
+/// [`infer_quantization_mode`] and aborted on inside MLX at the first forward
+/// pass. The kernels also need `group_size` to be a multiple of 32 so that a
+/// packed word never straddles a group, which [`SUPPORTED_AFFINE_GROUP_SIZES`]
+/// guarantees.
+pub fn validate_one_bit_layout(
+    bits: i32,
+    group_size: i32,
+    mode: &str,
+    has_biases: bool,
+) -> Result<(), String> {
+    if bits != 1 {
+        return Ok(());
+    }
+    if mode != "affine" || !has_biases {
+        return Err(format!(
+            "1-bit weights are affine-only: quantization.bits is 1 but the tensors describe \
+             mode {mode:?} (.biases present: {has_biases}); mlxcel runs 1-bit checkpoints only \
+             with a .scales and a .biases plane"
+        ));
+    }
+    if !SUPPORTED_AFFINE_GROUP_SIZES.contains(&group_size) {
+        return Err(format!(
+            "1-bit weights need group_size 32, 64 or 128, got {group_size}: the 1-bit kernels \
+             read one scale and bias per packed 32-bit word"
+        ));
+    }
+    Ok(())
+}
+
 /// Reject a declared quantization mode MLX cannot parse.
 ///
 /// Unlike [`validate_quantization_params`] this is an allowlist, and the
@@ -1518,6 +1854,122 @@ pub fn validate_quantization_mode(mode: &str) -> Result<(), String> {
          anything else, and that throw crosses the cxx bridge as an uncatchable abort at the \
          first forward pass rather than a load error"
     ))
+}
+
+/// Refuse a quantized layer whose mode the running backend has no kernel for
+/// (issue #1806).
+///
+/// Reads the backend capability table
+/// ([`crate::hardware::GpuBackendKind::quant_mode_support`]). A `Native` mode
+/// passes. Anything else fails the load here, with a message naming the mode,
+/// the backend and the way out, instead of reaching `quantized_matmul` /
+/// `gather_qmm`, whose unsupported-dispatch throw crosses the cxx bridge as an
+/// uncatchable abort at the first forward pass. A `ConvertTo` mode that reaches
+/// a layer loader means the checkpoint took no load-time conversion route: the
+/// conversions run before the model is built (the ModelOpt NVFP4 repack in the
+/// binary crate's `models/sanitize.rs` converts to affine on such a backend),
+/// so what arrives here in that mode is a layout none of them handles, for
+/// example an MLX-native NVFP4 export.
+///
+/// An unparseable mode is left to [`validate_quantization_mode`], so the two
+/// checks never both report the same string.
+///
+/// Used by: [`validate_quantization_mode_for_running_backend`], which every
+///          quantized layer loader calls with the running backend
+pub fn validate_quantization_mode_runnable(
+    mode: &str,
+    backend: crate::hardware::GpuBackendKind,
+) -> Result<(), String> {
+    use crate::hardware::{QuantMode, QuantModeSupport};
+    let Some(parsed) = QuantMode::from_mlx_name(mode) else {
+        return Ok(());
+    };
+    let name = backend.display_name();
+    match backend.quant_mode_support(parsed) {
+        QuantModeSupport::Native => Ok(()),
+        QuantModeSupport::ConvertTo(target) => {
+            let converted = if parsed == QuantMode::Nvfp4 {
+                " (mlxcel converts ModelOpt NVFP4 checkpoints automatically; this layer is in \
+                 another layout)"
+            } else {
+                ""
+            };
+            Err(format!(
+                "quantization mode {parsed} has no native kernel on the {name} backend, and this \
+                 checkpoint's {parsed} layout has no load-time conversion to {target}{converted}. \
+                 Re-quantize the model to {target} (for example with `mlx_lm.convert -q`) or run \
+                 it on a backend with native {parsed} kernels"
+            ))
+        }
+        QuantModeSupport::Unsupported => Err(format!(
+            "quantization mode {parsed} is not supported on the {name} backend and cannot be \
+             converted at load. Re-quantize the model to a mode this backend runs (for example \
+             affine with `mlx_lm.convert -q`) or run it on another backend"
+        )),
+    }
+}
+
+/// The load-log line for a quantized layer in `mode` that `backend` runs
+/// natively, or `None` when there is no route to report (issue #1808).
+///
+/// A line is due only for a block-float mode (affine is every backend's
+/// baseline) that the capability table marks `Native` on a backend where some
+/// mode is not native, which is ROCm today. There the same checkpoint could
+/// have been converted or refused, so the log states which route it took, as
+/// the NVFP4 repack line in the binary crate's `models/sanitize.rs` does for
+/// the conversion route. Metal, CUDA and the CPU run every mode natively, have
+/// no route to choose, and get no line, so their load output is unchanged.
+#[must_use]
+pub fn native_quantization_route_line(
+    mode: &str,
+    backend: crate::hardware::GpuBackendKind,
+) -> Option<String> {
+    use crate::hardware::{QuantMode, QuantModeSupport};
+    let parsed = QuantMode::from_mlx_name(mode)?;
+    let has_other_routes = QuantMode::ALL
+        .into_iter()
+        .any(|m| backend.quant_mode_support(m) != QuantModeSupport::Native);
+    if parsed == QuantMode::Affine
+        || !has_other_routes
+        || backend.quant_mode_support(parsed) != QuantModeSupport::Native
+    {
+        return None;
+    }
+    Some(format!(
+        "Quantization mode {parsed}: running on native {} kernels, no load-time conversion \
+         (backend quantization capability table)",
+        backend.display_name()
+    ))
+}
+
+/// [`validate_quantization_mode_runnable`] against the backend MLX resolved in
+/// this process, plus the load log: the first layer of each mode that passes
+/// prints [`native_quantization_route_line`] to stderr, once per process, so a
+/// load log says whether a block-float checkpoint ran natively or was
+/// converted (issue #1808).
+///
+/// Used by: the shared dense and embedding loaders (through
+///          `reconcile_quantization_layout_logged`),
+///          [`QuantizedMultiLinear::from_weights`] (MLA), and in the consuming
+///          crate `crate::models::switch_layers::SwitchLinear` (MoE experts),
+///          `crate::models::gpt_oss::ExpertLinear` and `kimi_linear`'s private
+///          `MultiLinear`
+pub fn validate_quantization_mode_for_running_backend(mode: &str) -> Result<(), String> {
+    use crate::hardware::QuantMode;
+    use std::sync::atomic::AtomicBool;
+    static LOGGED: [AtomicBool; QuantMode::ALL.len()] =
+        [const { AtomicBool::new(false) }; QuantMode::ALL.len()];
+
+    let backend = crate::hardware::gpu_backend_kind();
+    validate_quantization_mode_runnable(mode, backend)?;
+    if let Some(line) = native_quantization_route_line(mode, backend) {
+        // A route line implies a parsed mode, so the slot always exists.
+        let slot = QuantMode::ALL.iter().position(|m| m.as_str() == mode);
+        if slot.is_some_and(|slot| !LOGGED[slot].swap(true, Ordering::Relaxed)) {
+            eprintln!("{line}");
+        }
+    }
+    Ok(())
 }
 
 /// Reject a declared mode that contradicts the `.biases` plane the checkpoint
@@ -1862,6 +2314,9 @@ fn reconcile_quantization_layout_logged(
 ) -> Result<ReconciledQuant, String> {
     let layout = reconcile_quantization_layout(weight_shape, scales_shape, group_size, bits, mode)
         .map_err(|e| format!("{e} (prefix: {prefix})"))?;
+    // Kept out of the pure reconciler, whose shape tests must not depend on
+    // the host's backend.
+    validate_quantization_mode_for_running_backend(mode).map_err(|e| format!("{prefix}: {e}"))?;
     if layout.reconciled {
         tracing::warn!(
             target: "mlxcel::quant",
@@ -2108,6 +2563,8 @@ impl UnifiedLinear {
             // mode (gpt-oss) can.
             validate_quantization_biases(mode, biases.is_some())
                 .map_err(|e| format!("{e} (prefix: {prefix})"))?;
+            validate_one_bit_layout(effective_bits, effective_group_size, mode, biases.is_some())
+                .map_err(|e| format!("{e} (prefix: {prefix})"))?;
 
             // Optional native-NVFP4 global-scale sidecar (`weight_scale_2`).
             // Emitted by the direct ModelOpt transcode (issue #693); absent for
@@ -2168,6 +2625,9 @@ impl UnifiedLinear {
             {
                 None
             }
+            // The same fused consumers hand the triple to MLX's
+            // `quantized_matmul`, which has no 1-bit kernel (issue #1370).
+            UnifiedLinear::Quantized { weight, .. } if weight.is_one_bit() => None,
             UnifiedLinear::Quantized { weight, .. } => Some(weight),
             UnifiedLinear::Regular(_) => None,
         }
@@ -2256,6 +2716,15 @@ impl UnifiedLinear {
                     };
                 }
 
+                // Large-M prefill on measured hardware: dense f16 GEMM (#1994).
+                // Not for 1-bit weights, whose prefill has its own tiled kernel
+                // behind `quantized_linear_forward` (issue #1370).
+                if !weight.is_one_bit()
+                    && let Some(y) = prefill_dense_gemm_forward(x, weight, bias.as_ref())
+                {
+                    return y;
+                }
+
                 let bias_ptr = bias
                     .as_ref()
                     .map(|b| b.as_ref().unwrap() as *const MlxArray)
@@ -2335,6 +2804,8 @@ impl UnifiedLinear {
             {
                 None
             }
+            // No MLX 1-bit kernel behind the compiled consumers (issue #1370).
+            Self::Quantized { weight, .. } if weight.is_one_bit() => None,
             Self::Quantized { weight, .. } => Some(weight),
             Self::Regular(_) => None,
         }
@@ -2369,6 +2840,9 @@ impl UnifiedLinear {
             return None;
         }
         match self {
+            // The fused launcher calls MLX's `quantized_matmul`, which has no
+            // 1-bit kernel (issue #1370): take the caller's graph path.
+            Self::Quantized { weight, .. } if weight.is_one_bit() => None,
             Self::Quantized { weight, .. } => {
                 let mut q = cxx::UniquePtr::null();
                 let mut k = cxx::UniquePtr::null();
@@ -2858,6 +3332,11 @@ impl FusedQKVLinear {
             } else {
                 bits
             };
+            let qkv_has_biases = [&q_prefix, &k_prefix, &v_prefix]
+                .iter()
+                .all(|p| weights.contains_key(&format!("{p}.biases")));
+            validate_one_bit_layout(effective_bits, group_size, mode, qkv_has_biases)
+                .map_err(|e| format!("{e} (prefix: {q_prefix})"))?;
 
             // Concatenate along axis 0 (output dimension)
             let qkv_weight = {
@@ -3150,6 +3629,8 @@ impl FusedQKVLinear {
         let qkv = self.qkv_proj.project_concat(x);
         let qkv_shape = ffi::array_shape(&qkv);
         if qkv_shape.len() != 3
+            || qkv_shape[0] <= 0
+            || qkv_shape[1] <= 0
             || qkv_shape[2] != (self.n_heads + 2 * self.n_kv_heads) * self.head_dim
         {
             return None;
@@ -3172,6 +3653,9 @@ impl FusedQKVLinear {
             &mut q,
             &mut k,
             &mut v,
+        )
+        .expect(
+            "fused_rope_append_backend_available() checked the port, so the launcher must not refuse",
         );
         Some((q, k, v))
     }
@@ -3358,6 +3842,21 @@ impl FusedQKVLinear {
     }
 }
 
+/// Refuse a 1-bit per-head MLA projection at load (issue #1370).
+///
+/// The 1-bit support covers dense linears and embeddings; no public checkpoint
+/// ships a 1-bit MLA stack, so this path has no kernel coverage and no test,
+/// and is refused rather than left to run untested.
+fn reject_one_bit_multi_linear(bits: i32, prefix: &str) -> Result<(), String> {
+    if bits == 1 {
+        return Err(format!(
+            "{prefix}: 1-bit quantization is supported for dense linears and embeddings only, \
+             not for per-head MLA projections"
+        ));
+    }
+    Ok(())
+}
+
 /// Quantized per-head linear layer for MLA (Multi-head Latent Attention)
 /// Weight shape: [num_heads, output_dim, input_dim_packed]
 /// Used in GLM4 MoE Lite, DeepSeek-V2, etc.
@@ -3413,6 +3912,7 @@ impl QuantizedMultiLinear {
         bits: i32,
     ) -> Result<Self, String> {
         validate_quantization_params(group_size, bits)?;
+        reject_one_bit_multi_linear(bits, "QuantizedMultiLinear::new")?;
         let mode = infer_quantization_mode(biases.is_some(), group_size, bits);
         validate_quantization_biases(mode, biases.is_some())?;
         Ok(Self {
@@ -3457,6 +3957,7 @@ impl QuantizedMultiLinear {
         let biases_name = format!("{}.biases", prefix);
 
         validate_quantization_params(group_size, bits).map_err(|e| format!("{prefix}: {e}"))?;
+        reject_one_bit_multi_linear(bits, prefix)?;
 
         let weight = weights
             .get(&weight_name)
@@ -3483,6 +3984,9 @@ impl QuantizedMultiLinear {
         // an uncatchable abort at the first forward pass rather than a load
         // error.
         validate_quantization_biases(mode, biases.is_some())
+            .map_err(|e| format!("{prefix}: {e}"))?;
+        // A mode the running backend has no kernel for (issue #1806).
+        validate_quantization_mode_for_running_backend(mode)
             .map_err(|e| format!("{prefix}: {e}"))?;
 
         Ok(Self {
@@ -3587,7 +4091,10 @@ impl SwiGLUMLP {
 
     /// Forward pass
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
-        if self.use_compiled {
+        // The compiled helper calls MLX's `quantized_matmul` internally, which
+        // has no 1-bit kernel (issue #1370); the per-projection path below
+        // goes through the routed bridge primitive.
+        if self.use_compiled && !self.gate_proj.is_one_bit() {
             // Use compiled version with kernel fusion
             // Falls back to non-compiled for non-affine modes inside C++
             unsafe {
@@ -4346,11 +4853,58 @@ pub fn attention(
         return metal4_attention(q, k, v, scale, mask, softcap, window_size);
     }
 
-    if let Some(chunk) = materializing_sdpa_query_chunk(q, k, v, softcap, mask.is_some()) {
+    // `attention` always issues an array-masked (or unmasked) SDPA through
+    // `fast_scaled_dot_product_attention`; it never asks MLX for causal mode,
+    // so `do_causal` is false here. The causal entry point is
+    // `crate::fast_scaled_dot_product_attention_causal_windowed`.
+    if let Some(chunk) = materializing_sdpa_query_chunk(q, k, v, softcap, mask.is_some(), false) {
         return chunked_query_attention(q, k, v, scale, mask, softcap, chunk);
     }
 
     attention_dispatch(q, k, v, scale, mask, softcap)
+}
+
+/// Largest finite value float16 represents.
+///
+/// The ceiling `q @ k^T` has to stay under on an f16 checkpoint whose attention
+/// arithmetic is not widened. Named rather than written as a literal at each
+/// call site because the number is the whole content of the claim (issue
+/// #1830). It is the wrong threshold for bfloat16, which carries float32's
+/// exponent range; a bf16 family is checked for finiteness, not against this.
+pub const F16_MAX: f32 = 65504.0;
+
+/// Largest `|q @ k^T|` over a query/key pair, scaled, at the dtype handed in.
+///
+/// **Diagnostic only. No decode path may call this.** It materializes the whole
+/// score matrix and reads one scalar back to the host, which is a per-call GPU
+/// sync; the same boundary, present for another reason, cost 3.31x and 2.24x of
+/// decode on M5 Max (`tests/mamba2_hybrid_decode_finite.rs`). It exists so that
+/// "the scores stay inside the f16 range" is a number a test can compare
+/// against [`F16_MAX`], rather than a claim about a value nobody can see:
+/// [`attention`], [`attention_from_ptr`] and [`metal4_causal_attention`] all
+/// hand `q`, `k` and `v` to MLX's fused SDPA, so mlxcel never forms the scores
+/// and anything inspecting them has to recompute them.
+///
+/// The operands are deliberately left unwidened. Promoting them here would
+/// measure the widened path, which is the thing a caller is usually trying to
+/// show is necessary: `phi-2-4bit` ran f16 scores for months and passed 65504
+/// at layer 29 of 32, and layers 0 through 29 tracked the reference to three
+/// decimals first, so a check that samples an early layer sees nothing.
+///
+/// `q` and `k` are `[B, H, L, D]` and `[B, H, S, D]`; the product is taken over
+/// the last axis, giving `[B, H, L, S]`.
+///
+/// The head counts must already match. On a GQA family they do not, and the
+/// matmul aborts rather than broadcasting, so repeat the kv heads
+/// (`repeat(k, q_heads / kv_heads, 1)`) the way the SDPA kernel does before
+/// calling. Stated because the shapes above are easy to read as permissive:
+/// measuring Gemma 2, at 8 query heads over 4 kv heads, walked into it.
+pub fn max_abs_attention_score(q: &MlxArray, k: &MlxArray, scale: f32) -> f32 {
+    let k_t = ffi::transpose_axes(k, &[0, 1, 3, 2]);
+    let scores = ffi::matmul(q, &k_t);
+    let peak = ffi::max_all(&ffi::abs(&scores));
+    ffi::eval(&peak);
+    ffi::item_f32(&peak) * scale
 }
 
 /// Single-shot SDPA dispatch: softcap composite or MLX's fused/fallback SDPA.
@@ -4460,25 +5014,100 @@ fn sdpa_fallback_max_queries() -> i32 {
     })
 }
 
+/// Upper bound on the query rows whose cuDNN plan-cache key the patched
+/// `sdpa_cudnn` buckets, from `MLXCEL_SDPA_PLAN_BUCKET_MAX_QUERIES` (default
+/// 32; `0` disables bucketing). The `atoi`/`parse` divergence note on
+/// [`sdpa_fallback_max_queries`] applies here too.
+fn sdpa_plan_bucket_max_queries() -> i32 {
+    static MAX_QUERIES: OnceLock<i32> = OnceLock::new();
+    *MAX_QUERIES.get_or_init(|| {
+        std::env::var("MLXCEL_SDPA_PLAN_BUCKET_MAX_QUERIES")
+            .ok()
+            .map(|v| v.trim().parse::<i32>().unwrap_or(0))
+            .unwrap_or(0)
+    })
+}
+
+/// True when the patched `supports_sdpa_cudnn` keeps this call on cuDNN because
+/// its plan-cache key can be bucketed (issue #1820), so no score matrix is
+/// materialized and the small-query fallback below does not apply.
+///
+/// Mirrors `sdpa_plan_bucket_shape_eligible` in
+/// `src/lib/mlxcelverse/overlays/cuda/mlx/backend/cuda/scaled_dot_product_attention.cpp`,
+/// which is deliberately shape-only so it answers the same during MLX graph
+/// building as at eval time. The layout half of the C++ gate (k/v being slices
+/// of one fixed-size KV cache, and the mask being the broadcast plane
+/// `fast::scaled_dot_product_attention` builds) is not mirrored: when it fails,
+/// MLX still runs cuDNN on the exact shape rather than the ops fallback, so the
+/// score matrix is not materialized either way.
+///
+/// `arr_masked` and `do_causal` are separate because the C++ gate treats them
+/// differently and a single "masked" flag cannot express that: bucketing needs
+/// an array mask to widen, so it takes `has_arr_mask && !do_causal`, while
+/// #1799's fallback fires on either. Collapsing the two here would tell this
+/// mirror that a causal block stays on cuDNN when C++ actually sends it to the
+/// materializing fallback, dropping the query chunking from exactly that call.
+fn cuda_sdpa_plan_bucket_eligible(
+    q_len: i32,
+    k_len: i32,
+    arr_masked: bool,
+    do_causal: bool,
+) -> bool {
+    plan_bucket_eligible_with(
+        q_len,
+        k_len,
+        arr_masked,
+        do_causal,
+        sdpa_plan_bucket_max_queries(),
+    )
+}
+
+/// The eligibility predicate with the bound passed in rather than read from the
+/// environment, so it stays testable independently of the shipped default.
+///
+/// The default is `0`, meaning off: #1820 measured bucketing behind #1799's ops
+/// fallback at three of five block widths, so the shipped dispatch is #1799's
+/// alone and this predicate answers `false` unless a caller opts in. Tests here
+/// pass an explicit bound, because a `OnceLock` read of the environment cannot
+/// be varied per test.
+fn plan_bucket_eligible_with(
+    q_len: i32,
+    k_len: i32,
+    arr_masked: bool,
+    do_causal: bool,
+    max_queries: i32,
+) -> bool {
+    arr_masked && !do_causal && q_len > 1 && q_len <= max_queries && k_len > q_len
+}
+
 /// True when mlxcel's own small-query gate refuses cuDNN for this call, so MLX
 /// materializes the score matrix even though the dtype and head dims are
 /// flash-eligible and [`cuda_sdpa_materializes_scores`] alone would say no.
 ///
 /// Mirrors the gate added to `supports_sdpa_cudnn` in
-/// `src/lib/mlx-cpp/patches/mlx/backend/cuda/scaled_dot_product_attention.cpp`
+/// `src/lib/mlxcelverse/overlays/cuda/mlx/backend/cuda/scaled_dot_product_attention.cpp`
 /// (issue #1799): a masked or causal call with 2 to
 /// `MLXCEL_SDPA_FALLBACK_MAX_QUERIES` query rows over a longer key sequence,
 /// which is the speculative verify shape and the short trailing chunk of a
-/// chunked prefill. Keep the two in step. A stale mirror here silently drops
-/// the score-matrix chunking from exactly the calls the gate newly sends to the
-/// fallback, and raising the variable above its default would widen that hole
-/// without bound.
-fn cuda_sdpa_small_query_fallback(q_len: i32, k_len: i32, masked: bool) -> bool {
+/// chunked prefill. Since #1820 that gate no longer fires for an array-masked
+/// call whose key can be bucketed, so those stay on cuDNN, and what it still
+/// covers is the causal half: a `do_causal` block carries no array mask, so
+/// there is nothing for bucketing to widen and the fallback is still what runs.
+/// Keep the two in step. A stale mirror here silently drops the score-matrix
+/// chunking from exactly the calls the gate newly sends to the fallback, and
+/// raising the variable above its default would widen that hole without bound.
+fn cuda_sdpa_small_query_fallback(
+    q_len: i32,
+    k_len: i32,
+    arr_masked: bool,
+    do_causal: bool,
+) -> bool {
     cfg!(feature = "cuda")
-        && masked
+        && (arr_masked || do_causal)
         && q_len > 1
         && q_len <= sdpa_fallback_max_queries()
         && k_len > q_len
+        && !cuda_sdpa_plan_bucket_eligible(q_len, k_len, arr_masked, do_causal)
 }
 
 /// Pure chunk-length math for [`materializing_sdpa_query_chunk`].
@@ -4513,7 +5142,8 @@ pub(crate) fn materializing_sdpa_query_chunk(
     k: &MlxArray,
     v: &MlxArray,
     softcap: f32,
-    masked: bool,
+    arr_masked: bool,
+    do_causal: bool,
 ) -> Option<i32> {
     let budget = attention_chunk_budget_bytes();
     if budget == 0 {
@@ -4533,7 +5163,7 @@ pub(crate) fn materializing_sdpa_query_chunk(
     }
     let k_len = k_shape[2];
     if !cuda_sdpa_materializes_scores(q, v, softcap)
-        && !cuda_sdpa_small_query_fallback(q_len, k_len, masked)
+        && !cuda_sdpa_small_query_fallback(q_len, k_len, arr_masked, do_causal)
     {
         return None;
     }
@@ -4719,173 +5349,6 @@ pub unsafe fn attention_from_ptr(
     attention(q, k, v, scale, mask, softcap, window_size)
 }
 
-fn validate_paged_decode_inputs(
-    q: &MlxArray,
-    cache_keys: &[*const MlxArray],
-    cache_values: &[*const MlxArray],
-    metadata: &crate::cache::PagedDecodeMetadata,
-) -> Result<(), String> {
-    let q_shape = ffi::array_shape(q);
-    if q_shape.len() != 4 {
-        return Err(format!(
-            "paged decode attention expected q rank 4, got shape {:?}",
-            q_shape
-        ));
-    }
-    if q_shape[2] != 1 {
-        return Err(format!(
-            "paged decode attention only supports decode-only q_len == 1, got {}",
-            q_shape[2]
-        ));
-    }
-
-    let batch = q_shape[0].max(0) as usize;
-    if cache_keys.len() != batch || cache_values.len() != batch {
-        return Err(format!(
-            "paged decode attention expected {} cache pointers, got {} keys and {} values",
-            batch,
-            cache_keys.len(),
-            cache_values.len()
-        ));
-    }
-    if cache_keys.iter().any(|ptr| ptr.is_null()) || cache_values.iter().any(|ptr| ptr.is_null()) {
-        return Err(
-            "paged decode attention received a null dense compatibility cache pointer".to_string(),
-        );
-    }
-    if metadata.len() != batch {
-        return Err(format!(
-            "paged decode attention expected {} metadata entries, got {}",
-            batch,
-            metadata.len()
-        ));
-    }
-    if metadata.block_table_offsets.len() != batch + 1 {
-        return Err(format!(
-            "paged decode attention expected {} block offsets, got {}",
-            batch + 1,
-            metadata.block_table_offsets.len()
-        ));
-    }
-    if metadata
-        .block_table_offsets
-        .last()
-        .copied()
-        .unwrap_or_default() as usize
-        != metadata.block_tables.len()
-    {
-        return Err(
-            "paged decode attention block table offsets do not cover the flattened block table"
-                .to_string(),
-        );
-    }
-
-    Ok(())
-}
-
-/// Reference paged decode path over dense compatibility KV caches.
-///
-/// This stays entirely in Rust/FFI wrappers and is primarily used as a
-/// correctness baseline and benchmark fallback for the native paged decode
-/// kernel.
-pub fn paged_decode_attention_dense_fallback(
-    q: &MlxArray,
-    cache_keys: &[*const MlxArray],
-    cache_values: &[*const MlxArray],
-    metadata: &crate::cache::PagedDecodeMetadata,
-    scale: f32,
-) -> Result<UniquePtr<MlxArray>, String> {
-    validate_paged_decode_inputs(q, cache_keys, cache_values, metadata)?;
-
-    let q_shape = ffi::array_shape(q);
-    let batch = q_shape[0].max(0) as usize;
-    let mut outputs: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(batch);
-
-    for batch_idx in 0..batch {
-        let kv_len = metadata.kv_lens[batch_idx];
-        if kv_len <= 0 {
-            return Err(format!(
-                "paged decode fallback requires kv_len > 0 for batch index {batch_idx}, got {kv_len}"
-            ));
-        }
-
-        let q_i = ffi::slice(
-            q,
-            &[batch_idx as i32, 0, 0, 0],
-            &[batch_idx as i32 + 1, i32::MAX, 1, i32::MAX],
-        );
-
-        let table_begin = metadata.block_table_offsets[batch_idx] as usize;
-        let table_end = metadata.block_table_offsets[batch_idx + 1] as usize;
-        let key_cache = unsafe { &*cache_keys[batch_idx] };
-        let value_cache = unsafe { &*cache_values[batch_idx] };
-
-        let mut key_visible: Option<UniquePtr<MlxArray>> = None;
-        let mut value_visible: Option<UniquePtr<MlxArray>> = None;
-
-        for &logical_block in &metadata.block_tables[table_begin..table_end] {
-            let block_start = logical_block * metadata.block_size;
-            if block_start >= kv_len {
-                continue;
-            }
-            let block_end = (block_start + metadata.block_size).min(kv_len);
-
-            let key_block = ffi::slice(
-                key_cache,
-                &[0, 0, block_start, 0],
-                &[1, i32::MAX, block_end, i32::MAX],
-            );
-            let value_block = ffi::slice(
-                value_cache,
-                &[0, 0, block_start, 0],
-                &[1, i32::MAX, block_end, i32::MAX],
-            );
-
-            key_visible = Some(match key_visible {
-                Some(prev) => crate::concatenate(&prev, &key_block, 2),
-                None => key_block,
-            });
-            value_visible = Some(match value_visible {
-                Some(prev) => crate::concatenate(&prev, &value_block, 2),
-                None => value_block,
-            });
-        }
-
-        let key_visible = key_visible.ok_or_else(|| {
-            format!("paged decode fallback built no visible key blocks for batch index {batch_idx}")
-        })?;
-        let value_visible = value_visible.ok_or_else(|| {
-            format!(
-                "paged decode fallback built no visible value blocks for batch index {batch_idx}"
-            )
-        })?;
-
-        outputs.push(unsafe {
-            attention_from_ptr(
-                &q_i,
-                &key_visible,
-                &value_visible,
-                scale,
-                std::ptr::null(),
-                0.0,
-                0,
-            )
-        });
-    }
-
-    // `drain(..1)` panics on an empty vec, so reject `batch == 0` explicitly
-    // with a clean error instead (issue #195).
-    if outputs.is_empty() {
-        return Err("paged decode fallback received an empty batch (batch == 0)".to_string());
-    }
-    let mut outputs = outputs.into_iter();
-    let mut result = outputs.next().expect("outputs is non-empty: checked above");
-    for output in outputs {
-        result = crate::concatenate(&result, &output, 0);
-    }
-    Ok(result)
-}
-
 fn validate_pooled_paged_decode_inputs(
     q: &MlxArray,
     states: &[&crate::cache::PagedSequenceState],
@@ -4918,14 +5381,10 @@ fn validate_pooled_paged_decode_inputs(
 /// Reference paged decode path that gathers K/V from the [`PagedBlockPool`].
 ///
 /// This is the Phase 2 (#119) pooled read path of the unified paged KV cache
-/// (epic #116). It is the pooled analogue of [`paged_decode_attention_dense_fallback`],
-/// which stays the live decode path and the parity baseline this function is
-/// validated against. The two differ only in where the per-sequence visible
-/// K/V comes from: the dense fallback slices contiguous dense compatibility
-/// buffers, while this function calls [`crate::cache::PagedBlockPool::gather_visible`]
-/// to pull each sequence's physical blocks out of the pool by block-table order.
-/// Everything downstream — the per-batch `q` slice, the fused SDPA dispatch via
-/// [`attention_from_ptr`], and the axis-0 batch concat — is identical.
+/// (epic #116). It calls [`crate::cache::PagedBlockPool::gather_visible`] to
+/// pull each sequence's physical blocks out of the pool by block-table order,
+/// then runs the per-batch `q` slice through fused SDPA and concatenates the
+/// row outputs on axis 0.
 ///
 /// Per ADR 0001 (`docs/adr/0001-paged-attention-gather-vs-fused-kernel.md`) this
 /// is strategy option A, *gather-then-SDPA*: `gather_visible` builds a
@@ -4944,8 +5403,7 @@ fn validate_pooled_paged_decode_inputs(
 /// `trim_tokens` advances as the window slides), so `gather_visible` returns
 /// exactly the `[logical_start, len)` window already shaped
 /// `[1, n_kv_heads, visible_len, head_dim]` (SDPA-ready). That is why there is
-/// no separate "rotating" pooled variant mirroring
-/// [`paged_decode_attention_rotating_fallback`].
+/// no separate rotating pooled variant for ring-buffer cache storage.
 ///
 /// `gather_visible` returning `Ok(None)` (no visible tokens, or the layer has no
 /// pool storage yet) is treated as an error here, because decode requires a
@@ -5022,8 +5480,9 @@ pub enum PagedDecodeDispatch {
 }
 
 /// Compute backend the pooled decode runs on. The fused kernel has a Metal JIT
-/// body (ADR 0001, measured on Apple Silicon) and a CUDA JIT body (#634). Both
-/// are native candidates; the selector applies backend-specific thresholds.
+/// body (ADR 0001, measured on Apple Silicon), a CUDA JIT body (#634) and a HIP
+/// JIT body (#2068). All three are native candidates; the selector applies
+/// backend-specific thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PagedDecodeBackend {
     /// Apple Silicon Metal (the fused kernel's original home).
@@ -5032,11 +5491,12 @@ pub enum PagedDecodeBackend {
     /// pool blocks with no gather pass, so its advantage grows with context;
     /// the Metal-measured batch/context ceilings do not apply.
     Cuda,
+    /// AMD ROCm (the HIP port of the CUDA kernel, #2068). It follows the CUDA
+    /// rule, since it is the same kernel: native wherever the kernel can serve
+    /// the layer, with the same `gridDim.z` guard in front of the launch.
+    Rocm,
     /// Any backend with no fused kernel port, which today means CPU-only
-    /// builds and ROCm (issue #1803). Always gather. ROCm is a real GPU here,
-    /// not a CPU, and gets its own variant when its kernels are ported
-    /// (issue #1814); until then the answer is the same, so it shares this one
-    /// rather than pretending the ports exist.
+    /// builds and machines with no usable GPU. Always gather.
     Other,
 }
 
@@ -5104,6 +5564,10 @@ pub fn select_pooled_paged_dispatch(
         // Metal-measured batch and context ceilings do not apply because the
         // CUDA win grows with context rather than eroding at long context.
         PagedDecodeBackend::Cuda => slab_count <= NATIVE_MAX_SLABS,
+        // ROCm (#2068) runs the HIP port of the CUDA kernel, which reads the
+        // pool the same way, so it takes the CUDA rule. No ROCm-measured
+        // batch or context ceiling exists to justify a narrower island.
+        PagedDecodeBackend::Rocm => slab_count <= NATIVE_MAX_SLABS,
         PagedDecodeBackend::Other => false,
     };
     if native {
@@ -5127,8 +5591,9 @@ pub fn select_pooled_paged_dispatch(
 ///   values (`0` / `false` / `off` / `no`) as its kill switch: setting it
 ///   restores the pre-#899 gather-then-SDPA behaviour end to end.
 ///
-/// The separate `DecodeBatchContext::use_native_paged_kernel` request still
-/// governs the *dense-compat* block-table decode, which is a different path.
+/// Model-owned families are not governed by it: since #2172 they attend
+/// directly through their dense cache implementations (ADR 0009), without a
+/// pooled or block-table decode route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativePagedOverride {
     /// Force the fused kernel, bypassing the adaptive selector (the original
@@ -5226,28 +5691,32 @@ pub(crate) fn resolve_paged_v2_dispatch(
 
 /// The backend the fused kernel would run on, cached for the decode hot path.
 ///
-/// The fused kernel has a Metal JIT body and a CUDA JIT body (#634), so it is a
-/// native candidate whenever either backend is available at runtime
-/// ([`crate::metal_is_available`] / [`crate::cuda_is_available`], the same gates
-/// the model dispatch and C++ kernel selection use). This correctly falls to
-/// gather only for a CPU-only build or a machine with no usable GPU, neither of
-/// which a compile-time `target_os` check would catch. Metal is probed first so
-/// the Apple path is unchanged. Detection is process-static, so it is read once.
+/// The fused kernel has a Metal JIT body, a CUDA JIT body (#634) and a HIP JIT
+/// body (#2068). It is a native candidate only when
+/// [`crate::paged_attention_decode_available`] says the resolved backend has a
+/// port in the kernel's own table; then [`crate::metal_is_available`] /
+/// [`crate::cuda_is_available`] / [`crate::hardware::gpu_backend_kind`] name
+/// which one. A CPU-only build and a machine with no usable GPU fall to gather,
+/// neither of which a compile-time `target_os` check would catch. Metal is
+/// probed first and CUDA second so those paths are unchanged. Detection is
+/// process-static, so it is read once.
 pub(crate) fn paged_decode_backend() -> PagedDecodeBackend {
     use std::sync::OnceLock;
     static BACKEND: OnceLock<PagedDecodeBackend> = OnceLock::new();
     *BACKEND.get_or_init(|| {
-        // Asked first, so a backend with no fused kernel port can never be
-        // read as one that has it. `cuda_is_available()` is false on a ROCm
-        // build today, so this is belt and braces rather than a live fix, but
-        // the old order made correctness depend on that staying true
-        // (issue #1803).
-        if !crate::custom_kernels_available() {
+        // Asked first, so a backend with no paged-attention kernel port can
+        // never be read as one that has it. `cuda_is_available()` is false on
+        // a ROCm build today, so this is belt and braces rather than a live
+        // fix, but the old order made correctness depend on that staying true
+        // (issue #1803). The predicate reads the kernel's own port table.
+        if !crate::paged_attention_decode_available() {
             PagedDecodeBackend::Other
         } else if crate::metal_is_available() {
             PagedDecodeBackend::Metal
         } else if crate::cuda_is_available() {
             PagedDecodeBackend::Cuda
+        } else if crate::hardware::gpu_backend_kind() == crate::hardware::GpuBackendKind::Rocm {
+            PagedDecodeBackend::Rocm
         } else {
             PagedDecodeBackend::Other
         }
@@ -5282,7 +5751,7 @@ impl PagedDispatchCache {
     /// Bit carrying the decision alongside the packed key: set means
     /// [`PagedDecodeDispatch::Native`], clear means [`PagedDecodeDispatch::Gather`].
     /// The key uses bits `0..=49` ([`Self::pack_key`]: the backend tag now needs
-    /// two bits for the Metal/Cuda/Other trichotomy), so bit `50` is free.
+    /// two bits for the Metal/Cuda/Rocm/Other tags), so bit `50` is free.
     const DECISION_BIT: u64 = 1u64 << 50;
     /// Mask covering the packed-key bits (`0..=49`), used to compare a cell's
     /// key half against a freshly packed key while ignoring the decision bit.
@@ -5312,6 +5781,7 @@ impl PagedDispatchCache {
             PagedDecodeBackend::Metal => 0u64,
             PagedDecodeBackend::Cuda => 1u64,
             PagedDecodeBackend::Other => 2u64,
+            PagedDecodeBackend::Rocm => 3u64,
         };
         b | (v << 16) | (s << 32) | (k << 48)
     }
@@ -5376,10 +5846,8 @@ fn resolve_pooled_paged_dispatch(
 /// entry point to a library API (ADR 0001, resolving issue #710). The in-server
 /// decode routes pool-backed layers through the per-sequence `update_and_fetch`
 /// pool intercept (gather + standard SDPA, `src/models/llama3.rs`
-/// `is_paged_backed()`), and production models call
-/// [`paged_decode_attention_dense_compat`] / [`paged_decode_attention_dense_fallback`],
-/// never this function. It is kept and tested for external mlxcel-core consumers
-/// and `examples/paged_attention_kernel_bench.rs`. ADR 0001 records the
+/// `is_paged_backed()`). It is kept and tested for external mlxcel-core
+/// consumers and `examples/paged_attention_kernel_bench.rs`. ADR 0001 records the
 /// occupancy derivation: the selector's single-slab batched island (`B>=4`, at
 /// most ~256 tokens per sequence at `block_size` 32) is unreachable under the
 /// shipped serving defaults and transient even when entered, so a scheduler
@@ -5418,246 +5886,6 @@ pub fn paged_decode_attention_pooled(
         return Ok(out);
     }
     paged_decode_attention_pooled_fallback(q, pool, states, layer_idx, scale)
-}
-
-/// Native paged decode path over dense compatibility KV caches.
-///
-/// The C++ bridge consumes the logical block table metadata and performs the
-/// per-sequence block gathering plus SDPA dispatch natively, reducing Rust-side
-/// FFI churn on the decode hot path.
-pub fn paged_decode_attention_dense_compat(
-    q: &MlxArray,
-    cache_keys: &[*const MlxArray],
-    cache_values: &[*const MlxArray],
-    metadata: &crate::cache::PagedDecodeMetadata,
-    scale: f32,
-) -> Result<UniquePtr<MlxArray>, String> {
-    validate_paged_decode_inputs(q, cache_keys, cache_values, metadata)?;
-    Ok(unsafe {
-        ffi::paged_decode_attention_dense_compat(
-            q,
-            cache_keys,
-            cache_values,
-            &metadata.kv_lens,
-            &metadata.block_tables,
-            &metadata.block_table_offsets,
-            metadata.block_size,
-            scale,
-        )
-    })
-}
-
-fn validate_rotating_paged_decode_inputs(
-    q: &MlxArray,
-    cache_keys: &[*const MlxArray],
-    cache_values: &[*const MlxArray],
-    metadata: &crate::cache::RotatingPagedDecodeMetadata,
-) -> Result<(), String> {
-    let q_shape = ffi::array_shape(q);
-    if q_shape.len() != 4 {
-        return Err(format!(
-            "rotating paged decode attention expected q rank 4, got shape {:?}",
-            q_shape
-        ));
-    }
-    if q_shape[2] != 1 {
-        return Err(format!(
-            "rotating paged decode attention only supports decode-only q_len == 1, got {}",
-            q_shape[2]
-        ));
-    }
-
-    let batch = q_shape[0].max(0) as usize;
-    if cache_keys.len() != batch || cache_values.len() != batch {
-        return Err(format!(
-            "rotating paged decode attention expected {} cache pointers, got {} keys and {} values",
-            batch,
-            cache_keys.len(),
-            cache_values.len()
-        ));
-    }
-    if cache_keys.iter().any(|ptr| ptr.is_null()) || cache_values.iter().any(|ptr| ptr.is_null()) {
-        return Err(
-            "rotating paged decode attention received a null ring-buffer cache pointer".to_string(),
-        );
-    }
-    if metadata.len() != batch {
-        return Err(format!(
-            "rotating paged decode attention expected {} metadata entries, got {}",
-            batch,
-            metadata.len()
-        ));
-    }
-    Ok(())
-}
-
-/// Reference paged decode path over rotating ring-buffer KV caches.
-pub fn paged_decode_attention_rotating_fallback(
-    q: &MlxArray,
-    cache_keys: &[*const MlxArray],
-    cache_values: &[*const MlxArray],
-    metadata: &crate::cache::RotatingPagedDecodeMetadata,
-    scale: f32,
-) -> Result<UniquePtr<MlxArray>, String> {
-    validate_rotating_paged_decode_inputs(q, cache_keys, cache_values, metadata)?;
-
-    let q_shape = ffi::array_shape(q);
-    let batch = q_shape[0].max(0) as usize;
-    let mut outputs: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(batch);
-
-    for batch_idx in 0..batch {
-        let kv_len = metadata.kv_lens[batch_idx];
-        let logical_start = metadata.logical_starts[batch_idx];
-        if kv_len <= 0 {
-            return Err(format!(
-                "rotating paged decode fallback requires kv_len > 0 for batch index {batch_idx}, got {kv_len}"
-            ));
-        }
-
-        let q_i = ffi::slice(
-            q,
-            &[batch_idx as i32, 0, 0, 0],
-            &[batch_idx as i32 + 1, i32::MAX, 1, i32::MAX],
-        );
-
-        let key_cache = unsafe { &*cache_keys[batch_idx] };
-        let value_cache = unsafe { &*cache_values[batch_idx] };
-        let buffer_len = ffi::array_shape(key_cache)
-            .get(2)
-            .copied()
-            .unwrap_or_default();
-        if buffer_len <= 0 {
-            return Err(format!(
-                "rotating paged decode fallback requires non-empty buffer for batch index {batch_idx}"
-            ));
-        }
-        if logical_start < 0 || logical_start >= buffer_len {
-            return Err(format!(
-                "rotating paged decode fallback received invalid logical_start={logical_start} for buffer_len={buffer_len}"
-            ));
-        }
-
-        let block_count = (kv_len + metadata.block_size - 1) / metadata.block_size;
-        let mut key_visible: Option<UniquePtr<MlxArray>> = None;
-        let mut value_visible: Option<UniquePtr<MlxArray>> = None;
-        for logical_block in 0..block_count {
-            let logical_pos = logical_block * metadata.block_size;
-            let logical_end = (logical_pos + metadata.block_size).min(kv_len);
-            let token_count = logical_end - logical_pos;
-            if token_count <= 0 {
-                continue;
-            }
-
-            let physical_start = (logical_start + logical_pos).rem_euclid(buffer_len);
-            let physical_end = physical_start + token_count;
-            let key_block = if physical_end <= buffer_len {
-                ffi::slice(
-                    key_cache,
-                    &[0, 0, physical_start, 0],
-                    &[1, i32::MAX, physical_end, i32::MAX],
-                )
-            } else {
-                let key_tail = ffi::slice(
-                    key_cache,
-                    &[0, 0, physical_start, 0],
-                    &[1, i32::MAX, buffer_len, i32::MAX],
-                );
-                let key_head = ffi::slice(
-                    key_cache,
-                    &[0, 0, 0, 0],
-                    &[1, i32::MAX, physical_end - buffer_len, i32::MAX],
-                );
-                crate::concatenate(&key_tail, &key_head, 2)
-            };
-            let value_block = if physical_end <= buffer_len {
-                ffi::slice(
-                    value_cache,
-                    &[0, 0, physical_start, 0],
-                    &[1, i32::MAX, physical_end, i32::MAX],
-                )
-            } else {
-                let value_tail = ffi::slice(
-                    value_cache,
-                    &[0, 0, physical_start, 0],
-                    &[1, i32::MAX, buffer_len, i32::MAX],
-                );
-                let value_head = ffi::slice(
-                    value_cache,
-                    &[0, 0, 0, 0],
-                    &[1, i32::MAX, physical_end - buffer_len, i32::MAX],
-                );
-                crate::concatenate(&value_tail, &value_head, 2)
-            };
-
-            key_visible = Some(match key_visible {
-                Some(prev) => crate::concatenate(&prev, &key_block, 2),
-                None => key_block,
-            });
-            value_visible = Some(match value_visible {
-                Some(prev) => crate::concatenate(&prev, &value_block, 2),
-                None => value_block,
-            });
-        }
-
-        let key_visible = key_visible.ok_or_else(|| {
-            format!(
-                "rotating paged decode fallback built no visible key blocks for batch index {batch_idx}"
-            )
-        })?;
-        let value_visible = value_visible.ok_or_else(|| {
-            format!(
-                "rotating paged decode fallback built no visible value blocks for batch index {batch_idx}"
-            )
-        })?;
-
-        outputs.push(unsafe {
-            attention_from_ptr(
-                &q_i,
-                &key_visible,
-                &value_visible,
-                scale,
-                std::ptr::null(),
-                0.0,
-                0,
-            )
-        });
-    }
-
-    // `drain(..1)` panics on an empty vec, so reject `batch == 0` explicitly
-    // with a clean error instead (issue #195).
-    if outputs.is_empty() {
-        return Err(
-            "rotating paged decode fallback received an empty batch (batch == 0)".to_string(),
-        );
-    }
-    let mut outputs = outputs.into_iter();
-    let mut result = outputs.next().expect("outputs is non-empty: checked above");
-    for output in outputs {
-        result = crate::concatenate(&result, &output, 0);
-    }
-    Ok(result)
-}
-
-/// Native paged decode path over rotating ring-buffer KV caches.
-pub fn paged_decode_attention_rotating_compat(
-    q: &MlxArray,
-    cache_keys: &[*const MlxArray],
-    cache_values: &[*const MlxArray],
-    metadata: &crate::cache::RotatingPagedDecodeMetadata,
-    scale: f32,
-) -> Result<UniquePtr<MlxArray>, String> {
-    validate_rotating_paged_decode_inputs(q, cache_keys, cache_values, metadata)?;
-    Ok(unsafe {
-        ffi::paged_decode_attention_rotating_compat(
-            q,
-            cache_keys,
-            cache_values,
-            &metadata.kv_lens,
-            &metadata.logical_starts,
-            metadata.block_size,
-            scale,
-        )
-    })
 }
 
 /// Metal 4 fused attention dispatch with automatic hardware detection.
@@ -5779,6 +6007,234 @@ pub fn compiled_gelu_mlp_fp16(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seeded(shape: &[i32], seed: u64) -> UniquePtr<MlxArray> {
+        let len: usize = shape.iter().map(|d| *d as usize).product();
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        let data: Vec<f32> = (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 40) as f32) / ((1u32 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect();
+        ffi::from_slice_f32(&data, shape)
+    }
+
+    fn quantized_4bit(dense: &MlxArray) -> QuantizedWeight {
+        let q = ffi::quantize_weights(dense, 64, 4);
+        QuantizedWeight::new(
+            ffi::quantized_weights_w(&q),
+            ffi::quantized_weights_scales(&q),
+            ffi::quantized_weights_biases(&q),
+            64,
+            4,
+        )
+    }
+
+    fn raw_bytes(arr: &MlxArray) -> Vec<u8> {
+        ffi::eval(arr);
+        ffi::array_to_raw_bytes(arr)
+    }
+
+    /// Issues #1994 and #2001: with matching f16 or bf16 scales and input and
+    /// more than 512 output tiles, the dense path returns the same bytes as
+    /// `quantized_matmul`, with and without a linear bias. Narrow outputs
+    /// (512 tiles or fewer), mixed dtypes and short inputs are not eligible.
+    ///
+    /// On ROCm (#2081) the same holds only where `quantized_matmul` runs the
+    /// dequantize + hipBLASLt route, so the ROCm block below checks the
+    /// guarantee itself on shapes that reach other routes: any shape the rule
+    /// accepts must match, and a shape whose bytes differ must be refused.
+    #[test]
+    fn prefill_dense_gemm_matches_qmm_bytes_where_eligible() {
+        let (rows, k) = (1024, 2048);
+        for dt in [crate::dtype::FLOAT16, crate::dtype::BFLOAT16] {
+            let x = ffi::astype(&seeded(&[1, rows, k], 11), dt);
+            let wide = quantized_4bit(&ffi::astype(&seeded(&[1024, k], 7), dt));
+            let bias = ffi::astype(&seeded(&[1024], 13), dt);
+            // 1024 rows x 512 columns is exactly 512 tiles: MLX tiles the two
+            // paths differently there, so it must stay on qmm.
+            let narrow = quantized_4bit(&ffi::astype(&seeded(&[512, k], 7), dt));
+            assert!(
+                !prefill_dense_gemm_eligible(&x, &narrow, 1),
+                "dtype {dt}: narrow N"
+            );
+            assert!(
+                !prefill_dense_gemm_eligible(&x, &wide, 1025),
+                "dtype {dt}: min rows"
+            );
+
+            // On ROCm eligibility also depends on the device's qmm route
+            // (#2081). On the measured route both dtypes take dequantize +
+            // hipBLASLt at 1024 rows; elsewhere a refused shape skips the byte
+            // check instead of failing it.
+            let eligible = prefill_dense_gemm_eligible(&x, &wide, 1024);
+            let rocm = crate::hardware::gpu_backend_kind() == crate::hardware::GpuBackendKind::Rocm;
+            if rocm && !rocm_measured_route() && !eligible {
+                eprintln!(
+                    "skipping dtype {dt} byte check: this ROCm device's qmm route differs from dequantize + hipBLASLt (lablup/mlxcel#2081)"
+                );
+                continue;
+            }
+            assert!(eligible, "dtype {dt}");
+            for b in [None, Some(&bias)] {
+                let bias_ptr = b
+                    .map(|b| b.as_ref().unwrap() as *const MlxArray)
+                    .unwrap_or(std::ptr::null());
+                let want = unsafe {
+                    ffi::quantized_linear_forward(
+                        &x,
+                        &wide.weight,
+                        &wide.scales,
+                        wide.biases_ptr(),
+                        bias_ptr,
+                        wide.group_size,
+                        wide.bits,
+                        &wide.mode,
+                    )
+                };
+                let got = dense_gemm(&x, &wide, b);
+                assert_eq!(
+                    raw_bytes(&got),
+                    raw_bytes(&want),
+                    "dtype {dt} bias {}: dense GEMM must match qmm bytes",
+                    b.is_some()
+                );
+            }
+        }
+
+        if crate::hardware::gpu_backend_kind() == crate::hardware::GpuBackendKind::Rocm {
+            prefill_dense_gemm_rocm_route_guard(k);
+        }
+
+        let x16 = ffi::astype(&seeded(&[1, rows, k], 11), crate::dtype::FLOAT16);
+        let wbf = quantized_4bit(&ffi::astype(&seeded(&[1024, k], 7), crate::dtype::BFLOAT16));
+        assert_eq!(ffi::array_dtype(&wbf.scales), crate::dtype::BFLOAT16);
+        assert!(
+            !prefill_dense_gemm_eligible(&x16, &wbf, 1),
+            "bf16 scales with an f16 input must stay on qmm"
+        );
+    }
+
+    /// True on gfx1151, the device the ROCm qmm routes were measured on
+    /// (#2081), when no environment variable that moves a route is set.
+    fn rocm_measured_route() -> bool {
+        crate::rocm_arch::device_gfx_target() == Some("gfx1151")
+            && [
+                "MLX_ROCM_WMMA_QMM",
+                "MLX_ROCM_WMMA_QMM_MAX_M",
+                "MLX_ROCM_QMM_DEQUANT_GEMM",
+                "MLX_ROCM_QMM_DEQUANT_M_THRESHOLD",
+                "MLX_NO_HIPBLASLT",
+                "MLX_ROCM_FORCE_LOW_CU",
+                "MLX_ROCM_FORCE_WARP_SIZE",
+            ]
+            .iter()
+            .all(|name| std::env::var_os(name).is_none())
+    }
+
+    /// ROCm half of [`prefill_dense_gemm_matches_qmm_bytes_where_eligible`]:
+    /// shapes that pass the tile rule but reach different `quantized_matmul`
+    /// routes. Everywhere, a shape the rule accepts must match. On the
+    /// measured route, bf16 at 64 rows takes the fused WMMA kernel, whose
+    /// bytes differ, so the rule must refuse it, while f16 at 64 rows and bf16
+    /// at 256 rows take dequantize + hipBLASLt and must be accepted. A batch
+    /// axis above 1 makes `quantized_matmul` batch the GEMM, so it is refused
+    /// whatever the bytes.
+    fn prefill_dense_gemm_rocm_route_guard(k: i32) {
+        let measured = rocm_measured_route();
+        let mut refused_differing = 0;
+        for (dt, rows, n, expect_eligible) in [
+            (crate::dtype::BFLOAT16, 64, 8448, false),
+            (crate::dtype::FLOAT16, 64, 8448, true),
+            (crate::dtype::BFLOAT16, 256, 4096, true),
+        ] {
+            let x = ffi::astype(&seeded(&[1, rows, k], 17), dt);
+            let w = quantized_4bit(&ffi::astype(&seeded(&[n, k], 19), dt));
+            let want = unsafe {
+                ffi::quantized_linear_forward(
+                    &x,
+                    &w.weight,
+                    &w.scales,
+                    w.biases_ptr(),
+                    std::ptr::null(),
+                    w.group_size,
+                    w.bits,
+                    &w.mode,
+                )
+            };
+            let same = raw_bytes(&dense_gemm(&x, &w, None)) == raw_bytes(&want);
+            let eligible = prefill_dense_gemm_eligible(&x, &w, 1);
+            eprintln!(
+                "rocm route guard: dtype {dt} rows {rows} N {n}: eligible {eligible}, same bytes {same}"
+            );
+            assert!(
+                !eligible || same,
+                "dtype {dt} rows {rows} N {n}: eligible, but dense GEMM differs from qmm"
+            );
+            if measured {
+                assert_eq!(
+                    eligible, expect_eligible,
+                    "dtype {dt} rows {rows} N {n}: eligibility on gfx1151"
+                );
+            }
+            if !same {
+                refused_differing += 1;
+            }
+        }
+        if measured {
+            // The bf16 64-row case must really differ, or this guard would
+            // pass with the route check removed.
+            assert!(
+                refused_differing >= 1,
+                "no differing shape exercised the route check"
+            );
+        }
+
+        let batched_x = ffi::astype(&seeded(&[2, 512, k], 23), crate::dtype::BFLOAT16);
+        let w = quantized_4bit(&ffi::astype(&seeded(&[1024, k], 7), crate::dtype::BFLOAT16));
+        assert!(
+            !prefill_dense_gemm_eligible(&batched_x, &w, 1),
+            "a batch axis above 1 must stay on qmm on ROCm"
+        );
+    }
+
+    /// Pin [`max_abs_attention_score`] against products computed by hand, on
+    /// both sides of [`F16_MAX`].
+    ///
+    /// Without this the helper's own arithmetic is taken on faith, and a
+    /// transpose on the wrong axes or a missing `abs` would still produce a
+    /// plausible number that a range test would report as a pass.
+    #[test]
+    fn max_abs_attention_score_matches_hand_computed_products() {
+        // q and k are [1, 1, 2, 2], so q @ k^T is the 2x2 of dot products:
+        //   [1 2] . [5 6] = 17    [1 2] . [7 8] = 23
+        //   [3 4] . [5 6] = 39    [3 4] . [7 8] = 53   <- the max
+        let q = ffi::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 2, 2]);
+        let k = ffi::from_slice_f32(&[5.0, 6.0, 7.0, 8.0], &[1, 1, 2, 2]);
+        let peak = max_abs_attention_score(&q, &k, 2.0);
+        assert!(
+            (peak - 106.0).abs() < 1e-3,
+            "expected 53 * 2.0 = 106, got {peak}"
+        );
+        assert!(peak < F16_MAX, "{peak} should be under the f16 ceiling");
+
+        // The negative product is the largest in magnitude, so a helper that
+        // dropped `abs` would report 2 here instead of 90000.
+        let q = ffi::from_slice_f32(&[300.0, 1.0], &[1, 1, 1, 2]);
+        let k = ffi::from_slice_f32(&[-300.0, 2.0], &[1, 1, 1, 2]);
+        let peak = max_abs_attention_score(&q, &k, 1.0);
+        assert!(
+            (peak - 89_998.0).abs() < 1e-1,
+            "expected |300 * -300 + 1 * 2| = 89998, got {peak}"
+        );
+        assert!(
+            peak > F16_MAX,
+            "{peak} should be over the f16 ceiling {F16_MAX}"
+        );
+    }
 
     #[test]
     fn named_lora_selection_is_reversible_and_validated() {
@@ -6127,6 +6583,104 @@ mod tests {
         }
     }
 
+    /// Issue #1806: the per-layer guard passes exactly the table's `Native`
+    /// entries, and leaves an unparseable mode to `validate_quantization_mode`.
+    #[test]
+    fn quantization_mode_runnable_follows_the_capability_table() {
+        use crate::hardware::{GpuBackendKind, QuantMode, QuantModeSupport};
+        for backend in GpuBackendKind::ALL {
+            for mode in QuantMode::ALL {
+                let result = validate_quantization_mode_runnable(mode.as_str(), backend);
+                match backend.quant_mode_support(mode) {
+                    QuantModeSupport::Native => assert!(result.is_ok(), "{backend:?} {mode}"),
+                    _ => {
+                        let err = result.expect_err("a non-native mode must be refused");
+                        assert!(err.contains(mode.as_str()), "{err}");
+                        assert!(err.contains(backend.display_name()), "{err}");
+                    }
+                }
+            }
+            assert!(validate_quantization_mode_runnable("optiq", backend).is_ok());
+        }
+        let err = validate_quantization_mode_runnable("nvfp4", GpuBackendKind::Rocm).unwrap_err();
+        assert!(
+            err.contains("affine"),
+            "the message must name the way out: {err}"
+        );
+    }
+
+    /// Issue #1808: the load log names the native route for a block-float
+    /// mode only on a backend that has another route to choose (ROCm), and
+    /// says nothing for affine, for a mode that backend refuses, for an
+    /// unparseable mode, or on a backend that runs every mode natively, so
+    /// Metal, CUDA and CPU load output stays as it was.
+    #[test]
+    fn native_route_line_only_where_a_route_was_chosen() {
+        use crate::hardware::{GpuBackendKind, QuantMode, QuantModeSupport};
+        for backend in GpuBackendKind::ALL {
+            let all_native = QuantMode::ALL
+                .into_iter()
+                .all(|m| backend.quant_mode_support(m) == QuantModeSupport::Native);
+            for mode in QuantMode::ALL {
+                let line = native_quantization_route_line(mode.as_str(), backend);
+                let expected = mode != QuantMode::Affine
+                    && !all_native
+                    && backend.quant_mode_support(mode) == QuantModeSupport::Native;
+                assert_eq!(line.is_some(), expected, "{backend:?} {mode}: {line:?}");
+                if let Some(line) = line {
+                    assert!(line.contains(mode.as_str()), "{line}");
+                    assert!(line.contains(backend.display_name()), "{line}");
+                    assert!(line.contains("native"), "{line}");
+                }
+            }
+            assert_eq!(native_quantization_route_line("optiq", backend), None);
+        }
+        let rocm = native_quantization_route_line("mxfp4", GpuBackendKind::Rocm)
+            .expect("mxfp4 is native on ROCm, which also converts nvfp4");
+        assert!(rocm.contains("ROCm"), "{rocm}");
+        for backend in [
+            GpuBackendKind::Metal,
+            GpuBackendKind::Cuda,
+            GpuBackendKind::None,
+        ] {
+            assert_eq!(native_quantization_route_line("mxfp4", backend), None);
+        }
+    }
+
+    /// Issue #1806: an MLX-native NVFP4 layer (group 16, no biases, E4M3
+    /// scales) reaching the shared loader on a backend with no NVFP4 kernel is
+    /// a load error naming the layer, not an abort at the first matmul. On a
+    /// backend that runs NVFP4 the same layer still loads. Builds the layer
+    /// only; no kernel runs, so this is safe on every backend.
+    #[test]
+    fn shared_loader_refuses_nvfp4_where_the_backend_cannot_run_it() {
+        use crate::hardware::{QuantMode, QuantModeSupport, quant_mode_support};
+        let prefix = "model.layers.0.mlp.down_proj";
+        let mut weights = crate::weights::WeightMap::new();
+        // out 2, in 32: 32 * 4 bits / 32 = 4 packed u32 words, 32 / 16 = 2 groups.
+        weights.insert(
+            format!("{prefix}.weight"),
+            ffi::from_slice_u32(&[0u32; 8], &[2, 4]),
+        );
+        weights.insert(
+            format!("{prefix}.scales"),
+            ffi::from_bytes(&[0x38u8; 4], &[2, 2], crate::dtype::UINT8),
+        );
+        let loaded = UnifiedLinear::from_weights(&weights, prefix, 16, 4);
+        match quant_mode_support(QuantMode::Nvfp4) {
+            QuantModeSupport::Native => {
+                loaded.expect("a backend with native NVFP4 must keep loading it");
+            }
+            _ => {
+                let err = loaded
+                    .err()
+                    .expect("NVFP4 must be refused at load on this backend");
+                assert!(err.contains(prefix), "the error must name the layer: {err}");
+                assert!(err.contains("nvfp4"), "{err}");
+            }
+        }
+    }
+
     /// The declared `mode` is the third value in the same `quantization` block
     /// and, unlike `group_size` / `bits`, is bounded by an allowlist: MLX's
     /// `string_to_quantization_mode` is a closed four-value enum and mlxcel
@@ -6442,10 +6996,22 @@ mod tests {
             (16, 1, false, 64, 8, "mxfp8"),
         ] {
             let weights = mla_quantized_weights("embed_q", packed_in, num_groups, with_biases);
-            let loaded = QuantizedMultiLinear::from_weights(&weights, "embed_q", group_size, bits)
-                .unwrap_or_else(|e| {
-                    panic!("an honest {expected} embed_q must load, got: {e}");
-                });
+            let result = QuantizedMultiLinear::from_weights(&weights, "embed_q", group_size, bits);
+            // Issue #1806: a mode the running backend cannot run is refused at
+            // load, naming the layer, so only runnable modes reach the asserts.
+            let runnable = crate::hardware::QuantMode::from_mlx_name(expected)
+                .map(crate::hardware::quant_mode_support)
+                == Some(crate::hardware::QuantModeSupport::Native);
+            if !runnable {
+                let err = result
+                    .err()
+                    .expect("a non-runnable mode must be refused at load");
+                assert!(err.contains("embed_q") && err.contains(expected), "{err}");
+                continue;
+            }
+            let loaded = result.unwrap_or_else(|e| {
+                panic!("an honest {expected} embed_q must load, got: {e}");
+            });
             assert_eq!(
                 loaded.mode, expected,
                 "a plane with biases present = {with_biases} at {group_size} / {bits} is {expected}"
@@ -6513,9 +7079,19 @@ mod tests {
         ] {
             for with_biases in [true, false] {
                 let weights = mla_quantized_weights("embed_q", packed_in, num_groups, with_biases);
-                let loaded =
-                    QuantizedMultiLinear::from_weights(&weights, "embed_q", group_size, bits)
-                        .unwrap_or_else(|e| panic!("{group_size} / {bits} is a real export: {e}"));
+                let result =
+                    QuantizedMultiLinear::from_weights(&weights, "embed_q", group_size, bits);
+                // Issue #1806: a mode the running backend cannot run (nvfp4 on
+                // ROCm) is refused at load; that refusal is its own test.
+                let mode = infer_quantization_mode(with_biases, group_size, bits);
+                if validate_quantization_mode_runnable(mode, crate::hardware::gpu_backend_kind())
+                    .is_err()
+                {
+                    assert!(result.is_err(), "{mode} must be refused on this backend");
+                    continue;
+                }
+                let loaded = result
+                    .unwrap_or_else(|e| panic!("{group_size} / {bits} is a real export: {e}"));
                 validate_quantization_biases(loaded.mode, loaded.biases.is_some()).unwrap_or_else(
                     |e| {
                         panic!(
@@ -7377,19 +7953,63 @@ mod tests {
 
     #[test]
     fn small_query_fallback_mirrors_the_patched_cudnn_gate() {
-        // The shape the patched `supports_sdpa_cudnn` diverts: masked, 2 to 32
-        // rows, longer key sequence. Off a CUDA build the mirror is inert.
         let cuda = cfg!(feature = "cuda");
-        assert_eq!(cuda_sdpa_small_query_fallback(16, 4096, true), cuda);
-        assert_eq!(cuda_sdpa_small_query_fallback(2, 4096, true), cuda);
-        assert_eq!(cuda_sdpa_small_query_fallback(32, 4096, true), cuda);
-        // Unmasked calls keep cuDNN, so they never reach the fallback.
-        assert!(!cuda_sdpa_small_query_fallback(16, 4096, false));
+        // With bucketing off by default (#1820's measured recommendation), the
+        // #1799 fallback claims array-masked blocks again, exactly as on main.
+        assert_eq!(cuda_sdpa_small_query_fallback(16, 4096, true, false), cuda);
+        assert_eq!(cuda_sdpa_small_query_fallback(2, 4096, true, false), cuda);
+        assert_eq!(cuda_sdpa_small_query_fallback(32, 4096, true, false), cuda);
+        // The causal half of the #1799 gate is what bucketing does NOT take
+        // over: a `do_causal` block carries no array mask, so there is nothing
+        // to widen and C++ still routes it to the materializing ops fallback.
+        // Collapsing these two axes into one `masked` flag is what made this
+        // mirror claim the causal block stayed on cuDNN, which silently
+        // dropped its query chunking.
+        assert_eq!(cuda_sdpa_small_query_fallback(16, 4096, false, true), cuda);
+        assert_eq!(cuda_sdpa_small_query_fallback(2, 4096, false, true), cuda);
+        assert_eq!(cuda_sdpa_small_query_fallback(32, 4096, false, true), cuda);
+        // Neither masked nor causal: cuDNN takes it and never falls back.
+        assert!(!cuda_sdpa_small_query_fallback(16, 4096, false, false));
         // One-row decode, a block wider than the bound, and a prefill whose
         // key length does not exceed its query length are all outside the gate.
-        assert!(!cuda_sdpa_small_query_fallback(1, 4096, true));
-        assert!(!cuda_sdpa_small_query_fallback(33, 4096, true));
-        assert!(!cuda_sdpa_small_query_fallback(4096, 4096, true));
+        assert!(!cuda_sdpa_small_query_fallback(1, 4096, false, true));
+        assert!(!cuda_sdpa_small_query_fallback(33, 4096, false, true));
+        assert!(!cuda_sdpa_small_query_fallback(4096, 4096, false, true));
+    }
+
+    #[test]
+    fn plan_bucket_eligibility_mirrors_the_patched_cudnn_gate() {
+        // Bound passed explicitly: the shipped default is 0 (off, see
+        // `sdpa_plan_bucket_max_queries`), and a OnceLock environment read
+        // cannot be varied per test, so the predicate is exercised directly.
+        let elig = |q, k, m, c| plan_bucket_eligible_with(q, k, m, c, 32);
+        // The array-masked speculative verify shape, which #1820 buckets.
+        assert!(elig(2, 350, true, false));
+        assert!(elig(16, 4096, true, false));
+        assert!(elig(32, 4096, true, false));
+        // Causal-mode blocks carry no array mask, so bucketing cannot
+        // canonicalize their key and #1799's fallback still claims them. This
+        // is the axis the C++ gate rejects at `do_causal`, mirrored here.
+        assert!(!elig(16, 4096, false, true));
+        // Neither an array mask nor causal mode: nothing to widen either.
+        assert!(!elig(16, 4096, false, false));
+        // One-row decode has its own upstream canonicalization, a wider block
+        // amortizes its own plan build, and a prefill has no prior context.
+        assert!(!elig(1, 4096, true, false));
+        assert!(!elig(33, 4096, true, false));
+        assert!(!elig(4096, 4096, true, false));
+    }
+
+    #[test]
+    fn plan_bucketing_is_off_by_default_so_1799_dispatch_ships() {
+        // The shipped default must reproduce main's dispatch exactly: with the
+        // bound at 0 nothing is bucket-eligible, so #1799's fallback reclaims
+        // every array-masked verify block it claimed before #1820.
+        assert_eq!(sdpa_plan_bucket_max_queries(), 0);
+        assert!(!plan_bucket_eligible_with(4, 4096, true, false, 0));
+        let cuda = cfg!(feature = "cuda");
+        assert_eq!(cuda_sdpa_small_query_fallback(4, 4096, true, false), cuda);
+        assert_eq!(cuda_sdpa_small_query_fallback(16, 4096, false, true), cuda);
     }
 
     #[test]
@@ -7454,9 +8074,10 @@ mod tests {
         let full = attention_dispatch(&q, &k, &v, scale, Some(mask.as_ref().unwrap()), softcap);
         let chunked =
             chunked_query_attention(&q, &k, &v, scale, Some(mask.as_ref().unwrap()), softcap, 2);
+        let diff = max_abs_diff(&full, &chunked);
         assert!(
-            max_abs_diff(&full, &chunked) < 1e-5,
-            "softcap GQA chunked SDPA diverged from unchunked"
+            diff < 1e-5,
+            "softcap GQA chunked SDPA diverged from unchunked by {diff}"
         );
     }
 
@@ -7471,9 +8092,10 @@ mod tests {
 
         let full = attention_dispatch(&q, &k, &v, scale, Some(&mask), 0.0);
         let chunked = chunked_query_attention(&q, &k, &v, scale, Some(&mask), 0.0, 2);
+        let diff = max_abs_diff(&full, &chunked);
         assert!(
-            max_abs_diff(&full, &chunked) < 1e-5,
-            "broadcast-mask chunked SDPA diverged from unchunked"
+            diff < 1e-5,
+            "broadcast-mask chunked SDPA diverged from unchunked by {diff}"
         );
     }
 
@@ -7951,11 +8573,13 @@ mod tests {
     /// `group_size` that happens to satisfy the arithmetic).
     #[test]
     fn infer_bits_rejects_non_canonical_widths() {
-        // packed_in * 32 / (num_groups * group_size) = 32*4 / (32*2) = 2 is valid,
-        // so use a combination that yields 1 (invalid).
-        // packed_in=32, num_groups=32, group_size=32 → 32*32/(32*32) = 1.
-        let err = infer_quantization_bits(&[16, 32], &[16, 32], 32, 4);
-        assert!(err.is_err(), "bits=1 should be rejected");
+        // 1 bit is a loadable width since issue #1370, so use 7, which MLX has
+        // no kernel for and mlxcel does not add one for:
+        // packed_in=7, num_groups=1, group_size=32 → 7*32/(1*32) = 7.
+        let err = infer_quantization_bits(&[16, 7], &[16, 1], 32, 4);
+        assert!(err.is_err(), "bits=7 should be rejected");
+        // packed_in=32, num_groups=32, group_size=32 → 1, now accepted.
+        assert_eq!(infer_quantization_bits(&[16, 32], &[16, 32], 32, 4), Ok(1));
     }
 
     /// Empty/zero shapes are treated as pass-through (defensive — real arrays
@@ -8366,11 +8990,50 @@ mod tests {
         }
     }
 
-    /// The #905 kill switches are default-ON, which is the inverse of the
-    /// opt-in `MLXCEL_FUSED_QK_NORM` flag above, so they get their own pin: a
-    /// recognised disable string turns the fusion off, an unset variable leaves
-    /// the compiled-in default, and an unrecognised value must not silently
-    /// change the decode graph.
+    #[test]
+    fn fused_905_defaults_are_on_for_rocm_builds_only() {
+        // #2145: a `rocm` build turns both fusions on by default; Metal and CUDA
+        // builds keep them off. Pinned against the feature rather than a
+        // literal so each backend's build checks its own default.
+        assert_eq!(FUSED_ADD_RMSNORM_DEFAULT, cfg!(feature = "rocm"));
+        assert_eq!(FUSED_ROPE_APPEND_DEFAULT, cfg!(feature = "rocm"));
+        #[cfg(feature = "rocm")]
+        {
+            assert!(fused_add_rmsnorm_enabled_from(None));
+            assert!(fused_rope_append_enabled_from(None));
+            // The kill switch still turns them off on ROCm.
+            assert!(!fused_add_rmsnorm_enabled_from(Some("0")));
+            assert!(!fused_rope_append_enabled_from(Some("0")));
+        }
+        #[cfg(not(feature = "rocm"))]
+        {
+            assert!(!fused_add_rmsnorm_enabled_from(None));
+            assert!(!fused_rope_append_enabled_from(None));
+            // And `=1` still opts in elsewhere.
+            assert!(fused_add_rmsnorm_enabled_from(Some("1")));
+            assert!(fused_rope_append_enabled_from(Some("1")));
+        }
+    }
+
+    #[test]
+    fn fused_flag_explicit_value_separates_a_setting_from_the_default() {
+        assert_eq!(fused_flag_explicit_value(None), None);
+        for v in ["", "maybe", "2"] {
+            assert_eq!(fused_flag_explicit_value(Some(v)), None, "{v:?}");
+        }
+        for v in ["0", "false", "off", "no", " OFF "] {
+            assert_eq!(fused_flag_explicit_value(Some(v)), Some(false), "{v:?}");
+        }
+        for v in ["1", "true", "on", "yes", " Yes "] {
+            assert_eq!(fused_flag_explicit_value(Some(v)), Some(true), "{v:?}");
+        }
+    }
+
+    /// The #905 kill switches default per build (on for `rocm`, off elsewhere),
+    /// unlike the always-opt-in `MLXCEL_FUSED_QK_NORM` flag above, so they get
+    /// their own pin: a recognised disable string turns the fusion off, an
+    /// unset variable leaves the compiled-in default, and an unrecognised value
+    /// must not silently change the decode graph.
     #[test]
     fn fused_905_flags_follow_the_default_and_respect_explicit_values() {
         // Unset means the compiled-in default, whichever way it is set. Asserting
@@ -8463,8 +9126,8 @@ mod tests {
 
     use super::{
         NativePagedOverride, PAGED_DISPATCH_CACHE_EMPTY, PagedDecodeBackend, PagedDecodeDispatch,
-        PagedDispatchCache, parse_native_paged_override, resolve_dispatch_decision,
-        select_pooled_paged_dispatch,
+        PagedDispatchCache, paged_decode_backend, parse_native_paged_override,
+        resolve_dispatch_decision, select_pooled_paged_dispatch,
     };
 
     #[test]
@@ -8560,6 +9223,57 @@ mod tests {
                 "CUDA multi-slab (slabs={slabs}) must decline to gather"
             );
         }
+    }
+
+    #[test]
+    fn selector_rocm_backend_follows_the_cuda_rule() {
+        // ROCm (#2068) runs the HIP port of the CUDA kernel, so it takes the
+        // CUDA rule: native on every single-slab shape, including the b=1 and
+        // long-context regimes Metal routes to gather, and gather past one
+        // slab. Compared against CUDA shape by shape so the two cannot drift.
+        for &(b, ctx) in &[
+            (1usize, 128usize),
+            (1, 65536),
+            (3, 4096),
+            (4, 4097),
+            (16, 131072),
+        ] {
+            for &slabs in &[0usize, 1, 2, 8] {
+                let rocm = select_pooled_paged_dispatch(b, ctx, slabs, PagedDecodeBackend::Rocm);
+                assert_eq!(
+                    rocm,
+                    select_pooled_paged_dispatch(b, ctx, slabs, PagedDecodeBackend::Cuda),
+                    "ROCm must match CUDA at b={b} ctx={ctx} slabs={slabs}"
+                );
+                let expected = if slabs <= 1 {
+                    PagedDecodeDispatch::Native
+                } else {
+                    PagedDecodeDispatch::Gather
+                };
+                assert_eq!(rocm, expected, "ROCm b={b} ctx={ctx} slabs={slabs}");
+            }
+        }
+    }
+
+    #[test]
+    fn paged_decode_backend_names_the_resolved_backend() {
+        // The backend the fused kernel would run on agrees with the resolved
+        // GPU backend wherever that backend has the v1 port. Before #2068 a
+        // ROCm build answered `Other` even with a port in the table, so the
+        // native path was unreachable there.
+        use crate::hardware::{GpuBackendKind, gpu_backend_kind};
+        let backend = paged_decode_backend();
+        if !crate::paged_attention_decode_available() {
+            assert_eq!(backend, PagedDecodeBackend::Other);
+            return;
+        }
+        let expected = match gpu_backend_kind() {
+            GpuBackendKind::Metal => PagedDecodeBackend::Metal,
+            GpuBackendKind::Cuda => PagedDecodeBackend::Cuda,
+            GpuBackendKind::Rocm => PagedDecodeBackend::Rocm,
+            _ => PagedDecodeBackend::Other,
+        };
+        assert_eq!(backend, expected);
     }
 
     #[test]
@@ -8733,6 +9447,18 @@ mod tests {
             PagedDecodeDispatch::Gather,
             "Other must be gather (no kernel)"
         );
+        // ROCm (#2068) at the same shape: native like CUDA, so a ROCm tag that
+        // aliased Metal's or Other's cell would return their cached gather.
+        assert_eq!(
+            cache.select(1, 512, 1, PagedDecodeBackend::Rocm),
+            PagedDecodeDispatch::Native,
+            "ROCm single-slab b=1 must be native (not an aliased Metal/Other gather)"
+        );
+        assert_eq!(
+            cache.select(1, 512, 1, PagedDecodeBackend::Other),
+            PagedDecodeDispatch::Gather,
+            "Other must be gather after a ROCm query (not the aliased ROCm native)"
+        );
         // Re-query CUDA: still native, proving the Metal/Other writes did not
         // clobber the CUDA cell (each backend keeps its own last-key cell only
         // for the most recent distinct key, so this also confirms recompute
@@ -8746,9 +9472,10 @@ mod tests {
 
     #[test]
     fn dispatch_cache_cuda_pack_key_roundtrips_without_collision() {
-        // The 2-bit backend tag (Metal=0, Cuda=1, Other=2) must produce three
-        // distinct packed keys for one identical shape, and each must stay clear
-        // of the decision bit and the empty sentinel.
+        // The 2-bit backend tag (Metal=0, Cuda=1, Other=2, Rocm=3) must
+        // produce four distinct packed keys for one identical shape, and each
+        // must stay clear of the decision bit and the empty sentinel, also at
+        // the saturated shape where every field is all ones.
         let shape = (4usize, 4096usize, 1usize);
         let k_metal =
             PagedDispatchCache::pack_key(shape.0, shape.1, shape.2, PagedDecodeBackend::Metal);
@@ -8756,10 +9483,24 @@ mod tests {
             PagedDispatchCache::pack_key(shape.0, shape.1, shape.2, PagedDecodeBackend::Cuda);
         let k_other =
             PagedDispatchCache::pack_key(shape.0, shape.1, shape.2, PagedDecodeBackend::Other);
+        let k_rocm =
+            PagedDispatchCache::pack_key(shape.0, shape.1, shape.2, PagedDecodeBackend::Rocm);
+        let k_rocm_saturated = PagedDispatchCache::pack_key(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+            PagedDecodeBackend::Rocm,
+        );
         assert_ne!(k_metal, k_cuda, "Metal and CUDA keys must differ");
         assert_ne!(k_cuda, k_other, "CUDA and Other keys must differ");
         assert_ne!(k_metal, k_other, "Metal and Other keys must differ");
         for k in [k_metal, k_cuda, k_other] {
+            assert_ne!(
+                k, k_rocm,
+                "ROCm's key must differ from every other backend's"
+            );
+        }
+        for k in [k_metal, k_cuda, k_other, k_rocm, k_rocm_saturated] {
             assert_eq!(
                 k & PagedDispatchCache::DECISION_BIT,
                 0,
@@ -8793,5 +9534,89 @@ mod metal4_attention_switch_tests {
             !should_use_metal4_attention(),
             "no neural accelerator, so the Metal 4 attention route must decline"
         );
+    }
+}
+
+// Not limited to Metal builds since #2069: ROCm has a port too, and elsewhere
+// the wrapper runs the unfused pair, which the comparison then checks against
+// itself.
+#[cfg(test)]
+mod residual_add3_layer_norm_tests {
+    use super::*;
+    use crate::dtype;
+
+    fn normal(shape: &[i32], dt: i32, seed: u64, scale: f32) -> UniquePtr<MlxArray> {
+        let key = ffi::random_key(seed);
+        let x = unsafe { ffi::random_normal(shape, dtype::FLOAT32, &*key) };
+        let scaled = ffi::multiply(&x, &ffi::full_f32(&[1], scale, dtype::FLOAT32));
+        ffi::astype(&scaled, dt)
+    }
+
+    /// The fused kernel's contract is byte identity with `compiled_add3`
+    /// followed by `LayerNorm::forward`, the pair it replaces, not closeness.
+    /// Covers f16, bf16 and f32, with and without a bias, several rows, widths
+    /// that are not a multiple of the 8 reads per thread (the Metal kernel's
+    /// tail branch) or of the ROCm port's 1024-element stride, and the widest
+    /// row the kernel takes (`FUSED_ADD3_LAYER_NORM_MAX_DIM`). A tolerance
+    /// check here would let a reordered reduction pass. On a backend with a
+    /// port (Metal, ROCm since #2069) the kernel path must be the one taken.
+    #[test]
+    fn residual_add3_layer_norm_matches_the_unfused_pair() {
+        use crate::hardware::{GpuBackendKind, gpu_backend_kind};
+        // With the gate off the wrapper runs the unfused pair, and the test
+        // would compare that pair with itself and pass whatever the kernel does.
+        if !fused_add3_layer_norm_enabled() {
+            eprintln!(
+                "skipping: MLXCEL_FUSED_ADD_NORM disables the fused add3 + LayerNorm kernel, \
+                 so there is nothing to compare against the unfused pair"
+            );
+            return;
+        }
+        // ROCm's port is wave32-only and held back on a wave64 device (#2147).
+        if gpu_backend_kind() == GpuBackendKind::Metal
+            || (gpu_backend_kind() == GpuBackendKind::Rocm && ffi::rocm_device_warp_size() == 32)
+        {
+            assert!(
+                ffi::fused_add3_layer_norm_available(),
+                "Metal and wave32 ROCm have a fused add3 + LayerNorm port"
+            );
+        }
+        for (dt, dim, rows, with_bias) in [
+            (dtype::FLOAT16, 4096, 1, false),
+            (dtype::FLOAT16, 4096, 5, false),
+            (dtype::FLOAT16, 4100, 3, true),
+            (dtype::BFLOAT16, 4096, 2, true),
+            (dtype::FLOAT16, 96, 4, false),
+            (dtype::FLOAT32, 4096, 2, true),
+            (dtype::FLOAT32, 1025, 3, false),
+            (dtype::BFLOAT16, FUSED_ADD3_LAYER_NORM_MAX_DIM, 2, true),
+            (dtype::FLOAT16, FUSED_ADD3_LAYER_NORM_MAX_DIM, 1, false),
+            (dtype::BFLOAT16, 5, 2, false),
+        ] {
+            let shape = [1, rows, dim];
+            let a = normal(&shape, dt, 1, 1.0);
+            let b = normal(&shape, dt, 2, 1.0);
+            let x = normal(&shape, dt, 3, 4.0);
+            let norm = LayerNorm::new(
+                normal(&[dim], dt, 4, 0.5),
+                with_bias.then(|| normal(&[dim], dt, 5, 0.1)),
+                1e-5,
+            );
+
+            let (x_fused, h_fused) = residual_add3_layer_norm(&a, &b, &x, &norm);
+            let x_ref = ffi::compiled_add3(&a, &b, &x);
+            let h_ref = norm.forward(&x_ref);
+
+            let same_x = ffi::array_equal(&x_fused, &x_ref, false);
+            let same_h = ffi::array_equal(&h_fused, &h_ref, false);
+            assert!(
+                ffi::item_bool(&same_x),
+                "residual differs: dtype {dt} dim {dim} rows {rows} bias {with_bias}"
+            );
+            assert!(
+                ffi::item_bool(&same_h),
+                "normalized output differs: dtype {dt} dim {dim} rows {rows} bias {with_bias}"
+            );
+        }
     }
 }

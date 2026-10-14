@@ -508,11 +508,12 @@ pub struct AppState {
     /// `MLXCEL_VIDEO_DIR_ALLOWLIST`, canonicalized once at startup (issue
     /// #1766).
     ///
-    /// The video-frames fallback resolves local clips against this rather than
-    /// re-reading the environment and calling `std::fs::canonicalize` on each
-    /// entry per request, which ran on a Tokio worker. Empty by default, which
-    /// is the same fail-closed answer an unset variable gives: no local path
-    /// resolves until the startup pipeline installs the operator's list.
+    /// Native-video resolution and the video-frames fallback both resolve
+    /// local clips against this rather than re-reading the environment and
+    /// calling `std::fs::canonicalize` on each entry per request. Empty by
+    /// default, which is the same fail-closed answer an unset variable gives:
+    /// no local path resolves until the startup pipeline installs the
+    /// operator's list.
     pub(crate) video_dir_allowlist: Arc<Vec<PathBuf>>,
     /// Batch-level metrics (active sequences, queue depth) for admission
     /// control and status reporting.
@@ -533,6 +534,10 @@ pub struct AppState {
     /// publish and adopt detached caches. HTTP handlers may only call
     /// read-only observation methods on this store.
     pub prompt_cache: Option<Arc<PromptCacheStore>>,
+    /// Reasoning the server generated per chat turn, re-injected into a later
+    /// request whose client echoed only `content` (issue #2110). Bounded and
+    /// evicting; consulted only while `prompt_cache` is installed.
+    pub(crate) reasoning_echo: Arc<super::reasoning_echo::ReasoningEchoStore>,
     /// in-memory store backing `POST /v1/responses` with
     /// `store=true`, `GET /v1/responses/:id`, and `previous_response_id`
     /// chaining. `None` when the operator passed
@@ -556,6 +561,10 @@ pub struct AppState {
     /// `--reranker-model`); while it is `None` the route returns a structured
     /// `501 Not Implemented`.
     pub rerank_model: Option<Arc<dyn RerankModelProvider>>,
+    /// Realtime VoiceChat engine serving the `/v1/realtime` WebSocket
+    /// (#1376). `Some` only when `-m` is a Nemotron VoiceChat checkpoint;
+    /// the route is mounted only then.
+    pub realtime_engine: Option<Arc<super::realtime_engine::RealtimeVoiceChatEngine>>,
     /// Resumable-stream sessions for the b10621 `/v1/stream` lifecycle
     /// (#1444): streaming requests carrying `X-Conversation-Id` buffer their
     /// SSE bytes here for replay, lookup, and deletion.
@@ -580,6 +589,16 @@ pub struct AppState {
     /// Vertex AI predict adapter is enabled (#1456), so per-instance
     /// dispatch runs through the same middleware stack in-process.
     pub(crate) gcp_dispatch: Arc<std::sync::OnceLock<axum::Router>>,
+    /// Per-app WebUI catalog projection cache. Static metadata is cached here;
+    /// live provider/lifecycle fields are reprojected on every UI response.
+    #[cfg(feature = "webui")]
+    pub(crate) webui_catalog_cache: Arc<super::webui::catalog::CatalogProjectionCache>,
+    /// Single-model WebUI operation/event coordinator.
+    #[cfg(feature = "webui")]
+    pub(crate) webui_lifecycle: Arc<super::router_lifecycle::LifecycleCoordinator>,
+    /// Startup shape exposed by the WebUI bootstrap route.
+    #[cfg(feature = "webui")]
+    pub(crate) webui_startup: Arc<super::ServerStartupConfig>,
 }
 
 impl AppState {
@@ -763,11 +782,13 @@ impl AppState {
             pp_observability: Arc::new(PipelineObservability::new()),
             pp_tracer: None,
             prompt_cache: None,
+            reasoning_echo: Arc::new(super::reasoning_echo::ReasoningEchoStore::from_env()),
             responses_store: None,
             conversation_store: None,
             audio_model: None,
             embedding_model: None,
             rerank_model: None,
+            realtime_engine: None,
             stream_sessions: Arc::new(super::stream_session::StreamSessionManager::new()),
             completion_controls: Arc::new(
                 super::completion_control::CompletionControlRegistry::new(),
@@ -777,6 +798,12 @@ impl AppState {
             llama_scrape: Arc::new(std::sync::Mutex::new(LlamaScrapeBaseline::default())),
             started_at_unix: chrono::Utc::now().timestamp(),
             gcp_dispatch: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(feature = "webui")]
+            webui_catalog_cache: Arc::new(super::webui::catalog::CatalogProjectionCache::new()),
+            #[cfg(feature = "webui")]
+            webui_lifecycle: Arc::new(super::router_lifecycle::LifecycleCoordinator::new()),
+            #[cfg(feature = "webui")]
+            webui_startup: Arc::new(super::ServerStartupConfig::default()),
         }
     }
 
@@ -826,11 +853,13 @@ impl AppState {
             pp_observability: Arc::new(PipelineObservability::new()),
             pp_tracer: None,
             prompt_cache: None,
+            reasoning_echo: Arc::new(super::reasoning_echo::ReasoningEchoStore::from_env()),
             responses_store: None,
             conversation_store: None,
             audio_model: None,
             embedding_model: None,
             rerank_model: None,
+            realtime_engine: None,
             stream_sessions: Arc::new(super::stream_session::StreamSessionManager::new()),
             completion_controls: Arc::new(
                 super::completion_control::CompletionControlRegistry::new(),
@@ -840,6 +869,12 @@ impl AppState {
             llama_scrape: Arc::new(std::sync::Mutex::new(LlamaScrapeBaseline::default())),
             started_at_unix: chrono::Utc::now().timestamp(),
             gcp_dispatch: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(feature = "webui")]
+            webui_catalog_cache: Arc::new(super::webui::catalog::CatalogProjectionCache::new()),
+            #[cfg(feature = "webui")]
+            webui_lifecycle: Arc::new(super::router_lifecycle::LifecycleCoordinator::new()),
+            #[cfg(feature = "webui")]
+            webui_startup: Arc::new(super::ServerStartupConfig::default()),
         }
     }
 
@@ -857,6 +892,14 @@ impl AppState {
     #[must_use]
     pub(crate) fn with_video_dir_allowlist(mut self, allowlist: Arc<Vec<PathBuf>>) -> Self {
         self.video_dir_allowlist = allowlist;
+        self
+    }
+
+    /// Attach the startup configuration snapshot exposed by WebUI bootstrap.
+    #[cfg(feature = "webui")]
+    #[must_use]
+    pub(crate) fn with_webui_startup(mut self, startup: Arc<super::ServerStartupConfig>) -> Self {
+        self.webui_startup = startup;
         self
     }
 
@@ -919,6 +962,16 @@ impl AppState {
         provider: Option<Arc<dyn EmbeddingModelProvider>>,
     ) -> Self {
         self.embedding_model = provider;
+        self
+    }
+
+    /// Attach the realtime VoiceChat engine; mounts `/v1/realtime`.
+    #[must_use]
+    pub fn with_realtime_engine(
+        mut self,
+        engine: Option<Arc<super::realtime_engine::RealtimeVoiceChatEngine>>,
+    ) -> Self {
+        self.realtime_engine = engine;
         self
     }
 

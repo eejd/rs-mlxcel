@@ -88,7 +88,9 @@ mlxcel-server -m Qwen3.5-0.8B-4bit \
 
 Continuous batching and prompt-prefix caching are enabled by default. The
 native `cache_prompt` request field can opt a request out of both lookup and
-donation. `/v1/cache/stats` reports the cache state, while
+donation; send `cache_prompt: false` when greedy output must not depend on the
+cache state, since a cache hit prefills in two parts and can round differently
+(see [`llama-server-compat.md`](llama-server-compat.md#reproducible-greedy-output-send-cache_prompt-false)). `/v1/cache/stats` reports the cache state, while
 `POST /v1/cache/reset` clears it. Context shifting is disabled by default to
 match b10621; enable `--context-shift` and configure `--keep` when an
 application intentionally wants to retain part of an overlong conversation.
@@ -169,6 +171,17 @@ The server exposes the commonly used llama-server sampling stages, including
 top-k/top-p/min-p, typical-p, XTC, DRY, repetition/frequency/presence penalties,
 Mirostat, dynamic temperature, adaptive-p, logit bias, and probability reports.
 Startup defaults can be overridden on supported request schemas.
+
+mlxcel also accepts a boolean `p_less` request field (default `false`) on
+`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, and native
+`/completion`. It enables hyperparameter-free p-less truncation: after the
+penalties and top-n-sigma, tokens whose probability under the
+temperature-scaled softmax is below the collision probability
+`sum(p^2)` are masked, so a peaked distribution collapses toward its argmax
+and a flat one keeps most of the vocabulary. The most likely token always
+survives, greedy requests skip the filter, and there is no server-wide
+default. The CLI equivalent is `mlxcel generate --p-less` and
+`mlxcel chat --p-less`.
 
 `--grammar`, `--grammar-file`, `--json-schema`, and `--json-schema-file`
 constrain output. Native completion and infill requests additionally accept

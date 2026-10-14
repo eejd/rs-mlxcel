@@ -35,12 +35,53 @@ use crate::distributed::{
     validate_supported_runtime, write_plan_toml,
 };
 
+#[cfg(feature = "webui")]
+use super::app::create_app_with_secured_ui;
 use super::batch::BatchObservability;
 use super::state::ModelMediaSupport;
 use super::{
     AppState, BatchMetrics, ChatTemplateProcessor, ModelProvider, PipelineParallelRuntimeConfig,
     ServerConfig, ServerGenerateOptions, create_app,
 };
+
+#[cfg(feature = "webui")]
+use std::io::IsTerminal;
+
+#[cfg(feature = "webui")]
+#[derive(Clone)]
+pub(crate) struct WebUiTerminalSecret(String);
+
+#[cfg(feature = "webui")]
+impl std::fmt::Debug for WebUiTerminalSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WebUiTerminalSecret(<redacted>)")
+    }
+}
+
+#[cfg(feature = "webui")]
+impl WebUiTerminalSecret {
+    fn new(secret: String) -> Self {
+        Self(secret)
+    }
+
+    fn expose_once(&self) {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+                let _ = writeln!(tty, "mlxcel WebUI session key (shown once): {}", self.0);
+                return;
+            }
+        }
+        if std::io::stderr().is_terminal() {
+            eprintln!("mlxcel WebUI session key (shown once): {}", self.0);
+            return;
+        }
+        tracing::warn!(
+            "WebUI session key was generated but no controlling terminal was available after bind"
+        );
+    }
+}
 
 struct ResolvedDistributedStartup {
     _node_registry: Option<NodeRegistry>,
@@ -125,6 +166,14 @@ pub struct ServerStartupConfig {
     pub api_prefix: String,
     /// `--sse-ping-interval`; `None` = pings disabled (`-1` upstream).
     pub sse_ping_interval: Option<std::time::Duration>,
+    /// Serve the bundled local WebUI and authenticated `/ui-api/v1` adapter routes.
+    pub webui_enabled: bool,
+    /// Restart-local WebUI key generated before bind and printed after bind.
+    #[cfg(feature = "webui")]
+    pub(crate) webui_terminal_secret: Option<WebUiTerminalSecret>,
+    /// Shared policy clone updated with the exact bound authority after bind.
+    #[cfg(feature = "webui")]
+    pub(crate) webui_security_policy: Option<super::webui::security::WebUiSecurityPolicy>,
     /// `--threads-http`, already resolved to a concrete worker count by
     /// [`crate::server::transport::resolve_http_threads`].
     pub threads_http: usize,
@@ -148,6 +197,8 @@ pub struct ServerStartupConfig {
     /// "use the per-kind default" — `4` for MTP, `16` for DFlash. See
     /// [`crate::cli::speculative_args::default_block_size_for_kind`].
     pub draft_block_size: Option<u32>,
+    /// `--prompt-lookup-max-batch` (#2255).
+    pub prompt_lookup_max_batch: usize,
 
     // Chat template
     pub chat_template: Option<String>,
@@ -225,8 +276,10 @@ pub struct ServerStartupConfig {
     /// `--rerank-batch-size`. Forwarded to
     /// [`super::config::ServerConfig::rerank_batch_size`].
     pub rerank_batch_size: usize,
-    /// Prefill chunk size in tokens (0 = disabled).
+    /// Prefill chunk size when no other sequence is decoding (0 = disabled).
     pub prefill_chunk_size: usize,
+    /// Prefill chunk size while at least one other sequence is decoding.
+    pub prefill_chunk_size_contended: usize,
     /// Set when `--batch-size` and `--prefill-chunk-size` conflict; triggers a startup warning.
     pub batch_size_conflict: bool,
     /// Set when `--ubatch-size` was provided; triggers a startup info notice.
@@ -516,6 +569,10 @@ pub struct ServerStartupConfig {
     /// semantics. `None` (the default) keeps the pool unbounded.
     pub kv_cache_budget: Option<crate::memory_estimate::PagedBudgetDirective>,
 
+    /// Paged KV admission watermark (`--kv-admission-watermark`, issue
+    /// #2088). `None` keeps [`crate::server::DEFAULT_KV_ADMISSION_WATERMARK`].
+    pub kv_admission_watermark: Option<f64>,
+
     /// maximum number of responses kept in the
     /// [`crate::server::responses_store::ResponsesStore`]. `0` disables
     /// response persistence entirely, in which case `GET /v1/responses/:id`
@@ -582,6 +639,9 @@ pub struct ServerStartupConfig {
 
 impl Default for ServerStartupConfig {
     fn default() -> Self {
+        let prefill_chunk_policy = mlxcel_core::prefill_plan::PrefillChunkPolicy::resolve(
+            mlxcel_core::prefill_plan::prefill_chunk_override(),
+        );
         Self {
             reasoning_format: crate::server::ReasoningFormat::default(),
             reasoning_alias_field: crate::server::ReasoningAliasField::default(),
@@ -610,6 +670,11 @@ impl Default for ServerStartupConfig {
             sse_ping_interval: Some(std::time::Duration::from_secs(
                 crate::server::transport::DEFAULT_SSE_PING_INTERVAL_SECS as u64,
             )),
+            webui_enabled: false,
+            #[cfg(feature = "webui")]
+            webui_terminal_secret: None,
+            #[cfg(feature = "webui")]
+            webui_security_policy: None,
             threads_http: crate::server::transport::resolve_http_threads(
                 crate::server::transport::DEFAULT_THREADS_HTTP,
                 4,
@@ -625,6 +690,8 @@ impl Default for ServerStartupConfig {
             // has been resolved".
             draft_kind: None,
             draft_block_size: None,
+            prompt_lookup_max_batch:
+                crate::server::speculative_dispatch::DEFAULT_PROMPT_LOOKUP_MAX_BATCH,
             max_batch_size: None,
             max_queue_depth: 32,
             audio_queue_depth: crate::server::config::DEFAULT_AUDIO_QUEUE_DEPTH,
@@ -637,7 +704,8 @@ impl Default for ServerStartupConfig {
                 crate::server::config::DEFAULT_EMBEDDING_REQUEST_TIMEOUT_SECS,
             reranker_model_path: None,
             rerank_batch_size: crate::server::config::DEFAULT_RERANK_BATCH_SIZE,
-            prefill_chunk_size: 512,
+            prefill_chunk_size: prefill_chunk_policy.alone,
+            prefill_chunk_size_contended: prefill_chunk_policy.contended,
             batch_size_conflict: false,
             ubatch_size_provided: false,
             enable_preemption: false,
@@ -758,6 +826,7 @@ impl Default for ServerStartupConfig {
             // pairs with the batched-decode default. Disable with
             // `--kv-cache-budget none`.
             kv_cache_budget: Some(crate::memory_estimate::PagedBudgetDirective::Auto),
+            kv_admission_watermark: None,
             responses_store_max_entries: 1024,
             responses_store_max_bytes: super::responses_store::DEFAULT_RESPONSES_STORE_MAX_BYTES,
             responses_store_ttl_secs: 3600,
@@ -824,7 +893,8 @@ fn resolve_context_kv_cap(
     })
 }
 
-fn validate_parallel_context_startup(startup: &ServerStartupConfig) -> Result<()> {
+// Used by: server startup, WebUI next-load profile admission.
+pub(super) fn validate_parallel_context_startup(startup: &ServerStartupConfig) -> Result<()> {
     if startup.ctx_size == 0 {
         return Ok(());
     }
@@ -1271,7 +1341,10 @@ fn muse_glimmer_distributed_requested(startup: &ServerStartupConfig) -> bool {
         || startup.serving_bind.is_some()
 }
 
-fn validate_muse_glimmer_unsupported_startup(startup: &ServerStartupConfig) -> Result<()> {
+// Used by: server startup, WebUI next-load profile admission.
+pub(super) fn validate_muse_glimmer_unsupported_startup(
+    startup: &ServerStartupConfig,
+) -> Result<()> {
     if !is_muse_glimmer_model_path(&startup.model_path) {
         return Ok(());
     }
@@ -1474,6 +1547,49 @@ pub(super) fn resolve_chat_template(
     Ok(ChatTemplateProcessor::from_model_path(model_path)?.unwrap_or_default())
 }
 
+/// Load the tokenizer and the chat template the way `start_server` does,
+/// including the `enable_thinking` default for checkpoints whose tokenizer
+/// recognizes a think marker pair. Shared with the in-process server
+/// ([`crate::server::in_process`]) so `mlxcel run` renders prompts exactly as
+/// `/v1/chat/completions` does (issue #2173).
+pub(crate) fn load_chat_front(
+    startup: &ServerStartupConfig,
+) -> Result<(crate::tokenizer::MlxcelTokenizer, ChatTemplateProcessor)> {
+    let mut chat_template = resolve_chat_template(
+        startup.chat_template.as_deref(),
+        startup.chat_template_file.as_deref(),
+        &startup.model_path,
+    )?;
+    let tokenizer = crate::tokenizer::load_tokenizer(&startup.model_path)?;
+
+    // The one `enable_thinking` default every front applies
+    // (`server::chat_front`, #2176): on when the tokenizer recognizes a think
+    // marker pair, except for a template that wants thinking off (issue
+    // #686). Per-request kwargs and `--chat-template-kwargs` still win via
+    // `merge_server_and_request`.
+    if crate::server::chat_front::apply_thinking_default(&mut chat_template, &tokenizer) {
+        let thinking_markers = tokenizer.infer_thinking_markers();
+        tracing::info!(
+            think_start = ?thinking_markers.think_start,
+            think_end = ?thinking_markers.think_end,
+            think_start_tokens_len = thinking_markers
+                .think_start_tokens
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or(0),
+            think_end_tokens_len = thinking_markers
+                .think_end_tokens
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or(0),
+            "Tokenizer recognizes a think marker pair; defaulting \
+             chat_template kwarg `enable_thinking=true` (\
+             upstream PR #1114)"
+        );
+    }
+    Ok((tokenizer, chat_template))
+}
+
 /// Parse a preemption policy string from CLI into the enum.
 ///
 /// Accepts "longest-first" (default) and "lowest-priority" (case-insensitive).
@@ -1629,12 +1745,12 @@ pub(super) fn build_server_config(
         num_draft_tokens: startup.draft_max,
         // forward the speculative-decoding selector flags
         // verbatim. Reconciliation against the drafter `config.json`
-        // and dispatch into `MtpGenerator` / `DFlashGenerator` / the
-        // classic `SpeculativeGenerator` happens later inside the
-        // continuous-batching worker, when both the drafter path and
-        // the resolved kind are known.
+        // and dispatch into `MtpGenerator` / `DFlashGenerator` / plain
+        // decode happens later inside the continuous-batching worker,
+        // when both the drafter path and the resolved kind are known.
         draft_kind: startup.draft_kind.clone(),
         draft_block_size: startup.draft_block_size,
+        prompt_lookup_max_batch: startup.prompt_lookup_max_batch,
         max_batch_size,
         max_queue_depth: startup.max_queue_depth,
         audio_queue_depth: startup.audio_queue_depth,
@@ -1647,6 +1763,7 @@ pub(super) fn build_server_config(
         reranker_model_path: startup.reranker_model_path.clone(),
         rerank_batch_size: startup.rerank_batch_size,
         prefill_chunk_size: startup.prefill_chunk_size,
+        prefill_chunk_size_contended: startup.prefill_chunk_size_contended,
         // #1011: pass the explicit --prefill-grant-interval through untouched
         // (the scheduler resolves env / shipped default when this is None).
         prefill_grant_interval: startup.prefill_grant_interval,
@@ -1706,6 +1823,12 @@ pub(super) fn build_server_config(
         // forward the paged KV block-budget directive verbatim; the worker
         // resolves it to a concrete block count once the model is loaded.
         kv_cache_budget: startup.kv_cache_budget,
+        // issue #2088: resolve the admission watermark to its default here.
+        kv_admission_watermark: crate::server::clamp_kv_admission_watermark(
+            startup
+                .kv_admission_watermark
+                .unwrap_or(crate::server::DEFAULT_KV_ADMISSION_WATERMARK),
+        ),
         // forward the experimental VLM prefix-cache toggle (#124 step c).
         enable_vlm_prefix_cache: startup.enable_vlm_prefix_cache,
         // forward the validated CORS allow-list (#244); `None` keeps permissive.
@@ -1840,10 +1963,52 @@ fn initialize_server_logging(startup: &ServerStartupConfig) -> Result<()> {
     Ok(())
 }
 
-fn warmup_model(model_provider: &ModelProvider) -> Result<()> {
+/// Why the startup text warmup does not run for a model of `model_type`, or
+/// `None` when it runs. Shared by `start_server` and the in-process server
+/// (issue #2173) so both skip the same families.
+pub(crate) fn startup_warmup_skip_reason(
+    model_type: Option<crate::models::ModelType>,
+) -> Option<&'static str> {
+    use crate::models::ModelType;
+    match model_type? {
+        // Nemotron VoiceChat (issues #1374, #1376) has no chat worker to warm;
+        // its `/v1/realtime` engine thread warms EAR-TTS when a session opens.
+        ModelType::NemotronVoiceChat => {
+            Some("Skipping text warmup for Nemotron VoiceChat (served on /v1/realtime)")
+        }
+        // Florence-2 (issue #1073) and Nemotron-Parse (issue #1369) run on
+        // their seq2seq workers, which reject anything but a task marker with
+        // exactly one image, so the text literal "Hello" would only log a
+        // spurious failure. They warm on their first real request instead.
+        ModelType::Florence2VLM | ModelType::NemotronParseVLM => {
+            Some("Skipping text warmup for image-task seq2seq model (Florence-2 / Nemotron-Parse)")
+        }
+        _ => None,
+    }
+}
+
+/// Run the startup one-token warmup for the chat model at `model_path`,
+/// unless [`startup_warmup_skip_reason`] says its family cannot take it. A
+/// failed warmup is logged and never fatal: the first real request pays the
+/// cost instead.
+pub(crate) fn run_startup_warmup(model_path: &Path, model_provider: &ModelProvider) {
+    let model_type = crate::models::get_model_type(model_path).ok();
+    if let Some(reason) = startup_warmup_skip_reason(model_type) {
+        tracing::info!("{reason}");
+        return;
+    }
+    tracing::info!("Warming up model...");
+    match warmup_model(model_provider) {
+        Ok(()) => tracing::info!("Warmup complete"),
+        Err(err) => tracing::warn!("Warmup failed (non-fatal): {}", err),
+    }
+}
+
+pub(crate) fn warmup_model(model_provider: &ModelProvider) -> Result<()> {
     model_provider.generate(
         "Hello".to_string(),
         ServerGenerateOptions {
+            admission_notification: None,
             // Inert: the generation bounds are native-route fields (#1477).
             n_indent: 0,
             t_max_predict_ms: None,
@@ -1951,6 +2116,158 @@ fn validate_pipeline_parallel_startup(startup: &ServerStartupConfig) -> Result<(
         .map(|_| ())
 }
 
+fn prefixed_path(prefix: &str, path: &str) -> String {
+    if prefix.is_empty() {
+        path.to_string()
+    } else {
+        format!("{prefix}{path}")
+    }
+}
+
+#[cfg(feature = "webui")]
+fn webui_api_prefix(prefix: &str) -> String {
+    if prefix.is_empty() {
+        "/".to_string()
+    } else {
+        prefix.to_string()
+    }
+}
+
+#[cfg(feature = "webui")]
+fn webui_authority(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+#[cfg(feature = "webui")]
+fn webui_origin(scheme: &str, authority: &str) -> Result<axum::http::HeaderValue> {
+    format!("{scheme}://{authority}")
+        .parse()
+        .context("failed to build WebUI allowed Origin")
+}
+
+#[cfg(feature = "webui")]
+fn is_loopback_webui_host(host: &str) -> bool {
+    is_loopback_bind_host(host)
+}
+
+#[cfg(feature = "webui")]
+fn webui_listen_kind(
+    resolution: &crate::server::transport::ListenResolution,
+) -> super::webui::security::startup::WebUiListenKind {
+    match &resolution.target {
+        crate::server::transport::ListenTarget::Unix(_) => {
+            super::webui::security::startup::WebUiListenKind::UnixSocket
+        }
+        crate::server::transport::ListenTarget::Tcp { host, .. }
+            if is_loopback_webui_host(host) =>
+        {
+            super::webui::security::startup::WebUiListenKind::LoopbackTcp
+        }
+        crate::server::transport::ListenTarget::Tcp { .. } => {
+            super::webui::security::startup::WebUiListenKind::NonLoopbackTcp
+        }
+    }
+}
+
+#[cfg(feature = "webui")]
+fn webui_allowed_hosts(host: &str, port: u16) -> Vec<String> {
+    let mut hosts = vec![webui_authority(host, port)];
+    if is_loopback_webui_host(host) {
+        hosts.extend([
+            webui_authority("127.0.0.1", port),
+            webui_authority("localhost", port),
+            webui_authority("::1", port),
+        ]);
+    }
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+#[cfg(feature = "webui")]
+fn webui_can_show_secret() -> bool {
+    #[cfg(unix)]
+    {
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/tty")
+            .is_ok()
+        {
+            return true;
+        }
+    }
+    std::io::stderr().is_terminal()
+}
+
+#[cfg(feature = "webui")]
+fn resolve_webui_startup(
+    startup: &mut ServerStartupConfig,
+    mut api_keys: crate::server::ApiKeys,
+) -> Result<(
+    crate::server::ApiKeys,
+    Option<super::webui::security::WebUiSecurityPolicy>,
+)> {
+    if !startup.webui_enabled {
+        return Ok((api_keys, None));
+    }
+    let resolution = crate::server::transport::resolve_listen_target(&startup.host, startup.port)?;
+    let (host, port) = match &resolution.target {
+        crate::server::transport::ListenTarget::Tcp { host, port } => (host.as_str(), *port),
+        crate::server::transport::ListenTarget::Unix(_) => ("localhost", startup.port),
+    };
+    let scheme = if startup.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    let allowed_hosts = webui_allowed_hosts(host, port);
+    let allowed_origins = allowed_hosts
+        .iter()
+        .map(|host| webui_origin(scheme, host))
+        .collect::<Result<Vec<_>>>()?;
+    let security = super::webui::security::startup::resolve_webui_security(
+        super::webui::security::startup::WebUiSecurityConfig {
+            enabled: true,
+            listen: webui_listen_kind(&resolution),
+            tls_enabled: startup.tls.is_some(),
+            configured_key_present: !api_keys.is_empty(),
+            interactive_terminal: webui_can_show_secret(),
+            allowed_hosts,
+            allowed_origins,
+            public_webui_prefix: prefixed_path(&startup.api_prefix, "/webui"),
+            api_prefix: webui_api_prefix(&startup.api_prefix),
+        },
+    )?;
+    let Some(security) = security else {
+        return Ok((api_keys, None));
+    };
+    if let Some(credential) = security.generated_credential {
+        let secret = credential.into_terminal_secret();
+        startup.webui_terminal_secret = Some(WebUiTerminalSecret::new(secret.clone()));
+        api_keys = api_keys.with_extra_key(secret);
+        tracing::info!("WebUI startup generated a restart-local session key");
+    }
+    startup.webui_security_policy = Some(security.policy.clone());
+    Ok((api_keys, Some(security.policy)))
+}
+
+#[cfg(not(feature = "webui"))]
+fn resolve_webui_startup(
+    startup: &mut ServerStartupConfig,
+    api_keys: crate::server::ApiKeys,
+) -> Result<(crate::server::ApiKeys, Option<()>)> {
+    if startup.webui_enabled {
+        anyhow::bail!(
+            "--webui requires a binary built with the Cargo `webui` feature; rebuild mlxcel with bundled WebUI support"
+        );
+    }
+    Ok((api_keys, None))
+}
+
 fn log_endpoints(startup: &ServerStartupConfig, addr: &str) {
     tracing::info!("Starting mlxcel server on {}", addr);
     // Surface the backend's GPU count at startup (epic #486, sub-issue #487).
@@ -1983,6 +2300,28 @@ fn log_endpoints(startup: &ServerStartupConfig, addr: &str) {
         tracing::info!("  POST {prefix}/slots/:id_slot       - Slot save/restore/erase");
     }
     tracing::info!("  GET  {prefix}/health               - Health check");
+    if startup.webui_enabled {
+        let webui_path = prefixed_path(prefix, "/webui");
+        #[cfg(feature = "webui")]
+        if let Some(policy) = startup.webui_security_policy.as_ref() {
+            match axum::http::HeaderValue::from_str(addr)
+                .map_err(anyhow::Error::from)
+                .and_then(|origin| policy.update_exact_origin(origin))
+            {
+                Ok(()) => {}
+                Err(err) => tracing::error!(
+                    error = %err,
+                    "failed to install exact bound WebUI origin; browser requests may be rejected"
+                ),
+            }
+        }
+        tracing::info!("  GET  {webui_path}/                         - Bundled WebUI");
+        tracing::info!("Bundled WebUI: {addr}{webui_path}/");
+        #[cfg(feature = "webui")]
+        if let Some(secret) = startup.webui_terminal_secret.as_ref() {
+            secret.expose_once();
+        }
+    }
 }
 
 /// Bind and serve, applying the b10621 transport options (#1432).
@@ -2426,6 +2765,115 @@ fn validate_settings_endpoint_exposure(
     )
 }
 
+/// Size the cross-request prompt-prefix cache for this model and build its
+/// store, or `None` when the policy disables it.
+///
+/// Applies the model-aware capacity defaults and the hybrid-SSM APC rule to
+/// `config.prompt_cache` before building the store, so every caller serves
+/// with the same cache policy `start_server` does.
+///
+/// Used by: `start_server`, `engine_probe::ServerEngine::start`
+pub(super) fn resolve_prompt_cache_store(
+    config: &mut ServerConfig,
+    model_path: &Path,
+    batch_metrics: &Arc<BatchMetrics>,
+) -> Option<Arc<crate::server::prompt_cache::PromptCacheStore>> {
+    if config.prompt_cache.is_enabled()
+        && !config.prompt_cache.snapshot_capacity_bytes_explicit
+        && let Some(rec) = crate::server::prompt_cache::recommend_model_snapshot_capacity(
+            model_path,
+            config.context_size,
+            config.prompt_cache.snapshot_capacity_bytes,
+        )
+        && rec.capacity_bytes > config.prompt_cache.snapshot_capacity_bytes
+    {
+        tracing::info!(
+            previous_snapshot_capacity_bytes = config.prompt_cache.snapshot_capacity_bytes,
+            recommended_snapshot_capacity_bytes = rec.capacity_bytes,
+            representative_snapshot_bytes = rec.entry_bytes,
+            representative_tokens = rec.representative_tokens,
+            target_entries = rec.target_entries,
+            kv_bytes_at_representative_tokens = rec.kv_bytes_at_representative_tokens,
+            fixed_state_bytes = rec.fixed_state_bytes,
+            available_ceiling_bytes = rec.available_ceiling_bytes,
+            architecture = %rec.architecture,
+            "Applied model-aware prompt-cache snapshot capacity default"
+        );
+        config.prompt_cache.snapshot_capacity_bytes = rec.capacity_bytes;
+    }
+
+    if config.prompt_cache.is_enabled()
+        && !config.prompt_cache.capacity_bytes_explicit
+        && let Some(rec) = crate::server::prompt_cache::recommend_model_kv_store_capacity(
+            model_path,
+            config.context_size,
+            config.prompt_cache.capacity_bytes,
+        )
+        && rec.capacity_bytes > config.prompt_cache.capacity_bytes
+    {
+        tracing::info!(
+            previous_capacity_bytes = config.prompt_cache.capacity_bytes,
+            recommended_capacity_bytes = rec.capacity_bytes,
+            representative_entry_bytes = rec.entry_bytes,
+            representative_tokens = rec.representative_tokens,
+            target_entries = rec.target_entries,
+            available_ceiling_bytes = rec.available_ceiling_bytes,
+            architecture = %rec.architecture,
+            "Applied model-aware prompt-cache KV store capacity default"
+        );
+        config.prompt_cache.capacity_bytes = rec.capacity_bytes;
+    }
+
+    // hybrid SSM / linear-attention models cannot use APC because
+    // their recurrent state cannot be reconstructed from a token-prefix hash.
+    // Detect by reading model_type / architectures from config.json and
+    // force-disable APC at runtime (the whole-prefix prompt cache is still
+    // safe and stays enabled).
+    if config.prompt_cache.apc.enabled
+        && let Ok(Some(family)) =
+            crate::server::prompt_cache::detect_hybrid_ssm_from_path(model_path)
+    {
+        tracing::warn!(
+            model_type = %family,
+            "Detected hybrid SSM / linear-attention model family ({family}); \
+             auto-disabling APC because recurrent state cannot decompose \
+             into hashable blocks. Whole-prefix prompt cache is unaffected."
+        );
+        config.prompt_cache.apc.enabled = false;
+    }
+
+    // Cross-request prompt-prefix KV cache store.
+    // Gated on the config flag so a disabled policy reserves zero memory.
+    // wire BatchMetrics into the store so hits/misses/evictions
+    // are counted and exposed via /metrics.
+    if config.prompt_cache.is_enabled() {
+        let cache_metrics = Arc::new(crate::server::state::BatchMetricsCacheAdapter::new(
+            batch_metrics.clone(),
+        ));
+        let store = Arc::new(crate::server::prompt_cache::PromptCacheStore::with_metrics(
+            config.prompt_cache.clone(),
+            cache_metrics,
+        ));
+        tracing::info!(
+            capacity_bytes = config.prompt_cache.capacity_bytes,
+            max_entries = config.prompt_cache.max_entries,
+            ttl_seconds = config.prompt_cache.ttl.as_secs(),
+            snapshot_capacity_bytes = config.prompt_cache.snapshot_capacity_bytes,
+            snapshot_max_entries = config.prompt_cache.snapshot_max_entries,
+            snapshot_ttl_seconds = config.prompt_cache.snapshot_ttl.as_secs(),
+            min_prefix_tokens = config.prompt_cache.min_prefix_tokens,
+            apc_enabled = config.prompt_cache.apc.enabled,
+            apc_block_size = config.prompt_cache.apc.block_size,
+            apc_hash = %config.prompt_cache.apc.hash,
+            "Prompt-prefix cache store enabled (+ APC, snapshots)"
+        );
+        Some(store)
+    } else {
+        tracing::debug!("Prompt-prefix KV cache store disabled by config");
+        None
+    }
+}
+
 /// Start the server with the given startup configuration.
 ///
 /// Shared entry point used by both `mlxcel serve` and `mlxcel-server`.
@@ -2458,6 +2906,7 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     // checks must use the actual parsed keys: a configured key file may contain
     // only comments and blank lines, which is still an unauthenticated server.
     let api_keys = crate::server::resolve_api_keys(&startup.api_keys, &startup.api_key_files)?;
+    let (api_keys, webui_policy) = resolve_webui_startup(&mut startup, api_keys)?;
     validate_settings_endpoint_exposure(
         startup.enable_settings,
         &startup.host,
@@ -2487,9 +2936,12 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     // per model inside the router startup; a parse error or untranslatable
     // key fails startup there.
     if startup.model_path.as_os_str().is_empty()
-        && (startup.router_models_dir.is_some() || startup.models_preset.is_some())
+        && (startup.router_models_dir.is_some()
+            || startup.models_preset.is_some()
+            || startup.webui_enabled)
     {
-        return crate::server::router_server::run_router_server(startup, api_keys).await;
+        return crate::server::router_server::run_router_server(startup, api_keys, webui_policy)
+            .await;
     }
 
     // Outside router mode `--models-preset` steers nothing; accepting and
@@ -2524,15 +2976,15 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         "effective KV cache mode"
     );
 
-    // Florence-2 (issue #1073): the encoder-decoder (seq2seq) family is
-    // served on its dedicated worker loop (`server/florence2_worker.rs`),
-    // which the model worker thread branches into after loading the
-    // checkpoint, before any decoder-only scheduler starts. The #856-era
-    // startup refusal is gone; the flag below only gates the text-only
-    // warmup, which cannot run against an image-task model.
-    let is_florence2 = matches!(
+    // Nemotron VoiceChat (issues #1374, #1376) is a full-duplex speech model
+    // with no chat or completions surface. It is served on the `/v1/realtime`
+    // WebSocket by a dedicated engine thread (spawned below, next to the audio
+    // wiring); the chat provider skips its worker for this model type, the
+    // text warmup is skipped, and the chat routes answer 501 naming the
+    // socket.
+    let is_voicechat = matches!(
         crate::models::get_model_type(&startup.model_path),
-        Ok(crate::models::ModelType::Florence2VLM)
+        Ok(crate::models::ModelType::NemotronVoiceChat)
     );
 
     // Issue #688 (M1/M2 hardening): disable CUDA graph capture for hazard-family
@@ -2637,6 +3089,7 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
             kv_unified = startup.kv_unified,
             n_parallel = startup.n_parallel,
             prefill_chunk_size = startup.prefill_chunk_size,
+            prefill_chunk_size_contended = startup.prefill_chunk_size_contended,
             max_kv_size = ?startup.max_kv_size,
             "resolved context and batch geometry (0 = the checkpoint's own trained context)"
         );
@@ -2656,6 +3109,10 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     {
         let hw = mlxcel_core::hardware::get_hardware();
         tracing::debug!(
+            vendor = ?hw.vendor,
+            device_name = hw.device_name,
+            device_architecture = hw.device_architecture.as_deref().unwrap_or(""),
+            device_memory_bytes = hw.device_memory_bytes,
             silicon_gen = %hw.silicon_gen,
             gpu_cores = hw.gpu_core_count,
             memory_gb = hw.unified_memory_gb,
@@ -2676,6 +3133,14 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
             compiled_cuda_architectures = mlxcel_core::hardware::compiled_cuda_architectures(),
             "CUDA architecture capabilities detected"
         );
+        // The ROCm half (#1805), recorded the same way. `gfx_target` is None
+        // on every backend but ROCm, so this record is empty rather than
+        // misleading off AMD.
+        tracing::debug!(
+            gfx_target = mlxcel_core::rocm_arch::device_gfx_target().unwrap_or(""),
+            compiled_rocm_architectures = mlxcel_core::rocm_arch::compiled_rocm_architectures(),
+            "HIP architecture capabilities detected"
+        );
         // The graph capture budget `main` applied for this checkpoint's
         // family before any MLX op (#1798). Info, not debug: it changes
         // decode throughput and peak memory, so an operator reading a log
@@ -2688,6 +3153,8 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         }
     }
 
+    // Invalid explicit request caps fail startup, rather than silently disabling admission.
+    crate::execution::request_memory::budget_override()?;
     let runtime = crate::initialize_runtime_checked()?;
     if let Some(invalid) = runtime.invalid_device_override.as_deref() {
         tracing::warn!(
@@ -2785,12 +3252,7 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     if let Some(service_config) = distributed.remote_stage_service {
         return serve_remote_pipeline_stage(service_config).await;
     }
-    let mut chat_template = resolve_chat_template(
-        startup.chat_template.as_deref(),
-        startup.chat_template_file.as_deref(),
-        &startup.model_path,
-    )?;
-    let tokenizer = crate::tokenizer::load_tokenizer(&startup.model_path)?;
+    let (tokenizer, chat_template) = load_chat_front(&startup)?;
 
     // `--dry-sequence-breaker` carries b10621's string value domain since
     // #1485; the effective set (default set, replacement values, or the
@@ -2803,44 +3265,6 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
             breakers = ?config.default_dry_sequence_breakers,
             "DRY sequence breakers active (b10621 semantics: breaker token data derived from the vocabulary per request)"
         );
-    }
-
-    // align the chat-template `enable_thinking` Jinja kwarg
-    // default with upstream `TokenizerWrapper.apply_chat_template`'s
-    // `enable_thinking=self.has_thinking` behavior. When the underlying
-    // tokenizer recognizes a think marker pair (single-token `<think>` /
-    // `</think>`, single-token `<longcat_think>` variants, or multi-token
-    // `<|channel>thought` / `<channel|>` for Gemma 4 and friends), the
-    // server-side default flips to `true` so a request that does not set
-    // `chat_template_kwargs.enable_thinking` still sees thinking enabled
-    // by default. Per-request kwargs and the existing CLI/env defaults
-    // (`--chat-template-kwargs`, `LLAMA_ARG_CHAT_TEMPLATE_KWARGS`)
-    // continue to win on conflict via `merge_server_and_request`.
-    let thinking_markers = tokenizer.infer_thinking_markers();
-    // Issue #686: the Gemma-4 thinking-channel template's thinking-OFF branch
-    // is the correct interactive default (a CLOSED `<|channel>thought\n<channel|>`
-    // priming scaffold matching transformers' no-`enable_thinking` render), so
-    // the `has_thinking` heuristic below must not flip it on; forcing thinking
-    // there produces a bare `<|turn>model\n` that greedy-collapses to `<pad>`.
-    if thinking_markers.has_thinking() && !chat_template.wants_thinking_default_off() {
-        tracing::info!(
-            think_start = ?thinking_markers.think_start,
-            think_end = ?thinking_markers.think_end,
-            think_start_tokens_len = thinking_markers
-                .think_start_tokens
-                .as_ref()
-                .map(Vec::len)
-                .unwrap_or(0),
-            think_end_tokens_len = thinking_markers
-                .think_end_tokens
-                .as_ref()
-                .map(Vec::len)
-                .unwrap_or(0),
-            "Tokenizer recognizes a think marker pair; defaulting \
-             chat_template kwarg `enable_thinking=true` (\
-             upstream PR #1114)"
-        );
-        chat_template.set_default_enable_thinking(true);
     }
 
     // If the serving role is "router", start the lightweight HTTP router front-end
@@ -2897,78 +3321,8 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     let batch_metrics = Arc::new(BatchMetrics::new());
     let batch_observability = Arc::new(BatchObservability::new());
 
-    if config.prompt_cache.is_enabled()
-        && !config.prompt_cache.snapshot_capacity_bytes_explicit
-        && let Some(rec) = crate::server::prompt_cache::recommend_model_snapshot_capacity(
-            &startup.model_path,
-            config.context_size,
-            config.prompt_cache.snapshot_capacity_bytes,
-        )
-        && rec.capacity_bytes > config.prompt_cache.snapshot_capacity_bytes
-    {
-        tracing::info!(
-            previous_snapshot_capacity_bytes = config.prompt_cache.snapshot_capacity_bytes,
-            recommended_snapshot_capacity_bytes = rec.capacity_bytes,
-            representative_snapshot_bytes = rec.entry_bytes,
-            representative_tokens = rec.representative_tokens,
-            target_entries = rec.target_entries,
-            kv_bytes_at_representative_tokens = rec.kv_bytes_at_representative_tokens,
-            fixed_state_bytes = rec.fixed_state_bytes,
-            available_ceiling_bytes = rec.available_ceiling_bytes,
-            architecture = %rec.architecture,
-            "Applied model-aware prompt-cache snapshot capacity default"
-        );
-        config.prompt_cache.snapshot_capacity_bytes = rec.capacity_bytes;
-    }
-
-    // hybrid SSM / linear-attention models cannot use APC because
-    // their recurrent state cannot be reconstructed from a token-prefix hash.
-    // Detect by reading model_type / architectures from config.json and
-    // force-disable APC at runtime (the whole-prefix prompt cache is still
-    // safe and stays enabled).
-    if config.prompt_cache.apc.enabled
-        && let Ok(Some(family)) =
-            crate::server::prompt_cache::detect_hybrid_ssm_from_path(&startup.model_path)
-    {
-        tracing::warn!(
-            model_type = %family,
-            "Detected hybrid SSM / linear-attention model family ({family}); \
-             auto-disabling APC because recurrent state cannot decompose \
-             into hashable blocks. Whole-prefix prompt cache is unaffected."
-        );
-        config.prompt_cache.apc.enabled = false;
-    }
-
-    // Cross-request prompt-prefix KV cache store.
-    // Gated on the config flag so a disabled policy reserves zero memory.
-    // wire BatchMetrics into the store so hits/misses/evictions
-    // are counted and exposed via /metrics.
-    let prompt_cache_store = if config.prompt_cache.is_enabled() {
-        let cache_metrics = Arc::new(crate::server::state::BatchMetricsCacheAdapter::new(
-            batch_metrics.clone(),
-        ));
-        let store = Arc::new(crate::server::prompt_cache::PromptCacheStore::with_metrics(
-            config.prompt_cache.clone(),
-            cache_metrics,
-        ));
-        tracing::info!(
-            capacity_bytes = config.prompt_cache.capacity_bytes,
-            max_entries = config.prompt_cache.max_entries,
-            ttl_seconds = config.prompt_cache.ttl.as_secs(),
-            snapshot_capacity_bytes = config.prompt_cache.snapshot_capacity_bytes,
-            snapshot_max_entries = config.prompt_cache.snapshot_max_entries,
-            snapshot_ttl_seconds = config.prompt_cache.snapshot_ttl.as_secs(),
-            min_prefix_tokens = config.prompt_cache.min_prefix_tokens,
-            apc_enabled = config.prompt_cache.apc.enabled,
-            apc_block_size = config.prompt_cache.apc.block_size,
-            apc_hash = %config.prompt_cache.apc.hash,
-            "Prompt-prefix cache store enabled (+ APC, snapshots)"
-        );
-        Some(store)
-    } else {
-        tracing::debug!("Prompt-prefix KV cache store disabled by config");
-        None
-    };
+    let prompt_cache_store =
+        resolve_prompt_cache_store(&mut config, &startup.model_path, &batch_metrics);
 
     // `--timeout` is validated inside `new_with_server_config_and_prompt_cache` and
     // the resolved `Duration` is stashed on `ModelProvider`, where it flows into the drain loops.
@@ -2982,18 +3336,8 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         batch_observability.clone(),
     )?);
 
-    if startup.warmup && is_florence2 {
-        // The warmup prompt is the text literal "Hello"; the Florence-2
-        // seq2seq worker rejects any request that is not a task marker with
-        // exactly one image, so a warmup attempt would only log a spurious
-        // failure. The worker warms on its first real request instead.
-        tracing::info!("Skipping text warmup for Florence-2 (image-task seq2seq model)");
-    } else if startup.warmup {
-        tracing::info!("Warming up model...");
-        match warmup_model(model_provider.as_ref()) {
-            Ok(()) => tracing::info!("Warmup complete"),
-            Err(err) => tracing::warn!("Warmup failed (non-fatal): {}", err),
-        }
+    if startup.warmup {
+        run_startup_warmup(&startup.model_path, model_provider.as_ref());
     }
 
     // Warn if operator requested a distinct /metrics port — not yet wired.
@@ -3124,6 +3468,30 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
             _ => None,
         };
 
+    // Realtime VoiceChat wiring (#1376): load the checkpoint on the engine's
+    // own thread and block until it is ready, so `/health` is truthful once
+    // the listener binds. A failed load is fatal: the operator asked to serve
+    // this checkpoint and it has no other route to fall back to.
+    let realtime_engine = if is_voicechat {
+        let model_id = config
+            .model_alias
+            .clone()
+            .unwrap_or_else(|| model_provider.model_id().to_string());
+        tracing::info!(
+            "Detected Nemotron VoiceChat checkpoint; loading it on the realtime engine thread \
+             for /v1/realtime"
+        );
+        let engine = crate::server::realtime_engine::RealtimeVoiceChatEngine::spawn(
+            &startup.model_path,
+            model_id,
+        )
+        .map_err(|err| anyhow::anyhow!("failed to load Nemotron VoiceChat: {err:#}"))?;
+        tracing::info!("Nemotron VoiceChat ready; serving the /v1/realtime WebSocket");
+        Some(Arc::new(engine))
+    } else {
+        None
+    };
+
     // Embedding wiring (#1353): `--embedding-model` loads a second checkpoint
     // on its own worker thread; without it, an `-m` that detects as an
     // embedding kind is served on `/v1/embeddings` instead of chat (the chat
@@ -3195,8 +3563,15 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     .with_conversation_store(conversation_store)
     .with_audio_model(audio_model)
     .with_embedding_model(embedding_model)
-    .with_rerank_model(rerank_model);
-    let app = create_app(state);
+    .with_rerank_model(rerank_model)
+    .with_realtime_engine(realtime_engine);
+    #[cfg(feature = "webui")]
+    let state = state.with_webui_startup(Arc::new(startup.clone()));
+    let app = match webui_policy {
+        #[cfg(feature = "webui")]
+        Some(policy) => create_app_with_secured_ui(state, policy),
+        _ => create_app(state),
+    };
 
     serve_http(&startup, app).await
 }

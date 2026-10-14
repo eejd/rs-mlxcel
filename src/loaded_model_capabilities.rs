@@ -62,6 +62,8 @@ pub enum VlmRuntimeRef<'a> {
     LlmJpVl(&'a vision::LlmJpVlModel),
     /// GOT-OCR 2.0 (GOT) runtime (SAM ViT-B + linear projector + Qwen2-0.5B).
     GotOcr(&'a vision::GotOcrVlModel),
+    /// Mage-VL (mage_vl) runtime (Mage-ViT + 2x2 merger + plain Qwen3).
+    MageVl(&'a vision::MageVlModel),
     /// Kimi-VL / Kimi-VL 2.5 (MoonViT) runtime.
     KimiVL(&'a vision::KimiVLModel),
     /// Kimi K3 (MoonViT3D) runtime.
@@ -166,6 +168,19 @@ impl LoadedModel {
         self.vlm_runtime().is_some()
     }
 
+    /// Whether image or video input can reach a vision tower. `false` for a
+    /// non-VLM and for a Qwen-VL family or Mage-VL model loaded from a
+    /// vision-stripped checkpoint (#1367).
+    #[must_use]
+    pub fn has_vision_tower(&self) -> bool {
+        match self.vlm_runtime() {
+            Some(VlmRuntimeRef::Qwen(qwen)) => qwen.text_only_source().is_none(),
+            Some(VlmRuntimeRef::MageVl(mage)) => mage.vision.is_some(),
+            Some(_) => true,
+            None => false,
+        }
+    }
+
     /// Whether the loaded runtime has a public `input_audio` preparation path.
     #[must_use]
     pub fn supports_audio_input(&self) -> bool {
@@ -239,6 +254,7 @@ impl LoadedModel {
             Self::InternVLChatVLM(model) => Some(VlmRuntimeRef::InternVL(model)),
             Self::LlmJpVL(model) => Some(VlmRuntimeRef::LlmJpVl(model)),
             Self::GotOcrVLM(model) => Some(VlmRuntimeRef::GotOcr(model)),
+            Self::MageVLM(model) => Some(VlmRuntimeRef::MageVl(model)),
             Self::KimiVL(model) => Some(VlmRuntimeRef::KimiVL(model)),
             Self::KimiK3VLM(model) => Some(VlmRuntimeRef::KimiK3(model)),
             Self::LocateAnythingVLM(model) => Some(VlmRuntimeRef::LocateAnything(model)),

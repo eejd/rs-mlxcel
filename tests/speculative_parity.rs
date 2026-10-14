@@ -26,10 +26,10 @@
 //! ## Reachable pairings (this PR)
 //!
 //! - **Qwen 3.5 4B + DFlash** (`models/qwen3.5-4b-4bit` target, drafter
-//!   `models/Qwen3.5-4B-DFlash`, `block_size = 16`). The DFlash drafter
+//!   `models/qwen3.5-4b-dflash`, `block_size = 16`). The DFlash drafter
 //!   is loadable via `mlxcel_core::drafter::dflash::DFlashDrafter::load`
 //!   and the Qwen 3.5 text / VLM wrappers implement
-//!   `mlxcel_core::drafter::dflash::SpeculativeTarget` (wired the B>1 path too; enables the VLM-wrapped text-only server dispatch). The published upstream `z-lab/Qwen3.5-4B-DFlash`
+//!   `mlxcel_core::drafter::dflash::SpeculativeTarget` (wired the B>1 path too; enables the VLM-wrapped text-only server dispatch). The published upstream `z-lab/qwen3.5-4b-dflash`
 //!   checkpoint omits `embed_tokens.weight`; ported upstream's
 //!   lazy-bind shape so the drafter loads with a tombstone and resolves
 //!   its embedding from the target during `Drafter::bind`. The
@@ -40,7 +40,7 @@
 //!   `Speculative burst completed` instead of silently falling back.
 //!
 //! - **Gemma 4 31B + MTP assistant** (`models/gemma-4-31b-it-4bit` target,
-//!   drafter `models/gemma-4-31B-it-assistant-bf16`, `block_size = 4`). The
+//!   drafter `models/gemma-4-31b-it-assistant-bf16`, `block_size = 4`). The
 //!   MTP drafter is loadable via
 //!   `mlxcel_core::drafter::gemma4_assistant::Gemma4AssistantDraftModel::from_path`,
 //!   `Gemma4Wrapper` exposes the underlying primitives
@@ -108,6 +108,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{repo_binary_path, repo_model_dir};
+
+#[path = "speculative_parity/gemma4_batched.rs"]
+mod gemma4_batched;
 
 /// Fixed prompt submitted to both the speculative and the drafter-less
 /// server in the byte-equality phase. Deterministic content, no system
@@ -282,6 +285,149 @@ async fn server_round(
     }
 }
 
+/// Multi-width byte-equality for a DFlash pairing (issue #1935).
+///
+/// Runs the drafter-less baseline once and then one speculative server per
+/// width, and requires each width to land in one of exactly two acceptable
+/// states, naming which:
+///
+/// * the burst ran (`Speculative burst completed`, no decline line) and its
+///   text is byte-identical to the baseline, or
+/// * the exactness gate declined the burst, in which case the request was
+///   served by classic decode and byte-equality is not evidence about the
+///   verify path. The decline is reported as a decline.
+///
+/// A width that runs the burst and differs from the baseline fails, which is
+/// the condition issue #1935 was filed for. A width that declines does not
+/// fail, because declining is the gate working: on GB10 widths 8 and 16 are
+/// genuinely not byte-identical to the single-token chain, and no arrangement
+/// of this code makes them so.
+///
+/// The single-width [`assert_server_byte_equality`] stays for the MTP
+/// pairings, which have one measured width each.
+///
+/// `must_run` names the widths that must complete a burst rather than
+/// decline (#2191: on CUDA, widths 2 and 4 of the Qwen 3.5 4B pairing). Any
+/// decline must carry the probe's measured divergence, not a `NotRun`.
+async fn assert_server_byte_equality_at_widths(
+    pairing: &Pairing,
+    target_path: &std::path::Path,
+    draft_path: &std::path::Path,
+    widths: &[usize],
+    must_run: &[usize],
+) {
+    let draft_str = draft_path.to_string_lossy().to_string();
+
+    // Baseline first and once: every width compares against the same text,
+    // and a drafter-less server is the cheapest arm to hold the GPU.
+    let baseline = server_round(pairing.name, "baseline", target_path, &[]).await;
+
+    let mut ran = Vec::new();
+    let mut declined = Vec::new();
+    let mut mismatched = Vec::new();
+
+    for &width in widths {
+        let width_str = width.to_string();
+        let label = format!("speculative b={width}");
+        let spec = server_round(
+            pairing.name,
+            &label,
+            target_path,
+            &[
+                "--model-draft",
+                &draft_str,
+                "--draft-kind",
+                pairing.kind,
+                "--draft-block-size",
+                &width_str,
+            ],
+        )
+        .await;
+
+        let was_declined = spec.logs.contains("DFlash speculative dispatch declined");
+        let burst_ran = spec.logs.contains("Speculative burst completed");
+        assert!(
+            was_declined || burst_ran,
+            "[{}] b={width}: the server neither completed a speculative burst nor logged a \
+             decline, so this arm proves nothing either way. Captured logs:\n{}",
+            pairing.name,
+            spec.logs,
+        );
+
+        let identical = spec.content == baseline.content
+            && spec.completion_tokens == baseline.completion_tokens;
+        if was_declined {
+            // A decline only counts when the exactness gate measured it. The
+            // other decline reasons (a multimodal payload, an adopted
+            // prompt-cache prefix, a drafter from the wrong family) say
+            // nothing about verify-path parity, and letting one of them stand
+            // in for a measured verdict is how an all-declined run could pass
+            // while proving nothing.
+            assert!(
+                spec.logs
+                    .contains("the block-versus-chain exactness probe did not pass"),
+                "[{}] b={width}: the burst declined for a reason other than the exactness \
+                 probe, so this arm says nothing about verify-path parity. Captured \
+                 logs:\n{}",
+                pairing.name,
+                spec.logs,
+            );
+            assert!(
+                spec.logs.contains("differs from the single-token chain"),
+                "[{}] b={width}: the exactness gate declined without a measured divergence \
+                 (a probe that did not run is not a verdict). Captured logs:\n{}",
+                pairing.name,
+                spec.logs,
+            );
+            assert!(
+                !must_run.contains(&width),
+                "[{}] b={width}: this width must run the burst on this host, but the gate \
+                 declined it. Captured logs:\n{}",
+                pairing.name,
+                spec.logs,
+            );
+            declined.push(width);
+            assert!(
+                identical,
+                "[{}] b={width}: the burst declined to classic decode, so the response must \
+                 equal the drafter-less baseline byte for byte; it does not, which means the \
+                 decline path itself changed the output.\nspeculative: {:?}\nbaseline:    {:?}",
+                pairing.name, spec.content, baseline.content,
+            );
+        } else {
+            ran.push(width);
+            if !identical {
+                mismatched.push((width, spec.content.clone()));
+            }
+        }
+    }
+
+    eprintln!(
+        "[{}] widths that ran the burst: {ran:?}; widths the gate declined: {declined:?}",
+        pairing.name
+    );
+    assert!(
+        mismatched.is_empty(),
+        "[{}] these widths ran a speculative burst and produced text that is NOT \
+         byte-identical to the drafter-less baseline at temperature 0: {:?}.\nbaseline: {:?}",
+        pairing.name,
+        mismatched.iter().map(|(w, _)| *w).collect::<Vec<_>>(),
+        baseline.content,
+    );
+    // An all-declined run is acceptable only where `must_run` is empty: every
+    // decline above carried a measured divergence, so the contract held
+    // through the gate. `MLXCEL_MTP_ALLOW_INEXACT=1` remains the way to
+    // engage the burst anyway and forfeit the contract.
+    if ran.is_empty() {
+        eprintln!(
+            "[{}] every width declined by a measured exactness verdict, and every response \
+             equalled the drafter-less baseline byte for byte. That is the contract holding \
+             through the gate rather than through the verify block. Widths tried: {widths:?}",
+            pairing.name,
+        );
+    }
+}
+
 /// byte-equality phase: spawn `mlxcel-server` twice against the
 /// same `target_path` — once speculative (drafter attached via
 /// `--model-draft --draft-kind --draft-block-size`), once drafter-less —
@@ -379,21 +525,21 @@ const REACHABLE_PAIRINGS: &[Pairing] = &[
     Pairing {
         name: "Qwen 3.5 4B + DFlash (b=16)",
         target_dir: "qwen3.5-4b-4bit",
-        draft_dir: "Qwen3.5-4B-DFlash",
+        draft_dir: "qwen3.5-4b-dflash",
         kind: "dflash",
         block_size: 16,
     },
     Pairing {
         name: "Gemma 4 31B + MTP assistant (b=4)",
         target_dir: "gemma-4-31b-it-4bit",
-        draft_dir: "gemma-4-31B-it-assistant-bf16",
+        draft_dir: "gemma-4-31b-it-assistant-bf16",
         kind: "mtp",
         block_size: 4,
     },
     Pairing {
         name: "Gemma 4 Unified 12B + MTP assistant (b=4)",
         target_dir: "gemma-4-12b-it-4bit",
-        draft_dir: "gemma-4-12B-it-assistant-4bit",
+        draft_dir: "gemma-4-12b-it-assistant-4bit",
         kind: "mtp",
         block_size: 4,
     },
@@ -593,7 +739,7 @@ fn pairing_kind_resolution_matches_declaration() {
 /// 1. **Structural phase** (in-process): loads the target, asserts it is
 ///    a Qwen 3.5 family variant, resolves the drafter kind to
 ///    `DrafterKind::Dflash`, loads the DFlash drafter against the
-///    published upstream `z-lab/Qwen3.5-4B-DFlash` checkpoint — which
+///    published upstream `z-lab/qwen3.5-4b-dflash` checkpoint — which
 ///    omits `embed_tokens.weight` — and `bind()`s it to the target,
 ///    resolving `embed_tokens` lazily from the target (the pin). The in-process models are then dropped.
 /// 2. **Byte-equality phase** (subprocess): spawns `mlxcel-server` with
@@ -623,6 +769,7 @@ async fn greedy_parity_dflash_qwen35_4b() {
 
     // ---- Phase 1: structural check (in-process) ----
     {
+        common::apply_server_mlx_cache_defaults();
         let _runtime = initialize_runtime();
         mlxcel_core::synchronize_default();
         mlxcel_core::clear_memory_cache();
@@ -660,14 +807,14 @@ async fn greedy_parity_dflash_qwen35_4b() {
         assert_eq!(resolved_kind, DrafterKind::Dflash);
 
         // `load_drafter` constructs the full DFlashDrafter (weight loading
-        // + sanitize). The upstream `z-lab/Qwen3.5-4B-DFlash` checkpoint
+        // + sanitize). The upstream `z-lab/qwen3.5-4b-dflash` checkpoint
         // does NOT ship `embed_tokens.weight`; ported upstream's
         // lazy-bind shape so the loader builds an `embed_tokens = None`
         // tombstone instead of failing. A `LoadFailed` here is a
         // regression.
         let (mut drafter, drafter_kind) =
             mlxcel_core::drafter::load_drafter(&draft_path, Some(DrafterKind::Dflash)).expect(
-                "DFlash drafter must load against the published z-lab/Qwen3.5-4B-DFlash \
+                "DFlash drafter must load against the published z-lab/qwen3.5-4b-dflash \
                  checkpoint (embed_tokens.weight is absent and the loader \
                  builds a lazy-bind tombstone instead of failing)",
             );
@@ -699,7 +846,30 @@ async fn greedy_parity_dflash_qwen35_4b() {
     }
 
     // ---- Phase 2: end-to-end byte-equality (subprocess) ----
-    assert_server_byte_equality(pairing, &target_path, &draft_path).await;
+    // Every width issue #1935 measured, not just the one the pairing names.
+    // The divergence it reported was identical at 2, 4, 8 and 16, so a
+    // single-width arm could not tell a width-specific kernel boundary from a
+    // path difference shared by all of them, and the single width this test
+    // used to run was 16, which the gate now declines.
+    //
+    // Since #2191 the CUDA verify block rotates Q and K row by row like
+    // decode, so widths 2 and 4 must run the burst there and match byte for
+    // byte; 8 and 16 still decline through the probe's measured verdict
+    // (`M * B >= 8` moves MLX from `qmv` to `qmm_sm80`). Elsewhere the
+    // verdict decides and either outcome is accepted.
+    let must_run: &[usize] = if mlxcel_core::cuda_is_available() {
+        &[2, 4]
+    } else {
+        &[]
+    };
+    assert_server_byte_equality_at_widths(
+        pairing,
+        &target_path,
+        &draft_path,
+        &[2, 4, 8, 16],
+        must_run,
+    )
+    .await;
 }
 
 /// Greedy parity for the Gemma 4 31B + MTP assistant pairing.
@@ -750,6 +920,7 @@ async fn greedy_parity_mtp_gemma4_31b() {
 
     // ---- Phase 1: structural check (in-process) ----
     {
+        common::apply_server_mlx_cache_defaults();
         let _runtime = initialize_runtime();
         mlxcel_core::synchronize_default();
         mlxcel_core::clear_memory_cache();
@@ -848,6 +1019,7 @@ async fn greedy_parity_mtp_gemma4_unified_12b() {
 
     // ---- Phase 1: structural check (in-process) ----
     {
+        common::apply_server_mlx_cache_defaults();
         let _runtime = initialize_runtime();
         mlxcel_core::synchronize_default();
         mlxcel_core::clear_memory_cache();
@@ -936,6 +1108,7 @@ fn greedy_parity_mtp_gemma4_batched_b4_matches_b1() {
         return;
     }
 
+    common::apply_server_mlx_cache_defaults();
     let _runtime = initialize_runtime();
     mlxcel_core::synchronize_default();
     mlxcel_core::clear_memory_cache();
@@ -1095,6 +1268,7 @@ fn greedy_parity_mtp_gemma4_batched_b4_ragged_matches_b1() {
         return;
     }
 
+    common::apply_server_mlx_cache_defaults();
     let _runtime = initialize_runtime();
     mlxcel_core::synchronize_default();
     mlxcel_core::clear_memory_cache();
@@ -1259,6 +1433,7 @@ fn mtp_gemma4_ragged_throughput_probe() {
         return;
     }
 
+    common::apply_server_mlx_cache_defaults();
     let _runtime = initialize_runtime();
     mlxcel_core::synchronize_default();
     mlxcel_core::clear_memory_cache();
@@ -1402,7 +1577,7 @@ const _: () = {
     assert!(
         !REACHABLE_PAIRINGS.is_empty(),
         "REACHABLE_PAIRINGS must declare at least one pairing; \
-         see docs/model_tests.md::Speculative drafters",
+         see docs/benchmark_results/model_tests.md::Speculative drafters",
     );
 };
 
@@ -1411,88 +1586,99 @@ const _: () = {
 /// so the whole run stays on the uniform path) and compare against the B = 1
 /// adapter reference. Any mismatch here implicates the batched adapter's
 /// baseline mechanics rather than the divergent-round geometry.
+///
+/// Issue #2190: runs both row-wise pairs (31B, and the 12B, which takes the
+/// row-wise path on CUDA). The B = 1 linear adapter is decode-exact since
+/// #2185, so this is also the batched adapter's B = 1 decode-exactness gate.
 #[test]
-#[ignore = "real-model heavy diagnostic (Gemma-4-31B target + drafter)"]
+#[ignore = "real-model heavy diagnostic (Gemma-4-31B and 12B targets + drafters)"]
 fn b1_batched_baseline_probe() {
     use mlxcel::models::gemma4_mtp_target::{
         Gemma4MtpBatchedTargetAdapter, Gemma4MtpTargetAdapter,
     };
-    use mlxcel::{LoadedModel, initialize_runtime, load_model};
+    use mlxcel::{initialize_runtime, load_model};
     use mlxcel_core::drafter::{DrafterKind, load_drafter};
     use mlxcel_core::generate::SamplingConfig;
     use mlxcel_core::speculative::mtp::{MtpBatchedGenerator, MtpGenerator};
 
-    let pairing = &REACHABLE_PAIRINGS[1];
-    let (target_path, draft_path, present) = pairing_present(pairing);
-    if !present {
-        eprintln!("Skipping b1_batched_baseline_probe");
-        return;
-    }
+    common::apply_server_mlx_cache_defaults();
     let _runtime = initialize_runtime();
-    let (loaded_target, _tok) = load_model(&target_path).expect("target model must load");
-    let wrapper: &mlxcel::models::Gemma4Wrapper = match &loaded_target {
-        LoadedModel::Gemma4(w) => w,
-        LoadedModel::Gemma4VLM(vlm) => &vlm.text_model,
-        _ => panic!("requires a Gemma 4 family target"),
-    };
-    let block_size = pairing.block_size as usize;
-    let sampling = SamplingConfig::greedy();
-    let max_tokens = 24_usize;
-    let prompts: Vec<Vec<i32>> = vec![
-        vec![2, 105, 2364, 107, 9259, 108],
-        vec![2, 105, 2364, 107, 1596, 108],
-        vec![2, 105, 2364, 107, 6176, 108],
-        vec![2, 105, 2364, 107, 3030, 108],
-    ];
     let mut failures = Vec::new();
-    for (row, prompt) in prompts.iter().enumerate() {
-        let seq_id = mlxcel_core::cache::SequenceId::from_raw(3000 + row as u64);
-        let adapter = Gemma4MtpTargetAdapter::new(wrapper, Some(seq_id));
-        let (mut drafter, _) =
-            load_drafter(&draft_path, Some(DrafterKind::Mtp)).expect("MTP drafter must load");
-        drafter
-            .bind(wrapper as &dyn mlxcel_core::generate::LanguageModel)
-            .expect("drafter bind");
-        let mut generator = MtpGenerator::new(adapter, drafter, block_size);
-        let no_cancel = std::sync::atomic::AtomicBool::new(false);
-        let logprobs_config = mlxcel_core::sampling::LogprobsConfig::default();
-        let (reference, _, _) = generator.generate(
-            prompt,
-            max_tokens,
-            &sampling,
-            &[],
-            &no_cancel,
-            &logprobs_config,
-        );
+    let mut ran = 0;
+    for pairing in [
+        &REACHABLE_PAIRINGS[1],
+        &REACHABLE_PAIRINGS[UNIFIED_12B_MTP_PAIRING],
+    ] {
+        let (target_path, draft_path, present) = pairing_present(pairing);
+        if !present {
+            eprintln!("Skipping b1_batched_baseline_probe for {}", pairing.name);
+            continue;
+        }
+        ran += 1;
+        mlxcel_core::synchronize_default();
+        mlxcel_core::clear_memory_cache();
+        let (loaded_target, _tok) = load_model(&target_path).expect("target model must load");
+        let wrapper = gemma4_text_wrapper(&loaded_target);
+        let block_size = pairing.block_size as usize;
+        let sampling = SamplingConfig::greedy();
+        let max_tokens = 24_usize;
+        let prompts: Vec<Vec<i32>> = vec![
+            vec![2, 105, 2364, 107, 9259, 108],
+            vec![2, 105, 2364, 107, 1596, 108],
+            vec![2, 105, 2364, 107, 6176, 108],
+            vec![2, 105, 2364, 107, 3030, 108],
+        ];
+        for (row, prompt) in prompts.iter().enumerate() {
+            let seq_id = mlxcel_core::cache::SequenceId::from_raw(3000 + row as u64);
+            let adapter = Gemma4MtpTargetAdapter::new(wrapper, Some(seq_id));
+            let (mut drafter, _) =
+                load_drafter(&draft_path, Some(DrafterKind::Mtp)).expect("MTP drafter must load");
+            drafter
+                .bind(wrapper as &dyn mlxcel_core::generate::LanguageModel)
+                .expect("drafter bind");
+            let mut generator = MtpGenerator::new(adapter, drafter, block_size);
+            let no_cancel = std::sync::atomic::AtomicBool::new(false);
+            let logprobs_config = mlxcel_core::sampling::LogprobsConfig::default();
+            let (reference, _, _) = generator.generate(
+                prompt,
+                max_tokens,
+                &sampling,
+                &[],
+                &no_cancel,
+                &logprobs_config,
+            );
+            mlxcel_core::generate::LanguageModel::release_sequence_state_by_id(wrapper, seq_id);
 
-        let batch_adapter = Gemma4MtpBatchedTargetAdapter::new(wrapper, 1);
-        let (mut batched_drafter, _) =
-            load_drafter(&draft_path, Some(DrafterKind::Mtp)).expect("drafter must load");
-        batched_drafter
-            .bind(wrapper as &dyn mlxcel_core::generate::LanguageModel)
-            .expect("batched drafter bind");
-        let mut batched_generator =
-            MtpBatchedGenerator::new(batch_adapter, batched_drafter, block_size);
-        let run = batched_generator
-            .run_batched(std::slice::from_ref(prompt), &sampling, max_tokens)
-            .expect("B=1 batched MTP run must succeed");
-        let got = &run.tokens[0];
-        let first_mismatch = got
-            .iter()
-            .zip(reference.iter())
-            .position(|(g, w)| g != w)
-            .or_else(|| (got.len() != reference.len()).then(|| got.len().min(reference.len())));
-        eprintln!(
-            "[b1-batched probe] row {row}: accept_lens {:?}\n  b1-batched ({}): {:?}\n  b1 ref     ({}): {:?}\n  first_mismatch: {:?}",
-            run.accept_lens[0],
-            got.len(),
-            got,
-            reference.len(),
-            reference,
-            first_mismatch,
-        );
-        if let Some(i) = first_mismatch {
-            failures.push(format!("row {row} mismatch at {i}"));
+            let batch_adapter = Gemma4MtpBatchedTargetAdapter::new(wrapper, 1);
+            let (mut batched_drafter, _) =
+                load_drafter(&draft_path, Some(DrafterKind::Mtp)).expect("drafter must load");
+            batched_drafter
+                .bind(wrapper as &dyn mlxcel_core::generate::LanguageModel)
+                .expect("batched drafter bind");
+            let mut batched_generator =
+                MtpBatchedGenerator::new(batch_adapter, batched_drafter, block_size);
+            let run = batched_generator
+                .run_batched(std::slice::from_ref(prompt), &sampling, max_tokens)
+                .expect("B=1 batched MTP run must succeed");
+            let got = &run.tokens[0];
+            let first_mismatch = got
+                .iter()
+                .zip(reference.iter())
+                .position(|(g, w)| g != w)
+                .or_else(|| (got.len() != reference.len()).then(|| got.len().min(reference.len())));
+            eprintln!(
+                "[b1-batched probe] {} row {row}: accept_lens {:?}\n  b1-batched ({}): {:?}\n  b1 ref     ({}): {:?}\n  first_mismatch: {:?}",
+                pairing.name,
+                run.accept_lens[0],
+                got.len(),
+                got,
+                reference.len(),
+                reference,
+                first_mismatch,
+            );
+            if let Some(i) = first_mismatch {
+                failures.push(format!("{} row {row} mismatch at {i}", pairing.name));
+            }
         }
     }
     assert!(
@@ -1500,6 +1686,17 @@ fn b1_batched_baseline_probe() {
         "B=1 batched baseline drift:\n{}",
         failures.join("\n")
     );
+    eprintln!("[b1-batched probe] PASS on {ran} pair(s)");
+}
+
+/// The text wrapper of a Gemma 4 family target (text, VLM or Unified).
+fn gemma4_text_wrapper(loaded: &mlxcel::LoadedModel) -> &mlxcel::models::Gemma4Wrapper {
+    match loaded {
+        mlxcel::LoadedModel::Gemma4(w) => w,
+        mlxcel::LoadedModel::Gemma4VLM(vlm) => &vlm.text_model,
+        mlxcel::LoadedModel::Gemma4Unified(unified) => &unified.text_model,
+        _ => panic!("requires a Gemma 4 family target"),
+    }
 }
 
 /// Issue #203 diagnostic v2: EQUAL-length forced-geometry probe. Row 0 runs
@@ -1524,6 +1721,7 @@ fn divergent_hidden_probe_31b() {
         eprintln!("Skipping divergent_hidden_probe_31b");
         return;
     }
+    common::apply_server_mlx_cache_defaults();
     let _runtime = initialize_runtime();
     let (loaded_target, _tok) = load_model(&target_path).expect("target model must load");
     let wrapper: &mlxcel::models::Gemma4Wrapper = match &loaded_target {

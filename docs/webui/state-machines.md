@@ -11,7 +11,7 @@ Inference lifecycle is independent from download state. A catalog entry always r
 | `loading` | load failure | loader reports error | `failed` | failed replacement does not promise rollback to a released previous model |
 | `ready` | unload | new admission stopped | `draining` | unload with stale revision returns 409 |
 | `ready` | load | same model already ready | `ready` | duplicate load returns 409 conflict unless idempotency key replays the original operation |
-| `ready` | explicit eviction | caller names `eviction_target_id` and target is not busy beyond policy | `draining` | surprise eviction is forbidden |
+| `ready` | explicit eviction | caller names `eviction_target_id` with matching `eviction_target_expected_revision` and target is not busy beyond policy | `draining` | surprise eviction is forbidden; stale victim revisions fail before victim unload |
 | `draining` | requests complete | active request count reaches zero | `unloading` | load/unload races serialize through the coordinator |
 | `unloading` | worker exit observed | provider sender dropped and worker exit/memory-release observation completes | `unloaded` | capacity is not freed before worker exit observation |
 | `draining` | drain timeout | active requests remain | `draining` with model error | report recoverable blocked/failure on the operation, preserve resource ownership, and keep rejecting new loads until worker exit or operator-forced recovery is implemented |
@@ -37,7 +37,9 @@ Deletion refusal cases are 409 for transient busy states and 422 for unsupported
 
 `idempotency_key` scope is one `server_instance_id` and expires with operation history retention unless the operation is still active. Reusing the same key with the same request returns the original operation. Reusing the same key with a different normalized request returns 409 conflict. A changed `server_instance_id` means the client must not replay POSTs automatically; it must resnapshot and ask the user when necessary.
 
-Every mutating model request carries `expected_revision`. If the catalog entry revision changed since the UI snapshot, return 409 `stale_revision` with the current operation/model pointer when possible.
+Download operation history and idempotency records are process-local. After a server restart, clients must discard old operation references even if an operation ID string is reused in the new `server_instance_id`. Previously published managed snapshots are rediscovered from the configured store; abandoned private `.mlxcel-staging` directories are excluded from the catalog and are neither resumed nor automatically deleted by a new process. An explicit retry starts a new private stage and does not adopt another writer's partial files. This is process-restart reconciliation, not a guarantee of power-loss durability.
+
+Every mutating model request carries `expected_revision`. If the catalog entry revision changed since the UI snapshot, return 409 `stale_revision` with the current operation/model pointer when possible. Explicit eviction has a second fence: `eviction_target_id` and `eviction_target_expected_revision` must be provided together, and the victim's current revision must still match before any unload/drain is started.
 
 ## Snapshot to SSE fence
 

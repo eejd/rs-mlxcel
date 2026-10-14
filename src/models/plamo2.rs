@@ -606,7 +606,8 @@ impl Plamo2Mamba {
             self.time_step_limit.1,
             &mut output,
             &mut next_state,
-        );
+        )
+        .expect("ssm_kernel_available() reported a port, so the launcher must not refuse");
 
         (output, next_state)
     }
@@ -1249,11 +1250,15 @@ impl LanguageModel for Plamo2Model {
         Ok(())
     }
 
-    fn trim_internal_caches(&self, excess: i32) {
+    fn trim_state(
+        &self,
+        seq: Option<mlxcel_core::cache::SequenceId>,
+        excess: i32,
+    ) -> Result<(), String> {
         if excess <= 0 {
-            return;
+            return Ok(());
         }
-        self.sequence_state.with_sequence_state(None, |internal| {
+        let trim = |internal: &mut [_]| {
             for cache in internal.iter_mut() {
                 match cache {
                     Plamo2LayerCache::Attention(kv) => {
@@ -1267,6 +1272,15 @@ impl LanguageModel for Plamo2Model {
                     }
                 }
             }
-        });
+        };
+        match seq {
+            None => {
+                self.sequence_state.with_sequence_state(None, trim);
+                Ok(())
+            }
+            Some(seq_id) => self
+                .sequence_state
+                .with_existing_sequence_state(seq_id, trim),
+        }
     }
 }

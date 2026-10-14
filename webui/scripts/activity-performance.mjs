@@ -1,0 +1,149 @@
+// Copyright 2026 Lablup Inc. Licensed under the Apache License, Version 2.0.
+/* global URL, process, setTimeout, fetch, document, AbortSignal, window */
+// Root-owned real acceptance. Never run alongside unrelated GPU inference/tests.
+import { readFile, writeFile } from 'node:fs/promises';
+import { chromium } from '@playwright/test';
+import { performanceMode, assertGeometry, performanceCompletion } from './activity-performance-config.mjs';
+import { capturePerformanceDiagnostics } from './activity-performance-diagnostics.mjs';
+
+const base = new URL(process.env.WEBUI_PERF_BASE ?? 'http://127.0.0.1:8080/');
+if (!['127.0.0.1', '[::1]', 'localhost'].includes(base.hostname) || base.username || base.password || base.search || base.hash) throw new Error('Use a credential-free loopback API base (including any API prefix).');
+if (!base.pathname.endsWith('/')) base.pathname += '/';
+const key = (await readFile(required('WEBUI_PERF_KEY_FILE'), 'utf8')).trim();
+const model = required('WEBUI_PERF_INFERENCE_MODEL');
+const modelId = required('WEBUI_PERF_MODEL_ID');
+const output = required('WEBUI_PERF_OUTPUT');
+const nvidiaSmi = process.env.WEBUI_PERF_NVIDIA_SMI;
+const prompt = process.env.WEBUI_PERF_PROMPT_FILE ? await readFile(process.env.WEBUI_PERF_PROMPT_FILE, 'utf8') : 'Explain the difference between a process and a thread, in detail. '.repeat(100);
+const modeConfig = performanceMode(process.env.WEBUI_PERF_MODE);
+// Playwright's default Chromium arguments include --disable-backgrounding-occluded-windows and
+// --disable-renderer-backgrounding, which exist to keep ordinary tests deterministic by refusing
+// to treat a backgrounded window as hidden. That is the exact behaviour this gate measures: with
+// them on, a window the browser reports as `minimized` still reports document.hidden === false.
+// Drop only those two for the headed run. --disable-background-timer-throttling stays on, so a
+// hidden client that sends no observation request has to owe that to the application's own
+// backoff rather than to Chrome throttling its timers.
+const hiddenVisibilitySuppressingArgs = ['--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding'];
+const browser = await chromium.launch(modeConfig.headless ? { headless: true } : { headless: false, ignoreDefaultArgs: hiddenVisibilitySuppressingArgs });
+const preflight = [];
+const results = [];
+let uiRequests = 0;
+let contexts = [];
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const api = (path) => new URL(path, base).href;
+async function closeClients() { await Promise.all(contexts.map((context) => context.close())); contexts = []; }
+async function clients(mode) {
+  await closeClients();
+  if (mode === 'off') return;
+  for (let i = 0; i < (mode === 'two-visible' ? 2 : 1); i++) {
+    const context = await browser.newContext({ viewport: { width: 700, height: 900 } }); contexts.push(context);
+    const page = await context.newPage();
+    // Headless visible diagnostics use the default shell, without native windows.
+    let cdp = null;
+    let windowId;
+    if (!modeConfig.headless) {
+      cdp = await context.newCDPSession(page);
+      ({ windowId } = await cdp.send('Browser.getWindowForTarget'));
+      await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal', left: 20 + i * 710, top: 20, width: 700, height: 1000 } });
+    }
+    page.on('request', (request) => { if (request.url().includes('/ui-api/')) uiRequests++; });
+    await page.goto(api('webui/#activity'));
+    const geometry = await page.evaluate(() => ({ innerWidth: window.innerWidth, innerHeight: window.innerHeight, visualWidth: window.visualViewport?.width ?? 0, visualHeight: window.visualViewport?.height ?? 0 }));
+    preflight.push({ mode, client: i, geometry });
+    assertGeometry(geometry);
+    await page.locator('input[type="password"]').fill(key);
+    await page.locator('form button[type="submit"]').click();
+    await page.getByTestId('activity-page').waitFor();
+    const picker = page.getByRole('combobox');
+    await picker.click();
+    // Labels come from the same canonical catalog; never interpolate a repo into paths.
+    const catalog = await fetch(api('ui-api/v1/catalog?limit=200'), { headers: { Authorization: `Bearer ${key}` } }).then((r) => r.json());
+    const entry = catalog.items.find((item) => item.identity.id === modelId);
+    if (!entry) throw new Error('Selected model must be in the first canonical 200-entry page for this bounded harness.');
+    await page.getByRole('option', { name: entry.identity.display_name, exact: true }).click();
+    if (mode === 'hidden') {
+      if (cdp === null) throw new Error('Native hidden acceptance requires a headed browser.');
+      await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'minimized' } });
+      // The window manager applies the iconify asynchronously and the renderer's visibility
+      // change follows it, so a fixed wait cannot tell "the minimize never took effect" apart
+      // from "it has not propagated yet". Poll the genuine document.hidden to a deadline, and
+      // report the window state the browser actually holds when the deadline passes. This
+      // never substitutes a synthetic visibilitychange: only a real hidden document passes.
+      const deadline = Date.now() + 15000;
+      let hidden = await page.evaluate(() => document.hidden);
+      while (!hidden && Date.now() < deadline) { await sleep(250); hidden = await page.evaluate(() => document.hidden); }
+      if (!hidden) {
+        // Dropping the two visibility-suppressing launch arguments was not enough, so the next
+        // question is whether this browser propagates any real visibility change at all, or only
+        // refuses the window-manager iconify. Report three facts rather than guessing again:
+        // the command line actually in force (so a launch-argument change is verified, not
+        // assumed), the visibility state the page holds, and whether foregrounding a second tab
+        // in the same context makes this page report hidden through Chrome's own tab path.
+        const state = await cdp.send('Browser.getWindowBounds', { windowId }).then((r) => r.bounds.windowState).catch((error) => `unavailable: ${error.message}`);
+        const commandLine = await cdp.send('Browser.getBrowserCommandLine').then((r) => r.arguments.filter((a) => a.includes('background') || a.includes('occlu')).join(' ') || 'no backgrounding-related arguments').catch((error) => `unavailable: ${error.message}`);
+        const visibilityState = await page.evaluate(() => document.visibilityState);
+        let tabSwitchHidden;
+        try {
+          const sibling = await context.newPage();
+          await sibling.goto('data:text/html,<main>foreground</main>');
+          await sibling.bringToFront();
+          await sleep(1500);
+          tabSwitchHidden = String(await page.evaluate(() => document.hidden));
+          await sibling.close();
+        } catch (error) { tabSwitchHidden = `unavailable: ${error.message}`; }
+        throw new Error(`Native hidden acceptance failed: document.hidden stayed false for 15s after requesting minimize. windowState=${state}; visibilityState=${visibilityState}; backgrounding arguments in force=[${commandLine}]; document.hidden after foregrounding a sibling tab=${tabSwitchHidden}. Do not substitute a synthetic event.`);
+      }
+    }
+    await sleep(500);
+    if ((await page.evaluate(() => document.hidden)) !== (mode === 'hidden')) throw new Error(`Actual document visibility did not match ${mode}; do not substitute a synthetic event.`);
+  }
+  // Recheck every client after creating all windows, not just the newest one.
+  for (const context of contexts) {
+    for (const page of context.pages()) {
+      if ((await page.evaluate(() => document.hidden)) !== (mode === 'hidden')) throw new Error(`Actual concurrent visibility did not match ${mode}.`);
+    }
+  }
+  await sleep(2500);
+  if (mode === 'hidden') {
+    const before = uiRequests; await sleep(4500);
+    if (uiRequests !== before) throw new Error('Hidden Activity continued sending observation requests.');
+  }
+}
+async function request(mode, pair) {
+  const diagnosticsBefore = await capturePerformanceDiagnostics(nvidiaSmi);
+  const response = await fetch(api('completion?autoload=false'), { method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ model, prompt, n_predict: 256, seed: 42, temperature: 0, cache_prompt: false, stream: false }), signal: AbortSignal.timeout(600000) });
+  if (!response.ok) throw new Error(`Native completion failed (${response.status}); no response body logged.`);
+  const body = await response.json();
+  const rate = body.timings?.predicted_per_second;
+  if (!(typeof rate === 'number' && Number.isFinite(rate) && rate > 0)) throw new Error('No valid backend predicted_per_second; do not replace with wall-clock or word-count inference.');
+  const diagnosticsAfter = await capturePerformanceDiagnostics(nvidiaSmi);
+  const sample = { mode, pair, tokens_per_second: rate, predicted_tokens: body.timings.predicted_n, predicted_ms: body.timings.predicted_ms, diagnostics: { before: diagnosticsBefore, after: diagnosticsAfter } };
+  results.push(sample); process.stdout.write(`${JSON.stringify(sample)}\n`);
+  await writeFile(output, JSON.stringify({ status: 'in-progress', scope: modeConfig.name, hidden_native: modeConfig.headless ? 'not-run' : 'pending', preflight, samples: results }, null, 2));
+  return rate;
+}
+function median(values) { const sorted = [...values].sort((a, b) => a - b); return sorted[Math.floor(sorted.length / 2)]; }
+try {
+  // Validate geometry and actual visibility for every requested condition before
+  // even the GPU warmup. Never synthesize visibility or bypass failed clicks.
+  for (const condition of modeConfig.modes) await clients(condition);
+  await clients('off'); await request('warmup', -1);
+  const summaries = [];
+  for (const mode of modeConfig.modes) {
+    const paired = []; const baseline = [];
+    for (let pair = 0; pair < 5; pair++) {
+      const rates = {};
+      for (const condition of pair % 2 === 0 ? ['off', mode] : [mode, 'off']) { await clients(condition); rates[condition] = await request(condition, pair); }
+      baseline.push(rates.off); paired.push((rates.off - rates[mode]) / rates.off * 100);
+    }
+    const mean = baseline.reduce((a, b) => a + b, 0) / baseline.length;
+    const cv = Math.sqrt(baseline.reduce((sum, value) => sum + (value - mean) ** 2, 0) / baseline.length) / mean * 100;
+    const degradation = median(paired);
+    summaries.push({ mode, paired_runs: 5, median_decode_degradation_percent: degradation, baseline_cv_percent: cv, paired_range_percent: [Math.min(...paired), Math.max(...paired)], status: degradation > 2 || cv > 5 ? 'investigate' : 'within-target' });
+  }
+  await writeFile(output, JSON.stringify({ ...performanceCompletion(modeConfig, summaries), preflight, source: 'native completion backend timings.predicted_per_second; no browser or word-count estimate', samples: results, summaries }, null, 2));
+} catch (error) {
+  await writeFile(output, JSON.stringify({ status: 'failed', scope: modeConfig.name, hidden_native: modeConfig.headless ? 'not-run' : 'not-completed', preflight, samples: results, error: error instanceof Error ? error.message.replaceAll(key, '[redacted]') : 'unknown' }, null, 2));
+  throw error;
+} finally { await closeClients(); await browser.close(); }
+function required(name) { const value = process.env[name]; if (!value) throw new Error(`${name} is required`); return value; }

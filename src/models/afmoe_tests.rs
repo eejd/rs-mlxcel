@@ -622,6 +622,21 @@ impl crate::models::gemma3::CacheInterface for StubCache {
             mlxcel_core::copy(&self.values),
         )
     }
+
+    fn attend(
+        &mut self,
+        q: &MlxArray,
+        k: UniquePtr<MlxArray>,
+        v: UniquePtr<MlxArray>,
+        scale: f32,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let (keys, values) = self.update_and_fetch(k, v);
+        if mask.is_none() && mlxcel_core::array_shape(q)[2] > 1 {
+            return mlxcel_core::causal_attention(q, &keys, &values, scale, 0.0, 0);
+        }
+        mlxcel_core::layers::attention(q, &keys, &values, scale, mask, 0.0, 0)
+    }
 }
 
 #[test]
@@ -896,4 +911,55 @@ mod snapshot_prompt_cache {
             "unexpected error: {err}"
         );
     }
+}
+
+#[test]
+fn afmoe_loaded_model_chunking_contract_is_safe() {
+    use mlxcel_core::cache::SequenceId;
+
+    let args = small_args();
+    let weights = filled_weights(&args);
+    let model = AfmoeModel::from_weights(&weights, &args).expect("the model builds");
+    let language_model: &dyn LanguageModel = &model;
+    assert!(!language_model.supports_chunked_prefill());
+
+    let two_tokens = mlxcel_core::from_slice_i32(&[1, 2], &[1, 2]);
+    let three_tokens = mlxcel_core::from_slice_i32(&[3, 4, 5], &[1, 3]);
+    let mut unused_caches = language_model.make_caches();
+    let first = language_model.forward(&two_tokens, &mut unused_caches, None);
+    mlxcel_core::eval(&first);
+    let second = language_model.forward(&three_tokens, &mut unused_caches, None);
+    mlxcel_core::eval(&second);
+    model.sequence_state.with_sequence_state(None, |caches| {
+        assert_eq!(caches.len(), args.num_hidden_layers);
+        for cache in caches {
+            assert_eq!(
+                cache.offset(),
+                3,
+                "independent no-ID prompts must reset each KV cache"
+            );
+        }
+    });
+
+    let seq = SequenceId::from_raw(2289);
+    language_model.prepare_sequence_state(seq);
+    let first =
+        language_model.forward_with_sequence_id(&two_tokens, Some(seq), &mut unused_caches, None);
+    mlxcel_core::eval(&first);
+    let second =
+        language_model.forward_with_sequence_id(&three_tokens, Some(seq), &mut unused_caches, None);
+    mlxcel_core::eval(&second);
+    model
+        .sequence_state
+        .with_sequence_state_ref(seq, |caches| {
+            assert_eq!(caches.len(), args.num_hidden_layers);
+            for cache in caches {
+                assert_eq!(
+                    cache.offset(),
+                    5,
+                    "stable-ID continuation must retain each KV cache"
+                );
+            }
+        })
+        .expect("the prepared sequence state must remain available");
 }

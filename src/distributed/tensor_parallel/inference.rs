@@ -286,6 +286,10 @@ fn fallback_architecture(model_type: ModelType) -> &'static str {
         // the planner's supported-architecture validation rejects this string
         // before any TP load is attempted. It keeps the dispatch table total.
         ModelType::Gpt2 => "gpt2",
+        // nanochat is not tensor-parallel enabled: weightless norms and the
+        // `c_q` / `c_k` / `c_v` key names have no shard rules, so the planner
+        // rejects this string. It keeps the dispatch table total.
+        ModelType::NanoChat => "nanochat",
         // GPT-BigCode shares GPT-2's fused `c_attn` key names, and its
         // multi-query KV block cannot be split across ranks anyway, but this
         // string is not rejected here: `generate_shard_plan`'s architecture
@@ -436,6 +440,11 @@ fn fallback_architecture(model_type: ModelType) -> &'static str {
         // dispatch table total and the planner's supported-architecture
         // validation rejects this string.
         ModelType::LlmJpVLM => "llmjpvl",
+        // Mage-VL's decoder is a plain Qwen3, but the Mage-ViT tower has no
+        // sharded runtime and TP is refused for VLM-kind models earlier. The
+        // placeholder keeps the dispatch table total; the planner's
+        // supported-architecture validation rejects this string.
+        ModelType::MageVLM => "mage_vl",
         // GOT-OCR 2.0's decoder is Qwen2, but the vision tower has no sharded
         // runtime and TP is refused for VLM-kind models before this point. The
         // placeholder keeps the dispatch table total; the planner's
@@ -463,6 +472,9 @@ fn fallback_architecture(model_type: ModelType) -> &'static str {
         // inference, because the planner's supported-architecture validation
         // rejects this string. Placeholder keeps the dispatch table total.
         ModelType::Florence2VLM => "florence2",
+        // Nemotron-Parse: same seq2seq routing as Florence-2 (CLI driver and
+        // dedicated server worker); placeholder keeps the table total.
+        ModelType::NemotronParseVLM => "nemotron_parse",
         // Whisper is an ASR model served through the audio endpoints, never
         // routed to tensor-parallel text inference; the loader rejects it
         // earlier. Return a placeholder so the dispatch table stays total.
@@ -470,6 +482,9 @@ fn fallback_architecture(model_type: ModelType) -> &'static str {
         // Kokoro is a TTS model served through /v1/audio/speech, never routed
         // to tensor-parallel text inference; placeholder keeps the table total.
         ModelType::Kokoro => "kokoro",
+        // Nemotron VoiceChat runs its own duplex timeline, never tensor-parallel
+        // text inference; placeholder keeps the table total.
+        ModelType::NemotronVoiceChat => "nemotron_voicechat",
         // Embedding families are served through /v1/embeddings on their own
         // worker and never reach tensor-parallel text inference; the loader
         // rejects them earlier. Placeholder keeps the table total.

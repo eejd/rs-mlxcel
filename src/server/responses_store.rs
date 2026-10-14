@@ -33,7 +33,9 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::server::store_budget::{LruKey, serialized_json_len_saturating};
+use crate::server::store_budget::{
+    INITIAL_HASH_CAPACITY_LIMIT, LruKey, serialized_json_len_saturating,
+};
 use crate::server::types::responses_request::{
     ResponseInputContent, ResponseInputItem, ResponseInputPart, ResponseInputRole,
     ResponseToolOutput,
@@ -46,8 +48,6 @@ use crate::server::types::responses_response::ResponseObject;
 /// multimodal entries" footprint while leaving room for several max-size image
 /// requests inside the one-hour TTL window.
 pub const DEFAULT_RESPONSES_STORE_MAX_BYTES: usize = 256 * 1024 * 1024;
-
-const INITIAL_HASH_CAPACITY_LIMIT: usize = 4096;
 
 /// Persisted entry. Inputs and outputs are kept separately so the
 /// chain-resolution path can reconstruct the original conversation
@@ -380,9 +380,10 @@ fn response_input_content_size_bytes(content: &ResponseInputContent) -> usize {
 
 fn response_input_part_size_bytes(part: &ResponseInputPart) -> usize {
     match part {
-        ResponseInputPart::InputText { text } | ResponseInputPart::Text { text } => {
-            32usize.saturating_add(str_size_bytes(text))
-        }
+        ResponseInputPart::InputText { text }
+        | ResponseInputPart::Text { text }
+        | ResponseInputPart::OutputText { text } => 32usize.saturating_add(str_size_bytes(text)),
+        ResponseInputPart::Refusal { refusal } => 32usize.saturating_add(str_size_bytes(refusal)),
         ResponseInputPart::InputImage {
             image_url,
             detail,

@@ -22,7 +22,6 @@ use crate::multimodal::qwen_vl::{
     compute_qwen_vl_mrope_position_ids, forward_batched_with_seq_ids_dispatch,
 };
 use mlxcel_core::cache::SequenceId;
-use mlxcel_core::generate::DecodeBatchContext;
 use mlxcel_core::layers::KVCache;
 use mlxcel_core::{MlxArray, UniquePtr};
 
@@ -36,7 +35,10 @@ use mlxcel_core::{MlxArray, UniquePtr};
 /// - get_rope_index() computes spatial position IDs for merged sequences
 pub struct Qwen2VLModel {
     pub text_model: crate::models::Qwen2VLModel,
-    pub vision_encoder: encoders::qwen2_vl::Qwen2VLVisionEncoder,
+    /// `None` for a vision-stripped checkpoint loaded text-only (#1367).
+    pub vision_encoder: Option<encoders::qwen2_vl::Qwen2VLVisionEncoder>,
+    /// Model directory of a text-only load, used in the media rejection error.
+    pub text_only_path: Option<String>,
     pub processor: processors::qwen2_vl::Qwen2VLProcessor,
     pub image_token_id: i32,
     pub video_token_id: i32,
@@ -58,7 +60,11 @@ impl Qwen2VLModel {
         // Encode images through vision tower
         let embed_dtype = mlxcel_core::array_dtype(&inputs_embeds);
         let pv = mlxcel_core::astype(pixel_values, embed_dtype);
-        let vision_output = self.vision_encoder.forward_with_grid(&pv, grid_thw);
+        let vision_output = self
+            .vision_encoder
+            .as_ref()
+            .expect(crate::multimodal::qwen_vl::NO_VISION_TOWER_GUARD)
+            .forward_with_grid(&pv, grid_thw);
         let image_features = &vision_output.hidden_states;
 
         // Merge vision features at image token positions (LLaVA-style)
@@ -158,13 +164,12 @@ impl LanguageModel for Qwen2VLModel {
     /// `forward_batched`, which loops calling `forward()` without ids;
     /// that path silently produces wrong attention positions for VL
     /// rows in a batch.
-    fn forward_batched_with_context_and_ids(
+    fn forward_batched_with_ids(
         &self,
         input_ids: &MlxArray,
         seq_ids: Option<&[SequenceId]>,
         batch_caches: &mut [&mut [KVCache]],
         mask: Option<&MlxArray>,
-        context: Option<&DecodeBatchContext>,
     ) -> UniquePtr<MlxArray> {
         forward_batched_with_seq_ids_dispatch(
             &self.text_model,
@@ -172,7 +177,6 @@ impl LanguageModel for Qwen2VLModel {
             seq_ids,
             batch_caches,
             mask,
-            context,
         )
     }
 

@@ -70,13 +70,18 @@
 //! limit that makes top-k slow is ever lifted, widening the policy is a
 //! one-constant change against tests that already prove the kernel right.
 //!
-//! GPU-only: the kernel JITs through `mx.fast.metal_kernel` /
-//! `mx.fast.cuda_kernel`, so every test returns early on a CPU-only build,
+//! GPU-only: the kernel JITs through `mx.fast.metal_kernel`,
+//! `mx.fast.cuda_kernel` or `mx.fast.hip_kernel` (#2064), so every test returns
+//! early where the support predicate reports no port (a CPU-only build),
 //! matching the convention in `sampling_gumbel_tests.rs`.
 //!
 //! Run on Apple Silicon:
 //!   cargo test --release -p mlxcel-core --lib --features metal,accelerate \
 //!     sampling_rejection_tests::
+//!
+//! Run on ROCm:
+//!   cargo test --release -p mlxcel-core --lib --features rocm \
+//!     sampling_rejection_tests:: -- --test-threads=1
 
 use super::*;
 use std::collections::BTreeSet;
@@ -132,6 +137,37 @@ fn sample_count() -> usize {
 /// True when the rejection kernel can run here. CPU-only builds skip.
 fn gpu_backend() -> bool {
     sampling_rejection_available()
+}
+
+/// The kernel entry point with its refusal unwrapped.
+///
+/// Every call below sits behind `gpu_backend()`, which is the same support
+/// predicate the launcher refuses on (issue #1885). An `Err` here therefore
+/// means the gate and the launcher disagree, which is a defect worth failing
+/// loudly for rather than a backend this test should have skipped.
+fn fused_sample_rejection_ok(
+    logits: &MlxArray,
+    temperature: f32,
+    top_k: i32,
+    top_p: f32,
+    min_p: f32,
+    max_rounds: i32,
+) -> UniquePtr<MlxArray> {
+    fused_sample_rejection(logits, temperature, top_k, top_p, min_p, max_rounds)
+        .expect("gpu_backend() reported a rejection port, so the launcher must not refuse")
+}
+
+/// The deferred variant, same contract as `fused_sample_rejection_ok`.
+fn fused_sample_rejection_deferred_ok(
+    logits: &MlxArray,
+    temperature: f32,
+    top_k: i32,
+    top_p: f32,
+    min_p: f32,
+    max_rounds: i32,
+) -> UniquePtr<MlxArray> {
+    fused_sample_rejection_deferred(logits, temperature, top_k, top_p, min_p, max_rounds)
+        .expect("gpu_backend() reported a rejection port, so the launcher must not refuse")
 }
 
 // -- numeric helpers (same construction as `sampling_gumbel_tests.rs`) --
@@ -910,7 +946,7 @@ fn a_starved_round_cap_falls_back_and_the_event_is_counted() {
 
     reset_sampling_dispatch();
     assert_eq!(rejection_cap_overflow_rows(), 0);
-    let tokens = u32_values(&fused_sample_rejection(&batched, 1.0, 40, 1.0, 0.0, 1));
+    let tokens = u32_values(&fused_sample_rejection_ok(&batched, 1.0, 40, 1.0, 0.0, 1));
     assert_eq!(tokens.len(), rows);
     assert!(
         tokens.iter().all(|&id| (id as usize) < vocab),
@@ -946,6 +982,12 @@ fn a_starved_round_cap_falls_back_and_the_event_is_counted() {
 /// | top-k alone | 0.31x - 0.97x, every cell | no |
 /// | min-p alone | 0.47x - 0.88x at 152K | no |
 /// | top-k + top-p | 1.27x - 1.64x at 32K, 0.71x - 0.83x at 152K | only at vocab <= 32768 |
+///
+/// gfx1151 re-measured the joint row (#2157, vocab {32K, 64K, 128256, 151936,
+/// 152064}): batches 4 and 8 win everywhere, and end-to-end decode with the
+/// joint case routed measured 1.15x on Llama 3.1 8B (128256) and 1.12x on
+/// Qwen2.5-7B (152064), so a ROCm build caps it at 152064 instead.
+/// [`the_joint_vocab_cap_is_the_measured_crossover`] pins the per-build value.
 ///
 /// The kernel replaces a sort, so it wins exactly where the stock chain sorts,
 /// which is when top-p is active. The `rounds` column of the microbenchmark
@@ -984,15 +1026,31 @@ fn the_routing_policy_matches_the_measured_matrix() {
         );
     }
 
-    // The joint case is capped at the vocabulary where it was measured to win.
-    // 65536 is excluded because it has not been measured for this combination,
-    // not because it was measured to lose.
+    // The joint case is capped at the vocabulary where it was measured to win,
+    // which is per build (#2157). On M1 Ultra 65536 is excluded because it has
+    // not been measured for this combination. On gfx1151 every vocabulary up
+    // to 152064 routes; 128256 is the Llama 3 vocabulary that prompted the
+    // re-measurement, 151936 Qwen3's, 152064 Qwen 2.5's.
+    let rocm = cfg!(feature = "rocm");
     assert!(sampling_rejection_routes(4096, 40, 0.9, 0.0));
     assert!(sampling_rejection_routes(32_768, 40, 0.9, 0.0));
-    assert!(!sampling_rejection_routes(65_536, 40, 0.9, 0.0));
-    assert!(!sampling_rejection_routes(152_064, 40, 0.9, 0.0));
     assert!(sampling_rejection_routes(32_768, 40, 0.9, 0.05));
-    assert!(!sampling_rejection_routes(152_064, 40, 0.9, 0.05));
+    for vocab in [65_536, 128_256, 151_936, 152_064] {
+        assert_eq!(
+            sampling_rejection_routes(vocab, 40, 0.9, 0.0),
+            rocm,
+            "top-k + top-p at vocab {vocab}"
+        );
+        assert_eq!(
+            sampling_rejection_routes(vocab, 40, 0.95, 0.05),
+            rocm,
+            "top-k + top-p + min-p at vocab {vocab}"
+        );
+    }
+    // Above every measured vocabulary the joint case stays on the chain on
+    // every build (gpt-oss 201088, Gemma 262144).
+    assert!(!sampling_rejection_routes(201_088, 40, 0.9, 0.0));
+    assert!(!sampling_rejection_routes(262_144, 40, 0.95, 0.0));
 
     // A top-k that cannot bind is not a top-k: it leaves the chain's cost
     // profile at top-p alone, so it does not drag the joint ceiling in.
@@ -1000,6 +1058,42 @@ fn the_routing_policy_matches_the_measured_matrix() {
     // `top_k == 1` is the greedy spelling; `fused_sample` takes `argmax` long
     // before it reaches this policy, so the value here is not load-bearing.
     assert!(sampling_rejection_routes(152_064, 1, 0.9, 0.0));
+}
+
+/// The joint top-k + top-p cap is the measured crossover on this build, and the
+/// routing policy turns exactly at it (#2157).
+///
+/// M1 Ultra (#901) measured the crossover at 32768, which every non-ROCm build
+/// keeps. gfx1151 measured end-to-end wins at 128256 and 152064 and nothing
+/// above, so a ROCm build (`#ifdef MLXCEL_BRIDGE_ROCM_BACKEND`, which build.rs
+/// defines exactly when the `rocm` feature is on) caps at 152064. The value is
+/// a compile-time constant; this test is where each build's value is pinned.
+/// Pure host arithmetic, so it runs on a CPU-only build too.
+#[test]
+fn the_joint_vocab_cap_is_the_measured_crossover() {
+    const MEASURED_CAP: i32 = if cfg!(feature = "rocm") {
+        152_064
+    } else {
+        32_768
+    };
+    let cap = sampling_rejection_joint_vocab_max();
+    assert_eq!(
+        cap,
+        MEASURED_CAP,
+        "REJECTION_JOINT_VOCAB_MAX moved without a measurement (rocm build: {})",
+        cfg!(feature = "rocm")
+    );
+
+    // The policy reads the same constant the accessor reports: the cells on
+    // either side of it decide differently.
+    assert!(sampling_rejection_routes(cap, 40, 0.9, 0.0));
+    assert!(!sampling_rejection_routes(cap + 1, 40, 0.9, 0.0));
+    assert!(sampling_rejection_routes(cap, 40, 0.95, 0.02));
+    assert!(!sampling_rejection_routes(cap + 1, 40, 0.95, 0.02));
+    // Above the cap top-p alone still routes, and a top-k that cannot bind
+    // does not bring the cap in.
+    assert!(sampling_rejection_routes(cap + 1, 0, 0.9, 0.0));
+    assert!(sampling_rejection_routes(cap + 1, cap + 1, 0.9, 0.0));
 }
 
 /// Which path `fused_sample` took for one configuration, decided by comparing
@@ -1015,7 +1109,7 @@ fn took_the_kernel(batched: &MlxArray, top_k: i32, top_p: f32, min_p: f32) -> bo
     random_seed(0x0901_0F0F);
     let routed = u32_values(&fused_sample(batched, 1.0, top_k, top_p, min_p));
     random_seed(0x0901_0F0F);
-    let kernel = u32_values(&fused_sample_rejection(
+    let kernel = u32_values(&fused_sample_rejection_ok(
         batched, 1.0, top_k, top_p, min_p, cap,
     ));
     random_seed(0x0901_0F0F);
@@ -1075,24 +1169,33 @@ fn a_large_vocabulary_sends_the_joint_config_back_to_the_stock_chain() {
         return;
     }
     // The llama-server default (top-k 40 + top-p 0.9) above the measured
-    // ceiling. This is the cell that measured 0.71x-0.83x, so it must decline,
-    // and it must say the vocabulary is the reason.
-    let logits = spread_logits(65_536, 0x90F);
+    // ceiling, which is per build (#2157): 65536 on a build capped at 32768
+    // (M1 Ultra measured the joint case losing above it), and gpt-oss's
+    // 201088 on a ROCm build capped at 152064 (unmeasured above the cap). It
+    // must decline, and it must say the vocabulary is the reason.
+    let vocab: usize = if sampling_rejection_joint_vocab_max() < 65_536 {
+        65_536
+    } else {
+        201_088
+    };
+    assert!(vocab as i32 > sampling_rejection_joint_vocab_max());
+    let logits = spread_logits(vocab, 0x90F);
     let batched = tiled(&logits, 4);
 
     assert!(
         !took_the_kernel(&batched, 40, 0.9, 0.0),
-        "a 65536-vocabulary top-k + top-p launch reached the kernel"
+        "a {vocab}-vocabulary top-k + top-p launch reached the kernel"
     );
 
     reset_sampling_dispatch();
     let tokens = u32_values(&fused_sample(&batched, 1.0, 40, 0.9, 0.0));
     assert_eq!(tokens.len(), 4);
     let lines = recorded_dispatch();
+    let vocab_text = vocab.to_string();
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("not routed") && l.contains("65536")),
+            .any(|l| l.contains("not routed") && l.contains(&vocab_text)),
         "the decline did not name the vocabulary that caused it: {lines:?}"
     );
 
@@ -1100,7 +1203,7 @@ fn a_large_vocabulary_sends_the_joint_config_back_to_the_stock_chain() {
     // of splitting the policy by filter rather than by vocabulary alone.
     assert!(
         took_the_kernel(&batched, 0, 0.9, 0.0),
-        "top-p alone at vocab 65536 measured a win at every batch and must still route"
+        "top-p alone at vocab {vocab} must still route"
     );
 }
 
@@ -1154,7 +1257,7 @@ fn the_reference_arm_stays_on_the_argpartition_chain() {
     random_seed(0x0901_ABCD);
     let chain = u32_values(&fused_sample_categorical(&batched, 1.0, 40, 0.9, 0.0));
     random_seed(0x0901_ABCD);
-    let kernel = u32_values(&fused_sample_rejection(&batched, 1.0, 40, 0.9, 0.0, 32));
+    let kernel = u32_values(&fused_sample_rejection_ok(&batched, 1.0, 40, 0.9, 0.0, 32));
     assert_ne!(
         chain, kernel,
         "the reference arm produced the rejection kernel's stream; the A/B is measuring one path"
@@ -1291,7 +1394,7 @@ fn the_forced_entry_point_is_the_one_that_synchronizes() {
     let cap = sampling_rejection_max_rounds();
 
     let (build, drain) = build_and_drain(24, || {
-        fused_sample_rejection(&batched, 1.0, 0, 0.9, 0.0, cap)
+        fused_sample_rejection_ok(&batched, 1.0, 0, 0.9, 0.0, cap)
     });
     assert!(
         build > drain,
@@ -1339,7 +1442,7 @@ fn cap_overflow_is_detected_without_waiting_on_the_production_path() {
     // immediately under the target, so a one-round cap converges and there is
     // nothing to count. Requiring the draw to land in the top forty of 152064
     // entries is what makes one round hopeless.
-    let ids = u32_values(&fused_sample_rejection_deferred(
+    let ids = u32_values(&fused_sample_rejection_deferred_ok(
         &batched, 1.0, 40, 0.9, 0.0, 1,
     ));
     assert_eq!(ids.len(), rows);

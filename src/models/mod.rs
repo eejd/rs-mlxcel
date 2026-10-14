@@ -128,6 +128,7 @@ pub mod florence2;
 pub mod gemma;
 pub mod gemma2;
 pub mod gemma3;
+pub mod gemma3_backbone;
 pub mod gemma3_embedding;
 pub mod gemma3n;
 pub mod gemma4;
@@ -199,9 +200,12 @@ pub mod muse_glimmer;
 pub(crate) mod muse_glimmer_cache;
 pub mod muse_glimmer_config;
 pub(crate) mod muse_glimmer_layers;
+pub mod nanochat;
 pub mod nemotron;
 pub mod nemotron_h;
 pub mod nemotron_nas;
+pub mod nemotron_parse;
+pub mod nemotron_voicechat;
 pub mod olmo;
 pub mod olmo2;
 pub mod olmo3;
@@ -266,10 +270,13 @@ pub use deepseek_v2::DeepSeekV2Model;
 pub use deepseek_v3::DeepSeekV3Model;
 pub use deepseek_v4::DeepSeekV4Model;
 pub use deepseek_v32::DeepSeekV32Model;
+pub(crate) use detection::is_sequence_classification_architecture;
+pub(crate) use detection::vlm_has_vision;
+#[cfg(feature = "webui")]
 pub(crate) use detection::{
-    ModelDetectionProbes, config_has_embedding_architecture, detect_model_type_with_probes,
-    embedding_variant_for_model_type, is_encoder_only_model_type,
-    is_sequence_classification_architecture, modules_json_value_has_pooling,
+    ModelDetectionProbes, VLM_VISION_WEIGHT_PREFIXES, config_has_embedding_architecture,
+    detect_model_type_with_probes, embedding_variant_for_model_type, is_encoder_only_model_type,
+    modules_json_value_has_pooling,
 };
 pub use detection::{get_model_type, model_type_has_native_video, model_type_is_vision_capable};
 pub use diffusion_gemma::DiffusionGemmaModel;
@@ -345,9 +352,13 @@ pub use muse_glimmer::{
     DEFAULT_IMAGE_TOKEN_ID, MuseGlimmerConfig, MuseGlimmerTextConfig, MuseGlimmerTextModel,
     MuseGlimmerTextWrapper, MuseGlimmerVisionConfig,
 };
+pub use nanochat::NanoChatModel;
 pub use nemotron::NemotronModel;
 pub use nemotron_h::NemotronHModel;
 pub use nemotron_nas::NemotronNASModel;
+pub use nemotron_parse::{
+    NemotronParseConfig, NemotronParseModel, NemotronParseRunOutput, NemotronParseVlmModel,
+};
 pub use olmo::OlmoModel;
 pub use olmo2::OLMo2Model;
 pub use olmo3::OLMo3Model;
@@ -403,6 +414,7 @@ pub use whisper::WhisperModel;
 pub use youtu_vl_lm::YoutuLanguageModel;
 
 pub use kokoro::KokoroModel;
+pub use nemotron_voicechat::NemotronVoiceChatModel;
 
 /// Supported model types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -465,6 +477,9 @@ pub enum ModelType {
     /// LLM-jp-VL (`llmjpvl`): SigLIP2 tower + pixel-shuffle `mlp1` + a
     /// Llama (llm-jp-4-vl-9B) or Qwen3 (Jagle-VL-2.2B) decoder.
     LlmJpVLM,
+    /// Mage-VL (`mage_vl`): Mage-ViT tower (interleaved 4:6:6 3D RoPE) + 2x2
+    /// LayerNorm/MLP patch merger + a plain Qwen3 decoder (1-D RoPE).
+    MageVLM,
     /// GOT-OCR 2.0 (`GOT`): SAM ViT-B tower + `Linear(1024, 1024)` projector +
     /// Qwen2-0.5B decoder, on a fixed 256-token image block.
     GotOcrVLM,
@@ -479,6 +494,10 @@ pub enum ModelType {
     /// text stack. Encoder-decoder (seq2seq), so it is served through its own
     /// task pipeline (CLI early exit), not the autoregressive decode loop.
     Florence2VLM,
+    /// Nemotron-Parse (`nemotron_parse`): C-RADIO ViT-H tower + compression
+    /// neck + pre-norm mBART decoder. Encoder-decoder (seq2seq), served on
+    /// the same dedicated paths as Florence-2.
+    NemotronParseVLM,
     Gemma3n,    // Gemma 3n (text-only)
     Gemma3nVLM, // Gemma 3n VLM (MobileNetV5 + Gemma3n)
     Phi,        // Phi 1/2
@@ -583,6 +602,7 @@ pub enum ModelType {
     Gpt2,       // GPT-2 (learned absolute position embeddings, Conv1D weight layout)
     GptBigCode, // GPT-BigCode (StarCoder / SantaCoder: GPT-2 block with multi-query attention)
     GptNeoX,    // GPT-NeoX (EleutherAI Pythia: interleaved per-head QKV, partial RoPE)
+    NanoChat,   // nanochat (weightless RMSNorm, relu^2 MLP, mirrored RoPE, softcapped logits)
 
     // Code models
     StarCoder2,
@@ -653,6 +673,12 @@ pub enum ModelType {
 
     // Text-to-speech (StyleTTS2 acoustic model + built-in iSTFTNet vocoder)
     Kokoro,
+
+    /// Nemotron VoiceChat (`nemotron_voicechat`): full-duplex speech model
+    /// (FastConformer + RNNT, Nemotron-H with text and function heads,
+    /// EAR-TTS, neural codec). Runs its own timeline loop, not the
+    /// autoregressive decode loop.
+    NemotronVoiceChat,
 
     // Embedding models served through /v1/embeddings (epic #1348). Detected by
     // encoder-only `model_type`, embedding `architectures[0]`, a
@@ -742,6 +768,7 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::YoutuVLM,
     ModelType::InternVLChatVLM,
     ModelType::LlmJpVLM,
+    ModelType::MageVLM,
     ModelType::GotOcrVLM,
     ModelType::LocateAnythingVLM,
     ModelType::SmolVLM,
@@ -751,6 +778,7 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::Moondream3VLM,
     ModelType::Moondream2VLM,
     ModelType::Florence2VLM,
+    ModelType::NemotronParseVLM,
     ModelType::Gemma3n,
     ModelType::Gemma3nVLM,
     ModelType::Phi,
@@ -824,6 +852,7 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::Gpt2,
     ModelType::GptBigCode,
     ModelType::GptNeoX,
+    ModelType::NanoChat,
     // Code models
     ModelType::StarCoder2,
     ModelType::Mellum,
@@ -877,6 +906,8 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::Whisper,
     // Text-to-speech
     ModelType::Kokoro,
+    // Speech-to-speech (full duplex)
+    ModelType::NemotronVoiceChat,
     // Embedding models
     ModelType::Bert,
     ModelType::XlmRoberta,
@@ -1135,6 +1166,12 @@ impl ModelType {
             // ----- Text-to-speech (TTS) -----
             ModelType::Kokoro => ("Kokoro (StyleTTS2 + iSTFTNet)", "Text-to-speech"),
 
+            // ----- Speech-to-speech (full duplex) -----
+            ModelType::NemotronVoiceChat => (
+                "Nemotron VoiceChat (FastConformer + Nemotron-H + EAR-TTS + codec, full duplex)",
+                "Speech",
+            ),
+
             // ----- Embedding models (/v1/embeddings) -----
             ModelType::Bert => ("BERT / MiniLM encoder", "Embedding"),
             ModelType::XlmRoberta => ("XLM-RoBERTa encoder", "Embedding"),
@@ -1163,6 +1200,10 @@ impl ModelType {
             // ----- Specialized / other small/text -----
             ModelType::Gpt2 => (
                 "GPT-2 (learned absolute positions, Conv1D weights)",
+                "Specialized",
+            ),
+            ModelType::NanoChat => (
+                "nanochat (weightless RMSNorm, relu^2 MLP, softcapped logits)",
                 "Specialized",
             ),
             ModelType::GptBigCode => (
@@ -1224,6 +1265,10 @@ impl ModelType {
                 "LLM-jp VL (SigLIP2 + pixel-shuffle mlp1 + Llama/Qwen3)",
                 "Other VLM",
             ),
+            ModelType::MageVLM => (
+                "Mage-VL (Mage-ViT 3D-RoPE + 2x2 merger + Qwen3)",
+                "Other VLM",
+            ),
             ModelType::GotOcrVLM => (
                 "GOT-OCR 2.0 (SAM ViT-B + linear projector + Qwen2-0.5B)",
                 "Other VLM",
@@ -1246,6 +1291,10 @@ impl ModelType {
             ModelType::Moondream2VLM => ("Moondream 2 (SigLIP-style ViT + Phi text)", "Other VLM"),
             ModelType::Florence2VLM => (
                 "Florence-2 (DaViT + BART seq2seq, task prompts)",
+                "Other VLM",
+            ),
+            ModelType::NemotronParseVLM => (
+                "Nemotron-Parse (C-RADIO ViT-H + mBART seq2seq OCR)",
                 "Other VLM",
             ),
             ModelType::MiniCPMOVLM => (
@@ -1366,6 +1415,7 @@ mod metadata_tests {
             YoutuVLM,
             InternVLChatVLM,
             LlmJpVLM,
+            MageVLM,
             GotOcrVLM,
             LocateAnythingVLM,
             SmolVLM,
@@ -1375,6 +1425,7 @@ mod metadata_tests {
             Moondream3VLM,
             Moondream2VLM,
             Florence2VLM,
+            NemotronParseVLM,
             Gemma3n,
             Gemma3nVLM,
             Phi,
@@ -1437,6 +1488,7 @@ mod metadata_tests {
             Gpt2,
             GptBigCode,
             GptNeoX,
+            NanoChat,
             StarCoder2,
             Mellum,
             Laguna,
@@ -1477,6 +1529,7 @@ mod metadata_tests {
             RecurrentGemma,
             Whisper,
             Kokoro,
+            NemotronVoiceChat,
             Bert,
             XlmRoberta,
             ModernBert,
@@ -1579,6 +1632,12 @@ mod inkling_detection_tests;
 #[cfg(test)]
 #[path = "iquestloopcoder_tests.rs"]
 mod iquestloopcoder_tests;
+#[cfg(test)]
+#[path = "single_row_batch_parity_tests.rs"]
+mod single_row_batch_parity_tests;
+#[cfg(test)]
+#[path = "vlm_text_only_detection_tests.rs"]
+mod vlm_text_only_detection_tests;
 
 #[cfg(test)]
 #[path = "gemma3n_helpers_tests.rs"]

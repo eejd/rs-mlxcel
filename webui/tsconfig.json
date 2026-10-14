@@ -30,6 +30,10 @@
     "vite.config.ts",
     "vitest.config.ts",
     "playwright.config.ts",
-    "eslint.config.js"
+    "eslint.config.js",
+    "playwright.csp.config.ts",
+    "playwright.chat-real.config.ts",
+    "playwright.engines.config.ts",
+    "playwright.rust-router.config.ts"
   ]
 }

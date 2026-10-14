@@ -18,6 +18,10 @@
 use cmake::Config;
 use std::{env, path::PathBuf};
 
+// Shared backend selection for CMake and the runtime-control bridge.
+#[path = "build_support/metal_backend.rs"]
+mod metal_backend;
+
 // Single-source-of-truth resolution and verification of the pinned MLX commit.
 // Shared by path (not by dependency) with `mlxcel-mlx-pin`, which unit-tests it
 // without dragging in an MLX build; see that crate's manifest for the reason.
@@ -29,7 +33,7 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
     // The pinned MLX commit has exactly one home: GIT_TAG in
-    // ../mlx-cpp/CMakeLists.txt, which is what CMake actually fetches. Resolve
+    // ../mlxcelverse/CMakeLists.txt, which is what CMake actually fetches. Resolve
     // it once, here, before anything compares against it. Everything below
     // (the _deps/ purge decision, the MLXCEL_MLX_COMMIT export, the post-build
     // HEAD verification and the cache marker) consumes this one value, so they
@@ -59,8 +63,15 @@ fn main() {
     let rocm_arch = resolve_rocm_architectures();
     println!("cargo:rustc-env=MLXCEL_ROCM_ARCHITECTURES={rocm_arch}");
 
+    // Resolve once for both CMake and the bridge. On macOS a plain Cargo
+    // build enables Metal even without the optional `metal` feature (#1988).
+    let metal_override = env::var("MLXCEL_BUILD_METAL").ok();
+    let metal_backend =
+        metal_backend::resolve_metal_backend(cfg!(target_os = "macos"), metal_override.as_deref())
+            .unwrap_or_else(|error| panic!("{error}"));
+
     // Build MLX using cmake
-    let mlx_dst = build_mlx(&mlx_commit, &cuda_arch, &rocm_arch);
+    let mlx_dst = build_mlx(&mlx_commit, &cuda_arch, &rocm_arch, metal_backend);
     // Verify what actually landed on disk before blessing it. CMake reuses an
     // already-populated _deps/mlx-src rather than re-running FetchContent, so a
     // checkout restored from a CI cache or seeded by hand can disagree with the
@@ -81,48 +92,55 @@ fn main() {
         .file("cpp/mlx_cxx_kernels.cpp")
         .file("cpp/mlx_cxx_nemotron.cpp")
         .file("cpp/mlx_cxx_ext.cpp")
+        .file("cpp/mlx_cxx_one_bit.cpp")
         // Fused Sparse-V SDPA kernel launcher. Lives under
-        // `src/lib/mlx-cpp/turbo/` so the MLX-upstream-commit upgrade
+        // `src/lib/mlxcelverse/kernels/` so the MLX-upstream-commit upgrade
         // checklist ("Bumping the MLX upstream pin" in CONTRIBUTING.md)
         // treats this directory as in-scope.
         // Resolves which GPU backend the custom kernels target (issue
-        // #1803). Shared by the bridge and every turbo/ launcher.
-        .file("../mlx-cpp/turbo/gpu_backend.cpp")
-        .file("../mlx-cpp/turbo/sparse_v_sdpa.cpp")
+        // #1803). Shared by the bridge and every kernels/ launcher.
+        .file("../mlxcelverse/kernels/gpu_backend.cpp")
+        // The one place a fused kernel chooses its per-backend port (#1801).
+        .file("../mlxcelverse/kernels/kernel_port.cpp")
+        .file("../mlxcelverse/kernels/sparse_v_sdpa.cpp")
         // Fused Turbo4Delegated cold-V weighted-sum kernel
         // launcher. Reads the packed cold V directly so the dequantised
         // FP16 cold body never materialises in global memory; the host
         // pairs this with a hot-V matmul to produce the final SDPA output.
-        .file("../mlx-cpp/turbo/turbo4_delegated_sdpa.cpp")
+        .file("../mlxcelverse/kernels/turbo4_delegated_sdpa.cpp")
         // Fused paged-attention decode kernel launcher (epic #116 Phase 6,
         // #123). Reads scattered KV blocks out of the global pool via a block
         // table with no separate gather copy; the gather-then-SDPA path stays
         // the correctness reference and fallback.
-        .file("../mlx-cpp/turbo/paged_attention.cpp")
+        .file("../mlxcelverse/kernels/paged_attention.cpp")
         // Paged-attention decode v2 (#898): CSR page table plus cross-CTA
         // split-KV in `paged_attention_v2.cpp`, and the variable-length
         // attention-state merge kernel in `paged_attention_v2_merge.cpp`. The
         // merge half is split out because the cascade issue #903 reuses it
         // unchanged. v1 above stays intact and remains the default path.
-        .file("../mlx-cpp/turbo/paged_attention_v2.cpp")
-        .file("../mlx-cpp/turbo/paged_attention_v2_merge.cpp")
+        .file("../mlxcelverse/kernels/paged_attention_v2.cpp")
+        .file("../mlxcelverse/kernels/paged_attention_v2_merge.cpp")
         // Softmax-free Gumbel-max categorical sampling kernel launcher (#900).
         // Replaces the `random::categorical` normalization pass plus the
         // `argpartition` sort on the no-filter sampling path with one
         // index-carrying max reduction over the vocabulary.
-        .file("../mlx-cpp/turbo/sampling.cpp")
+        .file("../mlxcelverse/kernels/sampling.cpp")
         // Sorting-free top-k / top-p / min-p sampling by dual-pivot rejection
         // (#901). Replaces the `argpartition` + `argsort` + `cumsum` filter
         // chain with a shrinking probability interval resolved by two pivots
         // per vocabulary sweep.
-        .file("../mlx-cpp/turbo/sampling_rejection.cpp")
+        .file("../mlxcelverse/kernels/sampling_rejection.cpp")
         // Fused residual-add + RMSNorm and fused q/k RoPE + KV-append-layout
         // decode kernel launchers (#905). Both are two/three-output custom
         // kernels: MLX arrays are immutable from the graph's perspective, so
         // the in-place residual update and the append payload are returned as
         // values rather than written through.
-        .file("../mlx-cpp/turbo/fused_norm.cpp")
-        .file("../mlx-cpp/turbo/fused_rope_append.cpp")
+        .file("../mlxcelverse/kernels/fused_norm.cpp")
+        .file("../mlxcelverse/kernels/fused_rope_append.cpp")
+        // In-place decode KV row write (#1959): a primitive whose output
+        // adopts the cache buffer, since slice_update copies it whole while the
+        // previous pipelined step still references it.
+        .file("../mlxcelverse/kernels/kv_inplace_write.cpp")
         // C shim over the `qmm_naive` CTA tile selector (#1541), so
         // `qmm_naive_tile_tests.rs` can sweep the shipped selection function on
         // the host. The selector is pure integer arithmetic with no CUDA in it,
@@ -139,7 +157,7 @@ fn main() {
         .file("cpp/grouped_gemm_arch_probe.cpp")
         .include(&mlx_include)
         .include("cpp")
-        .include("../mlx-cpp/turbo")
+        .include("../mlxcelverse/kernels")
         .flag_if_supported("-std=c++20")
         .flag_if_supported("-Wno-unused-parameter")
         .flag_if_supported("-Wno-deprecated-declarations")
@@ -147,13 +165,11 @@ fn main() {
         // included by the generated cxx bridge, so suppress it for all profiles.
         .flag_if_supported("-Wno-deprecated-copy");
 
-    // The qmv_wide off-switch (issue #1187) lives in the
-    // mlx/backend/metal/quantized.cpp overlay, so its symbol exists only when
-    // the Metal backend is actually compiled. `__APPLE__` is not that
-    // condition: a macOS build without the `metal` feature sets
-    // MLX_BUILD_METAL=OFF and would link against a symbol that was never
-    // emitted. Gate on the feature that decides whether the file is built.
-    if std::env::var("CARGO_FEATURE_METAL").is_ok() {
+    // Used by: QMV exactness retry and decode command-buffer budget controls.
+    // These symbols exist precisely when CMake builds the Metal backend.
+    // Cargo's optional feature is not that condition: macOS defaults to Metal,
+    // while MLXCEL_BUILD_METAL=OFF explicitly disables it even with the feature.
+    if metal_backend {
         bridge.define("MLXCEL_BRIDGE_METAL_BACKEND", None);
     }
 
@@ -163,6 +179,21 @@ fn main() {
     // (issue #1803).
     if std::env::var("CARGO_FEATURE_ROCM").is_ok() {
         bridge.define("MLXCEL_BRIDGE_ROCM_BACKEND", None);
+    }
+
+    // Any GPU backend (#2108). MLX defines its GPU-side helpers, such as
+    // `copy_gpu_inplace` in `mlx/backend/gpu/copy.cpp`, only when it builds a
+    // GPU backend, so a bridge file that calls them must not reference them in
+    // a CPU-only Linux build or the final link fails. Keyed on the resolved
+    // `metal_backend` (not the Cargo feature, see above) and on the CUDA and
+    // ROCm features, which are exactly the conditions under which `build_mlx`
+    // turns a GPU backend on.
+    if metal_backend::gpu_backend_enabled(
+        metal_backend,
+        env::var_os("CARGO_FEATURE_CUDA").is_some(),
+        env::var_os("CARGO_FEATURE_ROCM").is_some(),
+    ) {
+        bridge.define("MLXCEL_BRIDGE_GPU_BACKEND", None);
     }
 
     // Add optimization flags for release builds
@@ -253,43 +284,61 @@ fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_bridge.h");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_internal.h");
+    println!("cargo:rerun-if-changed=build_support/metal_backend.rs");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_bridge.cpp");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_kernels.cpp");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_nemotron.cpp");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_ext.cpp");
+    println!("cargo:rerun-if-changed=cpp/mlx_cxx_one_bit.cpp");
     println!("cargo:rerun-if-changed=cpp/qmm_naive_tile_probe.cpp");
     println!("cargo:rerun-if-changed=cpp/grouped_gemm_arch_probe.cpp");
     println!("cargo:rerun-if-changed=metal/fused_attention_metal4.metal");
-    println!("cargo:rerun-if-changed=../mlx-cpp/CMakeLists.txt");
-    println!("cargo:rerun-if-changed=../mlx-cpp/patches");
-    println!("cargo:rerun-if-changed=../mlx-cpp/patches-cuda");
-    println!("cargo:rerun-if-changed=../mlx-cpp/patches-rocm");
+    println!("cargo:rerun-if-changed=../mlxcelverse/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=../mlxcelverse/overlays/cpu");
+    println!("cargo:rerun-if-changed=../mlxcelverse/overlays/metal");
+    println!("cargo:rerun-if-changed=../mlxcelverse/overlays/cuda");
+    println!("cargo:rerun-if-changed=../mlxcelverse/overlays/rocm");
     // Sparse-V fused-skip Metal kernel launchers.
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/CMakeLists.txt");
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/sparse_v_sdpa.h");
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/sparse_v_sdpa.cpp");
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/sparse_v_sdpa.metal");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/CMakeLists.txt");
+    // The port-selection helpers every launcher includes (#1803, #2147). Not
+    // tracked before, so an edit to the wavefront hold in `port_for` left the
+    // bridge library stale until some other tracked file changed.
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/gpu_backend.h");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/gpu_backend.cpp");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/kernel_port.h");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/kernel_port.cpp");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/sparse_v_sdpa.h");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/sparse_v_sdpa.cpp");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/sparse_v_sdpa.metal");
     // Turbo4Delegated cold-V fused weighted-sum kernel launcher.
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/turbo4_delegated_sdpa.h");
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/turbo4_delegated_sdpa.cpp");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/turbo4_delegated_sdpa.h");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/turbo4_delegated_sdpa.cpp");
     // Fused paged-attention decode kernel launcher (#123).
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/paged_attention.h");
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/paged_attention.cpp");
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/paged_attention.metal");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/paged_attention.h");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/paged_attention.cpp");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/paged_attention.metal");
+    // HIP bodies of the three paged-attention kernels (#2068).
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/paged_attention_hip.h");
 
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/paged_attention_v2.h");
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/paged_attention_v2.cpp");
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/paged_attention_v2_merge.cpp");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/paged_attention_v2.h");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/paged_attention_v2.cpp");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/paged_attention_v2_merge.cpp");
     // Gumbel-max categorical sampling kernel launcher (#900).
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/sampling.h");
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/sampling.cpp");
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/sampling_rejection.h");
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/sampling_rejection.cpp");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/sampling.h");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/sampling.cpp");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/sampling_gumbel_hip.h");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/sampling_rejection.h");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/sampling_rejection.cpp");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/sampling_rejection_hip.h");
     // Fused residual-add RMSNorm and fused RoPE + KV-append kernel launchers (#905).
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/fused_norm.h");
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/fused_norm.cpp");
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/fused_rope_append.h");
-    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/fused_rope_append.cpp");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/fused_norm.h");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/fused_norm.cpp");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/fused_norm_hip.h");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/fused_rope_append.h");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/fused_rope_append.cpp");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/fused_rope_append_hip.h");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/kv_inplace_write.h");
+    println!("cargo:rerun-if-changed=../mlxcelverse/kernels/kv_inplace_write.cpp");
     println!("cargo:rerun-if-env-changed=MLX_CUDA_ARCHITECTURES");
     println!("cargo:rerun-if-env-changed=MLX_ROCM_ARCHITECTURES");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
@@ -309,7 +358,7 @@ fn main() {
 /// after a successful build, `_deps/.mlx-build-commit` records the commit.
 /// If the marker is missing or doesn't match, we purge the entire `_deps/`.
 ///
-/// `expected_commit` is the value resolved from `../mlx-cpp/CMakeLists.txt` in
+/// `expected_commit` is the value resolved from `../mlxcelverse/CMakeLists.txt` in
 /// `main`, so this decision is made against the tag CMake would actually fetch.
 fn purge_stale_mlx_cache(out_dir: &std::path::Path, expected_commit: &str) {
     let deps_dir = out_dir.join("build/_deps");
@@ -367,34 +416,38 @@ fn mark_mlx_cache_valid(out_dir: &std::path::Path, expected_commit: &str) {
 // Each architecture list is consumed only by its own backend's branch below,
 // and at most one of the two backends is ever enabled.
 #[allow(unused_variables)]
-fn build_mlx(expected_commit: &str, cuda_architectures: &str, rocm_architectures: &str) -> PathBuf {
+fn build_mlx(
+    expected_commit: &str,
+    cuda_architectures: &str,
+    rocm_architectures: &str,
+    metal_backend: bool,
+) -> PathBuf {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     purge_stale_mlx_cache(&out_dir, expected_commit);
 
-    let mut config = Config::new("../mlx-cpp");
+    let mut config = Config::new("../mlxcelverse");
     config.very_verbose(true);
     config.define("CMAKE_INSTALL_PREFIX", ".");
 
     // Platform features
-    // On macOS: Metal and Accelerate are always available and enabled by default.
-    // Feature flags can still override (e.g. for CPU-only testing).
+    // On macOS: Metal and Accelerate are enabled by default. Environment
+    // overrides select CPU-only builds; the resolved Metal choice is shared
+    // with the bridge above.
     // On Linux: CPU-only by default, CUDA opt-in via feature flag.
     config.define("MLX_BUILD_CUDA", "OFF");
+    config.define("MLX_BUILD_METAL", if metal_backend { "ON" } else { "OFF" });
 
     #[cfg(target_os = "macos")]
     {
-        let build_metal = cmake_bool_from_env("MLXCEL_BUILD_METAL").unwrap_or("ON");
         let build_accelerate = cmake_bool_from_env("MLXCEL_BUILD_ACCELERATE").unwrap_or("ON");
 
         // Default to Metal + Accelerate on macOS, but allow CPU-only rebuilds
         // for environments where Metal device enumeration is unavailable.
-        config.define("MLX_BUILD_METAL", build_metal);
         config.define("MLX_BUILD_ACCELERATE", build_accelerate);
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        config.define("MLX_BUILD_METAL", "OFF");
         config.define("MLX_BUILD_ACCELERATE", "OFF");
     }
 
@@ -413,13 +466,16 @@ fn build_mlx(expected_commit: &str, cuda_architectures: &str, rocm_architectures
         // honored verbatim (escape hatch); otherwise we auto-detect via nvidia-smi
         // and fall back to Hopper's sm_90a.
         //
-        // The `a` suffix is load-bearing: MLX only defines MLX_CUDA_SM90A_ENABLED
-        // (which compiles the dedicated Hopper `qmm_sm90` quantized kernel) when
-        // "90a" is in the arch list. MLX's own CMake appends that suffix for
-        // cc >= 90, but only inside its `if(NOT DEFINED MLX_CUDA_ARCHITECTURES)`
-        // branch. Because we always pass MLX_CUDA_ARCHITECTURES explicitly, that
-        // branch never runs, so we apply the same rule ourselves here and in
-        // detect_cuda_arch. See docs/installation.md (CUDA architecture selection).
+        // MLX's own CMake would spell a detected capability itself, appending the
+        // architecture-specific `a` suffix for cc >= 90, but only inside its
+        // `if(NOT DEFINED MLX_CUDA_ARCHITECTURES)` branch. We always pass the
+        // variable explicitly, so that branch never runs and `sm_arch_with_suffix`
+        // spells it here instead. It deliberately stops suffixing at
+        // `FIRST_PLAIN_SM`, where MLX's rule would not: on Blackwell the suffix
+        // belongs on one translation unit rather than on the whole target, which
+        // is what `src/lib/mlxcelverse/CMakeLists.txt` arranges and what the release
+        // lists carry. See `sm_arch_with_suffix` and docs/installation.md (CUDA
+        // architecture selection).
         //
         // The value is resolved in `main` by `resolve_cuda_architectures` and
         // passed in, so the list CMake compiles for and the list recorded in
@@ -429,7 +485,7 @@ fn build_mlx(expected_commit: &str, cuda_architectures: &str, rocm_architectures
 
     #[cfg(feature = "rocm")]
     {
-        // Turns on the ROCm overlay in ../mlx-cpp/CMakeLists.txt and the
+        // Turns on the ROCm overlay in ../mlxcelverse/CMakeLists.txt and the
         // backend's own CMake in mlx/backend/rocm/. The backend passes one
         // `--offload-arch` per entry of CMAKE_HIP_ARCHITECTURES to hipcc.
         let rocm = rocm_path();
@@ -452,10 +508,9 @@ fn build_mlx(expected_commit: &str, cuda_architectures: &str, rocm_architectures
 
 /// Refuse feature combinations that cannot produce a working binary.
 ///
-/// The ROCm overlay replaces MLX core files that the CUDA-only patches also
-/// replace, and the `metal` feature makes the bridge reference symbols that
-/// only the Metal overlay emits. Failing here names the conflict instead of
-/// leaving it to a CMake error or an undefined symbol at link time.
+/// The ROCm and CUDA overlays replace the same MLX core files. Explicit
+/// backend feature selections remain mutually exclusive, and ROCm is Linux-only.
+/// Failing here names the conflict instead of leaving it to CMake or the linker.
 fn reject_conflicting_gpu_features() {
     if env::var_os("CARGO_FEATURE_ROCM").is_none() {
         return;
@@ -595,10 +650,15 @@ fn cmake_bool_from_env(name: &str) -> Option<&'static str> {
 ///
 /// An explicitly set `MLX_CUDA_ARCHITECTURES` wins verbatim (the documented
 /// escape hatch); otherwise `nvidia-smi` detection decides, and `90a` is the
-/// last resort. That fallback is why the runtime mismatch check exists: on a
-/// host without `nvidia-smi` it produces a binary that cannot run on its own
-/// build machine, and without the check the only symptom is an opaque CUDA
-/// load failure at the first kernel launch.
+/// last resort. It stays spelled `90a` for the same reason `sm_arch_with_suffix`
+/// still suffixes Hopper: that is what `release.yml` ships, and a fallback that
+/// said `90` would hand a host without `nvidia-smi` a build shape no published
+/// archive uses, which is the divergence lablup/mlxcel#1943 closed on Blackwell.
+///
+/// That fallback is why the runtime mismatch check exists: on a host without
+/// `nvidia-smi` it produces a binary that cannot run on its own build machine,
+/// and without the check the only symptom is an opaque CUDA load failure at the
+/// first kernel launch.
 ///
 /// Empty string on a non-CUDA build, which the runtime reads as "no compiled
 /// architecture list" and skips the check entirely.
@@ -623,7 +683,8 @@ fn detect_cuda_arch() -> Option<String> {
         .ok()?;
     let caps = String::from_utf8_lossy(&output.stdout);
     // Parse "X.Y" compute capabilities, convert to SM number (e.g. "9.0" -> "90"),
-    // and append the architecture-specific "a" suffix for cc >= 90 (e.g. "90a").
+    // and let `sm_arch_with_suffix` spell each one the way the release lists
+    // spell it: "90" becomes "90a", Blackwell stays plain.
     let archs: Vec<String> = caps
         .lines()
         .filter_map(|line| {
@@ -647,17 +708,53 @@ fn detect_cuda_arch() -> Option<String> {
     }
 }
 
-/// Append CUDA's architecture-specific `a` suffix for SM >= 90, mirroring MLX's
-/// own CMake logic (`MLX_CUDA_ARCHITECTURES GREATER_EQUAL 90` -> append `a`).
+/// First SM number this project names plainly even though CUDA offers an
+/// architecture-specific spelling for it: Blackwell's `sm_100`.
 ///
-/// The `a` suffix enables architecture-specific features (e.g. Hopper wgmma/TMA)
-/// the dedicated quantized kernels rely on, and it gates MLX_CUDA_SM90A_ENABLED on
-/// "90a" (not "90"). SM < 90 (e.g. Ampere sm_80/sm_86) has no `a` variant and is
-/// returned unchanged.
+/// Both release lists in `.github/workflows/release.yml` stop suffixing here,
+/// and `scripts/ci/check_cuda_arch_lists.py` rejects any workflow list that
+/// does not. Auto-detection uses the same boundary so that a local build and a
+/// shipped build differ in which architectures they cover and never in what
+/// machine code those architectures get (lablup/mlxcel#1943).
+#[cfg(feature = "cuda")]
+const FIRST_PLAIN_SM: u32 = 100;
+
+/// Spell one detected SM number the way the shipped architecture lists spell
+/// it: `a`-suffixed for Hopper, plain from `FIRST_PLAIN_SM` up.
+///
+/// Suffixing Blackwell is what that boundary exists to prevent. The whole
+/// target would compile under `__CUDA_ARCH_SPECIFIC__`, CUTLASS keys
+/// `CUTLASS_ARCH_MMA_SM121A_ENABLED` on the same macro, and every decode kernel
+/// would get a second, architecture-specific image that the driver prefers on a
+/// matching device. `src/lib/mlxcelverse/CMakeLists.txt` injects that image into
+/// `fp_quantize.cu` alone instead, the one translation unit that can reach
+/// MLX's hardware block-float converters, and that injection only fires for
+/// plain entries: an entry already carrying `a` is recorded as
+/// architecture-specific and skipped, because a duplicate `--generate-code` is
+/// an nvcc error rather than a no-op. A plain `121` is therefore what makes the
+/// shipped mechanism work (lablup/mlxcel#1934, PR #1938).
+///
+/// Hopper keeps `90a` because `release.yml` ships `90a` and this function's job
+/// is to agree with it. The suffix no longer gates anything at the current MLX
+/// pin: upstream commit `44540d12` moved `qmm_sm80`, `qmm_sm90` and
+/// `gather_gemm` to runtime NVRTC compilation and deleted the
+/// `MLX_CUDA_SM90A_ENABLED` definition an earlier revision of this comment
+/// cited, and `jit_module.cpp` now derives the NVRTC `--gpu-architecture` from
+/// the running device, appending `a` itself from compute capability 9 up.
+/// Cross-compiling the pinned tree at `90` and at `90a` agrees: `qmm_sm90.cu`,
+/// `qmm.cu` and `qmm_sm80.cu` emit no device function at either spelling, and
+/// `qmv.cu` and `fp_qmv.cu` emit identical SASS apart from the
+/// `EF_CUDA_ACCELERATORS` header flag that marks a cubin architecture-specific.
+/// `CUTLASS_ARCH_MMA_SM90A_ENABLED` still keys on
+/// `__CUDA_ARCH_FEAT_SM90_ALL`, so a later pin can make the suffix matter
+/// again, which is a second reason not to drop what the release list carries.
+///
+/// SM < 90 (Ampere `sm_80`, `sm_86`) has no `a` variant and is returned
+/// unchanged. See `docs/installation.md` (CUDA architecture selection).
 #[cfg(feature = "cuda")]
 fn sm_arch_with_suffix(sm: &str) -> String {
     match sm.parse::<u32>() {
-        Ok(n) if n >= 90 => format!("{sm}a"),
+        Ok(n) if (90..FIRST_PLAIN_SM).contains(&n) => format!("{sm}a"),
         _ => sm.to_string(),
     }
 }

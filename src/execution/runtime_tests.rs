@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use super::{
-    RuntimeDevice, cpu_override_requested, parse_memory_size, parse_runtime_device, resolve_device,
-    resolve_runtime_device, should_warn_cpu_only_on_nvidia_host,
+    DEFAULT_CACHE_LIMIT_BYTES, RuntimeDevice, cache_limit_bytes, cpu_override_requested,
+    parse_memory_size, parse_runtime_device, resolve_device, resolve_runtime_device,
+    should_warn_cpu_only_on_nvidia_host,
 };
 
 #[test]
@@ -208,11 +209,44 @@ fn checked_init_agrees_with_the_architecture_check_on_this_host() {
     // is never, and the two must not be able to drift apart: a refusal with no
     // mismatch, or a mismatch that starts anyway, are both bugs.
     let mismatch = mlxcel_core::hardware::cuda_arch_mismatch();
-    assert_eq!(
-        super::initialize_runtime_checked().is_err(),
-        mismatch.is_some(),
-        "refusal must track cuda_arch_mismatch(), which reported {mismatch:?}"
-    );
+    if mismatch.is_some() {
+        assert!(
+            super::initialize_runtime_checked().is_err(),
+            "a CUDA architecture mismatch must refuse to start: {mismatch:?}"
+        );
+    } else if mlxcel_core::rocm_arch::rocm_arch_mismatch().is_none() {
+        // Only assert the converse when the ROCm check has nothing to report
+        // either. `initialize_runtime_checked` gained a second refusal source
+        // in #1805, so without this guard a gfx mismatch would fail this test
+        // for the other backend's reason.
+        assert!(
+            super::initialize_runtime_checked().is_ok(),
+            "no CUDA architecture mismatch on this host, so start must not be refused"
+        );
+    }
+}
+
+#[test]
+fn checked_init_agrees_with_the_rocm_architecture_check_on_this_host() {
+    // The ROCm counterpart of the test above (issue #1805). Same standard: a
+    // refusal with no mismatch, or a mismatch that starts anyway, are both
+    // bugs. Inert off ROCm, where `rocm_arch_mismatch()` is always `None`.
+    let mismatch = mlxcel_core::rocm_arch::rocm_arch_mismatch();
+    if mismatch.is_some() {
+        assert!(
+            super::initialize_runtime_checked().is_err(),
+            "a gfx mismatch must refuse to start: {mismatch:?}"
+        );
+    } else {
+        // Only assert the converse when CUDA has nothing to report either,
+        // so this test cannot fail for the other backend's reason.
+        if mlxcel_core::hardware::cuda_arch_mismatch().is_none() {
+            assert!(
+                super::initialize_runtime_checked().is_ok(),
+                "no architecture mismatch on this host, so start must not be refused"
+            );
+        }
+    }
 }
 
 #[test]
@@ -225,4 +259,84 @@ fn the_architecture_refusal_only_applies_to_gpu_runs() {
     assert!(resolve_runtime_device(Some("gpu")).0.uses_gpu());
     // An unparseable override still resolves to the GPU, so it stays checked.
     assert!(resolve_runtime_device(Some("tpu")).0.uses_gpu());
+}
+
+// ── Buffer-cache bound (issues #627, #2062) ──────────────────────────────────
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+#[test]
+fn cache_limit_unset_applies_the_backend_default() {
+    // Unset and empty both mean "no operator choice", so the default applies.
+    assert_eq!(cache_limit_bytes(None, Some(2 * GIB)), Some(2 * GIB));
+    assert_eq!(cache_limit_bytes(Some(""), Some(2 * GIB)), Some(2 * GIB));
+    assert_eq!(cache_limit_bytes(Some("  "), Some(2 * GIB)), Some(2 * GIB));
+    // Metal and CUDA have no default, so unset stays unbounded there.
+    assert_eq!(cache_limit_bytes(None, None), None);
+}
+
+#[test]
+fn cache_limit_explicit_value_overrides_the_default() {
+    assert_eq!(
+        cache_limit_bytes(Some("512MB"), Some(2 * GIB)),
+        Some(512 * 1024 * 1024)
+    );
+    assert_eq!(cache_limit_bytes(Some("8G"), Some(2 * GIB)), Some(8 * GIB));
+    assert_eq!(cache_limit_bytes(Some("4096"), None), Some(4096));
+}
+
+#[test]
+fn cache_limit_zero_or_none_disables_the_default() {
+    for raw in ["0", "none", "NONE", "None", " none ", "0GB", "0K"] {
+        assert_eq!(cache_limit_bytes(Some(raw), Some(2 * GIB)), None, "{raw:?}");
+    }
+}
+
+#[test]
+fn cache_limit_garbage_keeps_the_default() {
+    // A typo must not silently remove the ROCm bound, and on a backend with
+    // no default it leaves the cache unbounded exactly as before.
+    for raw in ["2 gigs", "-1GB", "1.5"] {
+        assert_eq!(
+            cache_limit_bytes(Some(raw), Some(2 * GIB)),
+            Some(2 * GIB),
+            "{raw:?}"
+        );
+        assert_eq!(cache_limit_bytes(Some(raw), None), None, "{raw:?}");
+    }
+}
+
+#[test]
+fn the_default_cache_limit_is_rocm_only() {
+    if cfg!(feature = "rocm") {
+        assert_eq!(DEFAULT_CACHE_LIMIT_BYTES, Some(2 * GIB));
+    } else {
+        assert_eq!(
+            DEFAULT_CACHE_LIMIT_BYTES, None,
+            "Metal and CUDA keep MLX's own cache default"
+        );
+    }
+}
+
+#[test]
+fn the_cache_default_leaves_the_memory_limit_the_estimator_reads() {
+    // The pre-load estimate reads `memory_limit()` as the available memory
+    // on ROCm (issue #1805). The ROCm cache default (issue #2062) goes through
+    // `set_cache_limit` only, so runtime bring-up must leave that figure
+    // alone. An operator's MLXCEL_MEMORY_LIMIT legitimately moves it, so the
+    // check only runs without one.
+    if std::env::var_os("MLXCEL_MEMORY_LIMIT").is_some() {
+        return;
+    }
+    let before = mlxcel_core::memory::memory_limit();
+    let setup = super::initialize_runtime();
+    assert_eq!(setup.memory_limit_bytes, None);
+    assert_eq!(mlxcel_core::memory::memory_limit(), before);
+    if std::env::var_os("MLXCEL_CACHE_LIMIT").is_none() {
+        assert_eq!(
+            setup.cache_limit_bytes.map(|b| b as u64),
+            DEFAULT_CACHE_LIMIT_BYTES,
+            "unset MLXCEL_CACHE_LIMIT applies the backend default"
+        );
+    }
 }
