@@ -26,7 +26,6 @@ use crate::models::gated_delta::{gated_delta_update, scaled_fast_rms_norm_no_wei
 use crate::models::switch_layers::SwitchGLU;
 use crate::models::switch_layers::validate_expert_quantization_params;
 use mlxcel_core::cache::{SequenceId, SequenceStateLayout};
-use mlxcel_core::dtype;
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, silu, stack_arrays};
@@ -493,6 +492,22 @@ struct KimiMLAAttention {
     scale: f32,
 }
 
+/// Apply the repository's additive attention mask to MLA positional scores.
+///
+/// [`create_causal_mask`] produces zero for visible keys and negative infinity
+/// for blocked keys. Keep that representation additive here instead of using
+/// it as a boolean condition: zero would become `false`, reversing the mask
+/// and leaving the final prefill row entirely blocked.
+fn apply_mla_causal_mask(scores: &MlxArray, mask: &MlxArray) -> UniquePtr<MlxArray> {
+    let scores_dtype = mlxcel_core::array_dtype(scores);
+    let mask = if mlxcel_core::array_dtype(mask) == scores_dtype {
+        mlxcel_core::copy(mask)
+    } else {
+        mlxcel_core::astype(mask, scores_dtype)
+    };
+    mlxcel_core::add(scores, &mask)
+}
+
 impl KimiMLAAttention {
     fn forward(
         &self,
@@ -547,10 +562,9 @@ impl KimiMLAAttention {
         let k_pe_t = mlxcel_core::swap_axes(&cached_k_pe, -1, -2);
         let mut pe_scores = mlxcel_core::matmul(&q_pe_scaled, &k_pe_t);
 
-        // Apply causal mask to pe_scores
+        // Apply the additive causal mask to positional scores.
         if let Some(m) = mask {
-            let neg_inf = mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, dtype::FLOAT16);
-            pe_scores = mlxcel_core::where_cond(m, &pe_scores, &neg_inf);
+            pe_scores = apply_mla_causal_mask(&pe_scores, m);
         }
 
         // Attention computation (different paths for generation vs prefill)

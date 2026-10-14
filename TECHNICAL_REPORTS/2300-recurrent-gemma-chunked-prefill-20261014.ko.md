@@ -32,3 +32,7 @@ Capability는 sequence ID 유무에 따른 지원 여부를 표현할 수 없습
 ## 변경 요약
 
 Rust 모델 파일 하나에 capability override, 결정적 loaded-model fixture, state-contract 회귀 테스트 하나를 새 의존성 없이 추가합니다.
+
+## 최종 통합 검증
+
+MLX `243bdf09`, mlxcelverse, 앞서 머지한 모델 수정을 포함한 main `5f334629`를 소스 충돌 없이 통합했다. 다시 빌드한 CUDA `test-fast` binary에서 `models::recurrent_gemma` 테스트 7개가 모두 통과했다. 비영 가중치를 적재한 RGLRU fixture를 포함하며, 최종 pin에서 convolution/recurrent 상태 생성, ID 없는 prompt 초기화, 같은 ID의 분할 logits와 한 번에 실행한 결과의 일치를 새로 검증했다. Formatting과 diff 검사도 통과했다. 외부 체크포인트 추론 결과를 주장하지 않는다.

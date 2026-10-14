@@ -32,3 +32,7 @@ The capability cannot express support conditional on a sequence ID. Every honori
 ## Change summary
 
 One Rust model file adds the capability override, a deterministic loaded-model fixture, and one state-contract regression without new dependencies.
+
+## Final integration validation
+
+Integrated main `5f334629`, including MLX `243bdf09`, mlxcelverse, and preceding model fixes, without source conflicts. The rebuilt CUDA `test-fast` binary passes all seven `models::recurrent_gemma` tests, including the loaded nonzero-weight RGLRU fixture. This freshly checks convolution/recurrent state population, no-ID prompt reset, and stable-ID split logits against one-pass execution on the final pin. Formatting and diff checks pass. No external-checkpoint inference result is claimed.
