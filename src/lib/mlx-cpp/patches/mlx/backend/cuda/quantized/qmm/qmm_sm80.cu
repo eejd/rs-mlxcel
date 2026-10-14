@@ -212,7 +212,7 @@ void gather_qmm_rhs_sm80(
   int n = out.shape(-1);
   int k = x.shape(-1);
   int group_count = get_quantized_batch_count(w);
-  auto cta_tiler = make_cta_tiler(m, group_size);
+  auto cta_tiler = make_cta_tiler(m, group_size, encoder.device());
 
   std::string module_name = fmt::format(
       "gather_qmm_rhs_sm80_tn_{}_m{}_b{}_g{}_{}",
