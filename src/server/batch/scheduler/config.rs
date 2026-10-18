@@ -86,7 +86,7 @@ impl BatchScheduler {
         // (no real KV caches), so we size the pool to cover both the active
         // batch and the prefill queue so requests can be queued while another
         // sequence is generating.
-        let pool_capacity = max_batch_size + max_queue_depth;
+        let pool_capacity = scheduler_pool_capacity(max_batch_size, max_queue_depth);
         // issue #350: resolve the model's reserved output-illegal placeholder
         // ids once, before `model` is moved into the scheduler. Empty for
         // non-multimodal models (zero cost on the enqueue path).
@@ -768,5 +768,35 @@ mod sleep_idle_tests {
     fn a_positive_window_is_taken_in_seconds() {
         assert_eq!(resolve_sleep_idle(5), Some(Duration::from_secs(5)));
         assert_eq!(resolve_sleep_idle(3600), Some(Duration::from_secs(3600)));
+    }
+}
+
+/// Capacity of the scheduler's [`CachePool`]: the active batch plus the prefill
+/// queue.
+///
+/// The legacy `--no-batch` worker passes `usize::MAX` as an unbounded queue
+/// depth. A plain `+` wraps to `0` in a release build (no overflow checks), so
+/// the pool refused every sequence with `CachePool: max capacity (0) reached`
+/// and the server answered every request with HTTP 500. Saturate instead.
+pub(crate) fn scheduler_pool_capacity(max_batch_size: usize, max_queue_depth: usize) -> usize {
+    max_batch_size.saturating_add(max_queue_depth)
+}
+
+#[cfg(test)]
+mod pool_capacity_tests {
+    use super::scheduler_pool_capacity;
+
+    #[test]
+    fn capacity_covers_the_batch_and_the_queue() {
+        assert_eq!(scheduler_pool_capacity(4, 8), 12);
+        assert_eq!(scheduler_pool_capacity(1, 0), 1);
+    }
+
+    /// The legacy `--no-batch` worker asks for an unbounded queue; the pool
+    /// must stay unbounded, not wrap to zero capacity.
+    #[test]
+    fn an_unbounded_queue_depth_does_not_wrap_the_capacity_to_zero() {
+        assert_eq!(scheduler_pool_capacity(1, usize::MAX), usize::MAX);
+        assert_eq!(scheduler_pool_capacity(usize::MAX, usize::MAX), usize::MAX);
     }
 }
