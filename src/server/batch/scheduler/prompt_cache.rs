@@ -159,9 +159,48 @@ impl BatchScheduler {
         }
         if let SnapshotLookupOutcome::Hit {
             entry: snapshot_entry,
-            matched_len,
+            matched_len: store_matched_len,
         } = snapshot_outcome
         {
+            // Whole-prompt hit (#1760): never restore the last prompt token.
+            // The sampler needs logits from a forward over at least one token,
+            // so prefill always re-runs `tokens[len - 1]`; restoring it as well
+            // would put that token in the cache twice.
+            let matched_len = whole_prompt_reuse_cap(store_matched_len, tokens.len());
+            if matched_len < store_matched_len {
+                let truncatable = matched_len >= store.min_prefix_tokens().max(1)
+                    && snapshot_entry.with_snapshot(|snapshot| {
+                        self.model.snapshot_truncatable_to(snapshot, matched_len)
+                    });
+                if !truncatable {
+                    // Recurrent families, and rotating families whose ring
+                    // has wrapped, cannot drop the last token. A cold prefill
+                    // is the only correct answer; a partial or duplicated
+                    // restore would silently change the output.
+                    tracing::debug!(
+                        matched = store_matched_len,
+                        reuse_cap = matched_len,
+                        stored = snapshot_entry.tokens.len(),
+                        "prompt-cache hit covered the entire prompt but the snapshot cannot \
+                         be truncated to leave the last token for prefill; falling back to \
+                         cold prefill"
+                    );
+                    self.batch_observability
+                        .record_prompt_cache_reject_detailed(
+                            PromptCacheRejectReason::LayoutConstraints,
+                            None,
+                            matched_len,
+                            Some(snapshot_entry.tokens.len()),
+                        );
+                    return None;
+                }
+                tracing::debug!(
+                    matched = store_matched_len,
+                    restored = matched_len,
+                    "prompt-cache hit covered the entire prompt; restoring all but the last \
+                     token so prefill re-runs it to produce a sampling logit"
+                );
+            }
             let seq_id = match self.allocate_sequence_state() {
                 Ok(id) => id,
                 Err(err) => {
@@ -171,9 +210,9 @@ impl BatchScheduler {
                     return None;
                 }
             };
-            // A `matched_len` shorter than the stored entry means the store
-            // adopted at the longest common prefix, which only happens when
-            // the model agreed it could truncate there (#1145).
+            // A `matched_len` shorter than the stored entry means the restore
+            // truncates: the store adopted at the longest common prefix
+            // (#1145), or the whole-prompt cap above dropped the last token.
             let partial = matched_len < snapshot_entry.tokens.len();
             let restore = snapshot_entry.with_snapshot(|snapshot| {
                 if partial {
@@ -242,20 +281,42 @@ impl BatchScheduler {
         if self.model.sequence_state_layout().backend == SequenceStateBackend::ModelOwned {
             return None;
         }
-        let (entry, matched_len) = store.lookup_longest_prefix(&key, tokens)?;
+        let (entry, store_matched_len) = store.lookup_longest_prefix(&key, tokens)?;
         // #124 step c: multimodal sharing requires the matched prefix to cover
         // the ENTIRE stored entry. A partial (e.g. APC block-clamped) match
         // could leave image/audio placeholder tokens in the suffix, which the
         // token-path suffix prefill would mis-handle. Decline here (falling
         // back to a cold prefill) before consuming anything; the entry stays
         // available for a later exact match.
-        if require_whole_entry && matched_len < entry.tokens.len() {
+        if require_whole_entry && store_matched_len < entry.tokens.len() {
             self.batch_observability.record_prompt_cache_reject(
                 PromptCacheRejectReason::ModeMismatch,
+                None,
+                store_matched_len,
+            );
+            return None;
+        }
+        // Whole-prompt hit (#1760), same rule as the snapshot branch: adopt
+        // at most `len - 1` tokens so the prefill's forward over the last
+        // prompt token lands on a cache that does not already hold it. The
+        // dense truncate and the paged block floors below then install
+        // exactly this many (or fewer) tokens.
+        let matched_len = whole_prompt_reuse_cap(store_matched_len, tokens.len());
+        if matched_len < store.min_prefix_tokens().max(1) {
+            self.batch_observability.record_prompt_cache_reject(
+                PromptCacheRejectReason::PrefixTooShort,
                 None,
                 matched_len,
             );
             return None;
+        }
+        if matched_len < store_matched_len {
+            tracing::debug!(
+                matched = store_matched_len,
+                adopted = matched_len,
+                "prompt-cache hit covered the entire prompt; adopting all but the last token \
+                 so prefill re-runs it to produce a sampling logit"
+            );
         }
         // Length the adopted cache actually covers. The dense path truncates
         // to exactly `matched_len`; the paged paths floor to the pool block
@@ -1287,4 +1348,17 @@ impl BatchScheduler {
         // replacement removal, or an oversized / disabled decline.
         self.drain_store_paged_releases();
     }
+}
+
+/// Longest prefix a request of `prompt_len` tokens may adopt from a cache hit
+/// that matched `matched_len` of them (#1760).
+///
+/// Prefill must forward at least the last prompt token so the sampler has a
+/// logit row to draw the first generated token from. When a hit covers the
+/// whole prompt (a client replaying an identical prompt), the adopt therefore
+/// stops one token short, and the prefill's forward over that last token lands
+/// on the position it belongs to. Adopting all `prompt_len` tokens and then
+/// re-running the last one would leave it in the cache twice.
+pub(super) fn whole_prompt_reuse_cap(matched_len: usize, prompt_len: usize) -> usize {
+    matched_len.min(prompt_len.saturating_sub(1))
 }
