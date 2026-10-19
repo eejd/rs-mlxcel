@@ -2,9 +2,10 @@
 
 This fork (`eejd/rs-mlxcel`) mirrors `lablup/mlxcel` on `main` (fast-forward only, never edited).
 `local` is `main` plus the `topic/*` branches below, merged with `--no-ff`. Port `mlxcel-local` in
-`eejd/macports-ports-local` builds the tags `v<base>-local<NN>` on `local`; while upstream has no
-release past `v0.7.0` the tag is `v0.7.0.<YYYYMMDD>-local<NN>` (`<YYYYMMDD>` = date of the `main`
-commit it is cut from).
+`eejd/macports-ports-local` builds the tags `v<base>-local<NN>` on `local`, `<base>` being the last
+upstream release `main` contains (`v0.7.0`; upstream has cut no release since, though `main` is
+364 commits past it). The first tag is therefore `v0.7.0-local01` (docs/development-model.md,
+ADR-0008 §2: the dated `<last-release>.<YYYYMMDD>` form is the `-devel` version scheme only).
 
 ## Re-cut of 2026-10-19 (owner decision, option B of eejd/rs-mlxcel#1)
 
