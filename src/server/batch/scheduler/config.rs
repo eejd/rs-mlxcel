@@ -85,8 +85,11 @@ impl BatchScheduler {
         // Non-batching models use lightweight placeholder entries in the pool
         // (no real KV caches), so we size the pool to cover both the active
         // batch and the prefill queue so requests can be queued while another
-        // sequence is generating.
-        let pool_capacity = max_batch_size + max_queue_depth;
+        // sequence is generating. The legacy `--no-batch` worker passes
+        // `usize::MAX` as an unbounded queue depth: a plain `+` wraps to 0 in a
+        // release build (no overflow checks) and the pool then refuses every
+        // sequence, so saturate.
+        let pool_capacity = max_batch_size.saturating_add(max_queue_depth);
         // issue #350: resolve the model's reserved output-illegal placeholder
         // ids once, before `model` is moved into the scheduler. Empty for
         // non-multimodal models (zero cost on the enqueue path).
@@ -809,5 +812,28 @@ mod sleep_idle_tests {
     fn a_positive_window_is_taken_in_seconds() {
         assert_eq!(resolve_sleep_idle(5), Some(Duration::from_secs(5)));
         assert_eq!(resolve_sleep_idle(3600), Some(Duration::from_secs(3600)));
+    }
+}
+
+#[cfg(test)]
+mod pool_capacity_tests {
+    use super::super::request_memory_tests::scheduler_with_queue_depth;
+
+    /// The legacy `--no-batch` worker builds its scheduler with an unbounded
+    /// queue depth (`usize::MAX`). The pool capacity must not wrap to zero:
+    /// before the fix every dense-KV request answered `Server busy: CachePool:
+    /// max capacity (0) reached` (HTTP 500 on `/v1/completions`;
+    /// `CachePool::allocate` refuses a dense sequence once `active.len() >=
+    /// max_sequences`).
+    #[test]
+    fn an_unbounded_queue_depth_does_not_zero_the_cache_pool() {
+        let scheduler = scheduler_with_queue_depth(usize::MAX);
+        assert_eq!(scheduler.engine.pool().max_sequences(), usize::MAX);
+    }
+
+    #[test]
+    fn a_bounded_queue_depth_still_sizes_the_pool_to_batch_plus_queue() {
+        let scheduler = scheduler_with_queue_depth(8);
+        assert_eq!(scheduler.engine.pool().max_sequences(), 1 + 8);
     }
 }
