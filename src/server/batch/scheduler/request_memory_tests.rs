@@ -18,6 +18,10 @@ use mlxcel_core::memory::MemorySnapshot;
 use mlxcel_core::weights::WeightMap;
 
 pub(super) fn scheduler() -> BatchScheduler {
+    scheduler_with_queue_depth(8)
+}
+
+pub(super) fn scheduler_with_queue_depth(max_queue_depth: usize) -> BatchScheduler {
     let mut c: NemotronHConfig = serde_json::from_value(serde_json::json!({
         "model_type":"nemotron_h", "vocab_size":8, "hidden_size":8,
         "intermediate_size":16, "num_hidden_layers":1, "num_attention_heads":2,
@@ -51,7 +55,7 @@ pub(super) fn scheduler() -> BatchScheduler {
         vec![7],
         rx,
         1,
-        8,
+        max_queue_depth,
         Arc::new(BatchMetrics::new()),
         Arc::new(BatchObservability::new()),
         256,
