@@ -582,13 +582,12 @@ fn multibyte_text_in_names_values_cdata_and_literals_is_kept() {
 
 #[test]
 fn a_hex_escape_must_be_hex_digits() {
+    // `from_str_radix` alone would read `+123` as U+0123.
     let result = parse(
-        r#"<function name="echo_args"><param name="items">['\u+123', '\x4z']</param></function>"#,
+        r#"<function name="echo_args"><param name="items">['\u+123']</param></function><function name="echo_args"><param name="items">['\x4z']</param></function>"#,
     );
-    assert_eq!(
-        args(&result.tool_calls[0])["items"],
-        json!("['\\u+123', '\\x4z']")
-    );
+    assert_eq!(args(&result.tool_calls[0])["items"], "['\\u+123']");
+    assert_eq!(args(&result.tool_calls[1])["items"], "['\\x4z']");
 }
 
 /// A deterministic xorshift stream: the fuzz tests must fail the same way twice.
@@ -747,4 +746,19 @@ fn a_run_of_unclosed_openers_costs_a_bounded_number_of_rescans() {
     let start = std::time::Instant::now();
     assert!(try_minicpm5(&text, Some(&qualify_tools())).is_none());
     assert!(start.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn words_after_a_parameter_before_the_next_call_make_the_first_one_text() {
+    // Nothing says where that call ended, so it is not run; the next one is.
+    let result = parse(
+        r#"<function name="get_weather"><param name="city">Lima</param> and then <function name="get_weather"><param name="city">Oslo</param></function>"#,
+    );
+    assert_eq!(result.tool_calls.len(), 1);
+    assert_eq!(args(&result.tool_calls[0]), json!({"city": "Oslo"}));
+    assert!(
+        result
+            .content
+            .starts_with(r#"<function name="get_weather"><param name="city">Lima"#)
+    );
 }

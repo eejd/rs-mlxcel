@@ -185,14 +185,15 @@ fn prose_after_an_opener_is_released_at_once_not_at_the_end() {
 
 #[test]
 fn a_prose_opener_does_not_hide_a_later_call() {
-    let out = stream_chunked(
-        &format!(r#"Write <function name="x"> to open a call, as in {CALL}"#),
-        2,
-    );
-    assert_eq!(
-        out.content,
-        r#"Write <function name="x"> to open a call, as in "#
-    );
+    let text = format!(r#"Write <function name="x"> to open a call, as in {CALL}"#);
+    // Whole in one fragment, or cut so the decision falls mid-text.
+    for size in [2, 1000] {
+        assert_eq!(
+            stream_chunked(&text, size).content,
+            r#"Write <function name="x"> to open a call, as in "#,
+            "size {size}"
+        );
+    }
 }
 
 #[test]
