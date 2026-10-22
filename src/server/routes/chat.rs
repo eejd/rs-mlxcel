@@ -1490,7 +1490,8 @@ async fn stream_chat_completion(
                 StreamFilter::new_primed_open_thinking()
             } else {
                 StreamFilter::new()
-            },
+            }
+            .with_minicpm5_calls(parse_tools),
             lp_buffer: std::collections::VecDeque::new(),
             thinking_echo: ThinkingDelimiterEcho::new(primed_close_marker.as_deref()),
             saw_content: false,

@@ -35,6 +35,9 @@
 //!   `call:name{...}` syntax
 //! - ATEM (Muse/Onyx): `<atem:function_calls>` plus attribute-bearing
 //!   `<atem:invoke name=...>` / `<atem:parameter name=...>` tags
+//! - MiniCPM5: `<function name="fn"><param name="k">v</param></function>`, with
+//!   no outer wrapper, only when armed per stream (`with_minicpm5_calls`); the
+//!   call is read by the same scanner as the non-streaming parser
 //!
 //! **Tool-call suppression behavior:** when the filter enters `ToolCall` state,
 //! all subsequent tokens are suppressed from `delta.content`. The tool-call
@@ -47,6 +50,8 @@
 //! handles these families; this filter keeps the streaming path consistent.
 //!
 //! Used by: routes/chat (streaming path)
+
+use super::minicpm5;
 
 /// Split output from [`StreamFilter::feed`] / [`StreamFilter::flush`].
 ///
@@ -237,6 +242,9 @@ enum DelimiterAction {
     EnterAtemParameter,
     /// Exit an ATEM parameter tag and decrement ATEM nesting depth.
     ExitAtemParameter,
+    /// Start of a MiniCPM5 call. Not a delimiter that is consumed: the call
+    /// stays in the buffer and is read by `step_minicpm5`.
+    EnterMiniCpm5Call,
 }
 
 const ATEM_DYNAMIC_OPENERS: &[(&str, DelimiterAction)] = &[
@@ -431,6 +439,17 @@ const CHAT_DELIMITERS: &[(&str, DelimiterAction)] = &[
     ("<start_function_call>", DelimiterAction::EnterToolCall),
 ];
 
+/// What the MiniCPM5 call scanner decided about the opener at the buffer start.
+enum MiniCpm5Step {
+    /// Not decidable yet: keep the text buffered.
+    Wait,
+    /// A call that spans this many bytes: suppressed.
+    Call(usize),
+    /// Not a call: this many bytes (the opener) are content, and the text after
+    /// them is read again from the start.
+    Prose(usize),
+}
+
 /// The state of the streaming filter state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FilterState {
@@ -483,6 +502,18 @@ pub struct StreamFilter {
     /// non-zero, only `</atem:function_calls>` may resume visible content; inner
     /// invoke/parameter close tags cannot end suppression early.
     atem_wrapper_depth: usize,
+    /// MiniCPM5 calls are recognised ([`with_minicpm5_calls`](Self::with_minicpm5_calls)).
+    minicpm5_calls: bool,
+    /// The buffer starts with a `<function` opener whose call is being read.
+    minicpm5_open: bool,
+    /// The last read of that call stopped in its body, not in its opening tag.
+    minicpm5_body: bool,
+    /// Length of the buffer at the last read of that call.
+    minicpm5_checked: usize,
+    /// Openers decided so far (calls and prose), bounded like the parser's.
+    minicpm5_openers: usize,
+    /// A call just ended: drop the whitespace that follows it.
+    minicpm5_trim_ws: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -515,6 +546,12 @@ impl StreamFilter {
             max_delim_len,
             atem_depth: 0,
             atem_wrapper_depth: 0,
+            minicpm5_calls: false,
+            minicpm5_open: false,
+            minicpm5_body: false,
+            minicpm5_checked: 0,
+            minicpm5_openers: 0,
+            minicpm5_trim_ws: false,
         }
     }
 
@@ -533,6 +570,18 @@ impl StreamFilter {
         let mut s = Self::new();
         s.state = FilterState::Thinking;
         s
+    }
+
+    /// Arm the MiniCPM5 call grammar (`<function name=..><param name=..>`):
+    /// a call is suppressed from the content and left to the end-of-stream
+    /// parse. Arm it for a request whose tool calls are parsed
+    /// (`should_parse_tool_calls`) and for nothing else: the opener is ordinary
+    /// text in an answer that shows an XML snippet, and a request without
+    /// tools, or with `tool_choice: none`, has no call to find.
+    #[must_use]
+    pub fn with_minicpm5_calls(mut self, armed: bool) -> Self {
+        self.minicpm5_calls = armed;
+        self
     }
 
     /// Feed a decoded text fragment. Returns split output: `content` holds
@@ -695,6 +744,47 @@ impl StreamFilter {
                 break;
             }
 
+            // A MiniCPM5 call is read by the call scanner, not the delimiter
+            // table: its end is not a marker (a `</function>` inside a value or
+            // a CDATA payload does not end it).
+            if self.minicpm5_open {
+                match self.step_minicpm5(end_of_stream) {
+                    MiniCpm5Step::Wait => break,
+                    MiniCpm5Step::Call(len) => {
+                        let positions = self.drain_fragment_lengths(len);
+                        suppressed_positions += positions;
+                        consumed_positions += positions;
+                        self.buffer.drain(..len);
+                        self.minicpm5_openers += 1;
+                        self.minicpm5_open = false;
+                        self.minicpm5_trim_ws = true;
+                        self.state = FilterState::Content;
+                    }
+                    MiniCpm5Step::Prose(len) => {
+                        content.push_str(&self.buffer[..len]);
+                        consumed_positions += self.drain_fragment_lengths(len);
+                        self.buffer.drain(..len);
+                        self.minicpm5_openers += 1;
+                        self.minicpm5_open = false;
+                        self.state = FilterState::Content;
+                    }
+                }
+                continue;
+            }
+
+            // The whitespace between parallel calls and after the last one is
+            // not content: the parser reports the text outside the calls
+            // trimmed, and the stream must not add what it drops.
+            if self.minicpm5_trim_ws && self.state == FilterState::Content {
+                let padding = self.buffer.len() - self.buffer.trim_start().len();
+                consumed_positions += self.drain_fragment_lengths(padding);
+                self.buffer.drain(..padding);
+                if self.buffer.is_empty() {
+                    break;
+                }
+                self.minicpm5_trim_ws = false;
+            }
+
             match self.find_earliest_delimiter(end_of_stream) {
                 Some((pos, delim_len, action)) => {
                     // Text before the delimiter is attributed to the current
@@ -710,6 +800,16 @@ impl StreamFilter {
                         // from fragment_lengths and count as consumed (emitted).
                         consumed_positions += self.drain_fragment_lengths(pos);
                         self.buffer.drain(..pos);
+                    }
+
+                    if matches!(action, DelimiterAction::EnterMiniCpm5Call) {
+                        // The opener stays in the buffer: whether it is a call,
+                        // and where the call ends, is for `step_minicpm5`.
+                        self.minicpm5_open = true;
+                        self.minicpm5_body = false;
+                        self.minicpm5_checked = 0;
+                        self.state = FilterState::ToolCall;
+                        continue;
                     }
 
                     // Consume the delimiter bytes and count how many token
@@ -776,6 +876,52 @@ impl StreamFilter {
         }
     }
 
+    /// Whether a `<function` opener may start a MiniCPM5 call here: calls are
+    /// armed for this stream, the filter is in visible content (a model that
+    /// reasons about the syntax inside a thinking block is left alone) and the
+    /// opener budget is not spent.
+    fn minicpm5_arms_openers(&self) -> bool {
+        self.minicpm5_calls
+            && !self.minicpm5_open
+            && self.state == FilterState::Content
+            && self.minicpm5_openers < minicpm5::MAX_OPENERS
+    }
+
+    /// Decide the call whose opener starts the buffer, with the same scanner
+    /// the non-streaming parser runs on the whole text, so a call ends in the
+    /// same place on both paths and a decline leaves the same text behind.
+    ///
+    /// The scanner re-reads the call from its start, so once the opening tag
+    /// and the first token of the body are settled it is asked again only when
+    /// the text that arrived since could have ended the call: it holds a
+    /// `</function>` or a `<function`. A call is therefore read about once, not
+    /// once per token.
+    fn step_minicpm5(&mut self, end_of_stream: bool) -> MiniCpm5Step {
+        let buf = self.buffer.as_str();
+        if self.minicpm5_body && !end_of_stream {
+            // `</function>` and `<function ` are at most this long, so one that
+            // straddles the previous end of the buffer starts inside the window.
+            let mut from = self.minicpm5_checked.saturating_sub(16);
+            while !buf.is_char_boundary(from) {
+                from -= 1;
+            }
+            let fresh = &buf[from..];
+            if !fresh.contains("</function>") && !fresh.contains(minicpm5::CALL_OPENER) {
+                self.minicpm5_checked = buf.len();
+                return MiniCpm5Step::Wait;
+            }
+        }
+        match minicpm5::scan_call(buf, end_of_stream, None) {
+            minicpm5::CallScan::Call { end, .. } => MiniCpm5Step::Call(end),
+            minicpm5::CallScan::Prose => MiniCpm5Step::Prose(minicpm5::CALL_OPENER.len()),
+            minicpm5::CallScan::Pending { body } => {
+                self.minicpm5_body = body;
+                self.minicpm5_checked = buf.len();
+                MiniCpm5Step::Wait
+            }
+        }
+    }
+
     /// Find the earliest complete delimiter in the buffer.
     ///
     /// Returns `(byte_position, delimiter_len, action)`.
@@ -808,6 +954,19 @@ impl StreamFilter {
             if let Some((pos, len)) = self.find_atem_dynamic_open(prefix, end_of_stream) {
                 earliest = choose_earlier(earliest, (pos, len, action));
             }
+        }
+
+        if self.minicpm5_arms_openers()
+            && let Some(pos) = minicpm5::find_call_opener(&self.buffer, 0)
+        {
+            earliest = choose_earlier(
+                earliest,
+                (
+                    pos,
+                    minicpm5::CALL_OPENER.len(),
+                    DelimiterAction::EnterMiniCpm5Call,
+                ),
+            );
         }
 
         if let Some(candidate) = self.find_muse_recipient_header(end_of_stream) {
@@ -925,6 +1084,12 @@ impl StreamFilter {
                     }
                 }
             }
+            if self.minicpm5_arms_openers()
+                && suffix.len() <= minicpm5::CALL_OPENER.len()
+                && minicpm5::CALL_OPENER.starts_with(suffix)
+            {
+                return i;
+            }
             if MUSE_ASSISTANT_TO.starts_with(suffix) {
                 return i;
             }
@@ -952,6 +1117,9 @@ impl StreamFilter {
             }
             DelimiterAction::ExitMuseMessage => self.state = FilterState::Content,
             DelimiterAction::Strip => { /* consume delimiter, no state change */ }
+            // Never reaches here: `drain_buffer_inner` starts a MiniCPM5 call
+            // itself, because its end is not a delimiter (see `step_minicpm5`).
+            DelimiterAction::EnterMiniCpm5Call => {}
             DelimiterAction::EnterAtemBlock => {
                 self.atem_wrapper_depth = self.atem_wrapper_depth.saturating_add(1);
                 self.atem_depth = self.atem_depth.saturating_add(1);
@@ -2639,3 +2807,7 @@ mod tests {
 #[cfg(test)]
 #[path = "atem_stream_tests.rs"]
 mod atem_stream_tests;
+
+#[cfg(test)]
+#[path = "minicpm5_stream_tests.rs"]
+mod minicpm5_stream_tests;

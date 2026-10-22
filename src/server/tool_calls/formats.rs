@@ -1087,8 +1087,8 @@ fn extract_minimax_parameters(body: &str, fn_schema: Option<&serde_json::Value>)
 /// The schema-free guesses this replaced are gone: `yes`/`on`, `no`/`off` and
 /// `none`/`nil` are now the strings the model wrote unless a `boolean`
 /// declaration says otherwise.
-// Used by: try_minimax_m2, try_qwen3_coder
-fn coerce_xml_param(raw: &str, schema: Option<&serde_json::Value>) -> serde_json::Value {
+// Used by: try_minimax_m2, try_qwen3_coder, minicpm5
+pub(super) fn coerce_xml_param(raw: &str, schema: Option<&serde_json::Value>) -> serde_json::Value {
     let declared = schema.and_then(minimax_m3_schema_type);
     let keeps_raw_text =
         declared == Some(M3Type::Str) && !schema.is_some_and(schema_type_admits_null);
@@ -1105,8 +1105,8 @@ fn coerce_xml_param(raw: &str, schema: Option<&serde_json::Value>) -> serde_json
 
 /// Whether a schema's `type` explicitly admits JSON null, as a nullable
 /// declaration such as `{"type": ["string", "null"]}` does.
-// Used by: coerce_xml_param
-fn schema_type_admits_null(schema: &serde_json::Value) -> bool {
+// Used by: coerce_xml_param, minicpm5
+pub(super) fn schema_type_admits_null(schema: &serde_json::Value) -> bool {
     match schema.get("type") {
         Some(serde_json::Value::Array(items)) => items.iter().any(|v| v.as_str() == Some("null")),
         _ => false,
@@ -1948,7 +1948,7 @@ const MINIMAX_M3_MAX_DEPTH: usize = 64;
 
 /// Normalised schema kinds recognised by the MiniMax M3 coercion pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum M3Type {
+pub(super) enum M3Type {
     Integer,
     Number,
     Boolean,
@@ -2061,8 +2061,8 @@ fn minimax_m3_extract_invoke_name(attr_region: &str) -> Option<String> {
 /// lookup misses for every namespacing model, every value silently takes the
 /// loose rules, and the call still succeeds, so nothing marks the schema as
 /// having been ignored.
-// Used by: try_minimax_m3, try_glm47, try_longcat, try_minimax_m2, try_qwen3_coder
-fn minimax_m3_function_schema<'a>(
+// Used by: try_minimax_m3, try_glm47, try_longcat, try_minimax_m2, try_qwen3_coder, minicpm5
+pub(super) fn minimax_m3_function_schema<'a>(
     tools: Option<&'a [Tool]>,
     name: &str,
 ) -> Option<&'a serde_json::Value> {
@@ -2403,7 +2403,7 @@ fn parse_integer_literal(raw: &str) -> Option<serde_json::Value> {
 /// Map a schema's `type` (a string, or the first non-`null` of a type array) to
 /// a normalised [`M3Type`]. Handles the MiniMax type aliases (`int`, `uint`,
 /// `long`, `num`, `float`, `dict`, `list`) alongside the JSON-schema names.
-fn minimax_m3_schema_type(schema: &serde_json::Value) -> Option<M3Type> {
+pub(super) fn minimax_m3_schema_type(schema: &serde_json::Value) -> Option<M3Type> {
     let ty = schema.get("type")?;
     let name = match ty {
         serde_json::Value::String(s) => s.as_str(),
@@ -2838,8 +2838,8 @@ fn shell_split(s: &str) -> Vec<String> {
 }
 
 /// Look up a parameter's JSON schema inside a function's `parameters` object.
-// Used by: GLM-4.7, LongCat, MiniMax M2, Qwen3-Coder
-fn kv_param_schema<'a>(
+// Used by: GLM-4.7, LongCat, MiniMax M2, Qwen3-Coder, MiniCPM5
+pub(super) fn kv_param_schema<'a>(
     fn_schema: Option<&'a serde_json::Value>,
     key: &str,
 ) -> Option<&'a serde_json::Value> {

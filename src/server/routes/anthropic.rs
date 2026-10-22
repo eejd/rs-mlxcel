@@ -649,11 +649,14 @@ async fn stream_messages(
         // A primed prompt starts the filter inside the thinking block, so the
         // close-only trace streams as reasoning rather than answer text
         // (#2123), matching the non-streaming split.
-        let stream_filter = std::sync::Arc::new(std::sync::Mutex::new(if primed_open_thinking {
-            StreamFilter::new_primed_open_thinking()
-        } else {
-            StreamFilter::new()
-        }));
+        let stream_filter = std::sync::Arc::new(std::sync::Mutex::new(
+            if primed_open_thinking {
+                StreamFilter::new_primed_open_thinking()
+            } else {
+                StreamFilter::new()
+            }
+            .with_minicpm5_calls(parse_tools),
+        ));
         let filter_for_callback = stream_filter.clone();
         let emitter = std::sync::Arc::new(std::sync::Mutex::new(AnthropicBlockEmitter::new()));
         let emitter_for_callback = emitter.clone();
