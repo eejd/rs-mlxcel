@@ -20,7 +20,7 @@
 //! Used by: routes/chat, tool_calls::mod
 
 use super::types::{ParsedToolCall, ToolCallParseResult};
-use super::{atem, formats};
+use super::{atem, formats, minicpm5};
 use crate::server::types::request::Tool;
 
 /// Strip thinking/reasoning blocks from model output before parsing.
@@ -388,6 +388,11 @@ pub fn parse_tool_calls(raw_output: &str, tools: Option<&[Tool]>) -> ToolCallPar
         Plain(formats::try_function_gemma), // <start_function_call>call:... (distinct markers from Gemma 4)
         Plain(formats::try_hermes),         // <tool_call>: Hermes/Qwen/DeepSeek
         WithTools(formats::try_minimax_m2), // <invoke name=...><parameter name=...>...</parameter></invoke>
+        // <function name=...><param name=...>...</param></function>, no wrapper (MiniCPM5). Its
+        // `<function` + whitespace opener never matches `<function=NAME>` (Functionary v3.1,
+        // Qwen3-Coder), so it does not compete with those; the JSON-body parsers further down
+        // would read a JSON value inside one of its params, so it runs before them.
+        WithTools(minicpm5::try_minicpm5),
         Plain(formats::try_kimi_k2), // <|tool_calls_section_begin|>...<|tool_calls_section_end|>
         // [TOOL_CALLS]NAME[ARGS]{json}; declines (returns None) without [ARGS], so the
         // older JSON-array format below still falls through to try_mistral_nemo.

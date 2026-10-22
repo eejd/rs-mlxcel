@@ -238,7 +238,8 @@ impl InProcessServer {
             StreamFilter::new_primed_open_thinking()
         } else {
             StreamFilter::new()
-        };
+        }
+        .with_minicpm5_calls(parse_tools);
         let mut text = TurnText {
             raw: String::new(),
             content: String::new(),
