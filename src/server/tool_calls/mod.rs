@@ -22,6 +22,7 @@
 
 mod atem;
 mod formats;
+mod minicpm5;
 pub mod parser;
 pub mod stream_filter;
 pub mod types;
@@ -695,6 +696,7 @@ mod tool_choice_grammar_tests {
             ToolCallFormat::Gemma4,
             ToolCallFormat::FunctionGemma,
             ToolCallFormat::Qwen3Coder,
+            ToolCallFormat::Minicpm5,
             ToolCallFormat::Mistral,
             ToolCallFormat::Pythonic,
         ] {

@@ -72,6 +72,12 @@ pub enum ToolCallFormat {
     /// `item` tags form arrays; mixed text plus child elements route the text to
     /// a `$text` field) and values are coerced against the request tool schema.
     MinimaxM3,
+    /// MiniCPM5: `<function name="fn"><param name="k">v</param></function>` with
+    /// no outer wrapper; parallel calls are consecutive `<function>` blocks and a
+    /// value containing `<`, `&` or a newline is wrapped in a CDATA section.
+    /// Non-string arguments are written as Python literals (`True`,
+    /// `['a', 'b']`, `{'k': 1}`) and are typed against the request tool schema.
+    Minicpm5,
     /// Qwen3-Coder: `<tool_call><function=name><parameter=key>val</parameter></function></tool_call>`
     ///
     /// Named for the family that introduced it (the format is spelled out in
@@ -139,6 +145,7 @@ impl ToolCallFormat {
             Self::GenericJson => "generic_json",
             Self::MinimaxM2 => "minimax_m2",
             Self::MinimaxM3 => "minimax_m3",
+            Self::Minicpm5 => "minicpm5",
             Self::Qwen3Coder => "qwen3_coder",
             Self::Harmony => "harmony",
             Self::KimiK2 => "kimi_k2",
@@ -175,6 +182,7 @@ impl FromStr for ToolCallFormat {
             "generic_json" | "generic-json" => Ok(Self::GenericJson),
             "minimax_m2" | "minimax-m2" => Ok(Self::MinimaxM2),
             "minimax_m3" | "minimax-m3" => Ok(Self::MinimaxM3),
+            "minicpm5" | "minicpm-5" => Ok(Self::Minicpm5),
             "qwen3_coder" | "qwen3-coder" => Ok(Self::Qwen3Coder),
             "harmony" => Ok(Self::Harmony),
             "kimi_k2" | "kimi-k2" => Ok(Self::KimiK2),
