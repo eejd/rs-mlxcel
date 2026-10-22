@@ -5,7 +5,8 @@ This fork (`eejd/rs-mlxcel`) mirrors `lablup/mlxcel` on `main` (fast-forward onl
 `eejd/macports-ports-local` builds the tags `v<base>-local<NN>` on `local`, `<base>` being the last
 upstream release `main` contains (`v0.7.0`; upstream has cut no release since, though `main` is
 364 commits past it). The first tag is therefore `v0.7.0-local01` (docs/development-model.md,
-ADR-0008 §2: the dated `<last-release>.<YYYYMMDD>` form is the `-devel` version scheme only).
+ADR-0008 §2: the dated `<last-release>.<YYYYMMDD>` form is the `-devel` version scheme only); the
+tags are listed under "Tags" below.
 
 ## Re-cut of 2026-10-19 (owner decision, option B of eejd/rs-mlxcel#1)
 
@@ -35,6 +36,19 @@ five topics) that rs-mlxcel#1 built and measured.
 | Topic branch | What | Origin | Upstream status |
 |---|---|---|---|
 | `topic/no-batch-500` | the pool capacity `max_batch_size + max_queue_depth` saturates; `--no-batch` (queue depth `usize::MAX`) no longer wraps it to 0 and answers HTTP 500 `CachePool: max capacity (0) reached`, eejd/rs-mlxcel#9; the regression test builds a scheduler with an unbounded queue depth | local, own change (re-cut on `main`; the v0.7.0 version was `b9f2ed8e`) | not submitted; `main` has the same `+` and the same `usize::MAX` in the legacy worker |
-| `topic/tool-minicpm5` | tool-call parser for the MiniCPM5 grammar `<function name="fn"><param name="k">v</param></function>` (no wrapper, parallel calls as consecutive blocks, CDATA values, non-string arguments written as Python literals): tolerant and schema-typed, one scanner for the non-streaming parser and the stream filter (armed only for requests whose tool calls are parsed); before it MiniCPM5-2B-4bit `tool_call`/`tool_arg`/`tool_parallel` were 0/20 `server_fail`, the call left in `content`, eejd/rs-mlxcel#19 (draft PR eejd/rs-mlxcel#20) | local, own change, cut on `main` `99967257` (code only); behaviour follows the MiniCPM5 chat template and the tolerant parsers of mlx-lm (`mlx_lm/tool_parsers/minicpm5.py`, `Source: ml-explore/mlx-lm@259b8dd0`) and zig-mlx-serve (`parseMiniCpm5ToolCalls`, `Source: eejd/zig-mlx-serve@36c4deeb`); no code adopted | not submitted |
+| `topic/tool-minicpm5` | tool-call parser for the MiniCPM5 grammar `<function name="fn"><param name="k">v</param></function>` (no wrapper, parallel calls as consecutive blocks, CDATA values, non-string arguments written as Python literals): tolerant and schema-typed, one scanner for the non-streaming parser and the stream filter (armed only for requests whose tool calls are parsed); before it MiniCPM5-2B-4bit `tool_call`/`tool_arg`/`tool_parallel` were 0/20 `server_fail`, the call left in `content`, eejd/rs-mlxcel#19; merged as eejd/rs-mlxcel#20 (merge `ce2219e9`, 2026-10-22) | local, own change, cut on `main` `99967257` (code only); behaviour follows the MiniCPM5 chat template and the tolerant parsers of mlx-lm (`mlx_lm/tool_parsers/minicpm5.py`, `Source: ml-explore/mlx-lm@259b8dd0`) and zig-mlx-serve (`parseMiniCpm5ToolCalls`, `Source: eejd/zig-mlx-serve@36c4deeb`); no code adopted | not submitted |
 
 Nothing here is posted to `lablup/mlxcel` before the quantbench + agentbench soak (ADR-0008).
+
+## Tags
+
+| Tag | Commit | Contents | Checked |
+|---|---|---|---|
+| `v0.7.0-local01` (annotated, tag object `ccae26f5aa52fc2b06493f89e69e3b7b92f44bfd`) | `b9d5d9eda2023a609c11bdb0814ebdd7091d8bf8` (`local` after the merge of #17, 2026-10-19) | upstream `main` `99967257` + `UPSTREAM.md` + `topic/no-batch-500` (#14). Against `99967257` the tag changes 3 files: `UPSTREAM.md`, `src/server/batch/scheduler/config.rs`, `src/server/batch/scheduler/request_memory_tests.rs`. | the port `mlxcel-local` 0.7.0-local01 (eejd/macports-ports-local#1403, #1411) built and deployed it |
+| `v0.7.0-local02` (annotated, tag object `5228ef0f9c3d958d4ae0540a2471c3b19f1a151d`) | `15ef3bc8e7a0378d93d4925a3db575001c8556e4` (`local` after the merge of #21, 2026-10-22) | `v0.7.0-local01` + `topic/tool-minicpm5` (#20) + the `UPSTREAM.md` row for it (#21). Against `v0.7.0-local01` the tag changes 15 files: `CHANGELOG.md`, `UPSTREAM.md`, `src/server/{in_process/chat.rs,routes/{anthropic,chat,responses}.rs}` and `src/server/tool_calls/` (`formats.rs`, `minicpm5.rs`, `minicpm5_tests.rs`, `minicpm5_stream_tests.rs`, `mod.rs`, `parser.rs`, `stream_filter.rs`, `types.rs`, one fixture). `Cargo.toml`, `Cargo.lock` and `src/lib/mlxcelverse/CMakeLists.txt` (the MLX pin `243bdf09`) are byte-identical to `v0.7.0-local01`'s, so the port's registry crate list and its MLX distfile are unchanged. The tag's `UPSTREAM.md` is the one before this file's `Tags` section and the merged status of `topic/tool-minicpm5`; it is documentation only, the rows were added afterwards. | see the port PR for `mlxcel-local` 0.7.0-local02 (eejd/macports-ports-local) |
+
+The version a build of this fork reports (`mlxcel --version`, `mlxcel-server --version`, `/props`
+`build_info`, the web UI) is `CARGO_PKG_VERSION` of the root `mlxcel` package, `0.7.0` in this
+source. The port stamps `0.7.0+local<NN>` (`0.7.0+local02` for the newest tag) into `Cargo.toml` and
+`Cargo.lock` at build time (docs/development-model.md, "Version strings of `-local` builds"); there
+is no stamp commit here, so a build made from the fork alone reports `0.7.0`.
