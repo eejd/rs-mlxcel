@@ -32,6 +32,53 @@ use crate::layers::KVCache;
 use crate::loop_detection::LoopDetectionConfig;
 use crate::sampling::TokenBiasMap;
 use cxx::UniquePtr;
+#[cfg(test)]
+use std::marker::PhantomData;
+
+/// How a model processes a multi-row decode step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchedDecodeKind {
+    Native,
+    PerRowFallback,
+}
+
+/// Preserve the exact single-row graph while routing multi-row work to a native implementation.
+pub fn route_batched_decode<M: LanguageModel + ?Sized>(
+    model: &M,
+    input_ids: &MlxArray,
+    batch_caches: &mut [&mut [KVCache]],
+    batched: impl FnOnce(&mut [&mut [KVCache]]) -> UniquePtr<MlxArray>,
+) -> UniquePtr<MlxArray> {
+    match batch_caches.len() {
+        0 => ffi::zeros(&[0, 1, 1], crate::dtype::FLOAT32),
+        1 => model.forward(input_ids, batch_caches[0], None),
+        _ => batched(batch_caches),
+    }
+}
+
+/// Sequence-aware counterpart of [`route_batched_decode`].
+///
+/// Used by: Qwen2VLModel, Qwen3VLModel, Qwen3VLMoeModel, CohereCompassTextModel,
+/// Glm4vTextModel, Glm4vMoeTextModel, HunyuanVlTextModel, Ernie45MoeVlTextModel,
+/// PaddleOcrTextModel, MllamaVLModel.
+pub fn route_batched_decode_with_ids<M: LanguageModel + ?Sized>(
+    model: &M,
+    input_ids: &MlxArray,
+    seq_ids: Option<&[SequenceId]>,
+    batch_caches: &mut [&mut [KVCache]],
+    batched: impl FnOnce(&mut [&mut [KVCache]]) -> UniquePtr<MlxArray>,
+) -> UniquePtr<MlxArray> {
+    match batch_caches.len() {
+        0 => ffi::zeros(&[0, 1, 1], crate::dtype::FLOAT32),
+        1 => model.forward_with_sequence_id(
+            input_ids,
+            seq_ids.and_then(|ids| ids.first().copied()),
+            batch_caches[0],
+            None,
+        ),
+        _ => batched(batch_caches),
+    }
+}
 
 /// One named tensor captured from a model-owned recurrent sequence state.
 ///
@@ -151,6 +198,10 @@ impl ModelStateSnapshot {
 /// scheduler's prefill sites.
 #[inline]
 pub fn prefill_tile_alignment_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(pinned) = TILE_ALIGNMENT_OVERRIDE.with(std::cell::Cell::get) {
+        return pinned;
+    }
     if std::env::var_os("MLXCEL_NO_PADDED_PREFILL").is_some() {
         return false;
     }
@@ -159,6 +210,57 @@ pub fn prefill_tile_alignment_enabled() -> bool {
     }
     let hw = hardware::get_hardware();
     hw.has_neural_accelerator && hw.macos_supports_na
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread override set by [`pin_tile_alignment`]; `None` defers to the
+    /// debugging overrides and the hardware probe.
+    static TILE_ALIGNMENT_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// A per-thread test override for [`prefill_tile_alignment_enabled`].
+///
+/// The override is per-thread (mirroring `lang_bias_counters::scoped_override`)
+/// rather than a process-environment guard: reading the environment
+/// concurrently with a mutation is undefined behavior, and engine construction
+/// probes the alignment decision on many threads of the default parallel test
+/// runner. Guards nest; each drop restores what it replaced.
+///
+/// Test-only (`#[cfg(test)]`, like the scheduler's
+/// `pad_trim::set_alignment_override_for_test`): production decides the
+/// padding through the environment and the hardware probe only.
+///
+/// Not `Send`: the override lives in a thread-local, so the guard must be
+/// dropped on the thread that created it.
+#[cfg(test)]
+#[must_use = "the override is undone as soon as the guard is dropped"]
+pub(crate) struct TileAlignmentOverride {
+    previous: Option<bool>,
+    _not_send: PhantomData<*const ()>,
+}
+
+#[cfg(test)]
+impl Drop for TileAlignmentOverride {
+    fn drop(&mut self) {
+        TILE_ALIGNMENT_OVERRIDE.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Pin [`prefill_tile_alignment_enabled`] on or off for the calling thread
+/// until the returned guard is dropped, without touching the process
+/// environment.
+///
+/// Used by: the `mlxcel-core` engine tests that assert unpadded prefill
+/// behavior (lablup/mlxcel#2473).
+#[cfg(test)]
+pub(crate) fn pin_tile_alignment(enabled: bool) -> TileAlignmentOverride {
+    let previous = TILE_ALIGNMENT_OVERRIDE.with(|cell| cell.replace(Some(enabled)));
+    TileAlignmentOverride {
+        previous,
+        _not_send: PhantomData,
+    }
 }
 
 /// Pad an embeddings tensor from `[batch, actual_len, hidden]` to
@@ -238,6 +340,23 @@ pub trait LanguageModel {
     /// Return the currently injected model-owned KV cache mode table, if any.
     fn kv_cache_layer_modes(&self) -> Option<Vec<KVCacheMode>> {
         None
+    }
+
+    /// Return the per-layer mode each model-owned cache actually stores, with
+    /// `None` for a layer that holds no KV cache at all (a linear-attention,
+    /// recurrent, SSM or convolution layer, or a skipped attention block).
+    ///
+    /// The default is [`Self::kv_cache_layer_modes`] with every entry
+    /// stored. Families override it where that is not true: a sliding-window
+    /// `RotatingKVCache` stores FP16 for every mode but an aligned
+    /// `Turbo4Asym` (see `RotatingKVCache::stored_mode`, issue #2783), a
+    /// cache that ignores the mode stores FP16, and a model-owned family
+    /// with no mode table reports its real storage instead of `None`, so
+    /// per-layer reports count only the layers that really store the
+    /// requested mode (issue #2790). A wrapper must forward it.
+    fn kv_cache_storage_modes(&self) -> Option<Vec<Option<KVCacheMode>>> {
+        self.kv_cache_layer_modes()
+            .map(|modes| modes.into_iter().map(Some).collect())
     }
 
     /// Get the number of layers
@@ -380,6 +499,14 @@ pub trait LanguageModel {
 
     /// Called once after prefill completes and before decode starts.
     /// Used by models that need to adjust internal state between phases.
+    ///
+    /// Only an embedding (VLM) prefill runs it, and only after that
+    /// prefill's logits are evaluated, so an override may replace weight
+    /// arrays the prefill graph referenced (#2177). No family overrides it at
+    /// this commit; `LoadedModel`, `VisionModel` and the `&M` blanket impl
+    /// delegate to the wrapped model.
+    ///
+    /// Used by: `Engine::prefill`, its only caller.
     fn after_prefill(&self) {}
 
     /// Drop the trailing `excess` pad positions a padded prefill piece wrote
@@ -429,8 +556,9 @@ pub trait LanguageModel {
     /// this model's own per-sequence state (issue #2159).
     ///
     /// The scheduler pipelines decode for a family whose
-    /// [`Self::sequence_state_layout`] is model-owned only when this is
-    /// `true`; every other model-owned family stays on synchronous decode.
+    /// [`Self::sequence_state_layout`] is model-owned, or whose
+    /// [`Self::kv_cache_captures_sequence_state`] is `false`, only when this
+    /// is `true`; every other such family stays on synchronous decode.
     /// `true` promises that a rewind of up to
     /// [`crate::cache::DECODE_LOOKAHEAD_MAX_SPECULATIVE_APPENDS`] appends is
     /// exact for every layer, including a sliding window that has wrapped.
@@ -438,6 +566,27 @@ pub trait LanguageModel {
     /// Used by: server batch scheduler `lookahead_params`.
     fn supports_decode_lookahead_rewind(&self) -> bool {
         false
+    }
+
+    /// Whether the scheduler's KV cache slice holds this model's whole
+    /// per-token sequence state, so trimming or detaching that slice is the
+    /// whole story for the sequence.
+    ///
+    /// `true`, the default, for a pure transformer and for a model-owned
+    /// family (its own `sequence_state_layout()` gates already apply). A
+    /// dense family that keeps additional model-owned per-token state next to
+    /// its KV caches returns `false`: Baichuan-M1's K/V convolution state is
+    /// the case this exists for (#2567). Such a family pipelines decode only
+    /// when it also implements [`Self::supports_decode_lookahead_rewind`] and
+    /// [`Self::rewind_decode_appends`], which [`crate::engine::Engine`] then
+    /// calls on every lookahead teardown; the server's whole-prefix prompt
+    /// cache and its disaggregated KV handoff decline it, because a restored
+    /// KV prefix would arrive without that state.
+    ///
+    /// Used by: `Engine::can_unwind_lookahead`, `Engine::unwind_appends`,
+    /// server prompt-cache adopt/donate and `handoff_supported`.
+    fn kv_cache_captures_sequence_state(&self) -> bool {
+        true
     }
 
     /// Unwind the last `n` single-token decode appends from the model-owned
@@ -478,6 +627,20 @@ pub trait LanguageModel {
     /// Prepare model-owned/runtime sequence state before the scheduler starts
     /// using this `SequenceId`.
     fn prepare_sequence_state(&self, _seq_id: SequenceId) {}
+
+    /// Fallible [`Self::prepare_sequence_state`]: the hook
+    /// [`crate::engine::Engine::open`] calls. The default runs the
+    /// infallible hook and succeeds, which is right for every model that
+    /// keeps its state in process. A model whose preparation can be refused
+    /// by another party (the remote pipeline coordinator, whose stages may
+    /// decline a `PrepareSequence`) overrides this so the refusal fails only
+    /// that sequence: the engine releases what it allocated and returns an
+    /// `EngineError::Prepare`, and the scheduler answers the request with the
+    /// error instead of the model worker aborting (#2714, #2727).
+    fn try_prepare_sequence_state(&self, seq_id: SequenceId) -> Result<(), String> {
+        self.prepare_sequence_state(seq_id);
+        Ok(())
+    }
 
     /// Release model-owned/runtime sequence state by its scheduler `SequenceId`.
     fn release_sequence_state_by_id(&self, _seq_id: SequenceId) {}
@@ -632,13 +795,17 @@ pub trait LanguageModel {
     ///
     /// Standard transformer models return `true` (the default) because their
     /// state lives entirely in the external `KVCache` slice. SSM and hybrid
-    /// models (Mamba, Jamba, NemotronH, etc.) maintain internal recurrent
-    /// state that is not compatible with independent per-sequence cache
-    /// isolation, so they override this to return `false`.
+    /// models may also return `true` when their recurrent state is keyed by
+    /// sequence id and their batched forward preserves row isolation.
     ///
     /// Used by: CachePool (to reject unsupported models), server scheduler
     fn supports_batching(&self) -> bool {
         true
+    }
+
+    /// Whether multi-row decode shares model weights in one forward graph.
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::PerRowFallback
     }
 
     /// Whether the server batch scheduler may use the paged decode backend
@@ -678,6 +845,29 @@ pub trait LanguageModel {
         self.forward(input_ids, caches, mask)
     }
 
+    /// Fallible [`Self::forward_with_sequence_id`]: the forward the engine
+    /// runs for a single-row decode step, a verify pass and a scoring pass.
+    ///
+    /// The default runs the infallible forward and succeeds, which is right
+    /// for every model that computes in process: its failures are MLX
+    /// throws, caught at the eval. A model whose forward runs somewhere else
+    /// and can fail there (the remote pipeline coordinator, whose stage may
+    /// answer with an error or time out) overrides this and returns the
+    /// failure as a client-safe message; the engine turns it into
+    /// `EngineError::Forward` and the scheduler fails only that request
+    /// (#2727). An `Err` promises that the sequence's state was not
+    /// advanced, or was discarded with the request, so the caller has
+    /// nothing to unwind.
+    fn try_forward_with_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        seq_id: Option<SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> Result<UniquePtr<MlxArray>, String> {
+        Ok(self.forward_with_sequence_id(input_ids, seq_id, caches, mask))
+    }
+
     /// Sequence-aware counterpart of [`Self::forward_last_logits`].
     ///
     /// Server prefills need model-owned state keyed by `seq_id`, but only the
@@ -694,6 +884,20 @@ pub trait LanguageModel {
     ) -> UniquePtr<MlxArray> {
         let logits = self.forward_with_sequence_id(input_ids, seq_id, caches, mask);
         logits_at_position(&logits, last_pos)
+    }
+
+    /// Fallible [`Self::forward_last_logits_with_sequence_id`], the prefill
+    /// forward the engine runs; see [`Self::try_forward_with_sequence_id`]
+    /// for the contract (#2727). The default wraps the infallible hook.
+    fn try_forward_last_logits_with_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        seq_id: Option<SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+        last_pos: usize,
+    ) -> Result<UniquePtr<MlxArray>, String> {
+        Ok(self.forward_last_logits_with_sequence_id(input_ids, seq_id, caches, mask, last_pos))
     }
 
     /// Embedding-prefill forward with optional scheduler sequence identity.
@@ -761,6 +965,21 @@ pub trait LanguageModel {
     ) -> UniquePtr<MlxArray> {
         let _ = seq_ids;
         self.forward_batched(input_ids, batch_caches, mask)
+    }
+
+    /// Fallible [`Self::forward_batched_with_ids`], the forward the engine
+    /// runs for a decode step or a prefill cohort of more than one row; see
+    /// [`Self::try_forward_with_sequence_id`] for the contract (#2727). An
+    /// `Err` fails every row of the batch. The default wraps the infallible
+    /// hook.
+    fn try_forward_batched_with_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> Result<UniquePtr<MlxArray>, String> {
+        Ok(self.forward_batched_with_ids(input_ids, seq_ids, batch_caches, mask))
     }
 
     /// Batched decode: process B sequences in one forward pass.
@@ -1309,6 +1528,12 @@ pub struct TtftPhases {
     pub eval_ns: u128,
     /// Fixed post-eval work before the decode loop starts.
     pub post_ns: u128,
+    /// Checkpoint tensors the `eval` phase had to read and upload, with the
+    /// host staging and copy back-pressure legs split (#1564). `None` on a
+    /// build without the CUDA upload counters. Under the default eager
+    /// weight materialization this reads `weights=0` on a text-only first
+    /// token; a nonzero count is weight I/O charged to the first token.
+    pub weights: Option<crate::weight_materialize::WeightTransferStats>,
 }
 
 impl TtftPhases {
@@ -1337,7 +1562,7 @@ impl TtftPhases {
     #[must_use]
     pub fn format_line(&self, prompt_tokens: usize, prefill_ns: u128) -> String {
         let ms = |ns: u128| ns as f64 / 1e6;
-        format!(
+        let mut line = format!(
             "[TTFT] prompt={prompt_tokens} tok setup={:.2}ms build={:.2}ms sample={:.2}ms eval={:.2}ms post={:.2}ms | prefill={:.2}ms residual={:.2}ms",
             ms(self.setup_ns),
             ms(self.build_ns),
@@ -1346,7 +1571,12 @@ impl TtftPhases {
             ms(self.post_ns),
             ms(prefill_ns),
             ms(prefill_ns.saturating_sub(self.in_prefill_ns())),
-        )
+        );
+        if let Some(weights) = &self.weights {
+            line.push_str(" | eval ");
+            line.push_str(&weights.format_fields());
+        }
+        line
     }
 }
 

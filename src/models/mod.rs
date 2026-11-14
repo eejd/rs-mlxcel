@@ -16,7 +16,30 @@
 //!
 //! All implementations use mlxcel-core for direct MLX C++ bindings.
 
+pub(crate) mod batched_decode_cache;
+#[cfg(test)]
+mod batched_decode_coverage_tests;
+#[cfg(test)]
+pub(crate) mod batched_decode_harness;
+#[cfg(test)]
+pub(crate) mod deepstack_state_test_support;
+#[cfg(test)]
+mod mixtral_style_batched_decode_tests;
+#[cfg(test)]
+pub(crate) mod popular_dense_batched_decode_tests;
+#[cfg(test)]
+pub(crate) mod qwen_vl_batched_decode_test_support;
+#[cfg(test)]
+pub(crate) mod vlm_family_batched_decode_test_support;
+#[cfg(test)]
+mod vlm_family_batched_decode_tests;
+#[cfg(test)]
+pub(crate) mod wrapper_batched_decode_test_support;
+#[cfg(test)]
+mod wrapper_batched_decode_tests;
+
 pub(crate) mod col_late_interaction;
+pub(crate) mod deepstack_state;
 mod detection;
 pub(crate) mod embedding_sanitize;
 #[cfg(test)]
@@ -28,6 +51,7 @@ mod llama4_helpers;
 pub(crate) mod model_owned;
 pub mod multimodal_placeholders;
 pub(crate) mod qwen_mrope_state;
+pub(crate) mod recurrent_batch;
 mod recurrent_snapshot;
 pub mod registry;
 mod sanitize;
@@ -53,6 +77,7 @@ pub mod dynamic_ntk_rope;
 // already 3k lines and carries no MLX-op-heavy conversion of this size.
 pub mod fp8_block;
 pub mod gated_delta;
+pub(crate) mod mla_batched;
 // `rope_overrides` carries llama-server b10621's `--rope-scaling`,
 // `--rope-scale`, `--rope-freq-scale` and `--rope-freq-base` from the server
 // CLI down to the RoPE seams in `rope_utils` and `dynamic_ntk_rope` (#1450).
@@ -105,6 +130,10 @@ pub mod cohere_compass_rope;
 pub mod colidefics3;
 pub mod colqwen2_5;
 pub mod dbrx;
+pub mod deberta_v2;
+// Facade: the config type and the bucketing helper are re-exported from
+// `deberta_v2`, so callers keep one public path.
+mod deberta_v2_config;
 pub mod deepseek;
 pub mod deepseek_v2;
 pub mod deepseek_v3;
@@ -147,6 +176,7 @@ pub mod gpt2;
 pub mod gpt_bigcode;
 pub mod gpt_neox;
 pub mod gpt_oss;
+pub(crate) mod gpt_oss_common;
 pub mod granite;
 pub mod granitemoehybrid;
 pub mod helium;
@@ -181,6 +211,7 @@ pub mod mamba;
 pub mod mamba2;
 pub mod mellum;
 pub mod mimo;
+pub mod mimo_v2_flash;
 pub mod minicpm;
 pub mod minicpm3;
 pub mod minimax;
@@ -211,6 +242,8 @@ pub mod olmo;
 pub mod olmo2;
 pub mod olmo3;
 pub mod olmoe;
+pub mod openai_privacy_filter;
+pub(crate) mod openai_privacy_filter_layers;
 pub mod openelm;
 pub mod paddleocr_vl;
 pub mod phi;
@@ -232,6 +265,7 @@ pub mod qwen3_next;
 pub mod qwen3_vl;
 pub mod qwen3_vl_embedding;
 pub mod qwen3_vl_moe;
+pub mod qwen4_exp;
 pub mod recurrent_gemma;
 pub mod rwkv7;
 pub mod seed_oss;
@@ -336,6 +370,7 @@ pub use mamba::MambaModel;
 pub use mamba2::Mamba2Model;
 pub use mellum::{MellumModel, MellumWrapper};
 pub use mimo::MiMoModel;
+pub use mimo_v2_flash::MiMoV2FlashModel;
 pub use minicpm::MiniCPMModel;
 pub use minicpm3::MiniCPM3Model;
 pub use minimax::MiniMaxModel;
@@ -382,6 +417,7 @@ pub use qwen3_moe::Qwen3MoeModel;
 pub use qwen3_next::Qwen3NextModel;
 pub use qwen3_vl::Qwen3VLModel;
 pub use qwen3_vl_moe::Qwen3VLMoeModel;
+pub use qwen4_exp::Qwen4ExpModel;
 pub use recurrent_gemma::GriffinModel;
 pub use rwkv7::Rwkv7;
 pub(crate) use sanitize::{
@@ -396,6 +432,10 @@ pub use fp8_block::{
     Fp8BlockQuantization, has_block_fp8_weights, merge_fp8_block_quantization,
     qwen_fp8_block_quantization, requantize_block_fp8_weights,
 };
+/// E4M3 decoder shared with the image-generation FP8 loaders.
+///
+/// Used by: `fp8_block`, `imagegen::ideogram4::weights`.
+pub(crate) use sanitize::f8_e4m3_to_f32;
 #[cfg(any(test, feature = "xla-diagnostics", feature = "xla-diagnostics-cpu"))]
 pub(crate) use sanitize::load_weights_from_dir_with_filter;
 pub use sanitize::{
@@ -435,6 +475,7 @@ pub enum ModelType {
     Qwen35VLM,         // Qwen 3.5 VLM (Qwen3-VL vision + Qwen3.5 hybrid text)
     Qwen35Moe,         // Qwen 3.5 MoE Hybrid
     Qwen35MoeVLM,      // Qwen 3.5 MoE VLM
+    Qwen4ExpVLM,       // Qwen3.8-Flash-Next (qwen4_exp): QSA + hyper-connections + n-gram PLE + MoE
     Gemma,             // Gemma 1
     Gemma2,            // Gemma 2
     Gemma3,            // Gemma 3 (text-only)
@@ -558,6 +599,10 @@ pub enum ModelType {
     HunyuanMoe,
     HunyuanV1Dense,
     MiMo,
+    /// Xiaomi MiMo v2 Flash (`mimo_v2_flash`): hybrid sliding/full attention
+    /// MoE with a separate V head width, partial RoPE, dual RoPE bases, and
+    /// learned attention sinks on the sliding layers.
+    MiMoV2Flash,
     /// Ant Group Ling / Bailing MoE (`bailing_moe`): DeepSeek-shaped sparse
     /// decoder with a fused GQA `query_key_value` and a single wide shared
     /// expert.
@@ -730,6 +775,7 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::Qwen35VLM,
     ModelType::Qwen35Moe,
     ModelType::Qwen35MoeVLM,
+    ModelType::Qwen4ExpVLM,
     ModelType::Gemma,
     ModelType::Gemma2,
     ModelType::Gemma3,
@@ -830,6 +876,7 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::HunyuanMoe,
     ModelType::HunyuanV1Dense,
     ModelType::MiMo,
+    ModelType::MiMoV2Flash,
     ModelType::BailingMoe,
     ModelType::BailingMoeLinear,
     ModelType::Afmoe,
@@ -990,6 +1037,10 @@ impl ModelType {
             ModelType::GlmOcr => ("GLM-OCR", "GLM VLM"),
             ModelType::Qwen35VLM => ("Qwen 3.5 / 3.8 VLM", "Qwen VLM"),
             ModelType::Qwen35MoeVLM => ("Qwen 3.5 / 3.6 MoE VLM", "Qwen VLM"),
+            ModelType::Qwen4ExpVLM => (
+                "Qwen3.8-Flash-Next VLM (QSA + GatedDeltaNet + n-gram PLE + MoE)",
+                "Qwen VLM",
+            ),
 
             // ----- Gemma (text) -----
             ModelType::Gemma => ("Gemma 1", "Gemma"),
@@ -1241,6 +1292,10 @@ impl ModelType {
             ModelType::MiniCPM3 => ("MiniCPM 3", "Specialized"),
             ModelType::SmolLM3 => ("SmolLM 3", "Specialized"),
             ModelType::MiMo => ("MiMo (multi-token prediction)", "Specialized"),
+            ModelType::MiMoV2Flash => (
+                "Xiaomi MiMo v2 Flash (hybrid sliding/full attention MoE)",
+                "Xiaomi",
+            ),
             ModelType::Apertus => ("Apertus (dense)", "Specialized"),
             ModelType::SeedOss => ("Seed-OSS", "Specialized"),
 
@@ -1384,6 +1439,7 @@ mod metadata_tests {
             Qwen35VLM,
             Qwen35Moe,
             Qwen35MoeVLM,
+            Qwen4ExpVLM,
             Gemma,
             Gemma2,
             Gemma3,
@@ -1480,6 +1536,7 @@ mod metadata_tests {
             HunyuanMoe,
             HunyuanV1Dense,
             MiMo,
+            MiMoV2Flash,
             BailingMoe,
             BailingMoeLinear,
             Afmoe,
@@ -1724,7 +1781,7 @@ mod laguna_tests;
 
 #[cfg(test)]
 #[path = "granitemoehybrid_tests.rs"]
-mod granitemoehybrid_tests;
+pub(crate) mod granitemoehybrid_tests;
 
 #[cfg(test)]
 #[path = "minimax_tests.rs"]
@@ -1737,3 +1794,10 @@ mod modernbert_tests;
 #[cfg(test)]
 #[path = "modernbert_real_checkpoint_tests.rs"]
 mod modernbert_real_checkpoint_tests;
+
+#[cfg(test)]
+mod mixed_cache_batched_decode_tests;
+
+#[cfg(test)]
+#[path = "model_owned_kv_mode_tests.rs"]
+mod model_owned_kv_mode_tests;

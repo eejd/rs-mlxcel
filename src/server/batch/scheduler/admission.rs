@@ -332,9 +332,12 @@ impl BatchScheduler {
         // `prompt_tokens` into the post-injection stream the KV cache is built
         // over, and both the cache key (via the request's multimodal digest)
         // and the matched-prefix length are computed against that stream. No
-        // sequence id exists yet, so a preparation error just aborts the
-        // request with nothing to clean up. `Some(_)` marks "prepared early";
-        // the inner value is the optional merged embeddings.
+        // sequence id exists yet, so a preparation error owns no sequence to
+        // release, but a family may already have written its media fallback
+        // slots before failing (cancellation mid-preparation), and every
+        // return between here and the binds below must drop those slots
+        // (issue #2625). `Some(_)` marks "prepared early"; the inner value is
+        // the optional merged embeddings.
         let prepared_early = if vlm_sharing_ok {
             match prepare_request_vlm_embeddings(
                 self.engine.model(),
@@ -351,6 +354,7 @@ impl BatchScheduler {
             ) {
                 Ok(emb) => Some(emb),
                 Err(err) => {
+                    self.engine.model().clear_vlm_fallback_state();
                     let _ = response_tx.send(GenerateEvent::Error(err.to_string()));
                     return;
                 }
@@ -401,8 +405,15 @@ impl BatchScheduler {
                     Ok(id) => id,
                     Err(err) => {
                         tracing::warn!("Cache pool allocation failed: {err}");
-                        let _ =
-                            response_tx.send(GenerateEvent::Error(format!("Server busy: {err}")));
+                        // The early VLM-sharing preparation above already
+                        // wrote this request's media state into the model's
+                        // fallback slots, and no sequence will ever bind it.
+                        // Left in place, the next admitted request would bind
+                        // it as its own (issue #2625).
+                        self.engine.model().clear_vlm_fallback_state();
+                        let _ = response_tx.send(GenerateEvent::Error(
+                            paged_layout::allocation_failure_message(&err),
+                        ));
                         return;
                     }
                 };
@@ -445,6 +456,10 @@ impl BatchScheduler {
                     // a sequence that never reached a healthy finish.
                     self.prompt_cache_seq_ctx.remove(&seq_id);
                     self.release_sequence_caches(seq_id);
+                    // Releasing the sequence drops only per-sequence entries;
+                    // a partial preparation may have written the fallback
+                    // slots, which no bind will now drain (issue #2625).
+                    self.engine.model().clear_vlm_fallback_state();
                     let _ = response_tx.send(GenerateEvent::Error(err.to_string()));
                     return;
                 }
@@ -453,13 +468,14 @@ impl BatchScheduler {
 
         // mlx-vlm PR #1095: per-sequence MRoPE alignment.
         //
-        // The Qwen VL families compute the MRoPE position-id tensor and
-        // `rope_deltas` scalar inside `prepare_request_vlm_embeddings`
-        // (it runs the vision encoder and writes the result to the text
-        // model's fallback slot). Without binding that state to *this*
-        // sequence id, the next text-only request's decode step would
-        // pick up the previous VL row's delta and produce wrong
-        // attention positions. Bind unconditionally for Qwen VL models;
+        // The Qwen VL families (with GLM-4V and Cohere Compass), Qwen3-Omni,
+        // PaddleOCR-VL, ERNIE-4.5-MoE-VL and Hunyuan-VL compute the MRoPE
+        // position-id tensor and `rope_deltas` scalar inside
+        // `prepare_request_vlm_embeddings` (it runs the vision encoder and
+        // writes the result to the text model's fallback slot). Without
+        // binding that state to *this* sequence id, concurrent requests and
+        // the next text-only request would decode with the previous VL
+        // row's positions (#2634). Bind unconditionally for those models;
         // the call is a no-op for everything else.
         self.engine
             .model()
@@ -475,6 +491,16 @@ impl BatchScheduler {
         self.engine
             .model()
             .bind_gemma4_per_layer_inputs_to_sequence(seq_id);
+
+        // Same for Llama 3.2 Vision (#2567): `prepare_request_vlm_embeddings`
+        // stashes the request's cross-attention states in the model's
+        // fallback slot; bind them to this sequence before another request
+        // in the same drain tick overwrites the slot, and so a text-only
+        // request never attends to a previous request's image. No-op for
+        // everything else.
+        self.engine
+            .model()
+            .bind_mllama_image_state_to_sequence(seq_id);
 
         // Same lifecycle invariant for Falcon-OCR: the prefill state
         // (temporal positions, spatial coordinates, rope delta) is
@@ -606,7 +632,7 @@ impl BatchScheduler {
             created_at: Instant::now(),
             prefill_start: None,
             first_token_time: None,
-            prompt_lookup: None,
+            token_only: None,
             token_history: Vec::new(),
             sampler,
             merged_eos: Vec::new(),

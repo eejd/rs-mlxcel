@@ -101,6 +101,31 @@ fn inkling_decode_budget_caps_pixel_bytes_before_decode() {
     let over_cap = inkling_decoded_pixel_bytes(4096, 4096, 9).unwrap();
     assert!(over_cap > INKLING_MAX_DECODED_PIXEL_BYTES);
     assert_eq!(INKLING_MAX_DECODED_FRAMES, 32);
+
+    assert_eq!(
+        validate_decoded_video_budget(
+            Path::new("dense.mp4"),
+            4096,
+            4096,
+            8,
+            DEFAULT_MAX_DECODED_VIDEO_BYTES,
+        )
+        .unwrap(),
+        DEFAULT_MAX_DECODED_VIDEO_BYTES
+    );
+    let error = validate_decoded_video_budget(
+        Path::new("dense.mp4"),
+        4096,
+        4096,
+        9,
+        DEFAULT_MAX_DECODED_VIDEO_BYTES,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("reduce --max-frames or --target-fps"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -172,6 +197,7 @@ fn smart_nframes_policy_rejects_instead_of_clamping_when_requested() {
             max_frames: FPS_MAX_FRAMES,
             frame_factor: FRAME_FACTOR,
             reject_over_max: true,
+            keep_all_without_target_fps: false,
         },
     )
     .unwrap_err();
@@ -197,6 +223,7 @@ fn smart_nframes_policy_uses_caller_frame_factor_for_minimum() {
             max_frames: 16,
             frame_factor: 4,
             reject_over_max: true,
+            keep_all_without_target_fps: false,
         },
     )
     .unwrap_err();
@@ -204,6 +231,49 @@ fn smart_nframes_policy_uses_caller_frame_factor_for_minimum() {
     assert!(
         err.to_string().contains("need at least 4"),
         "error must use the policy frame factor, got: {err}"
+    );
+}
+
+#[test]
+fn smart_nframes_policy_can_keep_all_frames_without_an_fps_target() {
+    let policy = FrameSamplingPolicy {
+        min_frames: 1,
+        max_frames: 32,
+        frame_factor: 1,
+        reject_over_max: false,
+        keep_all_without_target_fps: true,
+    };
+    assert_eq!(
+        smart_nframes_with_policy(3, 6.0, None, None, policy).unwrap(),
+        3
+    );
+    assert_eq!(
+        smart_nframes_with_policy(48, 6.0, None, None, policy).unwrap(),
+        32
+    );
+    assert_eq!(
+        smart_nframes_with_policy(48, 6.0, Some(2.0), None, policy).unwrap(),
+        16
+    );
+}
+
+#[test]
+fn keep_all_policy_uses_a_consecutive_prefix_above_the_cap() {
+    let total = 100;
+    let kept = 64;
+    let policy = FrameSamplingPolicy {
+        min_frames: 1,
+        max_frames: kept,
+        frame_factor: 1,
+        reject_over_max: false,
+        keep_all_without_target_fps: true,
+    };
+    let consecutive = frame_indices_with_policy(total, kept, None, policy);
+    assert_eq!(consecutive, (0..64).collect::<Vec<_>>());
+    assert_ne!(consecutive, uniform_indices(total, kept));
+    assert_eq!(
+        frame_indices_with_policy(total, kept, Some(12.0), policy),
+        uniform_indices(total, kept)
     );
 }
 

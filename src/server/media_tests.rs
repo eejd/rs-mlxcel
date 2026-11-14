@@ -21,11 +21,14 @@ use std::sync::{
 
 use super::{
     ImageInputLimits, MediaRequestMetadata, collect_image_data, extract_chat_image_data,
-    extract_chat_video_paths_with_allowlist, read_image_url, scan_insecure_allowlist_dirs,
+    extract_chat_video_paths_with_allowlist, fetch_labeled_image, read_image_url,
     try_collect_image_data_with_limits, try_extract_chat_audio_data,
     try_extract_chat_audio_data_with_cancellation, try_extract_chat_image_data,
     try_read_image_url_with_limits,
 };
+// Only the `cfg(unix)` world-writable allowlist tests call it.
+#[cfg(unix)]
+use super::scan_insecure_allowlist_dirs;
 use crate::server::types::request::{InputAudio, VideoUrl};
 use crate::server::types::{
     ChatCompletionRequest, ContentPart, ImageUrl, Message, MessageContent, Role, SamplingParams,
@@ -1540,3 +1543,67 @@ fn no_mmproj_refusal_names_the_flag_rather_than_the_checkpoint() {
     );
     assert!(message.contains("--no-mmproj"), "{message}");
 }
+
+#[tokio::test]
+async fn fetch_labeled_image_decodes_a_data_url() {
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .expect("encode PNG");
+    let url = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(png.into_inner())
+    );
+    let image = fetch_labeled_image(&url, "input[0]", ImageInputLimits::default())
+        .await
+        .expect("valid PNG decodes");
+    assert_eq!((image.width(), image.height()), (2, 2));
+}
+
+#[tokio::test]
+async fn fetch_labeled_image_labels_an_unsupported_scheme() {
+    let err = fetch_labeled_image("ftp://x", "input[2]", ImageInputLimits::default())
+        .await
+        .expect_err("ftp is not an image source");
+    assert_eq!(err.error.message, "input[2]: unsupported image URL scheme");
+    assert_eq!(err.error.error_type, "invalid_request_error");
+}
+
+#[tokio::test]
+async fn fetch_labeled_image_labels_a_read_failure() {
+    let err = fetch_labeled_image(
+        "data:image/png;base64,%%%bad%%%",
+        "image[1]",
+        ImageInputLimits::default(),
+    )
+    .await
+    .expect_err("malformed base64 fails to read");
+    assert!(
+        err.error
+            .message
+            .starts_with("image[1]: failed to read image: "),
+        "{}",
+        err.error.message
+    );
+}
+
+#[tokio::test]
+async fn fetch_labeled_image_labels_a_decode_failure() {
+    let err = fetch_labeled_image(
+        "data:image/png;base64,aGVsbG8=",
+        "documents[0]",
+        ImageInputLimits::default(),
+    )
+    .await
+    .expect_err("non-image bytes fail to decode");
+    assert_eq!(
+        err.error.message,
+        "documents[0]: Failed to decode any images"
+    );
+}
+
+#[path = "media_url_disclosure_tests.rs"]
+mod url_disclosure;
+
+#[path = "media_net_proxy_tests.rs"]
+mod net_proxy;

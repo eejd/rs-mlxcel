@@ -48,6 +48,8 @@
 
 use std::num::NonZeroU32;
 
+use crate::server::StartupNotice;
+
 /// A validated thinking-token budget value.
 ///
 /// Construct via [`Self::from_raw_i32`]; the `Option<Self>` wrapper distinguishes
@@ -130,11 +132,17 @@ impl std::error::Error for ThinkingBudgetError {}
 /// Apply the canonical `LLAMA_ARG_THINK_BUDGET` env fallback and the legacy
 /// `LLAMA_ARG_REASONING_BUDGET` alias on top of a CLI value.
 ///
-/// CLI wins when both are set. Unparseable env values trigger a warning and
-/// the CLI value (or default) is kept.
+/// CLI wins when both are set. Unparseable env values push a warning onto
+/// `notices` and the CLI value (or default) is kept. The warning is returned
+/// rather than logged because this runs before the server installs its
+/// tracing subscriber (#2697).
 ///
 /// Returns the raw `i32` ready for [`ThinkingBudget::from_raw_i32`].
-pub fn resolve_server_default_reasoning_budget(cli_value: i32, cli_was_set: bool) -> i32 {
+pub fn resolve_server_default_reasoning_budget(
+    cli_value: i32,
+    cli_was_set: bool,
+    notices: &mut Vec<StartupNotice>,
+) -> i32 {
     const DEFAULT: i32 = -1;
     const CANONICAL_KEY: &str = "LLAMA_ARG_THINK_BUDGET";
     const LEGACY_KEY: &str = "LLAMA_ARG_REASONING_BUDGET";
@@ -144,9 +152,9 @@ pub fn resolve_server_default_reasoning_budget(cli_value: i32, cli_was_set: bool
             if std::env::var_os(key).is_none() {
                 continue;
             }
-            tracing::info!(
+            notices.push(StartupNotice::info(format!(
                 "{key} env var is set but --reasoning-budget CLI flag takes precedence; ignoring {key}"
-            );
+            )));
         }
         return cli_value;
     }
@@ -158,10 +166,9 @@ pub fn resolve_server_default_reasoning_budget(cli_value: i32, cli_was_set: bool
         return match raw.trim().parse::<i32>() {
             Ok(value) => value,
             Err(_) => {
-                tracing::warn!(
-                    "{key} env var has unparseable value {:?}; ignoring (expected integer >= -1)",
-                    raw
-                );
+                notices.push(StartupNotice::warn(format!(
+                    "{key} env var has unparseable value {raw:?}; ignoring (expected integer >= -1)"
+                )));
                 DEFAULT
             }
         };
@@ -1109,7 +1116,7 @@ mod tests {
             std::env::set_var("LLAMA_ARG_REASONING_BUDGET", "64");
         }
         assert_eq!(
-            resolve_server_default_reasoning_budget(32, true),
+            resolve_server_default_reasoning_budget(32, true, &mut Vec::new()),
             32,
             "CLI set to 32 must win over env=64"
         );
@@ -1120,13 +1127,19 @@ mod tests {
             std::env::set_var("LLAMA_ARG_REASONING_BUDGET", "128");
             std::env::set_var("LLAMA_ARG_THINK_BUDGET", "96");
         }
-        assert_eq!(resolve_server_default_reasoning_budget(-1, false), 96);
+        assert_eq!(
+            resolve_server_default_reasoning_budget(-1, false, &mut Vec::new()),
+            96
+        );
 
         // Case 3: unparseable canonical env falls back to default (-1).
         unsafe {
             std::env::set_var("LLAMA_ARG_THINK_BUDGET", "not-a-number");
         }
-        assert_eq!(resolve_server_default_reasoning_budget(-1, false), -1);
+        assert_eq!(
+            resolve_server_default_reasoning_budget(-1, false, &mut Vec::new()),
+            -1
+        );
 
         // Case 4: no env var and CLI at default (-1) → unbounded (-1).
         // Regression guard: `mlxcel-server` with no `--reasoning-budget` flag
@@ -1136,7 +1149,7 @@ mod tests {
             std::env::remove_var("LLAMA_ARG_REASONING_BUDGET");
         }
         assert_eq!(
-            resolve_server_default_reasoning_budget(-1, false),
+            resolve_server_default_reasoning_budget(-1, false, &mut Vec::new()),
             -1,
             "no CLI flag and no env var must yield unbounded (-1)"
         );
@@ -1162,7 +1175,7 @@ mod tests {
             .iter()
             .map(|s| AddedToken::from(*s, /*special=*/ true))
             .collect();
-        hf.add_tokens(&added);
+        hf.add_tokens(added).expect("added tokens register");
         crate::tokenizer::MlxcelTokenizer::HuggingFace(hf)
     }
 

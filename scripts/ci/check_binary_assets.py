@@ -57,7 +57,11 @@ BINARY_SNIFF_BYTES = 8000
 
 # Ceiling on the declared set as a whole, so growth inside an existing rule is
 # also a review event rather than a slow drift.
-TOTAL_BUDGET_BYTES = 256 * 1024
+# Retain the original allowance plus exact DINOv2, Sapiens2, SAM 3, Video
+# Depth Anything, SAM 3.1, Objects, PP-DocLayoutV3, SAM 3D Body,
+# RF-DETR, FLUX.2, Z-Image, Bonsai, ERNIE-Image, Mage-Flow, Qwen-Image,
+# and Ideogram 4 fixture bytes.
+TOTAL_BUDGET_BYTES = 42_749_699
 
 
 @dataclasses.dataclass(frozen=True)
@@ -70,6 +74,416 @@ class Rule:
 
 
 DECLARED = (
+    Rule(
+        pattern="docs/benchmark_results/data/native-batched-decode-m3ultra-2026-10-27/raw/vlm/qwen35/baseline/input-image.png",
+        max_bytes=679,
+        why="Pinned Qwen3.5-VL benchmark input image for hash-verifiable request replay.",
+    ),
+    Rule(
+        pattern="docs/benchmark_results/data/native-batched-decode-m3ultra-2026-10-27/raw/vlm/qwen35/candidate/input-image.png",
+        max_bytes=679,
+        why="Pinned Qwen3.5-VL benchmark input image for hash-verifiable request replay.",
+    ),
+    Rule(
+        pattern="docs/benchmark_results/data/native-batched-decode-m3ultra-2026-10-27/raw/vlm/lfm2/baseline/input-image.png",
+        max_bytes=679,
+        why="Pinned LFM2-VL benchmark input image for hash-verifiable request replay.",
+    ),
+    Rule(
+        pattern="docs/benchmark_results/data/native-batched-decode-m3ultra-2026-10-27/raw/vlm/lfm2/candidate/input-image.png",
+        max_bytes=679,
+        why="Pinned LFM2-VL benchmark input image for hash-verifiable request replay.",
+    ),
+    Rule(
+        pattern="tests/fixtures/bonsai/generate_512_seed9909.safetensors",
+        max_bytes=524_480,
+        why="Pinned Bonsai FLUX.2 generation latent trajectory for full-model parity.",
+    ),
+    Rule(
+        pattern="tests/fixtures/bonsai/transformer_step0_f32.safetensors",
+        max_bytes=557_232,
+        why="Pinned upstream Bonsai FLUX.2 first-step F32 transformer output.",
+    ),
+    Rule(
+        pattern="tests/fixtures/bonsai/generate_512_seed9909.png",
+        max_bytes=370_849,
+        why="Pinned decoded Bonsai generation output compared pixelwise in parity tests.",
+    ),
+    Rule(
+        pattern="tests/fixtures/flux2/edit_512_seed123.safetensors",
+        max_bytes=524_480,
+        why="Pinned FLUX.2 edit latent trajectory for upstream full-model parity.",
+    ),
+    Rule(
+        pattern="tests/fixtures/flux2/generate_512_seed9909.safetensors",
+        max_bytes=524_480,
+        why="Pinned FLUX.2 generation latent trajectory for upstream full-model parity.",
+    ),
+    Rule(
+        pattern="tests/fixtures/flux2/transformer_step0_f32.safetensors",
+        max_bytes=557_232,
+        why="Pinned upstream FLUX.2 first-step F32 transformer output.",
+    ),
+    Rule(
+        pattern="tests/fixtures/flux2/edit_512_seed123.png",
+        max_bytes=338_348,
+        why="Pinned decoded FLUX.2 edit output compared pixelwise by parity tests.",
+    ),
+    Rule(
+        pattern="tests/fixtures/flux2/edit_reference.png",
+        max_bytes=348_745,
+        why="Fixed upstream FLUX.2 edit input preserved at native 512-pixel resolution.",
+    ),
+    Rule(
+        pattern="tests/fixtures/flux2/generate_512_seed9909.png",
+        max_bytes=340_928,
+        why="Pinned decoded FLUX.2 generation output compared pixelwise by parity tests.",
+    ),
+    Rule(
+        pattern="tests/fixtures/imagegen/z_image_parity.safetensors",
+        max_bytes=198_396,
+        why="Compact upstream Z-Image full-model numerical parity references.",
+    ),
+    Rule(
+        pattern="tests/fixtures/imagegen/ernie_image_parity.safetensors",
+        max_bytes=247_627,
+        why="Compact upstream ERNIE-Image full-model numerical parity references.",
+    ),
+    Rule(
+        pattern="tests/fixtures/imagegen/z_image_tiny_refs.safetensors",
+        max_bytes=1_638,
+        why="Tiny upstream Z-Image transformer normalization and RoPE references.",
+    ),
+    Rule(
+        pattern="tests/fixtures/imagegen/mage_flow_parity.safetensors",
+        max_bytes=263_655,
+        why="Pooled upstream Mage-Flow turbo and edit runs (latents, images, conditioner) for whole-run parity.",
+    ),
+    Rule(
+        pattern="tests/fixtures/imagegen/mage_flow_tiny_refs.safetensors",
+        max_bytes=289_328,
+        why="Upstream Mage-Flow RoPE, tiny-transformer and real Mage-VAE stage references.",
+    ),
+    Rule(
+        pattern="tests/fixtures/imagegen/qwen_image_parity.safetensors",
+        max_bytes=95_601,
+        why="Pooled upstream Qwen-Image generate and edit runs plus tokenizer ids for whole-run parity.",
+    ),
+    Rule(
+        pattern="tests/fixtures/imagegen/qwen_image_tiny_refs.safetensors",
+        max_bytes=303_683,
+        why="Upstream Qwen-Image tiny transformer, KV cache, RoPE and residual/plain VAE references.",
+    ),
+    Rule(
+        pattern="tests/fixtures/imagegen/ideogram4_parity.safetensors",
+        max_bytes=45_936,
+        why="Pooled upstream Ideogram 4 turbo run (token ids, noise checksum, latents, image) for whole-run parity.",
+    ),
+    Rule(
+        pattern="tests/fixtures/imagegen/ideogram4_tiny_refs.safetensors",
+        max_bytes=60_936,
+        why="Tiny upstream Ideogram 4 transformer (random bf16 weights) with its M-RoPE tables and outputs.",
+    ),
+    Rule(
+        pattern="tests/fixtures/imagegen/ming_image_parity.safetensors",
+        max_bytes=103_154,
+        why="Pooled upstream Ming-Image bf16 and 4-bit runs (token ids, noise checksum, latents, RGBA image) for whole-run parity.",
+    ),
+    Rule(
+        pattern="tests/fixtures/imagegen/ming_image_tiny_refs.safetensors",
+        max_bytes=2_092,
+        why="Tiny upstream Ming-Image transformer outputs with and without the second caption stream.",
+    ),
+    Rule(
+        pattern="tests/fixtures/rfdetr/base/input.safetensors",
+        max_bytes=3_763_296,
+        why="Exact authenticated RF-DETR Base processor output for full-model parity.",
+    ),
+    Rule(
+        pattern="tests/fixtures/rfdetr/base/raw.safetensors",
+        max_bytes=114_160,
+        why="Authentic RF-DETR Base F32 logits and boxes from the released checkpoint.",
+    ),
+    Rule(
+        pattern="tests/fixtures/rfdetr/seg/input.safetensors",
+        max_bytes=1_769_568,
+        why="Exact authenticated RF-DETR Seg Small processor output for full-model parity.",
+    ),
+    Rule(
+        pattern="tests/fixtures/rfdetr/seg/raw.safetensors",
+        max_bytes=3_724_640,
+        why="Authentic RF-DETR Seg Small F32 logits, boxes, and mask logits.",
+    ),
+    Rule(
+        pattern="tests/fixtures/rfdetr/seg/mask-000.png",
+        max_bytes=2_898,
+        why="Source-resolution upstream RF-DETR Seg Small mask for selected detection 0.",
+    ),
+    Rule(
+        pattern="tests/fixtures/rfdetr/seg/mask-001.png",
+        max_bytes=646,
+        why="Source-resolution upstream RF-DETR Seg Small mask for selected detection 1.",
+    ),
+    Rule(
+        pattern="tests/fixtures/rfdetr/seg/mask-002.png",
+        max_bytes=2_527,
+        why="Source-resolution upstream RF-DETR Seg Small mask for selected detection 2.",
+    ),
+    Rule(
+        pattern="tests/fixtures/rfdetr/seg/mask-003.png",
+        max_bytes=776,
+        why="Source-resolution upstream RF-DETR Seg Small mask for selected detection 3.",
+    ),
+    Rule(
+        pattern="tests/fixtures/pp_doclayout_v3/input.safetensors",
+        max_bytes=13_697_116,
+        why="Exact decoded RGB and Torchvision uint8-bicubic PP-DocLayoutV3 processor input.",
+    ),
+    Rule(
+        pattern="tests/fixtures/pp_doclayout_v3/paddle_raw.safetensors",
+        max_bytes=395_168,
+        why="Authentic raw F32 outputs from the released Paddle PP-DocLayoutV3 checkpoint.",
+    ),
+    Rule(
+        pattern="tests/fixtures/pp_doclayout_v3/hashnuke_raw.safetensors",
+        max_bytes=395_168,
+        why="Authentic raw F32 outputs from the released converted PP-DocLayoutV3 checkpoint.",
+    ),
+    Rule(
+        pattern="tests/fixtures/pp_doclayout_v3/two_column_page.png",
+        max_bytes=590_803,
+        why="Licensed ACL 2019 BERT page used for PP reading-order and Falcon-OCR integration.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3d_body/reference-boxed.safetensors",
+        max_bytes=666_588,
+        why="Authentic complete SAM 3D Body boxed mesh, joints, camera and topology reference.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3d_body/reference-default.safetensors",
+        max_bytes=666_588,
+        why="Authentic complete SAM 3D Body default mesh, joints, camera and topology reference.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3d_body/geometry.safetensors",
+        max_bytes=6_632,
+        why="Authentic tiny CPU rotation, FK and ordered scatter outputs from pinned SAM 3D Body.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3d_body/crop-tiny.safetensors",
+        max_bytes=2_824,
+        why="Authentic OpenCV full and partial crop outputs from a synthetic tiny RGB image.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3d_objects/focal-solver-states-cpu.safetensors",
+        max_bytes=1_035,
+        why="Authentic CPU control for backend-specific compiled focal solver rounding, using the same sampled UV/XYZ inputs.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3d_objects/focal-solver-inputs.safetensors",
+        max_bytes=82_084,
+        why="Exact sampled UV/XYZ from authenticated MoGe affine output for the Objects compiled focal solver oracle.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3d_objects/focal-solver-states.safetensors",
+        max_bytes=1_035,
+        why="Pinned upstream focal solver initial and thirty compiled iteration states plus final focal/shift.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3d_objects/gelu-tanh-power-cpu.safetensors",
+        max_bytes=197_600,
+        why="Authentic CPU control for backend-specific F32 tanh GELU rounding; regenerated by generate_gelu_tanh_power_oracle.py --device cpu.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3d_objects/gelu-tanh-power.safetensors",
+        max_bytes=197_600,
+        why="Pinned exact-native BF16/F32 Objects tanh GELU Power graph oracle; regenerated by generate_gelu_tanh_power_oracle.py.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3d_objects/layers.safetensors",
+        max_bytes=67_631,
+        why="Pinned exact-native BF16 Objects graph helper and GELU reference literals; regenerated by generate_helper_oracles.py.",
+    ),
+    Rule(
+        pattern="tests/fixtures/dinov2/small_reference.safetensors",
+        max_bytes=1_392_288,
+        why="Complete pinned HF DINOv2 small CPU f32 reference outputs and deterministic input; regenerated by generate_reference.py.",
+    ),
+    Rule(
+        pattern="tests/fixtures/dinov2/register_small_reference.safetensors",
+        max_bytes=1_398_448,
+        why="Complete pinned HF DINOv2 register-small CPU f32 reference outputs and deterministic input; regenerated by generate_reference.py.",
+    ),
+    Rule(
+        pattern="tests/fixtures/video_depth_anything/davis_64.mp4",
+        max_bytes=69_065,
+        why="Pinned 64-frame DAVIS car-turn clip for consecutive-frame Video Depth Anything parity and CLI validation.",
+    ),
+    Rule(
+        pattern="tests/fixtures/video_depth_anything/davis_40_frames.safetensors",
+        max_bytes=1_474_656,
+        why="Exact decoded uint8 RGB frames shared by the authentic Video Depth Anything CPU references.",
+    ),
+    Rule(
+        pattern="tests/fixtures/video_depth_anything/small_relative_40.safetensors",
+        max_bytes=1_966_288,
+        why="Complete pinned upstream Small relative Video Depth Anything CPU float32 output for 40 frames.",
+    ),
+    Rule(
+        pattern="tests/fixtures/video_depth_anything/small_metric_40.safetensors",
+        max_bytes=1_966_288,
+        why="Complete pinned upstream Small metric Video Depth Anything CPU float32 output for 40 frames.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3/cats.png",
+        max_bytes=672 * 1024,
+        why=(
+            "Losslessly recompressed COCO two-cat image used for real-checkpoint "
+            "SAM 3 image and box-prompt parity."
+        ),
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3/car-clip.mp4",
+        max_bytes=192 * 1024,
+        why=(
+            "Three-frame DAVIS car clip used for real-checkpoint SAM 3 memory "
+            "tracking parity; codec-decoded pixels are part of the fixture."
+        ),
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3/text-reference.safetensors",
+        max_bytes=84 * 1024,
+        why=(
+            "Pinned mlx-vlm token IDs, attention mask, CLIP hidden states and "
+            "projected tokens for stage-by-stage SAM 3 checkpoint parity."
+        ),
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3/pixel-reference.safetensors",
+        max_bytes=24 * 1024,
+        why=(
+            "Sampled pixels from the pinned Pillow bilinear SAM 3 processor, "
+            "covering resize and normalization before model inference."
+        ),
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3/cats-mask-0.png",
+        max_bytes=2 * 1024,
+        why="One-bit upstream SAM 3 mask for the right cat.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3/cats-mask-1.png",
+        max_bytes=2 * 1024,
+        why="One-bit upstream SAM 3 mask for the left cat.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3/box-mask-0.png",
+        max_bytes=2 * 1024,
+        why="One-bit upstream SAM 3 box-prompt mask for the right cat.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3/box-mask-1.png",
+        max_bytes=5 * 1024,
+        why="One-bit upstream SAM 3 box-prompt mask for the left cat.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3/video-native-mask-0.png",
+        max_bytes=1024,
+        why="One-bit pinned upstream SAM 3 native-resolution tracking mask, frame 0.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3/video-native-mask-1.png",
+        max_bytes=1024,
+        why="One-bit pinned upstream SAM 3 native-resolution tracking mask, frame 1.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3/video-native-mask-2.png",
+        max_bytes=1024,
+        why="One-bit pinned upstream SAM 3 native-resolution tracking mask, frame 2.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3/video-source-mask-0.png",
+        max_bytes=1024,
+        why="One-bit pinned upstream SAM 3 source-resolution tracking mask, frame 0.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3/video-source-mask-1.png",
+        max_bytes=1024,
+        why="One-bit pinned upstream SAM 3 source-resolution tracking mask, frame 1.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3/video-source-mask-2.png",
+        max_bytes=1024,
+        why="One-bit pinned upstream SAM 3 source-resolution tracking mask, frame 2.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3_1/three-cars.mp4",
+        max_bytes=48 * 1024,
+        why=(
+            "Three consecutive frames from the genuine OpenGeos traffic video, "
+            "used for nine-object SAM 3.1 multiplex tracking parity."
+        ),
+    ),
+    Rule(
+        pattern="tests/fixtures/sam3_1/*.png",
+        max_bytes=2 * 1024,
+        why=(
+            "One-bit upstream SAM 3.1 cat and nine-object traffic masks. Exact "
+            "checkpoint, source-video, and runtime provenance is stored beside them."
+        ),
+    ),
+    Rule(
+        pattern="tests/fixtures/imagegen/dit_blocks_refs.safetensors",
+        max_bytes=6 * 1024,
+        why="Tiny upstream DiT numerical references; generated by generate_imagegen_fixtures.py.",
+    ),
+    Rule(
+        pattern="tests/fixtures/imagegen/qwen3_encoder_refs.safetensors",
+        max_bytes=10 * 1024,
+        why="Tiny upstream Qwen3 hidden-state references; generated by generate_imagegen_fixtures.py.",
+    ),
+    Rule(
+        pattern="tests/fixtures/imagegen/vae_ernie_refs.safetensors",
+        max_bytes=170 * 1024,
+        why="Fixed-latent upstream VAE outputs for numerical parity; generated by generate_imagegen_fixtures.py.",
+    ),
+    Rule(
+        pattern="tests/fixtures/imagegen/vae_tiny.safetensors",
+        max_bytes=156 * 1024,
+        why="Seeded tiny VAE weights and reference outputs; generated by generate_imagegen_fixtures.py.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sapiens2/person.jpg",
+        max_bytes=50_427,
+        why=(
+            "Fixed upstream Sapiens2 pose and dense-prediction parity image. "
+            "Its source URL and SHA-256 are pinned beside the numerical fixtures."
+        ),
+    ),
+    Rule(
+        pattern="tests/fixtures/sapiens2/person.png",
+        max_bytes=766_288,
+        why=(
+            "Lossless canonical RGB input for Sapiens2 numerical parity. It is "
+            "the Pillow-decoded form of the pinned JPEG and removes JPEG decoder "
+            "rounding differences from cross-runtime comparisons."
+        ),
+    ),
+    Rule(
+        pattern="tests/fixtures/sapiens2/seg-bf16.png",
+        max_bytes=8_481,
+        why="Pinned Sapiens2 BF16 segmentation reference with provenance beside the fixture.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sapiens2/seg-a7d-rocm-bf16.png",
+        max_bytes=8_487,
+        why="Pinned Sapiens2 BF16 segmentation reference with provenance beside the fixture.",
+    ),
+    Rule(
+        pattern="tests/fixtures/sapiens2/seg-rocm-bf16.png",
+        max_bytes=8_510,
+        why="Pinned Sapiens2 BF16 segmentation reference with provenance beside the fixture.",
+    ),
     Rule(
         pattern="tests/fixtures/*.png",
         max_bytes=32 * 1024,
@@ -107,6 +521,16 @@ DECLARED = (
             "and CSVs carry the numbers, and the archive is there to audit a "
             "run. Keep each under 32 KB compressed; larger log sets belong "
             "outside the repository."
+        ),
+    ),
+    Rule(
+        pattern="docs/benchmark_results/data/*.7z",
+        max_bytes=32 * 1024,
+        why=(
+            "Evidence from a failed acceptance attempt whose report keeps the "
+            "conclusions in plain text. One archive per attempt replaces hundreds "
+            "of loose files nobody reads in review, following the archived-log "
+            "precedent of #2267. Same 32 KB ceiling as the tarballs above."
         ),
     ),
 )

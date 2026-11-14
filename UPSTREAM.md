@@ -40,6 +40,15 @@ five topics) that rs-mlxcel#1 built and measured.
 
 Nothing here is posted to `lablup/mlxcel` before the quantbench + agentbench soak (ADR-0008).
 
+## Merge of upstream v0.8.1 (2026-11-14)
+
+`local` now contains upstream `v0.8.1` (2026-11-03; 239 commits past the earlier base `99967257`) by a merge commit (branch `merge/upstream-v0.8.1`; history kept, no force-push, no tag cut). The MLX pin moves from `243bdf09` to `7ca40033` and the root package version from `0.7.0` to `0.8.1` (the port stamp `+local<NN>` applies on top). Of the two carried topics:
+
+- `topic/no-batch-500` is still needed: v0.8.1 `src/server/batch/scheduler/config.rs:89` still computes `pool_capacity = max_batch_size + max_queue_depth`, which wraps with `--no-batch`. It merged without conflict.
+- `topic/tool-minicpm5`: the parser (`minicpm5.rs`) merged as is except one new field (`ParsedToolCall.id`, set to `None`). The streaming hooks were re-applied onto upstream's reworked `StreamFilter` (held trailing whitespace, Harmony state, `with_answer_wrapper`): the call scanner is entered from `drain_into`, a finished call sets `hold_ws_after_call` and a whitespace `leading_trim` like any other tool call. Three stream tests changed expectation because upstream now holds trailing whitespace and drops it at the end of the stream (#2464): a space before a held partial opener, before a call at the end of the text, and a final no-break space no longer stream.
+
+Conflicts elsewhere were textual (`.with_minicpm5_calls(..)` chained after `.with_answer_wrapper(..)` on four routes, `mod` lines, comments, CHANGELOG). Four earlier topics are in v0.8.1 itself (see the table above). `cargo test -p mlxcel --lib tool_calls` passes (572 tests); see the PR for the wider run.
+
 ## Tags
 
 | Tag | Commit | Contents | Checked |

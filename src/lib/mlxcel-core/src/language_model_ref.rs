@@ -48,6 +48,10 @@ impl<M: LanguageModel + ?Sized> LanguageModel for &M {
         (**self).kv_cache_layer_modes()
     }
 
+    fn kv_cache_storage_modes(&self) -> Option<Vec<Option<KVCacheMode>>> {
+        (**self).kv_cache_storage_modes()
+    }
+
     fn num_layers(&self) -> usize {
         (**self).num_layers()
     }
@@ -112,6 +116,10 @@ impl<M: LanguageModel + ?Sized> LanguageModel for &M {
         (**self).supports_decode_lookahead_rewind()
     }
 
+    fn kv_cache_captures_sequence_state(&self) -> bool {
+        (**self).kv_cache_captures_sequence_state()
+    }
+
     fn rewind_decode_appends(&self, seq_id: SequenceId, n: i32) -> Result<(), String> {
         (**self).rewind_decode_appends(seq_id, n)
     }
@@ -126,6 +134,10 @@ impl<M: LanguageModel + ?Sized> LanguageModel for &M {
 
     fn prepare_sequence_state(&self, seq_id: SequenceId) {
         (**self).prepare_sequence_state(seq_id)
+    }
+
+    fn try_prepare_sequence_state(&self, seq_id: SequenceId) -> Result<(), String> {
+        (**self).try_prepare_sequence_state(seq_id)
     }
 
     fn release_sequence_state_by_id(&self, seq_id: SequenceId) {
@@ -203,6 +215,16 @@ impl<M: LanguageModel + ?Sized> LanguageModel for &M {
         (**self).forward_with_sequence_id(input_ids, seq_id, caches, mask)
     }
 
+    fn try_forward_with_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        seq_id: Option<SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> Result<UniquePtr<MlxArray>, String> {
+        (**self).try_forward_with_sequence_id(input_ids, seq_id, caches, mask)
+    }
+
     fn forward_last_logits_with_sequence_id(
         &self,
         input_ids: &MlxArray,
@@ -212,6 +234,17 @@ impl<M: LanguageModel + ?Sized> LanguageModel for &M {
         last_pos: usize,
     ) -> UniquePtr<MlxArray> {
         (**self).forward_last_logits_with_sequence_id(input_ids, seq_id, caches, mask, last_pos)
+    }
+
+    fn try_forward_last_logits_with_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        seq_id: Option<SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+        last_pos: usize,
+    ) -> Result<UniquePtr<MlxArray>, String> {
+        (**self).try_forward_last_logits_with_sequence_id(input_ids, seq_id, caches, mask, last_pos)
     }
 
     fn forward_with_embeddings_and_sequence_id(
@@ -268,6 +301,16 @@ impl<M: LanguageModel + ?Sized> LanguageModel for &M {
         (**self).forward_batched_with_ids(input_ids, seq_ids, batch_caches, mask)
     }
 
+    fn try_forward_batched_with_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> Result<UniquePtr<MlxArray>, String> {
+        (**self).try_forward_batched_with_ids(input_ids, seq_ids, batch_caches, mask)
+    }
+
     fn forward_batched(
         &self,
         input_ids: &MlxArray,
@@ -319,21 +362,42 @@ mod tests {
         fn output_suppressed_token_ids(&self) -> Vec<i32> {
             vec![9]
         }
+
+        fn try_prepare_sequence_state(&self, seq_id: SequenceId) -> Result<(), String> {
+            Err(format!("refused {seq_id}"))
+        }
+
+        fn try_forward_with_sequence_id(
+            &self,
+            _input_ids: &MlxArray,
+            _seq_id: Option<SequenceId>,
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+        ) -> Result<UniquePtr<MlxArray>, String> {
+            Err("forward refused".to_string())
+        }
     }
 
-    fn through_ref<M: LanguageModel>(model: M) -> (usize, bool, bool, Vec<i32>) {
+    fn through_ref<M: LanguageModel>(model: M) -> (usize, bool, bool, Vec<i32>, bool, bool) {
+        let input = crate::ffi::zeros(&[1, 1], crate::dtype::FLOAT32);
         (
             model.num_layers(),
             model.supports_batching(),
             model.supports_paged_decode_backend(),
             model.output_suppressed_token_ids(),
+            model
+                .try_prepare_sequence_state(SequenceId::from_raw(1))
+                .is_err(),
+            model
+                .try_forward_with_sequence_id(&input, None, &mut [], None)
+                .is_err(),
         )
     }
 
     #[test]
     fn reference_forwards_overridden_provided_methods() {
         let model = Overrides;
-        assert_eq!(through_ref(&model), (7, false, true, vec![9]));
+        assert_eq!(through_ref(&model), (7, false, true, vec![9], true, true));
         assert_eq!(
             <&Overrides as LanguageModel>::sequence_state_layout(&&model),
             model.sequence_state_layout()

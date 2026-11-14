@@ -17,7 +17,7 @@
 //! This module keeps the user-facing `generate` flow readable by separating
 //! prompt preparation, generation-mode selection, and terminal output helpers.
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 #[cfg(feature = "xla-backend")]
 use std::io::Read;
 use std::io::{self, IsTerminal, Write as IoWrite};
@@ -36,7 +36,8 @@ use mlxcel::{
     downloader::resolve_model_source_with_override,
     initialize_runtime_checked,
     memory_estimate::{
-        MemoryEstimate, QuantHint, estimate_total_memory, format_bytes, format_estimate,
+        GENERATE_PREFLIGHT_REMEDIATION, MemoryEstimate, QuantHint, enforce_preflight,
+        estimate_total_memory, format_bytes, format_estimate,
     },
     quant_advisor::{advise_quantization, print_quant_advice},
     sampling::{ResolvedSamplingParams, build_sampling_config},
@@ -60,7 +61,11 @@ use mlxcel_core::sampling_token_bias::compose_token_bias;
 use mlxcel::cli::speculative_args::resolve_draft_block_size_for_target;
 use mlxcel::cli::turbo_args::{resolve_and_announce_kv_cache_mode, resolve_kv_cache_mode};
 use mlxcel::models::drafter_loader::load_drafter;
-use mlxcel_core::drafter::{DrafterKind, resolve_drafter_kind};
+use mlxcel_core::drafter::{
+    DrafterKind, auto_detected_full_model_dir, checkpoint_vocab_size, drafter_config_problem,
+    full_model_vocab_problem, resolve_drafter_kind,
+};
+use mlxcel_core::speculative::full_model_drafter::{DraftModelState, FullModelDrafter};
 
 use super::generate_vlm;
 use crate::GenerateArgs;
@@ -202,8 +207,19 @@ fn load_generation_model(
     // definition of "active", but the number is always whatever MLX
     // itself will compare against `memory_limit()` next.
     let snap = mlxcel_core::memory::snapshot();
+    // On Windows ROCm the allocator also holds pinned host copies of the GPU
+    // buffers the CPU touched (issue #2643); they come from host RAM, not from
+    // the device memory `resident` counts, so they are shown beside it.
+    let host_shadows = if snap.host_shadow_bytes > 0 {
+        format!(
+            ", host shadows: {:.1} MB",
+            snap.host_shadow_bytes as f64 / (1024.0 * 1024.0)
+        )
+    } else {
+        String::new()
+    };
     println!(
-        "Model loaded in {:.3}s (resident: {:.2} GB, peak: {:.2} GB).",
+        "Model loaded in {:.3}s (resident: {:.2} GB, peak: {:.2} GB{host_shadows}).",
         load_elapsed.as_secs_f64(),
         snap.active_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         snap.peak_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -213,6 +229,7 @@ fn load_generation_model(
         peak_bytes = snap.peak_bytes,
         cache_bytes = snap.cache_bytes,
         limit_bytes = snap.limit_bytes,
+        host_shadow_bytes = snap.host_shadow_bytes,
         load_seconds = load_elapsed.as_secs_f64(),
         "Model resident after load",
     );
@@ -378,24 +395,11 @@ fn run_memory_preflight(
     let banner = format_estimate(&args.model.model, &estimate);
     println!("{banner}");
 
-    if !estimate.fits {
-        if args.generation.force_memory {
-            eprintln!(
-                "WARNING: --estimate-memory preflight says this load is over budget by {}. \
-                 Continuing because --force was set.",
-                format_bytes(estimate.overflow_bytes()),
-            );
-        } else {
-            return Err(anyhow::anyhow!(
-                "--estimate-memory: total {} exceeds available {} by {}. \
-                 Pass --force (or --no-memory-check) to override, or rerun with \
-                 a smaller --max-tokens / a smaller model.",
-                format_bytes(estimate.total_bytes),
-                format_bytes(estimate.available_bytes),
-                format_bytes(estimate.overflow_bytes()),
-            ));
-        }
-    }
+    enforce_preflight(
+        &estimate,
+        args.generation.force_memory,
+        GENERATE_PREFLIGHT_REMEDIATION,
+    )?;
 
     Ok(Some(estimate))
 }
@@ -410,6 +414,10 @@ fn validate_pipeline_parallel_args(args: &GenerateArgs) -> Result<()> {
         pp.pp_micro_batch_size > 0,
         "--pp-micro-batch-size must be greater than 0"
     );
+    // Pipeline parallelism is off: nothing to validate here. This includes
+    // TP-only runs (`--tp-size > 1` with the default `--pp-size 1`), which are
+    // a supported, shipped path and are dispatched on `tp_size` elsewhere.
+    // Past this point `pp_layers.is_some() || pp_size >= 2` always holds.
     if pp.pp_layers.is_none() && pp.pp_size <= 1 {
         return Ok(());
     }
@@ -424,19 +432,14 @@ fn validate_pipeline_parallel_args(args: &GenerateArgs) -> Result<()> {
     // and does not write up the 2D composition yet.
     let tp_size = args.tensor_parallel.tp_size;
     if tp_size > 1 {
+        // Soft guard against an inconsistent topology. It is reachable only
+        // with `--pp-size 0` plus an explicit `--pp-layers` spec (which gets
+        // past the early return) alongside `--tp-size > 1`. The full
+        // `pp_size * tp_size == nodes` check is performed at the cluster-TOML
+        // validator layer for remote topologies; here we only guard the local
+        // single-process 2D case.
         ensure!(
-            pp.pp_size >= 2 || pp.pp_layers.is_some(),
-            "2D parallelism requires --pp-size >= 2 (or an explicit --pp-layers spec) \
-             alongside --tp-size > 1"
-        );
-        // Soft guard against obvious topology mistakes. A negative-like sanity
-        // check here surfaces a clear error instead of a cryptic routing or
-        // sharding failure later on. The full `pp_size * tp_size == nodes`
-        // check is performed at the cluster-TOML validator layer for remote
-        // topologies; here we only guard the local single-process 2D case.
-        let total_ranks = (pp.pp_size as u64).saturating_mul(tp_size as u64);
-        ensure!(
-            total_ranks > 0,
+            pp.pp_size > 0,
             "inconsistent 2D topology: pp_size={} tp_size={}",
             pp.pp_size,
             tp_size
@@ -460,11 +463,6 @@ fn validate_pipeline_parallel_args(args: &GenerateArgs) -> Result<()> {
         ensure!(
             !spec.trim().is_empty(),
             "--pp-layers must not be empty when provided"
-        );
-    } else {
-        ensure!(
-            pp.pp_size >= 2,
-            "--pp-size must be at least 2 to enable pipeline parallelism"
         );
     }
     Ok(())
@@ -946,7 +944,8 @@ fn cli_video_content_part_count(model_path: &Path, num_videos: usize) -> usize {
             | mlxcel::models::ModelType::Qwen3VL
             | mlxcel::models::ModelType::Qwen3VLMoe
             | mlxcel::models::ModelType::Qwen35VLM
-            | mlxcel::models::ModelType::Qwen35MoeVLM,
+            | mlxcel::models::ModelType::Qwen35MoeVLM
+            | mlxcel::models::ModelType::Qwen4ExpVLM,
         ) => num_videos,
         _ => 0,
     }
@@ -1768,7 +1767,7 @@ fn generate_xla(
 // Takes a concrete `&LoadedModel` (rather than a generic `M: LanguageModel`)
 // so the `--draft-kind mtp` branch can match the target's family and select the
 // matching per-target `MtpTarget` adapter (issue #166). Every inner call
-// (`generate_standard`, `generate_with_embeddings`, `SpeculativeGenerator::generate`)
+// (`generate_standard`, `generate_with_embeddings`)
 // stays generic over `LanguageModel`; `LoadedModel` implements that trait, so
 // the monomorphized code for the non-MTP paths is identical to the prior generic
 // form. The sole caller already passes `&LoadedModel`.
@@ -1807,23 +1806,26 @@ pub(super) fn run_generation_mode(
             token_bias,
         )?
     } else if let Some(ref draft_model_path) = args.model.draft_model {
-        // resolve the effective DrafterKind from
-        // (a) the explicit `--draft-kind` CLI flag, OR
-        // (b) the drafter's `config.json::model_type` auto-detection.
-        //
-        // When `--draft-kind` is unset AND the auto-detect maps to the
-        // default DFlash kind (no `model_type` or unknown `model_type`),
-        // we keep the classic `SpeculativeGenerator` path so all the
-        // existing offline speculative-decoding workflows continue to
-        // function bit-exactly. An explicit `--draft-kind` (or an
-        // auto-detected MTP shape) routes through the kind-specific
-        // generator path.
+        // Resolve the DrafterKind from the explicit `--draft-kind` flag or the
+        // drafter's `config.json::model_type`, then pick the round loop. A
+        // drafter with no offline round loop on this target stops here, before
+        // the block-size peek and before any drafter load.
         let explicit_kind = args
             .speculative
             .parse_kind()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let resolved_kind = resolve_drafter_kind(draft_model_path, explicit_kind)
             .map_err(|e| anyhow::anyhow!("--draft-kind / drafter config: {e}"))?;
+        let route = resolve_offline_draft_route(
+            draft_model_path,
+            explicit_kind,
+            resolved_kind,
+            super::generate_dflash::offline_dflash_target_supported(model),
+        )?;
+        let resolved_kind = match route {
+            OfflineDraftRoute::FullModel => DrafterKind::FullModel,
+            OfflineDraftRoute::Mtp | OfflineDraftRoute::Dflash => resolved_kind,
+        };
         // Keyed on the TARGET checkpoint's quantization as well as the
         // drafter, because the verify block runs through the target's
         // quantized projections; see `mlxcel::cli::draft_block_policy`
@@ -1843,191 +1845,66 @@ pub(super) fn run_generation_mode(
             resolved_block_size.describe()
         );
         let block_size = resolved_block_size.width;
-        let user_requested_explicit_kind = explicit_kind.is_some();
 
-        // issue #166 / #1165: when the resolved kind is MTP (explicit
-        // `--draft-kind mtp`, or auto-detected from an MTP `model_type`),
-        // drive the kind-specific `MtpGenerator` round loop here, reusing the
-        // SAME per-target `MtpTarget` adapters the server burst path uses
-        // (`src/models/gemma4_mtp_target.rs`, `src/models/qwen3_5_mtp_target.rs`).
-        // This runs BEFORE `load_model(draft_model_path)` because an MTP
-        // drafter is loaded as a `Drafter` (via `load_drafter`), not as a full
-        // `LoadedModel`. DFlash / InternalMtp explicit kinds and the
-        // auto-detect classic path are untouched and fall through below.
-        if should_route_offline_mtp(user_requested_explicit_kind, resolved_kind) {
-            if vlm_embeddings.is_some() {
-                return Err(anyhow!(
-                    "--draft-kind mtp does not support multimodal (image / audio / \
-                     video) input in the offline `mlxcel generate` path; rerun with \
-                     a text-only prompt, or omit --draft-model for multimodal \
-                     generation"
-                ));
+        match route {
+            // issue #166 / #1165: the kind-specific `MtpGenerator` round loop,
+            // reusing the per-target `MtpTarget` adapters the server burst path
+            // uses (`src/models/gemma4_mtp_target.rs`,
+            // `src/models/qwen3_5_mtp_target.rs`).
+            OfflineDraftRoute::Mtp => {
+                if vlm_embeddings.is_some() {
+                    return Err(anyhow!(
+                        "--draft-kind mtp does not support multimodal (image / audio / \
+                         video) input in the offline `mlxcel generate` path; rerun with \
+                         a text-only prompt, or omit --draft-model for multimodal \
+                         generation"
+                    ));
+                }
+                return run_offline_mtp(
+                    model,
+                    draft_model_path,
+                    prompt_tokens,
+                    args.generation.max_tokens,
+                    sampling_config,
+                    block_size as usize,
+                    kv_cache_mode,
+                    token_bias,
+                );
             }
-            return run_offline_mtp(
+            // issue #1351: a DFlash drafter paired with a target that has an
+            // offline DFlash arm (Laguna), explicit or auto-detected alike.
+            OfflineDraftRoute::Dflash => {
+                if vlm_embeddings.is_some() {
+                    return Err(anyhow!(
+                        "--draft-kind dflash does not support multimodal input in the offline \
+                         `mlxcel generate` path; rerun with a text-only prompt, or omit \
+                         --draft-model"
+                    ));
+                }
+                return super::generate_dflash::run_offline_dflash(
+                    model,
+                    draft_model_path,
+                    prompt_tokens,
+                    args.generation.max_tokens,
+                    sampling_config,
+                    block_size as usize,
+                    token_bias,
+                );
+            }
+            // #2757: an ordinary full model drafting on the engine's
+            // token-only round loop, the loop `--prompt-lookup` runs.
+            OfflineDraftRoute::FullModel => run_offline_full_model(
                 model,
                 draft_model_path,
+                args,
                 prompt_tokens,
-                args.generation.max_tokens,
                 sampling_config,
+                vlm_embeddings.is_some(),
                 block_size as usize,
                 kv_cache_mode,
                 token_bias,
-            );
+            )?,
         }
-
-        // issue #1351: a DFlash drafter paired with a target that has an
-        // offline DFlash arm (Laguna) runs the `DFlashGenerator` round loop
-        // here, explicit `--draft-kind dflash` or auto-detected alike (a
-        // DFlash drafter directory cannot take the classic path in any case).
-        if resolved_kind == DrafterKind::Dflash
-            && super::generate_dflash::offline_dflash_target_supported(model)
-            && mlxcel_core::drafter::dflash::is_dflash_drafter_dir(draft_model_path)
-        {
-            if vlm_embeddings.is_some() {
-                return Err(anyhow!(
-                    "--draft-kind dflash does not support multimodal input in the offline \
-                     `mlxcel generate` path; rerun with a text-only prompt, or omit \
-                     --draft-model"
-                ));
-            }
-            return super::generate_dflash::run_offline_dflash(
-                model,
-                draft_model_path,
-                prompt_tokens,
-                args.generation.max_tokens,
-                sampling_config,
-                block_size as usize,
-                token_bias,
-            );
-        }
-
-        // The classic `SpeculativeGenerator` below needs a full `LoadedModel`
-        // for the drafter, which a DFlash checkpoint is not. Reject it here,
-        // before the load prints a "Loading draft model" line it cannot honor
-        // (#1168).
-        reject_dflash_drafter_offline(draft_model_path)?;
-
-        println!("Loading draft model from {:?}...", draft_model_path);
-        let (draft_model, _draft_tokenizer) = select_backend().load_model(draft_model_path)?;
-        println!("Draft model loaded.");
-        // This line reports what the drafter's `config.json` *auto-detected*,
-        // which is not the same thing as the path this command will run. With
-        // no explicit `--draft-kind`, an auto-detected `dflash` still falls
-        // through to the classic `SpeculativeGenerator` below. Printing only
-        // the detected kind made a benchmark run indistinguishable from a
-        // DFlash round-loop run, so the path actually taken is now printed too.
-        println!(
-            "Resolved drafter kind: {} (block_size = {block_size}{})",
-            resolved_kind,
-            if args.speculative.draft_block_size.is_some() {
-                ", explicit"
-            } else {
-                ", default"
-            },
-        );
-        if !user_requested_explicit_kind {
-            println!(
-                "Drafter kind was auto-detected only; running the classic \
-                 SpeculativeGenerator path (pass --draft-kind explicitly to select a \
-                 kind-specific round loop)."
-            );
-        }
-
-        // MTP is handled above (issue #166). The remaining explicit kinds
-        // (DFlash, InternalMtp) still need their kind-specific round loops and
-        // per-target `SpeculativeTarget` impls wired into this offline path, so
-        // surface a clear, actionable error that names the responsible follow-up
-        // rather than silently falling back to the classic path (which would
-        // miss the perf the operator asked for). When `--draft-kind` was unset
-        // (auto-detect resolved to a kind), we instead log an info line and keep
-        // the classic path so the default `--draft-model some/dflash-drafter`
-        // workflow remains backward-compatible.
-        if user_requested_explicit_kind {
-            return Err(anyhow!(
-                "--draft-kind {kind} is plumbed end-to-end but \
-                 the offline `mlxcel generate` path does not yet construct the \
-                 kind-specific `{generator}` round loop on this target model. \
-                 The runtime wiring lands in {tracker}. For now, omit \
-                 `--draft-kind` to use the classic SpeculativeGenerator with \
-                 your `--draft-model` drafter.",
-                kind = resolved_kind,
-                generator = match resolved_kind {
-                    DrafterKind::Mtp => "MtpGenerator",
-                    DrafterKind::Dflash => "DFlashGenerator",
-                    DrafterKind::InternalMtp => "InternalMtpGenerator",
-                    // `DrafterKind` is `#[non_exhaustive]`; future variants
-                    // land in follow-up epics and surface a generic name
-                    // until they get their own tracker hint.
-                    _ => "speculative round loop",
-                },
-                tracker = match resolved_kind {
-                    DrafterKind::Mtp =>
-                        "the MtpGenerator round loop and the per-target MtpTarget impls",
-                    DrafterKind::Dflash =>
-                        "the DFlashGenerator round loop and the per-target SpeculativeTarget impls",
-                    DrafterKind::InternalMtp => "follow-up sub-issues",
-                    _ => "follow-up speculative-decoding sub-issues",
-                },
-            ));
-        }
-        // Auto-detect resolved a kind but the operator didn't explicitly
-        // request it. Log the resolution for diagnostic purposes and
-        // fall through to the classic SpeculativeGenerator so the
-        // historical `--draft-model <path>` workflow remains
-        // bit-exactly the same as before this change.
-        tracing::info!(
-            drafter = %draft_model_path.display(),
-            resolved_kind = %resolved_kind,
-            block_size = block_size,
-            "Auto-detected drafter kind; using classic SpeculativeGenerator path \
-             (pass --draft-kind explicitly once the {} round loop is wired for this target)",
-            resolved_kind,
-        );
-
-        // Deprecated since #2176: the classic draft-model loop is the last
-        // decode loop outside the engine. It is removed in the next minor
-        // release (see CHANGELOG, Unreleased); the engine-side speculative
-        // paths are `--draft-kind mtp`, `--draft-kind dflash` and
-        // `--prompt-lookup`.
-        eprintln!(
-            "WARNING: the classic draft-model speculative path (--draft-model without \
-             --draft-kind mtp or dflash) is deprecated and will be removed in the next minor \
-             release; use --draft-kind mtp or --draft-kind dflash with a matching drafter, or \
-             --prompt-lookup for drafter-free speculation."
-        );
-        tracing::warn!(
-            drafter = %draft_model_path.display(),
-            "classic SpeculativeGenerator path is deprecated (#2176)"
-        );
-        let draft_num_layers = draft_model.num_layers();
-        let main_num_layers = model.num_layers();
-        // Axis B (B8): speculative decoding must apply the bias on the target
-        // (main) model only: see `SpeculativeGenerator::with_token_bias` and
-        // `draft_sampling` for the acceptance-rate rationale.
-        // The deprecated loop's one call site, behind the notice above.
-        #[allow(deprecated)]
-        let mut spec_generator =
-            mlxcel::SpeculativeGenerator::new(main_num_layers, draft_num_layers)
-                .with_token_bias(token_bias);
-
-        let result = spec_generator.generate(
-            model,
-            &draft_model,
-            prompt_tokens,
-            args.generation.max_tokens,
-            args.model.num_draft_tokens,
-            sampling_config,
-        );
-
-        // The CLI installs no tracing subscriber, so the info-level acceptance
-        // instrumentation inside `SpeculativeGenerator` never reaches a
-        // terminal. Print the summary on stdout unconditionally: it names the
-        // acceptance rule that actually ran and the mean accepted draft length,
-        // which are the two facts an acceptance-rate A/B has to be able to
-        // state about itself.
-        println!("{}", spec_generator.acceptance_stats().summary_line());
-
-        result
     } else if let Some(embeddings) = vlm_embeddings {
         generate_with_embeddings(
             model,
@@ -2147,72 +2024,167 @@ fn run_prompt_lookup(
 
 /// Routing gate for the offline MTP speculative path (issue #166).
 ///
-/// Returns `true` only when the operator explicitly passed `--draft-kind mtp`
-/// (an auto-detected MTP shape with no explicit flag keeps the classic
-/// `SpeculativeGenerator` path for backward compatibility, matching the prior
-/// behavior). DFlash / InternalMtp explicit kinds return `false` and fall
-/// through to the deferred-error branch. Extracted as a pure function so the
-/// loop-construction decision is unit-testable without loading a model.
-fn should_route_offline_mtp(
-    _user_requested_explicit_kind: bool,
-    resolved_kind: DrafterKind,
-) -> bool {
-    // Route on the RESOLVED kind, explicit or auto-detected (#1165
-    // acceptance: a `qwen3_5_mtp` drafter auto-resolves to MTP with no
-    // `--draft-kind`). Auto-detect only resolves to `Mtp` for a genuinely
-    // MTP `model_type` (`gemma4_assistant`, `gemma4_unified_assistant`,
-    // `qwen3_5_mtp`), none of which can load as a standalone model, so the
-    // classic fall-through those drafters used to hit was always a
-    // downstream load error, never a working path. Unknown model_types
-    // still auto-resolve to the DFlash default and keep the classic
-    // SpeculativeGenerator (the small-full-model-as-drafter workflow).
+/// Routes on the RESOLVED kind, explicit or auto-detected (#1165 acceptance: a
+/// `qwen3_5_mtp` drafter auto-resolves to MTP with no `--draft-kind`). Extracted
+/// as a pure function so the loop-construction decision is unit-testable
+/// without loading a model.
+fn should_route_offline_mtp(resolved_kind: DrafterKind) -> bool {
     resolved_kind == DrafterKind::Mtp
 }
 
-/// Reject a DFlash speculative drafter before the offline path tries to load
-/// it as a full standalone model (#1168).
+/// The offline round loop a `--draft-model` run takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OfflineDraftRoute {
+    Mtp,
+    Dflash,
+    /// An ordinary full model on the engine's token-only round loop (#2757).
+    FullModel,
+}
+
+/// Pick the offline round loop for `--draft-model`, or refuse the pair.
 ///
-/// The offline `--draft-model` path has always called `load_model` on the
-/// drafter directory, because the classic `SpeculativeGenerator` it falls
-/// through to drives a full `LoadedModel`. A DFlash checkpoint is not one: it
-/// ships no `embed_tokens` and no `lm_head`, and its tensors carry no `model.`
-/// prefix. It nevertheless declares `"model_type": "qwen3"`, so it used to be
-/// classified as an ordinary Qwen 3 model and die on
-/// `Weight not found: model.embed_tokens.weight`, naming a tensor instead of
-/// the problem. The same pair works on `mlxcel-server`, which routes the
-/// drafter through `load_drafter` and drives the DFlash round loop.
+/// The DFlash arm keys on [`mlxcel_core::drafter::dflash::is_dflash_drafter_dir`],
+/// a **structural** probe of the drafter's `config.json`, as well as on the
+/// resolved kind: `DEFAULT_DRAFTER_KIND` is `Dflash`, so an ordinary full model
+/// also resolves to `Dflash` and only the probe tells the two apart
+/// ([`auto_detected_full_model_dir`], the rule `mlxcel-server` applies too).
+/// An explicit `--draft-kind full-model` is honored on any readable model
+/// directory that is not a DFlash drafter.
 ///
-/// The gate is [`mlxcel_core::drafter::dflash::is_dflash_drafter_dir`], a
-/// **structural** probe of the drafter's `config.json`, not the resolved
-/// [`DrafterKind`]. `DEFAULT_DRAFTER_KIND` is `Dflash`, so every drafter that
-/// is not a Gemma 4 assistant auto-resolves to `Dflash`, including an ordinary
-/// small full model used as a classic drafter. Rejecting on the resolved kind
-/// would break that legitimate, currently-working pairing; rejecting on the
-/// checkpoint's own DFlash markers does not.
-///
-/// Called after the explicit `--draft-kind mtp` gate, which is a different
-/// request with its own targeted errors, and before `load_model`. Everything
-/// that reaches `load_model` here (no `--draft-kind`, or an explicit
-/// `--draft-kind dflash`) passes through this check.
-fn reject_dflash_drafter_offline(draft_model_path: &Path) -> Result<()> {
-    if !mlxcel_core::drafter::dflash::is_dflash_drafter_dir(draft_model_path) {
-        return Ok(());
+/// This reads only the drafter's `config.json`, so a refused pair fails before
+/// any drafter load.
+fn resolve_offline_draft_route(
+    draft_model_path: &Path,
+    explicit_kind: Option<DrafterKind>,
+    resolved_kind: DrafterKind,
+    target_has_dflash_arm: bool,
+) -> Result<OfflineDraftRoute> {
+    if should_route_offline_mtp(resolved_kind) {
+        return Ok(OfflineDraftRoute::Mtp);
+    }
+    let is_dflash_dir = mlxcel_core::drafter::dflash::is_dflash_drafter_dir(draft_model_path);
+    if resolved_kind == DrafterKind::Dflash && is_dflash_dir && target_has_dflash_arm {
+        return Ok(OfflineDraftRoute::Dflash);
+    }
+    if auto_detected_full_model_dir(draft_model_path, explicit_kind, resolved_kind) {
+        return Ok(OfflineDraftRoute::FullModel);
+    }
+    let path = draft_model_path.display();
+    let alternatives = "Use a drafter this target has a round loop for with --draft-kind mtp or \
+                        --draft-kind dflash, an ordinary smaller checkpoint that shares the \
+                        target's tokenizer with --draft-kind full-model, or --prompt-lookup for \
+                        speculation without a drafter checkpoint";
+    if is_dflash_dir && resolved_kind == DrafterKind::FullModel {
+        return Err(anyhow!(
+            "--draft-kind full-model: {path} is a DFlash-family drafter checkpoint, not an \
+             ordinary full model. {alternatives}."
+        ));
+    }
+    if is_dflash_dir {
+        // These checkpoints borrow embed_tokens and lm_head from the target when
+        // they bind, and `mlxcel-server` drives the round loop for more targets.
+        return Err(anyhow!(
+            "--draft-model {path} is a DFlash-family drafter and this target has no offline \
+             DFlash round loop. {alternatives}, or run `mlxcel-server` with the same -m target \
+             and --draft-model {path}."
+        ));
+    }
+    // No loader runs after this refusal, so an unreadable config must be reported here.
+    if let Some(problem) = drafter_config_problem(draft_model_path) {
+        return Err(anyhow!("--draft-model {path}: {problem}. {alternatives}."));
+    }
+    if resolved_kind == DrafterKind::FullModel {
+        return Ok(OfflineDraftRoute::FullModel);
+    }
+    Err(anyhow!(
+        "--draft-model {path} is not a DFlash drafter, so --draft-kind {resolved_kind} does not \
+         apply to it. {alternatives}."
+    ))
+}
+
+/// Offline speculative decoding with an ordinary full model as the drafter
+/// (#2757), on the engine's token-only loop with [`FullModelDrafter`]: the
+/// loop `--prompt-lookup` runs, with the drafter's own KV caches rolled back
+/// alongside the target's. Refuses, before the drafter loads, a target whose
+/// state cannot be rewound, a drafter whose vocabulary the target cannot
+/// index, and multimodal prompts; the drafter itself is refused after the
+/// load when its state cannot be rewound (the same rule, #2495). Warms up
+/// as `run_prompt_lookup` does. The returned stats time the whole call,
+/// prefill included, as `generate_standard` does.
+#[allow(clippy::too_many_arguments)]
+fn run_offline_full_model(
+    model: &mlxcel::LoadedModel,
+    draft_model_path: &Path,
+    args: &GenerateArgs,
+    prompt_tokens: &[i32],
+    sampling_config: &SamplingConfig,
+    has_multimodal_input: bool,
+    block_size: usize,
+    kv_cache_mode: KVCacheMode,
+    token_bias: TokenBiasMap,
+) -> Result<(Vec<i32>, GenerationStats)> {
+    ensure!(
+        !has_multimodal_input,
+        "--draft-kind full-model supports text-only prompts; drop --image/--audio/--video"
+    );
+    ensure!(
+        block_size >= 1,
+        "--draft-kind full-model needs --draft-block-size of at least 1"
+    );
+    if let Some(reason) = mlxcel::prompt_lookup_unsupported_reason(model) {
+        anyhow::bail!("--draft-model cannot draft for this target: {reason}");
+    }
+    if let Some(problem) = full_model_vocab_problem(draft_model_path, &args.model.model) {
+        anyhow::bail!("--draft-model {}: {problem}", draft_model_path.display());
     }
 
-    Err(anyhow!(
-        "--draft-model {path} is a DFlash-family speculative drafter (Qwen 3.5 \
-         DFlash, LFM2 DSpark or Muse Glimmer assistant), not a standalone model, and \
-         the offline `mlxcel generate` path does not construct the `DFlashGenerator` \
-         round loop. \
-         Loading it here would route it through the standalone model loader, \
-         which fails on the drafter's missing embed_tokens (these drafters borrow \
-         embed_tokens and lm_head from the target when they bind). To use this \
-         drafter, run `mlxcel-server` with the same -m target and `--draft-model \
-         {path}` (`--draft-kind dflash` is optional; the kind is auto-detected). \
-         For an offline speculative run, pass a small full model as --draft-model \
-         instead, which keeps the classic SpeculativeGenerator path.",
-        path = draft_model_path.display(),
-    ))
+    // Both lines go to stderr: stdout holds the echoed prompt without a
+    // trailing newline at this point, and the reply follows it.
+    eprintln!("Loading full-model drafter from {draft_model_path:?}...");
+    let before = mlxcel_core::memory::snapshot().active_bytes;
+    let load_start = Instant::now();
+    let (draft_model, _draft_tokenizer) = select_backend()
+        .load_model(draft_model_path)
+        .map_err(|err| anyhow!("--draft-model {}: {err}", draft_model_path.display()))?;
+    let after = mlxcel_core::memory::snapshot().active_bytes;
+    eprintln!(
+        "Drafter loaded in {:.2}s (+{:.2} GB resident)",
+        load_start.elapsed().as_secs_f64(),
+        after.saturating_sub(before) as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
+    let mut state = DraftModelState::new(&draft_model)
+        .map_err(|err| anyhow!("--draft-model {}: {err}", draft_model_path.display()))?
+        .with_input_vocab(checkpoint_vocab_size(draft_model_path));
+    let mut drafter = FullModelDrafter::new(&draft_model, &mut state);
+
+    let mut client = raw_completion_client(model, kv_cache_mode, token_bias);
+    let warmup_tokens = args.generation.max_tokens.min(16);
+    let warmup = DirectRequest::text(prompt_tokens, warmup_tokens, sampling_config);
+    client
+        .generate_with_drafter(&warmup, &mut drafter, block_size, |_| true)
+        .map_err(|err| anyhow!("--draft-model warmup failed: {err}"))?;
+    // A reply the drafter gets right at every round uses one verify width;
+    // the timed run would then pay each other width's first-use cost
+    // mid-decode.
+    client
+        .warm_up_verify_widths(prompt_tokens, block_size)
+        .map_err(|err| anyhow!("--draft-model verify-width warmup failed: {err}"))?;
+    let request = DirectRequest::text(prompt_tokens, args.generation.max_tokens, sampling_config);
+    let start_time = Instant::now();
+    let run = client
+        .generate_with_drafter(&request, &mut drafter, block_size, |_| true)
+        .map_err(|err| anyhow!("--draft-model generation failed: {err}"))?;
+    let total_time = start_time.elapsed();
+    let tokens = run.run.tokens;
+    // Diagnostics go to stderr on their own line, as `--prompt-lookup` does.
+    eprintln!();
+    eprintln!("{}", drafter.stats().summary_line(tokens.len()));
+    let stats = if args.generation.profile {
+        run.run.stats
+    } else {
+        generation_stats_from_duration(prompt_tokens.len(), tokens.len(), total_time)
+    };
+    Ok((tokens, stats))
 }
 
 /// Drive a constructed [`mlxcel_core::speculative::mtp::target::MtpTarget`]
@@ -2255,8 +2227,7 @@ where
     );
     // The CLI installs no tracing subscriber, so the acceptance facts an A/B
     // needs (rounds, proposed and accepted draft tokens, the realized tokens
-    // per round including the bonus) are printed here, as the classic
-    // speculative path prints its `acceptance_stats().summary_line()`.
+    // per round including the bonus) are printed here.
     if let Some(acceptance) = generator.last_acceptance() {
         println!("{}", mtp_acceptance_line(&acceptance));
     }
@@ -2449,8 +2420,8 @@ fn run_offline_mtp(
                 "--draft-kind mtp is only supported for Gemma 4 (text, VLM, or \
                  Unified), Qwen 3.5 (text or VLM), Inkling (text or VLM), and \
                  GLM-4.7-Flash (glm4_moe_lite) targets; the loaded target \
-                 is not MTP-capable. Omit --draft-kind to use the classic \
-                 SpeculativeGenerator with your --draft-model drafter."
+                 is not MTP-capable. Use --prompt-lookup for speculation without a \
+                 drafter checkpoint, or omit --draft-model."
             ));
         }
     };
@@ -2686,13 +2657,8 @@ fn chat_options_from_args(args: &GenerateArgs) -> Result<crate::commands::ChatOp
     server.adapter = args.model.adapter.clone();
     if let Some((draft_model, draft_kind)) = repl_drafter(args) {
         server.draft_model = Some(draft_model);
-        server.draft_kind = Some(draft_kind);
+        server.draft_kind = draft_kind;
         server.draft_block_size = args.speculative.draft_block_size;
-    } else if args.model.draft_model.is_some() {
-        eprintln!(
-            "Note: --draft-model is ignored in the chat REPL unless --draft-kind dflash|mtp is \
-             given; classic draft-model decoding runs only with -p."
-        );
     }
     Ok(crate::commands::ChatOptions {
         model: args.model.model.clone(),
@@ -2706,17 +2672,15 @@ fn chat_options_from_args(args: &GenerateArgs) -> Result<crate::commands::ChatOp
     })
 }
 
-/// The drafter the chat REPL hands to the in-process server, if any. On
-/// `generate`, `--draft-model` alone names a classic draft model, which the
-/// server does not run (its classic dispatch decodes plainly), and the REPL
-/// before issue #2173 ignored speculative flags altogether. So the REPL uses
-/// a drafter only when `--draft-kind` explicitly names a server speculative
-/// path (`dflash` or `mtp`); `mlxcel run` passes `--draft-model` as is,
-/// because there it always means a server drafter.
-fn repl_drafter(args: &GenerateArgs) -> Option<(std::path::PathBuf, String)> {
+/// The drafter the chat REPL hands to the in-process server, if any:
+/// `--draft-model` as is, with `--draft-kind` when one was given, exactly as
+/// `mlxcel run` passes them. Until #2757 the REPL took a drafter only under an
+/// explicit `--draft-kind dflash|mtp`, because an ordinary full model had no
+/// server round loop; the server now resolves every kind, auto-detected or
+/// explicit, and refuses what it cannot serve at startup.
+fn repl_drafter(args: &GenerateArgs) -> Option<(std::path::PathBuf, Option<String>)> {
     let draft_model = args.model.draft_model.clone()?;
-    let kind = args.speculative.draft_kind.as_deref()?;
-    matches!(kind, "dflash" | "mtp").then(|| (draft_model, kind.to_string()))
+    Some((draft_model, args.speculative.draft_kind.clone()))
 }
 
 pub(crate) fn run_generate(mut args: GenerateArgs) -> Result<()> {
@@ -2802,6 +2766,15 @@ fn run_generate_once(mut args: GenerateArgs) -> Result<()> {
     // before the resolver below can auto-download the checkpoint.
     validate_prompt_lookup_args(&args)?;
 
+    // Native Windows is single-node only (#58). Refused before the model is
+    // resolved, so a repo id is not downloaded only to be turned away.
+    if args.tensor_parallel.tp_size > 1 {
+        mlxcel::distributed::ensure_distributed_supported("--tp-size")?;
+    }
+    if cli_pipeline_requested(&args) {
+        mlxcel::distributed::ensure_distributed_supported("--pp-size / --pp-layers")?;
+    }
+
     // Resolve `-m` into a concrete model directory (epic #92, issue #94)
     // before any consumer reads it. An existing path is used verbatim
     // (byte-identical to the pre-#94 local-path behavior); an `owner/name`
@@ -2816,6 +2789,21 @@ fn run_generate_once(mut args: GenerateArgs) -> Result<()> {
         args.model.models_dir.as_deref(),
         args.model.revision.as_deref(),
     )?;
+    // `--draft-model` takes the same path-or-repo-id shapes as `-m`, resolved
+    // before the drafter kind is sniffed from its directory. `--revision`
+    // belongs to the target and is not applied to it.
+    if let Some(draft) = args.model.draft_model.take() {
+        args.model.draft_model = Some(
+            mlxcel::downloader::resolve_draft_model_source(
+                &draft,
+                mlxcel::downloader::ModelSourceOptions {
+                    models_dir: args.model.models_dir.as_deref(),
+                    ..Default::default()
+                },
+            )
+            .with_context(|| format!("resolving --draft-model {}", draft.display()))?,
+        );
+    }
 
     // Nemotron VoiceChat (issue #1374) is a full-duplex speech model with
     // its own timeline loop: `-p` is its system prompt and the output length
@@ -2833,6 +2821,11 @@ fn run_generate_once(mut args: GenerateArgs) -> Result<()> {
         args.generation.turbo.kv_cache_mode.as_deref(),
     )
     .map_err(|e| anyhow::anyhow!("{}", e))?;
+    mlxcel::cli::turbo_args::log_kv_cache_mode_precedence_notice(
+        args.generation.turbo.cache_type_k.as_deref(),
+        args.generation.turbo.cache_type_v.as_deref(),
+        args.generation.turbo.kv_cache_mode.as_deref(),
+    );
     // issue #1350: substitute the mode this model can actually run before
     // anything reads it. `-m` was resolved to a local directory just above, so
     // the model_type lookup is a plain file read. Everything downstream (the

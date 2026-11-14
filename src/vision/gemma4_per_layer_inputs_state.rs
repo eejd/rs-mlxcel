@@ -102,6 +102,16 @@ impl Gemma4PerLayerInputsState {
         *self.fallback.borrow_mut() = per_layer_inputs;
     }
 
+    /// Drop whatever the fallback slot holds. The scheduler calls this when a
+    /// request's admission aborts after its media preparation wrote the slot
+    /// but before a sequence id was bound (issue #2625), so the next request
+    /// cannot inherit the failed request's tensor.
+    ///
+    /// Used by: Gemma4VLModel, Gemma4UnifiedModel
+    pub(crate) fn clear_fallback(&self) {
+        self.fallback.borrow_mut().take();
+    }
+
     /// Move the fallback slot's contents into the per-sequence map under
     /// `seq_id`. Drains the fallback so the next request cannot inherit
     /// the previous row's tensor — this is the burst-enqueue race fix
@@ -130,6 +140,14 @@ impl Gemma4PerLayerInputsState {
     /// accesses without re-entering `RefCell::borrow_mut`.
     pub(crate) fn take_for_sequence(&self, seq_id: SequenceId) -> Option<UniquePtr<MlxArray>> {
         self.sequences.borrow_mut().remove(&seq_id)
+    }
+
+    /// Whether embedding preparation left a per-layer tensor waiting for this
+    /// sequence's prefill. The fallback check covers the short interval before
+    /// the scheduler binds a freshly prepared tensor to its sequence id.
+    /// Native token-only decode must not consume or skip either state.
+    pub(crate) fn has_pending_for_sequence(&self, seq_id: SequenceId) -> bool {
+        self.sequences.borrow().contains_key(&seq_id) || self.fallback.borrow().is_some()
     }
 
     /// Drain the fallback slot. Used by the legacy CLI prefill path

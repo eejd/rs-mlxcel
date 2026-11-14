@@ -29,14 +29,21 @@ API 변경은 생산자 스키마(`docs/webui/api.yaml`), 생성된 선언, 픽�
 
 화면별 동작은 [catalog.ko.md](catalog.ko.md)(모델), [chat.md](chat.md), [activity.md](activity.md), [settings.md](settings.md), [runtime.md](runtime.md)에 있습니다.
 
+## ui-common CLI와 에이전트 지침
+
+`@lablup/ui-common-cli`는 `@lablup/ui-common`과 같은 정확한 버전의 개발 의존성이며, 두 패키지는 함께 올립니다. 컴포넌트를 감싸기 전에 무엇을 제공하는지 확인할 때 씁니다. 저장소 루트에서 `pnpm --dir webui run ui-common component <Name>`, `... search "<찾을 것>"`, `... docs <주제>`를 실행합니다(`webui/` 안에서는 `pnpm exec ui-common <cmd>`). 템플릿과 테마 스캐폴드는 이 빌드가 쓰지 않는 StyleX 컴파일러를 전제하므로 참고용으로만 씁니다.
+
+`webui/AGENTS.md`(이를 가져오기만 하는 `webui/CLAUDE.md`를 통해 에이전트가 읽음)는 `webui/`에만 적용되는 에이전트 지침입니다. `UI-COMMON` 표식 사이의 블록은 생성물입니다. ui-common을 올린 뒤 `webui/` 안에서 `pnpm exec ui-common agents --write AGENTS.md`를 실행하면 블록만 다시 쓰고 그 뒤의 WebUI 전용 PROJECT LINES는 유지합니다. 블록이 오래되면 `pnpm --dir webui run check:agents`가 실패하며, `webui-bundle` CI 작업과 `make verify-webui-frontend`가 이를 실행합니다. 저장소가 추적하는 `AGENTS.md`와 `CLAUDE.md`는 이 두 파일뿐이며, 나머지는 `.gitignore`가 로컬에만 둡니다.
+
 ## 프런트엔드 빌드와 자산 재생성
 
-도구 버전은 정확히 고정되어 있습니다. Node 26.5.1, pnpm 11.18.0입니다. 저장소 루트에서 실행합니다.
+도구 버전은 정확히 고정되어 있습니다. Node 26.5.1, pnpm 12.16.1입니다. 저장소 루트에서 실행합니다.
 
 ```bash
 pnpm --dir webui install --frozen-lockfile
 pnpm --dir webui run typecheck
 pnpm --dir webui run lint
+pnpm --dir webui run check:agents
 pnpm --dir webui run unit
 python3 scripts/webui/build_bundle.py
 make verify-webui-bundle
@@ -61,4 +68,4 @@ Cargo는 `src/webui/assets/`에 커밋된 파일을 임베드할 뿐 Node를 실
 
 ## 라이선스
 
-번들에 들어가는 프런트엔드 런타임 의존성은 `webui/public/third-party-licenses.txt`(번들에 복사됨)에 라이선스 전문을, 최상위 `NOTICE`에 항목을 두어야 합니다. 다른 프로젝트에서 가져와 고친 파일은 `webui/src/design-system/themes/glass.css`처럼 출처를 밝히는 머리 주석을 둡니다. 글꼴 파일, Apple 디자인 키트 자산, SF Symbols, 직접 만들지 않은 아이콘은 추가하지 마세요. WebUI는 시스템 글꼴과 프로젝트에서 만든 SVG 아이콘을 씁니다.
+번들에 들어가는 프런트엔드 런타임 의존성은 `webui/public/third-party-licenses.txt`(번들에 복사됨)에 라이선스 전문을, 최상위 `NOTICE`에 항목을 두어야 합니다. 다른 프로젝트에서 가져와 고친 파일은 `webui/src/design-system/themes/glass.css`처럼 출처를 밝히는 머리 주석을 둡니다. 글꼴 파일, Apple 디자인 키트 자산, SF Symbols, 다른 아이콘 세트는 추가하지 마세요. WebUI는 시스템 글꼴과, Astryx가 자체 컨트롤에 쓰는 것과 같은 lucide-react 아이콘을 씁니다.

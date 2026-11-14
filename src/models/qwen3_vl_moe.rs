@@ -27,17 +27,22 @@
 //! Used by: Qwen3-VL-MoE
 //! Reference: https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/qwen3_vl_moe/language.py
 
-use crate::models::qwen_mrope_state::MRopeState;
+use crate::models::deepstack_state::DeepStackState;
+use crate::models::qwen_mrope_state::{
+    MRopeState, concatenate_scattered, decode_offsets, scatter_group_logits, select_cache_rows,
+    take_rows,
+};
 use crate::models::switch_layers::SwitchGLU;
 use mlxcel_core::cache::SequenceId;
+use mlxcel_core::generate::{BatchedDecodeKind, LanguageModel, route_batched_decode_with_ids};
 use mlxcel_core::layers::{FusedQKVLinear, KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
-use std::cell::RefCell;
 
 // Config.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Qwen3VLMoeConfig {
     pub hidden_size: usize,
     pub num_hidden_layers: usize,
@@ -74,6 +79,8 @@ pub struct Qwen3VLMoeConfig {
     #[serde(default)]
     pub head_dim: Option<usize>,
 }
+
+mlxcel_core::impl_rope_lifting_deserialize!(Qwen3VLMoeConfig);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RopeScaling {
@@ -309,6 +316,66 @@ struct Attention {
     head_dim: i32,
     rope_base: f32,
     scale: f32,
+}
+
+impl mlxcel_core::batched_decode::SplitAttention for Attention {
+    fn split_shape(&self) -> mlxcel_core::batched_decode::SplitAttentionShape {
+        mlxcel_core::batched_decode::SplitAttentionShape {
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            scale: self.scale,
+        }
+    }
+
+    fn qk_norm_heads(
+        &self,
+        q: UniquePtr<MlxArray>,
+        k: UniquePtr<MlxArray>,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        (self.q_norm.forward(&q), self.k_norm.forward(&k))
+    }
+
+    fn rope_batched(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        offsets: &[i32],
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        (
+            mlxcel_core::fast_rope_batched(q, self.head_dim, false, self.rope_base, 1.0, offsets),
+            mlxcel_core::fast_rope_batched(k, self.head_dim, false, self.rope_base, 1.0, offsets),
+        )
+    }
+}
+
+struct Qwen3VLMoeMropeAttention<'a> {
+    attention: &'a Attention,
+    cos: &'a MlxArray,
+    sin: &'a MlxArray,
+}
+
+impl mlxcel_core::batched_decode::SplitAttention for Qwen3VLMoeMropeAttention<'_> {
+    fn split_shape(&self) -> mlxcel_core::batched_decode::SplitAttentionShape {
+        mlxcel_core::batched_decode::SplitAttention::split_shape(self.attention)
+    }
+
+    fn qk_norm_heads(
+        &self,
+        q: UniquePtr<MlxArray>,
+        k: UniquePtr<MlxArray>,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        mlxcel_core::batched_decode::SplitAttention::qk_norm_heads(self.attention, q, k)
+    }
+
+    fn rope_batched(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        _offsets: &[i32],
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        apply_multimodal_rotary_pos_emb(q, k, self.cos, self.sin)
+    }
 }
 
 impl Attention {
@@ -729,6 +796,33 @@ impl DecoderLayer {
         let r = self.mlp.forward(&self.post_attention_layernorm.forward(&h));
         mlxcel_core::add(&h, &r)
     }
+
+    fn forward_batched<A: mlxcel_core::batched_decode::SplitAttention + ?Sized>(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut KVCache],
+        layer_idx: usize,
+        mask: Option<&MlxArray>,
+        attention: &A,
+    ) -> UniquePtr<MlxArray> {
+        let normed = self.input_layernorm.forward(x);
+        let (q, k, v) = self.attn.qkv_proj.forward(&normed);
+        let seq_len = mlxcel_core::array_shape(&q)[1];
+        let metadata = crate::models::batched_decode_cache::uniform_layer_metadata(
+            caches,
+            seq_len,
+            0,
+            "Qwen3VLMoe",
+            layer_idx,
+        );
+        let attention_output = mlxcel_core::batched_decode::forward_split_attention(
+            attention, &q, &k, &v, caches, &metadata, mask,
+        );
+        let attention_output = self.attn.o_proj.forward(&attention_output);
+        let h = mlxcel_core::add(x, &attention_output);
+        let r = self.mlp.forward(&self.post_attention_layernorm.forward(&h));
+        mlxcel_core::add(&h, &r)
+    }
 }
 
 fn load_rms_norm(weights: &WeightMap, prefix: &str, eps: f32) -> Result<RMSNorm, String> {
@@ -751,9 +845,9 @@ pub struct Qwen3VLMoeModel {
     /// in a server batch needs its own delta — the legacy fallback slot
     /// preserves CLI/single-row behavior when no `SequenceId` is plumbed.
     mrope_state: MRopeState,
-    /// DeepStack state: visual position masks and visual embeddings
-    visual_pos_masks: RefCell<Option<UniquePtr<MlxArray>>>,
-    deepstack_visual_embeds: RefCell<Option<Vec<UniquePtr<MlxArray>>>>,
+    /// Per-sequence DeepStack state (visual position masks and per-layer
+    /// visual embeddings), bound alongside the MRoPE entry (#2567).
+    deepstack_state: DeepStackState,
 }
 
 impl Qwen3VLMoeModel {
@@ -788,8 +882,7 @@ impl Qwen3VLMoeModel {
             lm_head,
             _config: config.clone(),
             mrope_state: MRopeState::new(),
-            visual_pos_masks: RefCell::new(None),
-            deepstack_visual_embeds: RefCell::new(None),
+            deepstack_state: DeepStackState::new(),
         })
     }
 
@@ -817,19 +910,22 @@ impl Qwen3VLMoeModel {
         self.mrope_state.clear_fallback();
     }
 
-    /// Drop a server sequence's MRoPE entry so the per-sequence map
-    /// does not grow without bound across requests.
+    /// Drop a server sequence's MRoPE and DeepStack entries so the
+    /// per-sequence maps do not grow without bound across requests.
     pub fn release_mrope_sequence(&self, seq_id: SequenceId) {
         self.mrope_state.release_sequence(seq_id);
+        self.deepstack_state.release_sequence(seq_id);
     }
 
-    /// Move whatever the fallback slot holds into the per-sequence map
-    /// under `seq_id`. Called by the scheduler right after the vision
-    /// wrapper's `get_input_embeddings` has populated the fallback slot,
-    /// so subsequent decode steps for this sequence resolve the MRoPE
-    /// state by id instead of by leaky scalar.
+    /// Move whatever the fallback slots hold (MRoPE and DeepStack) into the
+    /// per-sequence maps under `seq_id`. Called by the scheduler right after
+    /// the vision wrapper's `get_input_embeddings` has populated the fallback
+    /// slots, so this sequence's prefill injects its own DeepStack features
+    /// and its decode steps resolve the MRoPE state by id instead of by leaky
+    /// scalar (#2567).
     pub fn bind_mrope_state_to_sequence(&self, seq_id: SequenceId) {
         self.mrope_state.bind_fallback_to_sequence(seq_id);
+        self.deepstack_state.bind_fallback_to_sequence(seq_id);
     }
 
     /// Remove and return the per-sequence MRoPE entry under `seq_id`
@@ -853,37 +949,48 @@ impl Qwen3VLMoeModel {
         self.mrope_state.bind_for_sequence(seq_id, entry);
     }
 
-    /// Set DeepStack state after vision processing
+    /// Set DeepStack state after vision processing (fallback slot; the
+    /// scheduler binds it to the request's sequence right afterwards).
     pub fn set_deepstack_state(
         &self,
         visual_pos_masks: UniquePtr<MlxArray>,
         deepstack_visual_embeds: Vec<UniquePtr<MlxArray>>,
     ) {
-        *self.visual_pos_masks.borrow_mut() = Some(visual_pos_masks);
-        *self.deepstack_visual_embeds.borrow_mut() = Some(deepstack_visual_embeds);
+        self.deepstack_state
+            .set_fallback(visual_pos_masks, deepstack_visual_embeds);
     }
 
-    /// Clear DeepStack state
+    /// Clear the fallback DeepStack state. Per-sequence entries are released
+    /// with their sequences.
     pub fn clear_deepstack_state(&self) {
-        *self.visual_pos_masks.borrow_mut() = None;
-        *self.deepstack_visual_embeds.borrow_mut() = None;
+        self.deepstack_state.clear_fallback();
     }
 
+    /// Remove and return `seq_id`'s DeepStack entry (scheduler preemption).
+    pub(crate) fn take_deepstack_entry(
+        &self,
+        seq_id: SequenceId,
+    ) -> Option<crate::models::deepstack_state::DeepStackEntry> {
+        self.deepstack_state.take_for_sequence(seq_id)
+    }
+
+    /// Re-install a taken DeepStack entry under a (possibly new) `seq_id`.
+    pub(crate) fn install_deepstack_entry(
+        &self,
+        seq_id: SequenceId,
+        entry: crate::models::deepstack_state::DeepStackEntry,
+    ) {
+        self.deepstack_state.bind_for_sequence(seq_id, entry);
+    }
+
+    /// Whether the row resolved by `seq_id` needs neither MRoPE positions nor
+    /// a DeepStack injection, so plain 1-D RoPE decode is exact for it. Both
+    /// checks read the row's own entry (#2567).
     fn can_use_text_only_fast_path(&self, seq_id: Option<SequenceId>) -> bool {
         let has_mrope_state = self.mrope_state.with_entry(seq_id, |entry| {
             entry.position_ids.is_some() || entry.rope_deltas.unwrap_or(0) != 0
         });
-        if has_mrope_state {
-            return false;
-        }
-
-        let has_visual_mask = self.visual_pos_masks.borrow().is_some();
-        let has_deepstack_embeds = self
-            .deepstack_visual_embeds
-            .borrow()
-            .as_ref()
-            .is_some_and(|embeds| !embeds.is_empty());
-        !has_visual_mask && !has_deepstack_embeds
+        !has_mrope_state && !self.deepstack_state.has_entry(seq_id)
     }
 
     /// DeepStack: add visual features at image positions in hidden states
@@ -992,6 +1099,12 @@ impl Qwen3VLMoeModel {
         let cache_offset = caches[0].offset;
         if input_embeddings.is_none() && cache_offset == 0 {
             self.clear_mrope_state();
+            // Only the fallback slot is cleared: a bound server row reads its
+            // own entry, so another request's DeepStack state stays put
+            // (#2567). On the server the fallback is already drained at
+            // admission; on the CLI, whose raw-completion client forwards
+            // under an unbound id, a fresh text-only prompt ends the previous
+            // image request as before.
             self.clear_deepstack_state();
         }
 
@@ -1079,24 +1192,27 @@ impl Qwen3VLMoeModel {
             None
         };
 
-        // Get deepstack state references
-        let ds_masks = self.visual_pos_masks.borrow();
-        let ds_embeds = self.deepstack_visual_embeds.borrow();
+        // This sequence's DeepStack entry (the fallback for the CLI).
+        self.deepstack_state.with_entry(seq_id, |deepstack| {
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                h = layer.forward(&h, &mut caches[layer_idx], mask, &position_ids);
 
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, &mut caches[layer_idx], mask, &position_ids);
-
-            // DeepStack: inject visual features after this layer
-            if let (Some(masks), Some(embeds)) = (&*ds_masks, &*ds_embeds)
-                && layer_idx < embeds.len()
-                && cache_offset == 0
-            {
-                h = Self::deepstack_process(&h, masks, &embeds[layer_idx]);
+                // DeepStack: inject visual features after this layer
+                if let Some(entry) = deepstack
+                    && layer_idx < entry.embeds.len()
+                    && cache_offset == 0
+                {
+                    h = Self::deepstack_process(
+                        &h,
+                        &entry.visual_pos_masks,
+                        &entry.embeds[layer_idx],
+                    );
+                }
             }
-        }
 
-        h = self.norm.forward(&h);
-        self.lm_head.forward(&h)
+            h = self.norm.forward(&h);
+            self.lm_head.forward(&h)
+        })
     }
 
     fn forward_text_only(
@@ -1179,10 +1295,171 @@ impl Qwen3VLMoeModel {
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }
+
+    /// Native sequence-aware decode. Each row's DeepStack entry is keyed by
+    /// its sequence (#2567); a row that owns one leaves the plain group through
+    /// `can_use_text_only_fast_path`, and decode never injects (offset 0 only).
+    pub(crate) fn forward_batched_decode_with_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        route_batched_decode_with_ids(self, input_ids, seq_ids, batch_caches, |batch_caches| {
+            let shape = mlxcel_core::array_shape(input_ids);
+            let Some(seq_ids) = seq_ids.filter(|ids| ids.len() == batch_caches.len()) else {
+                return crate::multimodal::qwen_vl::forward_batched_with_seq_ids_dispatch(
+                    self,
+                    input_ids,
+                    seq_ids,
+                    batch_caches,
+                    mask,
+                );
+            };
+            if shape.len() != 2 || shape[1] != 1 {
+                return crate::multimodal::qwen_vl::forward_batched_with_seq_ids_dispatch(
+                    self,
+                    input_ids,
+                    Some(seq_ids),
+                    batch_caches,
+                    mask,
+                );
+            }
+
+            let offsets = decode_offsets(batch_caches, "Qwen3VLMoe");
+            let Some(positions) = self.mrope_state.batched_decode_positions(seq_ids, &offsets)
+            else {
+                return crate::multimodal::qwen_vl::forward_batched_with_seq_ids_dispatch(
+                    self,
+                    input_ids,
+                    Some(seq_ids),
+                    batch_caches,
+                    mask,
+                );
+            };
+
+            let mut plain_rows = Vec::new();
+            let mut mrope_rows = Vec::new();
+            for (row, &seq_id) in seq_ids.iter().enumerate() {
+                if self.can_use_text_only_fast_path(Some(seq_id)) {
+                    plain_rows.push(row);
+                } else {
+                    mrope_rows.push(row);
+                }
+            }
+            self.forward_decode_groups(
+                input_ids,
+                seq_ids,
+                batch_caches,
+                mask,
+                &positions,
+                &plain_rows,
+                &mrope_rows,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_decode_groups(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: &[SequenceId],
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+        positions: &MlxArray,
+        plain_rows: &[usize],
+        mrope_rows: &[usize],
+    ) -> UniquePtr<MlxArray> {
+        let mut outputs: Vec<Option<UniquePtr<MlxArray>>> = std::iter::repeat_with(|| None)
+            .take(seq_ids.len())
+            .collect();
+        for (rows, use_mrope) in [(plain_rows, false), (mrope_rows, true)] {
+            if rows.is_empty() {
+                continue;
+            }
+            let logits = if rows.len() == 1 {
+                let row = rows[0];
+                let ids = take_rows(input_ids, rows, 0);
+                let row_mask = mask.map(|value| take_rows(value, rows, 0));
+                self.forward_with_sequence_id(
+                    &ids,
+                    Some(seq_ids[row]),
+                    batch_caches[row],
+                    row_mask.as_deref(),
+                )
+            } else {
+                let ids = take_rows(input_ids, rows, 0);
+                let row_mask = mask.map(|value| take_rows(value, rows, 0));
+                let mut caches = select_cache_rows(batch_caches, rows);
+                let row_positions = use_mrope.then(|| take_rows(positions, rows, 1));
+                self.forward_decode_group(
+                    &ids,
+                    &mut caches,
+                    row_mask.as_deref(),
+                    row_positions.as_deref(),
+                )
+            };
+            scatter_group_logits(&mut outputs, rows, &logits);
+        }
+        concatenate_scattered(outputs, "Qwen3VLMoe")
+    }
+
+    fn forward_decode_group(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+        positions: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let mut h = self.embed_tokens.forward(input_ids);
+        let tables = positions.map(|positions| {
+            self.layers
+                .first()
+                .expect("Qwen3VLMoe native decode requires at least one layer")
+                .attn
+                .mrope
+                .forward(positions)
+        });
+        for layer_idx in 0..self.layers.len() {
+            let mut layer_caches = crate::models::batched_decode_cache::collect_layer_caches(
+                batch_caches,
+                "Qwen3VLMoe",
+                layer_idx,
+            );
+            h = if let Some((cos, sin)) = tables.as_ref() {
+                let attention = Qwen3VLMoeMropeAttention {
+                    attention: &self.layers[layer_idx].attn,
+                    cos,
+                    sin,
+                };
+                self.layers[layer_idx].forward_batched(
+                    &h,
+                    &mut layer_caches,
+                    layer_idx,
+                    mask,
+                    &attention,
+                )
+            } else {
+                self.layers[layer_idx].forward_batched(
+                    &h,
+                    &mut layer_caches,
+                    layer_idx,
+                    mask,
+                    &self.layers[layer_idx].attn,
+                )
+            };
+        }
+        self.lm_head.forward(&self.norm.forward(&h))
+    }
 }
 
 // LanguageModel trait implementation.
 impl mlxcel_core::generate::LanguageModel for Qwen3VLMoeModel {
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
@@ -1221,6 +1498,16 @@ impl mlxcel_core::generate::LanguageModel for Qwen3VLMoeModel {
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         self.forward_for_sequence(input_ids, input_embeddings, caches, mask, seq_id)
+    }
+
+    fn forward_batched_with_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_batched_decode_with_ids(input_ids, seq_ids, batch_caches, mask)
     }
 
     fn release_sequence_state_by_id(&self, seq_id: SequenceId) {
@@ -1280,4 +1567,4 @@ mod deepstack_injection_tests {
 
 #[cfg(test)]
 #[path = "qwen3_vl_moe_tests.rs"]
-mod tests;
+pub(crate) mod tests;

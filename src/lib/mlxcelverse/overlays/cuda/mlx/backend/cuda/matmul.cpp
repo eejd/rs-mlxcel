@@ -2,9 +2,15 @@
 // Modified by mlxcel: Added general GatherMM case using CUTLASS grouped GEMM
 // (copied at b98831ad and merged with upstream 4652b0086 at 9a795735 in #1198).
 // Modified from upstream MLX 9a795735 mlx/backend/cuda/matmul.cpp
+// BlockMaskedMM::eval_gpu taken verbatim from upstream bff10220 (#58): the
+// overlay predated it, so the BlockMaskedMM vtable referenced an undefined
+// symbol. GNU ld dropped the unused vtable; MSVC's link refuses it.
+// MLXCEL_CUDA_DISABLE_GEMV diagnostic switch on the dense gemv dispatch
+// (gemv-vs-cuBLASLt decode A/B).
 
 #include "mlx/backend/common/matmul.h"
 #include "mlx/backend/cuda/device.h"
+#include "mlx/backend/cuda/gemms/block_mask.h"
 #include "mlx/backend/cuda/gemms/cublas_gemm.h"
 #include "mlx/backend/cuda/gemms/gemv.h"
 #include "mlx/backend/cuda/gemms/grouped_gemm.h"
@@ -12,6 +18,7 @@
 #include "mlx/primitives.h"
 
 #include <nvtx3/nvtx3.hpp>
+#include <cstdlib>
 #include <numeric>
 
 namespace mlx::core {
@@ -96,8 +103,18 @@ void gemm_and_bias(
     batch_shape = {1};
   }
 
+  // [mlxcel] MLXCEL_CUDA_DISABLE_GEMV=1 sends M=1 (and N=1) dense matmuls to
+  // cuBLASLt instead of MLX's gemv kernel. Diagnostic A/B switch for the
+  // gemv-vs-cuBLASLt decode measurement; read once so getenv stays off the
+  // per-launch path. gather_mm keeps its own gemv path.
+  static const bool disable_gemv = []() {
+    const char* e = std::getenv("MLXCEL_CUDA_DISABLE_GEMV");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
+
   // Use gemmv when possible
-  if (!bias && cu::can_use_gemv(M, N, K, a_transposed, b_transposed)) {
+  if (!bias && !disable_gemv &&
+      cu::can_use_gemv(M, N, K, a_transposed, b_transposed)) {
     cu::gemv(
         a,
         b,
@@ -156,7 +173,18 @@ void gather_mm_rhs(
         "[gather_mm] Group count can not be larger than 1024.");
   }
 
-  auto [a_transposed, lda, a] = ensure_batch_contiguous(a_, encoder, s);
+  // [mlxcel #2462] This branch only runs for M == 1, so `a` is `[..., 1, K]`
+  // and the grouped GEMM stacks consecutive gathered rows into one problem,
+  // walking them with the batch stride. `ensure_batch_contiguous` returned
+  // `strides(-2)` as that leading dimension, which is the stride of a size-1
+  // axis: MLX ignores it when it flags an array row-contiguous, so it is
+  // whatever the producer left there (1 after a transpose of `[..., K, 1]`),
+  // and every row after the first of a group then read the wrong memory.
+  // Row-contiguous `[..., 1, K]` is K consecutive elements per row by
+  // definition; anything else is copied into that layout.
+  auto a = ensure_row_contiguous(a_, encoder, s);
+  bool a_transposed = false;
+  int64_t lda = a.shape(-1);
   auto [b_transposed, ldb, b] = ensure_batch_contiguous(b_, encoder, s);
   auto indices = ensure_row_contiguous(indices_, encoder, s);
 
@@ -204,6 +232,82 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   gemm_and_bias(
       encoder, M, N, K, a_transposed, lda, b_transposed, ldb, out, a, b);
+}
+
+void BlockMaskedMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+  nvtx3::scoped_range r("BlockMaskedMM::eval_gpu");
+  if (!issubdtype(out.dtype(), floating)) {
+    throw std::runtime_error(
+        "[BlockMaskedMM] Does not yet support non-floating point types.");
+  }
+  auto& s = stream();
+  auto& encoder = cu::get_command_encoder(s);
+
+  auto& a_pre = inputs[0];
+  auto& b_pre = inputs[1];
+
+  // Return 0s if either input is empty.
+  if (a_pre.size() == 0 || b_pre.size() == 0) {
+    array zero(0, a_pre.dtype());
+    encoder.add_temporary(zero);
+    fill_gpu(zero, out, s);
+    return;
+  }
+
+  int M = a_pre.shape(-2);
+  int N = b_pre.shape(-1);
+  int K = a_pre.shape(-1);
+
+  if (M == 0 || N == 0) {
+    return;
+  }
+  if (K == 0) {
+    array zero(0, a_pre.dtype());
+    encoder.add_temporary(zero);
+    fill_gpu(zero, out, s);
+    return;
+  }
+
+  out.set_data(cu::malloc_async(out.nbytes(), encoder));
+
+  bool has_op_mask = inputs.size() > 3;
+  bool has_out_mask = inputs.size() == 3 || inputs.size() == 5;
+
+  int64_t batch_count = out.size() / (int64_t(M) * N);
+
+  bool a_transposed;
+  int64_t lda;
+  array a = a_pre;
+  bool b_transposed;
+  int64_t ldb;
+  array b = b_pre;
+
+  if (has_op_mask) {
+    // Fused copy + mask in a single pass per matrix.
+    auto& lhs_mask = inputs[inputs.size() - 2];
+    auto& rhs_mask = inputs[inputs.size() - 1];
+    a = copy_with_block_mask(
+        encoder, a_pre, lhs_mask, block_size_, M, K, batch_count);
+    b = copy_with_block_mask(
+        encoder, b_pre, rhs_mask, block_size_, K, N, batch_count);
+    a_transposed = false;
+    lda = K;
+    b_transposed = false;
+    ldb = N;
+  } else {
+    std::tie(a_transposed, lda, a) = check_transpose(encoder, s, a_pre);
+    std::tie(b_transposed, ldb, b) = check_transpose(encoder, s, b_pre);
+  }
+
+  // Run GEMM.
+  gemm_and_bias(
+      encoder, M, N, K, a_transposed, lda, b_transposed, ldb, out, a, b);
+
+  // Apply output mask.
+  if (has_out_mask) {
+    auto& out_mask = inputs[2];
+    apply_block_mask(encoder, out, out_mask, block_size_, M, N, batch_count);
+  }
 }
 
 void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {

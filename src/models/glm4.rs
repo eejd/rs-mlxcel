@@ -20,7 +20,7 @@
 //! - 4 RMSNorm layers per block (input, post_self_attn, post_attention, post_mlp)
 //! - RoPE with traditional=true
 
-use mlxcel_core::generate::LanguageModel;
+use mlxcel_core::generate::{BatchedDecodeKind, LanguageModel, route_batched_decode};
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
@@ -29,6 +29,7 @@ use std::path::Path;
 
 // Configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(remote = "Self")]
 pub struct ModelArgs {
     pub model_type: String,
     pub hidden_size: usize,
@@ -54,6 +55,8 @@ pub struct ModelArgs {
     #[serde(default)]
     pub quantization: Option<Quantization>,
 }
+
+mlxcel_core::impl_rope_lifting_deserialize!(ModelArgs);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Quantization {
@@ -213,6 +216,43 @@ impl Attention {
     }
 }
 
+impl mlxcel_core::batched_decode::SplitAttention for Attention {
+    fn split_shape(&self) -> mlxcel_core::batched_decode::SplitAttentionShape {
+        mlxcel_core::batched_decode::SplitAttentionShape {
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            scale: self.scale,
+        }
+    }
+
+    fn rope_batched(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        offsets: &[i32],
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        (
+            mlxcel_core::fast_rope_batched(
+                q,
+                self.rope_dims,
+                self.rope_traditional,
+                self.rope_base,
+                1.0,
+                offsets,
+            ),
+            mlxcel_core::fast_rope_batched(
+                k,
+                self.rope_dims,
+                self.rope_traditional,
+                self.rope_base,
+                1.0,
+                offsets,
+            ),
+        )
+    }
+}
+
 // MLP with Fused gate_up_proj.
 pub struct MLP {
     pub gate_up_proj: UnifiedLinear, // Fused: outputs 2 * intermediate_size
@@ -297,6 +337,39 @@ impl TransformerBlock {
         mlxcel_core::add(&h, &mlp_out)
     }
 
+    pub fn forward_batched(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut KVCache],
+        layer_idx: usize,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let normed = self.input_layernorm.forward(x);
+        let q = self.self_attn.q_proj.forward(&normed);
+        let k = self.self_attn.k_proj.forward(&normed);
+        let v = self.self_attn.v_proj.forward(&normed);
+        let seq_len = mlxcel_core::array_shape(&q)[1];
+        let metadata = crate::models::batched_decode_cache::uniform_layer_metadata(
+            caches, seq_len, 0, "GLM4", layer_idx,
+        );
+        let attn = mlxcel_core::batched_decode::forward_split_attention(
+            &self.self_attn,
+            &q,
+            &k,
+            &v,
+            caches,
+            &metadata,
+            mask,
+        );
+        let attn = self.self_attn.o_proj.forward(&attn);
+        let attn = self.post_self_attn_layernorm.forward(&attn);
+        let h = mlxcel_core::add(x, &attn);
+        let h = self.post_attention_layernorm.forward(&h);
+        let mlp = self.mlp.forward(&h);
+        let mlp = self.post_mlp_layernorm.forward(&mlp);
+        mlxcel_core::add(&h, &mlp)
+    }
+
     pub fn from_weights(
         weights: &WeightMap,
         args: &ModelArgs,
@@ -367,6 +440,25 @@ impl Glm4Model {
         self.lm_head.forward(&h)
     }
 
+    pub fn forward_batched_impl(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let mut h = self.embed_tokens.forward(input_ids);
+        for layer_idx in 0..self.layers.len() {
+            let mut layer_caches = crate::models::batched_decode_cache::collect_layer_caches(
+                batch_caches,
+                "GLM4",
+                layer_idx,
+            );
+            h = self.layers[layer_idx].forward_batched(&h, &mut layer_caches, layer_idx, mask);
+        }
+        let h = self.norm.forward(&h);
+        self.lm_head.forward(&h)
+    }
+
     /// Create KV caches for all layers
     pub fn make_caches(&self) -> Vec<KVCache> {
         (0..self.layers.len()).map(|_| KVCache::new()).collect()
@@ -434,6 +526,10 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
 
 // LanguageModel trait implementation.
 impl LanguageModel for Glm4Model {
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
@@ -454,5 +550,16 @@ impl LanguageModel for Glm4Model {
     fn eos_token_ids(&self) -> Vec<i32> {
         // GLM4 EOS tokens
         vec![2, 151329, 151336, 151338] // </s>, <|endoftext|>, <|user|>, <|observation|>
+    }
+
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        route_batched_decode(self, input_ids, batch_caches, |caches| {
+            self.forward_batched_impl(input_ids, caches, mask)
+        })
     }
 }

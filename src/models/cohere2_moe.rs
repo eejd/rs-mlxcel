@@ -32,7 +32,7 @@
 //! `src/models/cohere2.rs`; the routed-MoE dispatch mirrors
 //! `src/models/olmoe.rs::SparseMoeBlock::forward`.
 
-use mlxcel_core::generate::LanguageModel;
+use mlxcel_core::generate::{BatchedDecodeKind, LanguageModel, route_batched_decode};
 use mlxcel_core::layers::{
     FusedQKVLinear, KVCache, LayerNorm, RMSNorm, UnifiedEmbedding, UnifiedLinear,
 };
@@ -52,6 +52,7 @@ use std::path::Path;
 /// overrides `moe_gate_act`, `prefix_dense_intermediate_size` defaults to
 /// `intermediate_size`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Cohere2MoeConfig {
     pub model_type: String,
 
@@ -135,6 +136,8 @@ pub struct Cohere2MoeConfig {
     #[serde(default)]
     pub quantization: Option<QuantizationConfig>,
 }
+
+mlxcel_core::impl_rope_lifting_deserialize!(Cohere2MoeConfig);
 
 /// `eos_token_id` may be a single int or a list of ints (reused shape from
 /// `src/models/cohere2.rs`).
@@ -483,6 +486,7 @@ impl Cohere2MoeAttention {
         args: &Cohere2MoeConfig,
         layer_idx: usize,
         prefix: &str,
+        sliding_cache_window: i32,
     ) -> Result<Self, String> {
         let group_size = args.group_size();
         let bits = args.bits();
@@ -519,7 +523,7 @@ impl Cohere2MoeAttention {
             rope_base: args.rope_theta,
             use_rope,
             window_size: if use_sliding_window {
-                args.sliding_window as i32
+                sliding_cache_window
             } else {
                 0
             },
@@ -745,10 +749,42 @@ impl Cohere2MoeDecoderLayer {
         mlxcel_core::add(&sum, x)
     }
 
+    pub fn forward_batched(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut KVCache],
+        mask: Option<&MlxArray>,
+        layer_idx: usize,
+    ) -> UniquePtr<MlxArray> {
+        let h = self.input_layernorm.forward(x);
+        let (q, k, v) = self.self_attn.qkv_proj.forward(&h);
+        let seq_len = mlxcel_core::array_shape(&q)[1];
+        let metadata = crate::models::batched_decode_cache::uniform_layer_metadata(
+            caches,
+            seq_len,
+            self.self_attn.window_size,
+            "Cohere2MoeModel",
+            layer_idx,
+        );
+        let attn = mlxcel_core::batched_decode::forward_split_attention(
+            &self.self_attn,
+            &q,
+            &k,
+            &v,
+            caches,
+            &metadata,
+            mask,
+        );
+        let attn = self.self_attn.o_proj.forward(&attn);
+        let ff = self.ffn.forward(&h);
+        mlxcel_core::add(&mlxcel_core::add(&attn, &ff), x)
+    }
+
     pub fn from_weights(
         weights: &WeightMap,
         args: &Cohere2MoeConfig,
         layer_idx: usize,
+        sliding_cache_window: i32,
     ) -> Result<Self, String> {
         let prefix = format!("model.layers.{}", layer_idx);
 
@@ -757,6 +793,7 @@ impl Cohere2MoeDecoderLayer {
             args,
             layer_idx,
             &format!("{}.self_attn", prefix),
+            sliding_cache_window,
         )?;
 
         let ffn = if args.is_dense_layer(layer_idx) {
@@ -790,6 +827,9 @@ pub struct Cohere2MoeModel {
     pub lm_head: UnifiedLinear,
     pub logit_scale: f32,
     pub config: Cohere2MoeConfig,
+    /// The validated sliding window the dense prefill mask uses (issue
+    /// #2798), computed once at load.
+    sliding_cache_window: i32,
     // First sliding and first global attention layer indices, used to size the
     // two prefill masks from the matching cache's live window.
     swa_idx: usize,
@@ -815,7 +855,7 @@ impl Cohere2MoeModel {
             let sliding = Some(create_sliding_window_prefill_mask_dense(
                 l as i32,
                 swa_live_len,
-                self.config.sliding_window as i32,
+                self.sliding_cache_window,
             ));
             (full, sliding)
         } else {
@@ -847,6 +887,27 @@ impl Cohere2MoeModel {
     ) -> UniquePtr<MlxArray> {
         let h = self.embed_tokens.forward(input_ids);
         self.run_layers(h, caches)
+    }
+
+    pub fn forward_batched_impl(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let mut h = self.embed_tokens.forward(input_ids);
+        for layer_idx in 0..self.layers.len() {
+            let mut caches = crate::models::batched_decode_cache::collect_layer_caches(
+                batch_caches,
+                "Cohere2MoeModel",
+                layer_idx,
+            );
+            h = self.layers[layer_idx].forward_batched(&h, &mut caches, mask, layer_idx);
+        }
+        let logits = self.lm_head.forward(&self.norm.forward(&h));
+        let scale =
+            mlxcel_core::full_f32(&[1], self.logit_scale, mlxcel_core::array_dtype(&logits));
+        mlxcel_core::multiply(&logits, &scale)
     }
 
     /// Get token embeddings (for VLM merge / speculative paths).
@@ -890,6 +951,11 @@ impl Cohere2MoeModel {
     pub fn from_weights(weights: &WeightMap, args: &Cohere2MoeConfig) -> Result<Self, String> {
         let group_size = args.group_size();
         let bits = args.bits();
+        let sliding_cache_window = mlxcel_core::cache::cache_window(
+            "Cohere2 MoE",
+            args.sliding_window,
+            (0..args.num_hidden_layers).any(|i| args.is_sliding_window_layer(i)),
+        )?;
 
         // First sliding and first global layer indices (from the new
         // classification). Both fall back to 0 when absent; the mask keyed to a
@@ -906,7 +972,12 @@ impl Cohere2MoeModel {
 
         let mut layers = Vec::with_capacity(args.num_hidden_layers);
         for i in 0..args.num_hidden_layers {
-            layers.push(Cohere2MoeDecoderLayer::from_weights(weights, args, i)?);
+            layers.push(Cohere2MoeDecoderLayer::from_weights(
+                weights,
+                args,
+                i,
+                sliding_cache_window,
+            )?);
         }
 
         let norm = Cohere2MoeNorm::from_weights(weights, args, "model.norm")?;
@@ -926,6 +997,7 @@ impl Cohere2MoeModel {
             lm_head,
             logit_scale: args.logit_scale,
             config: args.clone(),
+            sliding_cache_window,
             swa_idx,
             ga_idx,
         })
@@ -933,7 +1005,109 @@ impl Cohere2MoeModel {
 }
 
 // LanguageModel trait implementation.
+impl mlxcel_core::batched_decode::SplitAttention for Cohere2MoeAttention {
+    fn split_shape(&self) -> mlxcel_core::batched_decode::SplitAttentionShape {
+        mlxcel_core::batched_decode::SplitAttentionShape {
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            scale: self.scale,
+        }
+    }
+
+    fn rope_batched(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        offsets: &[i32],
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        if self.use_rope {
+            (
+                mlxcel_core::fast_rope_batched(
+                    q,
+                    self.rope_dims,
+                    true,
+                    self.rope_base,
+                    1.0,
+                    offsets,
+                ),
+                mlxcel_core::fast_rope_batched(
+                    k,
+                    self.rope_dims,
+                    true,
+                    self.rope_base,
+                    1.0,
+                    offsets,
+                ),
+            )
+        } else {
+            (mlxcel_core::copy(q), mlxcel_core::copy(k))
+        }
+    }
+
+    fn custom_row_attend(&self) -> bool {
+        self.window_size > 0
+    }
+
+    fn attend_row(
+        &self,
+        q: &MlxArray,
+        k: UniquePtr<MlxArray>,
+        v: UniquePtr<MlxArray>,
+        cache: &mut KVCache,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let query_len = mlxcel_core::array_shape(q)[2];
+        let (cache_k, cache_v) = cache.update_and_fetch(k, v);
+        if query_len > 1 {
+            let k_shape = mlxcel_core::array_shape(&cache_k);
+            let k_len = k_shape[2];
+            let mask_klen = mask
+                .map(|m| *mlxcel_core::array_shape(m).last().unwrap_or(&k_len))
+                .unwrap_or(k_len);
+            let (k_used, v_used) = if self.window_size > 0 && k_len > mask_klen {
+                let v_shape = mlxcel_core::array_shape(&cache_v);
+                let start = k_len - mask_klen;
+                (
+                    Some(mlxcel_core::slice(
+                        &cache_k,
+                        &[0, 0, start, 0],
+                        &[k_shape[0], k_shape[1], k_len, k_shape[3]],
+                    )),
+                    Some(mlxcel_core::slice(
+                        &cache_v,
+                        &[0, 0, start, 0],
+                        &[v_shape[0], v_shape[1], k_len, v_shape[3]],
+                    )),
+                )
+            } else {
+                (None, None)
+            };
+            let k_ref = k_used.as_deref().unwrap_or(&cache_k);
+            let v_ref = v_used.as_deref().unwrap_or(&cache_v);
+            let mask_ptr = mask.map_or(std::ptr::null(), |m| m as *const MlxArray);
+            unsafe {
+                mlxcel_core::layers::attention_from_ptr(
+                    q,
+                    k_ref,
+                    v_ref,
+                    self.scale,
+                    mask_ptr,
+                    0.0,
+                    self.window_size,
+                )
+            }
+        } else {
+            mlxcel_core::causal_attention(q, &cache_k, &cache_v, self.scale, 0.0, self.window_size)
+        }
+    }
+}
+
 impl LanguageModel for Cohere2MoeModel {
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
@@ -971,6 +1145,17 @@ impl LanguageModel for Cohere2MoeModel {
             Some(EosTokenId::Multiple(ids)) => ids.clone(),
             None => vec![255001], // Default Cohere EOS token.
         }
+    }
+
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        route_batched_decode(self, input_ids, batch_caches, |batch_caches| {
+            self.forward_batched_impl(input_ids, batch_caches, mask)
+        })
     }
 }
 

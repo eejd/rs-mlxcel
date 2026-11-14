@@ -29,6 +29,8 @@ use mlxcel_core::layers::{LayerNorm, Linear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 
+use super::resample_matrix::{self, ResampleKernel};
+
 /// Static geometry / width configuration for the SAM tower.
 #[derive(Clone)]
 pub struct SamConfig {
@@ -61,55 +63,12 @@ impl Default for SamConfig {
 
 // ── bicubic resample (PyTorch align_corners=False, antialias) ────────────────
 
-/// Keys cubic-convolution kernel, PyTorch ATen coefficient `a = -0.75`.
-fn cubic(x: f32) -> f32 {
-    const A: f32 = -0.75;
-    let x = x.abs();
-    if x <= 1.0 {
-        (A + 2.0) * x * x * x - (A + 3.0) * x * x + 1.0
-    } else if x < 2.0 {
-        A * x * x * x - 5.0 * A * x * x + 8.0 * A * x - 4.0 * A
-    } else {
-        0.0
-    }
-}
-
-/// `[out_size, in_size]` cubic interpolation matrix for one axis, matching
-/// PyTorch `interpolate(mode="bicubic", align_corners=False)`. With `antialias`
-/// and downsampling (`scale > 1`) the filter support is stretched by `scale`
-/// and the taps renormalized (SAM `pos_embed`); without it the plain 4-tap
-/// kernel is used (CLIP `position_embedding`).
-fn interp_matrix(in_size: i32, out_size: i32, antialias: bool) -> Vec<f32> {
-    let scale = in_size as f32 / out_size as f32;
-    let filterscale = if antialias { scale.max(1.0) } else { 1.0 };
-    let support = 2.0 * filterscale; // cubic base support is 2
-    let inv = 1.0 / filterscale;
-    let mut m = vec![0.0f32; (out_size * in_size) as usize];
-    for o in 0..out_size {
-        let center = (o as f32 + 0.5) * scale;
-        let xmin = ((center - support + 0.5).floor() as i32).max(0);
-        let xmax = ((center + support + 0.5).floor() as i32).min(in_size);
-        let mut taps: Vec<(i32, f32)> = Vec::new();
-        let mut total = 0.0f32;
-        for idx in xmin..xmax {
-            let w = cubic((idx as f32 + 0.5 - center) * inv);
-            taps.push((idx, w));
-            total += w;
-        }
-        if total == 0.0 {
-            // Degenerate (out of range): clamp to nearest source pixel.
-            let idx = center.floor().clamp(0.0, (in_size - 1) as f32) as i32;
-            m[(o * in_size + idx) as usize] += 1.0;
-            continue;
-        }
-        for (idx, w) in taps {
-            m[(o * in_size + idx) as usize] += w / total;
-        }
-    }
-    m
-}
-
 /// Separable bicubic resample of a `[in_h, in_w, dim]` grid to `[out_h, out_w, dim]`.
+///
+/// With `antialias` and downsampling (`scale > 1`) the filter support is
+/// stretched by `scale` and the taps renormalized (SAM `pos_embed`); without it
+/// the plain 4-tap kernel is used (CLIP `position_embedding`). The matrices come
+/// from the shared [`resample_matrix::interp_matrix`].
 pub(crate) fn bicubic_resample(
     grid: &MlxArray,
     in_h: i32,
@@ -119,16 +78,9 @@ pub(crate) fn bicubic_resample(
     out_w: i32,
     antialias: bool,
 ) -> UniquePtr<MlxArray> {
-    let w_h = mlxcel_core::from_slice_f32(&interp_matrix(in_h, out_h, antialias), &[out_h, in_h]);
-    let w_w = mlxcel_core::from_slice_f32(&interp_matrix(in_w, out_w, antialias), &[out_w, in_w]);
-    let grid2 = mlxcel_core::reshape(grid, &[in_h, in_w * dim]);
-    let tmp = mlxcel_core::matmul(&w_h, &grid2);
-    let tmp = mlxcel_core::reshape(&tmp, &[out_h, in_w, dim]);
-    let tmp = mlxcel_core::transpose_axes(&tmp, &[1, 0, 2]);
-    let tmp = mlxcel_core::reshape(&tmp, &[in_w, out_h * dim]);
-    let out = mlxcel_core::matmul(&w_w, &tmp);
-    let out = mlxcel_core::reshape(&out, &[out_w, out_h, dim]);
-    mlxcel_core::transpose_axes(&out, &[1, 0, 2])
+    let w_h = resample_matrix::interp_matrix(in_h, out_h, ResampleKernel::Cubic, antialias);
+    let w_w = resample_matrix::interp_matrix(in_w, out_w, ResampleKernel::Cubic, antialias);
+    resample_matrix::separable_resample(grid, in_h, in_w, dim, out_h, out_w, &w_h, &w_w)
 }
 
 // ── window partition / unpartition ───────────────────────────────────────────
@@ -388,6 +340,27 @@ impl SamEncoder {
         prefix: &str,
         config: SamConfig,
     ) -> Result<Self, String> {
+        Self::from_weights_impl(weights, prefix, config, None)
+    }
+
+    /// Load the SAM tower with checkpoint quantization metadata available for
+    /// the learned absolute and relative-position tables.
+    pub fn from_weights_with_quant(
+        weights: &WeightMap,
+        prefix: &str,
+        config: SamConfig,
+        group_size: i32,
+        bits: i32,
+    ) -> Result<Self, String> {
+        Self::from_weights_impl(weights, prefix, config, Some((group_size, bits)))
+    }
+
+    fn from_weights_impl(
+        weights: &WeightMap,
+        prefix: &str,
+        config: SamConfig,
+        quant: Option<(i32, i32)>,
+    ) -> Result<Self, String> {
         let get = |name: &str| -> Result<UniquePtr<MlxArray>, String> {
             weights
                 .get(name)
@@ -411,24 +384,44 @@ impl SamEncoder {
                 1e-6,
             ))
         };
+        let learned = |name: &str, shape: &[i32]| -> Result<UniquePtr<MlxArray>, String> {
+            if !weights.contains_key(name) {
+                return Err(format!("SAM weight missing: {name}"));
+            }
+            crate::vision::weights::load_dense_param(weights, name, shape, quant)
+        };
 
         let patch_w = conv_channels_last(get(&format!("{prefix}.patch_embed.proj.weight"))?);
         let patch_b = get(&format!("{prefix}.patch_embed.proj.bias"))?;
-        let pos_embed = get(&format!("{prefix}.pos_embed"))?;
+        let pos_embed = learned(
+            &format!("{prefix}.pos_embed"),
+            &[1, config.grid, config.grid, config.embed_dim],
+        )?;
 
         let head_dim = config.embed_dim / config.num_heads;
         let mut blocks = Vec::with_capacity(config.depth);
         for i in 0..config.depth {
             let bp = format!("{prefix}.blocks.{i}");
             let is_global = config.global_attn_indexes.contains(&i);
+            let rel_side = if is_global {
+                config.grid
+            } else {
+                config.window_size
+            };
             let attn = SamAttention {
                 qkv: lin(&format!("{bp}.attn.qkv"))?,
                 proj: lin(&format!("{bp}.attn.proj"))?,
                 num_heads: config.num_heads,
                 head_dim,
                 scale: (head_dim as f32).powf(-0.5),
-                rel_pos_h: get(&format!("{bp}.attn.rel_pos_h"))?,
-                rel_pos_w: get(&format!("{bp}.attn.rel_pos_w"))?,
+                rel_pos_h: learned(
+                    &format!("{bp}.attn.rel_pos_h"),
+                    &[2 * rel_side - 1, head_dim],
+                )?,
+                rel_pos_w: learned(
+                    &format!("{bp}.attn.rel_pos_w"),
+                    &[2 * rel_side - 1, head_dim],
+                )?,
             };
             blocks.push(SamBlock {
                 norm1: ln(&format!("{bp}.norm1"))?,
@@ -526,7 +519,7 @@ mod tests {
     #[test]
     fn interp_matrix_rows_sum_to_one() {
         for (a, b, anti) in [(64, 40, true), (16, 10, false), (16, 16, false)] {
-            let m = interp_matrix(a, b, anti);
+            let m = resample_matrix::interp_matrix(a, b, ResampleKernel::Cubic, anti);
             for row in 0..b {
                 let s: f32 = (0..a).map(|k| m[(row * a + k) as usize]).sum();
                 assert!((s - 1.0).abs() < 1e-4, "row {row} sums to {s}");

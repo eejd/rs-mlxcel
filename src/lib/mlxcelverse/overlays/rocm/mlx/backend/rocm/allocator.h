@@ -11,6 +11,8 @@
 #include "mlx/allocator.h"
 #include "mlx/backend/common/buffer_cache.h"
 
+#include <atomic>
+#include <cstdint>
 #include <deque>
 #include <mutex>
 #include <utility>
@@ -20,10 +22,36 @@ namespace mlx::core::rocm {
 
 using allocator::Buffer;
 
+// Whether the CPU can dereference the unified-path device allocations
+// (hipMalloc, fine-grained) directly. Linux KFD maps them into the process
+// (APU UMA, large BAR), so `device == -1` buffers are read and written in
+// place. Windows WDDM does not map them, even on an APU: there every CPU access
+// goes through the host shadow (Buffer::raw_ptr) and gpu_ptr flushes CPU writes
+// back. Managed and pinned host memory would be CPU-visible on Windows, but
+// they are capped at the OS-visible RAM, while the UMA carve-out is device
+// memory (lablup/mlxcel#2601).
+constexpr bool device_memory_host_visible() {
+#ifdef _WIN32
+  return false;
+#else
+  return true;
+#endif
+}
+
 // Matches CudaBuffer + fields required for discrete-GPU host access and
 // stream-ordered free (CUDA uses move_to_unified_memory instead of shadow).
 // Field order is ABI-stable for brace-init sites outside this file
 // (e.g. gemms/naive_gemm.hip): data, size, is_managed, device, ...
+//
+// The shadow has two flags (lablup/mlxcel#2643). `host_dirty`: the shadow
+// holds CPU writes the device has not seen; gpu_ptr flushes it before a kernel
+// reads the buffer. `host_valid`: the shadow's bytes equal the device's as of
+// the last host access, so a read-only host access (rocm::host_read_ptr) can
+// use it without another device-to-host copy. A buffer whose shadow is neither
+// dirty nor valid is refreshed from the device on the next host access.
+// gpu_ptr clears `host_valid` because the kernel it serves may write the
+// buffer; a recycled buffer starts with both flags clear so its previous
+// owner's shadow is neither flushed nor served.
 struct RocmBuffer {
   void* data;
   size_t size;
@@ -32,6 +60,9 @@ struct RocmBuffer {
   void* host_shadow;
   bool host_dirty;
   void* alloc_stream; // stream used for hipMallocAsync / hipFreeAsync
+  // Appended last so a brace-init with the seven fields above still compiles
+  // and value-initializes this to false.
+  bool host_valid;
 };
 
 // ---------------------------------------------------------------------------
@@ -107,8 +138,29 @@ class RocmAllocator : public allocator::Allocator {
   // Free device + delete shell (CUDA free_cuda_buffer).
   void free_rocm_buffer(RocmBuffer* buf);
 
-  void ensure_host_shadow(RocmBuffer& buf);
+  // Give `buf` a host shadow whose bytes match the device unless the shadow
+  // is dirty (then it is the authority). `for_write` marks the shadow dirty,
+  // because the caller will write through it; a read-only caller leaves it
+  // clean and valid. Throws when hipHostMalloc or the copy fails; the byte
+  // counter moves only on a successful allocation (lablup/mlxcel#2643).
+  void ensure_host_shadow(RocmBuffer& buf, bool for_write);
   void flush_host_shadow(RocmBuffer& buf);
+  // Free the shadow, if any, and clear both flags. Every free path and the
+  // arena wrapper reuse go through here so the byte counter cannot drift.
+  void release_host_shadow(RocmBuffer& buf);
+
+  // Pinned bytes the live host shadows hold (the shadowed buffers' allocator
+  // sizes), and the process-wide device-to-host and host-to-device copy
+  // counts. Relaxed atomics: ensure_host_shadow runs without mutex_.
+  size_t get_host_shadow_memory() const {
+    return host_shadow_bytes_.load(std::memory_order_relaxed);
+  }
+  uint64_t host_shadow_downloads() const {
+    return host_shadow_downloads_.load(std::memory_order_relaxed);
+  }
+  uint64_t host_shadow_uploads() const {
+    return host_shadow_uploads_.load(std::memory_order_relaxed);
+  }
 
   bool decode_arena_begin(size_t capacity, int device, void* stream);
   void decode_arena_reset();
@@ -173,6 +225,9 @@ class RocmAllocator : public allocator::Allocator {
   BufferCache<RocmBuffer> buffer_cache_;
   size_t active_memory_{0};
   size_t peak_memory_{0};
+  std::atomic<size_t> host_shadow_bytes_{0};
+  std::atomic<uint64_t> host_shadow_downloads_{0};
+  std::atomic<uint64_t> host_shadow_uploads_{0};
   std::vector<void*> free_streams_;
   std::vector<void*> mem_pools_;
   SmallSizePool scalar_pool_;

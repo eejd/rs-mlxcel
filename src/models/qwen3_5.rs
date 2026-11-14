@@ -29,8 +29,8 @@ use crate::distributed::pipeline::LayerFilter;
 use crate::distributed::pipeline::StageExecutionOutput;
 use crate::distributed::pipeline::partial_loading::filter_weight_map;
 use crate::models::gated_delta::{
-    GatedDeltaCache, RMSNormGated, gated_delta_update, gated_delta_update_chain_parity,
-    scaled_fast_rms_norm_no_weight,
+    GatedDeltaCache, QK_L2NORM_EPS, RMSNormGated, gated_delta_update,
+    gated_delta_update_chain_parity, normalize_qk,
 };
 use crate::models::model_owned::{KvCacheLayerModes, ModelOwnedSequenceState};
 use crate::models::qwen_mrope_state::MRopeState;
@@ -42,7 +42,7 @@ use crate::models::speculative_exactness::{
 };
 use mlxcel_core::cache::{CachePool, KVCacheMode, SequenceId, SequenceStateLayout};
 use mlxcel_core::dtype;
-use mlxcel_core::generate::LanguageModel;
+use mlxcel_core::generate::{BatchedDecodeKind, LanguageModel, route_batched_decode_with_ids};
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, silu, stack_arrays};
 use mlxcel_core::weights::WeightMap;
@@ -755,12 +755,10 @@ impl Qwen35GatedDeltaNet {
             })
         });
 
-        // Apply RMS norm with scaling (same as Qwen3Next). Reference mlx-lm
-        // keeps this on mx.fast.rms_norm rather than expanding it into
-        // primitive ops.
+        // L2-normalize q/k on the fused rms_norm kernel, with the reference
+        // l2norm eps (mlx-lm `normalize_qk`, same as Qwen3Next).
         let inv_scale = (self.head_k_dim as f32).powf(-0.5);
-        let q = scaled_fast_rms_norm_no_weight(&q, inv_scale * inv_scale, 1e-6);
-        let k = scaled_fast_rms_norm_no_weight(&k, inv_scale, 1e-6);
+        let (q, k) = normalize_qk(&q, &k, inv_scale, QK_L2NORM_EPS);
 
         // Run gated delta update (use guarded_mask which is None if batch dims mismatch)
         let (out, new_state) = gated_delta_update(
@@ -935,10 +933,9 @@ impl Qwen35GatedDeltaNet {
             })
         });
 
-        // RMSNorm scaling for q and k (preserves the verify-pass dtype).
+        // L2-normalize q/k (preserves the verify-pass dtype).
         let inv_scale = (self.head_k_dim as f32).powf(-0.5);
-        let q = scaled_fast_rms_norm_no_weight(&q, inv_scale * inv_scale, 1e-6);
-        let k = scaled_fast_rms_norm_no_weight(&k, inv_scale, 1e-6);
+        let (q, k) = normalize_qk(&q, &k, inv_scale, QK_L2NORM_EPS);
 
         // Capture the snapshot BEFORE the gated_delta_update consumes/mutates
         // the recurrent state. The drafter uses these to replay over the
@@ -1054,8 +1051,7 @@ impl Qwen35GatedDeltaNet {
         );
 
         let inv_scale = (self.head_k_dim as f32).powf(-0.5);
-        let q = scaled_fast_rms_norm_no_weight(&q, inv_scale * inv_scale, 1e-6);
-        let k = scaled_fast_rms_norm_no_weight(&k, inv_scale, 1e-6);
+        let (q, k) = normalize_qk(&q, &k, inv_scale, QK_L2NORM_EPS);
 
         let beta = mlxcel_core::sigmoid(&b_proj);
         let g = crate::models::gated_delta::compute_g(&self.a_log, &a, &self.dt_bias);
@@ -1482,6 +1478,237 @@ impl Qwen35Model {
         }
     }
 
+    fn validate_cache_row(&self, row_idx: usize, row: &[Qwen3NextCache]) {
+        assert_eq!(
+            row.len(),
+            self.layers.len(),
+            "Qwen 3.5 batched decode cache count mismatch for row {row_idx}"
+        );
+        for (layer_idx, (cache, layer)) in row.iter().zip(&self.layers).enumerate() {
+            assert!(
+                matches!(
+                    (cache, layer.is_linear),
+                    (Qwen3NextCache::Linear(_), true) | (Qwen3NextCache::Attention(_), false)
+                ),
+                "Qwen 3.5 batched decode cache kind mismatch for row {row_idx}, layer {layer_idx}"
+            );
+        }
+    }
+
+    fn validate_batch_cache_layout(&self, rows: &[Vec<Qwen3NextCache>]) {
+        for (row_idx, row) in rows.iter().enumerate() {
+            self.validate_cache_row(row_idx, row);
+        }
+    }
+
+    fn validate_prepared_cache_layout(&self, ids: &[SequenceId]) {
+        for (row_idx, &id) in ids.iter().enumerate() {
+            self.sequence_state
+                .with_sequence_state_ref(id, |row| self.validate_cache_row(row_idx, row))
+                .expect("preflighted Qwen 3.5 sequence state");
+        }
+    }
+
+    fn batch_states_uniform(&self, rows: &[Vec<Qwen3NextCache>]) -> bool {
+        self.layers.iter().enumerate().all(|(layer_idx, layer)| {
+            if layer.is_linear {
+                let recurrent: Vec<_> = rows
+                    .iter()
+                    .map(|row| match &row[layer_idx] {
+                        Qwen3NextCache::Linear(cache) => cache,
+                        Qwen3NextCache::Attention(_) => unreachable!("preflighted cache type"),
+                    })
+                    .collect();
+                super::recurrent_batch::gated_delta_rows_uniform(&recurrent)
+            } else {
+                true
+            }
+        })
+    }
+
+    fn decode_position_ids_for_row(
+        &self,
+        seq_id: SequenceId,
+        caches: &[Qwen3NextCache],
+    ) -> Option<UniquePtr<MlxArray>> {
+        let cache_offset = caches
+            .iter()
+            .find_map(|cache| match cache {
+                Qwen3NextCache::Attention(kv) => Some(kv.offset),
+                Qwen3NextCache::Linear(_) => None,
+            })
+            .unwrap_or(0);
+        self.mrope_state.with_entry(Some(seq_id), |entry| {
+            let stored_shape = entry
+                .position_ids
+                .as_ref()
+                .map(|positions| mlxcel_core::array_shape(positions));
+            match mrope_position_source(stored_shape.as_deref(), 1, 1, cache_offset) {
+                MRopePositionSource::SliceStored { start, end } => {
+                    let stored = entry
+                        .position_ids
+                        .as_ref()
+                        .expect("stored MRoPE position source");
+                    Some(mlxcel_core::slice(stored, &[0, 0, start], &[3, 1, end]))
+                }
+                MRopePositionSource::Recompute => Self::compute_decode_position_ids_with_delta(
+                    entry.rope_deltas,
+                    1,
+                    1,
+                    cache_offset,
+                ),
+            }
+        })
+    }
+
+    fn forward_rows_with_states(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: &[SequenceId],
+        rows: &mut [Vec<Qwen3NextCache>],
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(input_ids);
+        let outputs: Vec<_> = rows
+            .iter_mut()
+            .enumerate()
+            .map(|(row, state)| {
+                let input =
+                    mlxcel_core::slice(input_ids, &[row as i32, 0], &[row as i32 + 1, shape[1]]);
+                let positions = self.mrope_state.with_entry(Some(seq_ids[row]), |entry| {
+                    let offset = state
+                        .iter()
+                        .find_map(|cache| match cache {
+                            Qwen3NextCache::Attention(kv) => Some(kv.offset),
+                            Qwen3NextCache::Linear(_) => None,
+                        })
+                        .unwrap_or(0);
+                    let stored_shape = entry
+                        .position_ids
+                        .as_ref()
+                        .map(|stored| mlxcel_core::array_shape(stored));
+                    match mrope_position_source(stored_shape.as_deref(), 1, shape[1], offset) {
+                        MRopePositionSource::SliceStored { start, end } => {
+                            let stored = entry
+                                .position_ids
+                                .as_ref()
+                                .expect("stored MRoPE position source");
+                            Some(mlxcel_core::slice(stored, &[0, 0, start], &[3, 1, end]))
+                        }
+                        MRopePositionSource::Recompute => {
+                            Self::compute_decode_position_ids_with_delta(
+                                entry.rope_deltas,
+                                1,
+                                shape[1],
+                                offset,
+                            )
+                        }
+                    }
+                });
+                self.forward_internal(&input, None, state, positions.as_deref())
+            })
+            .collect();
+        mlxcel_core::concatenate_many(
+            &outputs.iter().map(|output| &**output).collect::<Vec<_>>(),
+            0,
+        )
+    }
+
+    fn forward_batched_decode_with_caches(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: &[SequenceId],
+        rows: &mut [Vec<Qwen3NextCache>],
+    ) -> UniquePtr<MlxArray> {
+        if !self.batch_states_uniform(rows) {
+            return self.forward_rows_with_states(input_ids, seq_ids, rows);
+        }
+        let position_ids: Vec<_> = seq_ids
+            .iter()
+            .copied()
+            .zip(rows.iter())
+            .map(|(seq_id, caches)| self.decode_position_ids_for_row(seq_id, caches))
+            .collect();
+        let has_mrope = position_ids.iter().any(Option::is_some);
+
+        let mut h = self.embed_tokens.forward(input_ids);
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let normed = layer.input_layernorm.forward(&h);
+            let attention = match &layer.attention {
+                Qwen35AttentionVariant::Linear(attn) => {
+                    let states: Vec<_> = rows
+                        .iter()
+                        .map(|row| match &row[layer_idx] {
+                            Qwen3NextCache::Linear(cache) => cache,
+                            Qwen3NextCache::Attention(_) => unreachable!("preflighted cache type"),
+                        })
+                        .collect();
+                    let offsets: Vec<_> = states.iter().map(|state| state.offset).collect();
+                    let mut stacked = super::recurrent_batch::stack_gated_delta(&states)
+                        .expect("preflighted Qwen3.5 gated-delta states");
+                    let output = attn.forward(&normed, None, Some(&mut stacked));
+                    for (row, state) in
+                        rows.iter_mut()
+                            .zip(super::recurrent_batch::split_gated_delta(
+                                &stacked, &offsets,
+                            ))
+                    {
+                        row[layer_idx] = Qwen3NextCache::Linear(state);
+                    }
+                    output
+                }
+                Qwen35AttentionVariant::FullAttention(attn) if !has_mrope => {
+                    let mut caches: Vec<_> = rows
+                        .iter_mut()
+                        .map(|row| match &mut row[layer_idx] {
+                            Qwen3NextCache::Attention(cache) => cache,
+                            Qwen3NextCache::Linear(_) => unreachable!("preflighted cache type"),
+                        })
+                        .collect();
+                    attn.forward_batched_decode(&normed, &mut caches, "Qwen3.5", layer_idx)
+                }
+                Qwen35AttentionVariant::FullAttention(attn) => {
+                    let outputs: Vec<_> = rows
+                        .iter_mut()
+                        .enumerate()
+                        .map(|(row, caches)| {
+                            let input = mlxcel_core::slice(
+                                &normed,
+                                &[row as i32, 0, 0],
+                                &[row as i32 + 1, 1, i32::MAX],
+                            );
+                            let cache = match &mut caches[layer_idx] {
+                                Qwen3NextCache::Attention(cache) => cache,
+                                Qwen3NextCache::Linear(_) => unreachable!("preflighted cache type"),
+                            };
+                            attn.forward_with_position_ids(
+                                &input,
+                                cache,
+                                None,
+                                position_ids[row].as_deref(),
+                            )
+                        })
+                        .collect();
+                    mlxcel_core::concatenate_many(
+                        &outputs.iter().map(|output| &**output).collect::<Vec<_>>(),
+                        0,
+                    )
+                }
+            };
+            h = mlxcel_core::add(&h, &attention);
+            let normed = layer.post_attention_layernorm.forward(&h);
+            let mlp = match &layer.mlp {
+                Qwen35MLPVariant::Dense(mlp) => mlp.forward(&normed),
+                Qwen35MLPVariant::MoE(moe) => moe.forward(&normed),
+            };
+            h = mlxcel_core::add(&h, &mlp);
+        }
+        let h = self.norm.forward(&h);
+        match &self.lm_head {
+            Some(lm_head) => lm_head.forward(&h),
+            None => self.embed_tokens.as_linear(&h),
+        }
+    }
+
     fn make_internal_caches(&self) -> Vec<Qwen3NextCache> {
         self.layers
             .iter()
@@ -1802,7 +2029,10 @@ impl Qwen35Model {
     fn visible_len(cache: &Qwen3NextCache) -> usize {
         match cache {
             Qwen3NextCache::Attention(kv) => kv.seq_len().max(0) as usize,
-            Qwen3NextCache::Linear(gd) => gd.offset.max(0) as usize,
+            // Gated-delta state is model-owned recurrence, not external K/V.
+            // Keep its paged-shadow layer empty so accounting does not reserve
+            // blocks that no attention lookup can ever read.
+            Qwen3NextCache::Linear(_) => 0,
         }
     }
 
@@ -2147,6 +2377,12 @@ impl Qwen35Model {
     /// state by id instead of by leaky scalar.
     pub fn bind_mrope_state_to_sequence(&self, seq_id: SequenceId) {
         self.mrope_state.bind_fallback_to_sequence(seq_id);
+    }
+
+    /// Clear the fallback MRoPE state without binding it (admission abort
+    /// after media preparation, issue #2625).
+    pub fn clear_mrope_state(&self) {
+        self.mrope_state.clear_fallback();
     }
 
     /// Remove and return the per-sequence MRoPE entry under `seq_id`
@@ -3533,6 +3769,10 @@ impl LanguageModel for Qwen35Model {
         true
     }
 
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
+    }
+
     fn supports_batched_prefill(&self) -> bool {
         true
     }
@@ -3562,6 +3802,15 @@ impl LanguageModel for Qwen35Model {
 
     fn kv_cache_layer_modes(&self) -> Option<Vec<KVCacheMode>> {
         self.kv_cache_layer_modes.clone_modes()
+    }
+
+    /// Gated-delta linear layers hold no KV (issue #2790).
+    fn kv_cache_storage_modes(&self) -> Option<Vec<Option<KVCacheMode>>> {
+        self.kv_cache_layer_modes
+            .storage_modes(|layer_idx| match self.layers.get(layer_idx) {
+                Some(layer) if !layer.is_linear => crate::models::model_owned::LayerKv::Full,
+                _ => crate::models::model_owned::LayerKv::None,
+            })
     }
 
     fn reset_runtime_state(&self) {
@@ -3673,38 +3922,73 @@ impl LanguageModel for Qwen35Model {
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         let shape = mlxcel_core::array_shape(input_ids);
-        if batch_caches.len() <= 1 || shape[1] <= 1 {
-            if batch_caches.len() == 1 {
-                let token_0 = mlxcel_core::slice(input_ids, &[0, 0], &[1, shape[1]]);
-                return self.forward_with_sequence_id(
-                    &token_0,
-                    seq_ids.and_then(|ids| ids.first().copied()),
-                    batch_caches[0],
-                    None,
+        assert_eq!(shape.len(), 2, "Qwen 3.5 batched input must be rank 2");
+        assert_eq!(
+            shape[0] as usize,
+            batch_caches.len(),
+            "Qwen 3.5 input/cache row mismatch"
+        );
+        if let Some(ids) = seq_ids {
+            assert_eq!(
+                ids.len(),
+                batch_caches.len(),
+                "Qwen 3.5 requires one sequence id per batch row"
+            );
+            let mut unique = std::collections::HashSet::with_capacity(ids.len());
+            for &id in ids {
+                assert!(
+                    unique.insert(id),
+                    "Qwen 3.5 batched decode: duplicate model-owned sequence state for sequence {id}"
                 );
             }
-            return self.forward_batched_rows_sequential(input_ids, seq_ids, batch_caches);
         }
 
-        if mask.is_some() {
-            return self.forward_batched_rows_sequential(input_ids, seq_ids, batch_caches);
-        }
-
-        if let Some(seq_ids) = seq_ids {
-            if !self.configured_attention_kv_modes_all_fp16() {
-                tracing::debug!(
-                    "Qwen 3.5 batched prefill is disabled for non-FP16 model-owned KV modes until row-split sidecars are supported"
-                );
-                return self.forward_batched_rows_sequential(
-                    input_ids,
-                    Some(seq_ids),
-                    batch_caches,
-                );
+        route_batched_decode_with_ids(self, input_ids, seq_ids, batch_caches, |batch_caches| {
+            if let Some(ids) = seq_ids {
+                self.sequence_state
+                    .validate_sequence_states(ids)
+                    .unwrap_or_else(|err| panic!("Qwen 3.5 batched decode: {err}"));
+                self.validate_prepared_cache_layout(ids);
             }
-            return self.forward_batched_prefill(input_ids, seq_ids);
-        }
+            if shape[1] == 1 {
+                let Some(ids) = seq_ids else {
+                    // Preserve the legacy no-id fallback-slot semantics.
+                    return self.forward_batched_rows_sequential(input_ids, None, batch_caches);
+                };
+                if mask.is_some() {
+                    return self.forward_batched_rows_sequential(
+                        input_ids,
+                        Some(ids),
+                        batch_caches,
+                    );
+                }
+                return self
+                    .sequence_state
+                    .with_batched_sequence_states(ids, |rows| {
+                        self.validate_batch_cache_layout(rows);
+                        self.forward_batched_decode_with_caches(input_ids, ids, rows)
+                    })
+                    .unwrap_or_else(|err| panic!("Qwen 3.5 batched decode: {err}"));
+            }
 
-        self.forward_batched_rows_sequential(input_ids, None, batch_caches)
+            if mask.is_some() {
+                return self.forward_batched_rows_sequential(input_ids, seq_ids, batch_caches);
+            }
+            if let Some(ids) = seq_ids {
+                if !self.configured_attention_kv_modes_all_fp16() {
+                    tracing::debug!(
+                        "Qwen 3.5 batched prefill is disabled for non-FP16 model-owned KV modes until row-split sidecars are supported"
+                    );
+                    return self.forward_batched_rows_sequential(
+                        input_ids,
+                        Some(ids),
+                        batch_caches,
+                    );
+                }
+                return self.forward_batched_prefill(input_ids, ids);
+            }
+            self.forward_batched_rows_sequential(input_ids, None, batch_caches)
+        })
     }
 
     fn eos_token_ids(&self) -> Vec<i32> {

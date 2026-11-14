@@ -655,19 +655,26 @@ fn drain_generation_events_impl_detects_phase2_decode_hang() {
 
     let (tx, rx) = mpsc::channel::<GenerateEvent>();
 
-    // Send one Token event to transition into Phase 2, then drop the sender
-    // so no further events will arrive — simulating a worker that goes silent
-    // after producing the first token.
+    // Leak one sender clone so the channel never disconnects: Phase 2's
+    // recv_timeout then fires deterministically. The original held the
+    // sender alive with a 200 ms timed sleep, which raced the 150 ms timeout
+    // against scheduler noise on a loaded runner (nightly 41227995596): when
+    // the main thread was slow to enter Phase 2, the drop won, the channel
+    // disconnected first, and drain returned ChatWorkerGoneError, whose
+    // message carries no hang text and flipped the message assertion.
+    std::mem::forget(tx.clone());
+
+    // Send one Token event to transition into Phase 2; no further events
+    // will arrive — simulating a worker that goes silent after producing
+    // the first token.
     let worker = thread::spawn(move || {
         tx.send(GenerateEvent::Token(
             "first".to_string(),
             TokenMeta::default(),
         ))
         .expect("send first token");
-        // Hold sender alive briefly so Phase 2 enters recv_timeout, then drop
-        // it to also trigger Disconnected — whichever fires first is fine.
-        thread::sleep(Duration::from_millis(200));
-        // sender dropped here — channel disconnects if timeout didn't fire yet
+        // The worker's own sender drops here; the leaked clone above keeps
+        // the channel connected so the timeout path is the only outcome.
     });
 
     let mut received_tokens: Vec<String> = Vec::new();
@@ -826,13 +833,16 @@ fn request_memory_admission_excludes_nonlocal_and_speculative_workers() {
 #[tokio::test]
 async fn request_memory_admission_bypassed_worker_needs_no_admitted_event() {
     use crate::distributed::disaggregated::ServingMode;
-    for (pipeline, tp_size, mode, speculation, metal_gpu) in [
-        (true, 1, ServingMode::Hybrid, false, true),
-        (false, 2, ServingMode::Hybrid, false, true),
-        (false, 1, ServingMode::PrefillOnly, false, true),
-        (false, 1, ServingMode::DecodeOnly, false, true),
-        (false, 1, ServingMode::Hybrid, true, true),
-        (false, 1, ServingMode::Hybrid, false, false),
+    for (pipeline, tp_size, mode, speculation, metal_gpu, single_slot) in [
+        (true, 1, ServingMode::Hybrid, false, true, true),
+        (false, 2, ServingMode::Hybrid, false, true, true),
+        (false, 1, ServingMode::PrefillOnly, false, true, true),
+        (false, 1, ServingMode::DecodeOnly, false, true, true),
+        (false, 1, ServingMode::Hybrid, true, true, true),
+        (false, 1, ServingMode::Hybrid, false, false, true),
+        // A native decode batch uses the scheduler's ordinary paged admission
+        // and emits no single-slot request-memory handshake.
+        (false, 1, ServingMode::Hybrid, false, true, false),
     ] {
         let (options_tx, _options_rx) = mpsc::channel();
         // This worker emits Done only. Accidentally waiting for Admitted would
@@ -843,6 +853,7 @@ async fn request_memory_admission_bypassed_worker_needs_no_admitted_event() {
             request_memory_worker_path_supported(pipeline, tp_size, mode, speculation),
             metal_gpu,
             Some(crate::models::ModelType::NemotronH),
+            single_slot,
         );
         let mut options = sample_options();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -865,24 +876,36 @@ fn request_memory_admission_requires_metal_gpu_and_actual_target_family() {
     assert!(request_memory_provider_wait_enabled(
         true,
         true,
-        Some(ModelType::NemotronH)
+        Some(ModelType::NemotronH),
+        true
     ));
     assert!(!request_memory_provider_wait_enabled(
         true,
         false,
-        Some(ModelType::NemotronH)
+        Some(ModelType::NemotronH),
+        true
     ));
     assert!(!request_memory_provider_wait_enabled(
         false,
         true,
-        Some(ModelType::NemotronH)
+        Some(ModelType::NemotronH),
+        true
     ));
     assert!(!request_memory_provider_wait_enabled(
         true,
         true,
-        Some(ModelType::Llama)
+        Some(ModelType::Llama),
+        true
     ));
-    assert!(!request_memory_provider_wait_enabled(true, true, None));
+    assert!(!request_memory_provider_wait_enabled(
+        true,
+        true,
+        Some(ModelType::NemotronH),
+        false
+    ));
+    assert!(!request_memory_provider_wait_enabled(
+        true, true, None, true
+    ));
 }
 
 #[test]
@@ -936,4 +959,131 @@ async fn request_memory_admission_legacy_provider_preserves_preheader_rejection(
     let mut options = sample_options();
     options.max_tokens = 1;
     assert!(provider.generate("short".into(), options).is_ok());
+}
+
+/// A provider over a hand-rolled worker thread, for the shutdown tests.
+fn provider_with_worker(
+    request_tx: mpsc::Sender<ModelRequest>,
+    worker_handle: std::thread::JoinHandle<()>,
+) -> ModelProvider {
+    let (worker_handle, worker_exit) = observe_worker_exit(worker_handle);
+    ModelProvider {
+        request_tx,
+        model_id: "test-model".to_string(),
+        created_at: 0,
+        loaded: Arc::new(AtomicBool::new(true)),
+        snapshot_reuse_capable: Arc::new(AtomicBool::new(false)),
+        chat_unavailable: Arc::new(AtomicBool::new(false)),
+        batch_metrics: Arc::new(BatchMetrics::new()),
+        batch_observability: Arc::new(BatchObservability::new()),
+        max_queue_depth: usize::MAX,
+        request_memory_admission: false,
+        single_stream_queue_admission: Arc::new(AtomicBool::new(false)),
+        sleeping: Arc::new(AtomicBool::new(false)),
+        prompt_cache: None,
+        prompt_tokenizer: None,
+        decode_hang_timeout: DECODE_HANG_TIMEOUT,
+        worker_exit,
+        _worker_handle: worker_handle,
+    }
+}
+
+#[test]
+fn shutdown_and_wait_joins_a_cooperative_worker_and_is_idempotent() {
+    let (request_tx, request_rx) = mpsc::channel::<ModelRequest>();
+    let worker = std::thread::spawn(move || {
+        while let Ok(request) = request_rx.recv() {
+            if matches!(request, ModelRequest::Shutdown) {
+                break;
+            }
+        }
+    });
+    let provider = provider_with_worker(request_tx, worker);
+    assert!(!provider.worker_exit_observed());
+
+    provider
+        .shutdown_and_wait(Duration::from_secs(5))
+        .expect("a cooperative worker exits");
+    assert!(provider.worker_exit_observed());
+
+    // The worker is gone and its request channel is closed: a second call
+    // neither errors nor waits.
+    let started = std::time::Instant::now();
+    provider
+        .shutdown_and_wait(Duration::from_secs(5))
+        .expect("a second shutdown is a no-op");
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn shutdown_and_wait_returns_ok_at_once_for_a_worker_that_already_exited() {
+    let (request_tx, request_rx) = mpsc::channel::<ModelRequest>();
+    let worker = std::thread::spawn(move || drop(request_rx));
+    let provider = provider_with_worker(request_tx, worker);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !provider.worker_exit_observed() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker exit was not observed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // A zero timeout can only succeed when the exit was already observed, and
+    // the closed request channel is not reported as an error.
+    provider
+        .shutdown_and_wait(Duration::ZERO)
+        .expect("an exited worker needs no wait");
+}
+
+#[test]
+fn shutdown_and_wait_reports_a_worker_panic_during_teardown() {
+    let (request_tx, request_rx) = mpsc::channel::<ModelRequest>();
+    let worker = std::thread::spawn(move || {
+        let _ = request_rx.recv();
+        panic!("teardown boom");
+    });
+    let provider = provider_with_worker(request_tx, worker);
+
+    let message = provider
+        .shutdown_and_wait(Duration::from_secs(5))
+        .expect_err("a panicking worker is an error")
+        .to_string();
+    assert!(
+        message.starts_with("server model worker panicked: "),
+        "{message}"
+    );
+    assert!(message.contains("teardown boom"), "{message}");
+    assert!(provider.worker_exit_observed());
+}
+
+#[test]
+fn shutdown_and_wait_times_out_on_a_worker_that_ignores_shutdown() {
+    let (request_tx, request_rx) = mpsc::channel::<ModelRequest>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || {
+        // Take the shutdown request and ignore it until the test lets go.
+        let _ = request_rx.recv();
+        let _ = release_rx.recv();
+    });
+    let provider = provider_with_worker(request_tx, worker);
+
+    let started = std::time::Instant::now();
+    let message = provider
+        .shutdown_and_wait(Duration::from_secs(1))
+        .expect_err("a worker that never exits is an error")
+        .to_string();
+    let elapsed = started.elapsed();
+    assert_eq!(message, "server model worker did not exit within 1s");
+    assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
+    assert!(!provider.worker_exit_observed());
+
+    release_tx
+        .send(())
+        .expect("worker is parked on the release channel");
+    provider
+        .shutdown_and_wait(Duration::from_secs(5))
+        .expect("the released worker exits");
+    assert!(provider.worker_exit_observed());
 }

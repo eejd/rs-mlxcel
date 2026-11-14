@@ -303,8 +303,11 @@ impl DFlashConfig {
             }
         }
 
-        serde_json::from_value(serde_json::Value::Object(flat))
-            .map_err(|e| format!("Failed to parse DFlashConfig: {e}"))
+        // transformers 5 keeps `rope_theta` only under `rope_parameters`
+        // (#2443); without the lift the drafter would run at the default base.
+        let mut flat = serde_json::Value::Object(flat);
+        crate::rope_parameters::lift_rope_parameters(&mut flat);
+        serde_json::from_value(flat).map_err(|e| format!("Failed to parse DFlashConfig: {e}"))
     }
 
     /// Whether this checkpoint is an LFM2 / LFM2.5 DSpark drafter: a DFlash
@@ -391,8 +394,9 @@ pub const DSPARK_DRAFT_ARCHITECTURE: &str = "Lfm2DSparkDraftModel";
 ///   `Dflash` and `drafter_kind_by_model_type` maps only the two Gemma 4
 ///   assistant types, so *every* drafter that is not a Gemma 4 assistant
 ///   auto-resolves to `Dflash`, including an ordinary small full model used as
-///   a classic drafter. Keying on the resolved kind would reject that
-///   legitimate, currently-working pairing.
+///   a drafter. Keying on the resolved kind would call that a DFlash
+///   checkpoint and hide the real problem from the refusal `mlxcel generate`
+///   prints for it.
 ///
 /// What a DFlash drafter really carries is a nested `dflash_config` object
 /// and/or `architectures: ["DFlashDraftModel"]` (the Poolside Laguna drafters
@@ -435,9 +439,10 @@ pub fn is_dflash_drafter_config(config: &serde_json::Value) -> bool {
 ///
 /// Reads `path/config.json` and applies [`is_dflash_drafter_config`].
 ///
-/// Returns `false` when the config is missing or unparseable: this is a
-/// pre-load guard, and a config that cannot be read is the general loader's
-/// error to report with its own diagnostics, not this probe's to swallow.
+/// Returns `false` when the config is missing or unparseable. A `false` return
+/// does not distinguish an unreadable config from a non-DFlash one, so a caller
+/// that refuses without loading the checkpoint must report the unreadable case
+/// itself.
 pub fn is_dflash_drafter_dir(path: &Path) -> bool {
     let Ok(bytes) = std::fs::read(path.join("config.json")) else {
         return false;
@@ -672,9 +677,9 @@ mod tests {
     #[test]
     fn probe_rejects_an_ordinary_qwen3_full_model() {
         // The regression this whole probe exists to avoid: an ordinary small
-        // full model used as a classic `--draft-model` drafter resolves to
-        // `DrafterKind::Dflash` by default, but it is NOT a DFlash drafter and
-        // must keep loading through the standalone model loader.
+        // full model passed as `--draft-model` resolves to `DrafterKind::Dflash`
+        // by default, but it is NOT a DFlash drafter and must keep loading
+        // through the standalone model loader as `-m`.
         assert!(!is_dflash_drafter_config(&json!({
             "architectures": ["Qwen3ForCausalLM"],
             "model_type": "qwen3",

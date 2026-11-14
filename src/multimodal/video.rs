@@ -150,8 +150,11 @@ pub const INKLING_MAX_VIDEO_CLIPS: usize = INKLING_MAX_VIDEO_PAIRS / 2;
 /// No more than two unique decoded frames are required per selected pair.
 pub const INKLING_MAX_DECODED_FRAMES: usize = INKLING_MAX_VIDEO_PAIRS * 2;
 
-/// Conservative request-wide cap for decoded frame storage (RGBA worst case).
-pub const INKLING_MAX_DECODED_PIXEL_BYTES: usize = 512 * 1024 * 1024;
+/// Conservative per-request cap for decoded frame storage (RGBA worst case).
+pub const DEFAULT_MAX_DECODED_VIDEO_BYTES: usize = 512 * 1024 * 1024;
+
+/// Inkling uses the shared decoded-video storage cap.
+pub const INKLING_MAX_DECODED_PIXEL_BYTES: usize = DEFAULT_MAX_DECODED_VIDEO_BYTES;
 
 /// One semantic part of Inkling's timestamped video prompt.
 #[derive(Debug, Clone, PartialEq)]
@@ -292,6 +295,8 @@ pub struct FrameSamplingPolicy {
     pub max_frames: usize,
     pub frame_factor: usize,
     pub reject_over_max: bool,
+    /// Keep every source frame up to `max_frames` when no FPS is requested.
+    pub keep_all_without_target_fps: bool,
 }
 
 impl Default for FrameSamplingPolicy {
@@ -301,6 +306,7 @@ impl Default for FrameSamplingPolicy {
             max_frames: FPS_MAX_FRAMES,
             frame_factor: FRAME_FACTOR,
             reject_over_max: false,
+            keep_all_without_target_fps: false,
         }
     }
 }
@@ -552,6 +558,7 @@ impl PrivateTempDir {
     pub fn create(prefix: &str) -> io::Result<Self> {
         require_plain_file_name(prefix)?;
         let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
@@ -944,16 +951,19 @@ pub fn smart_nframes_with_policy(
         return Ok(nframes);
     }
 
-    let fps = target_fps.unwrap_or(DEFAULT_FPS);
-    if fps <= 0.0 {
-        return Err(VideoError::Extract {
-            path: PathBuf::new(),
-            message: format!("target fps must be > 0; got {fps}"),
-        });
-    }
-    let video_fps_safe = if video_fps > 0.0 { video_fps } else { 1.0 };
-
-    let raw = total_frames as f64 / video_fps_safe * fps;
+    let raw = if target_fps.is_none() && policy.keep_all_without_target_fps {
+        total_frames as f64
+    } else {
+        let fps = target_fps.unwrap_or(DEFAULT_FPS);
+        if fps <= 0.0 {
+            return Err(VideoError::Extract {
+                path: PathBuf::new(),
+                message: format!("target fps must be > 0; got {fps}"),
+            });
+        }
+        let video_fps_safe = if video_fps > 0.0 { video_fps } else { 1.0 };
+        total_frames as f64 / video_fps_safe * fps
+    };
     let requested = ceil_by_factor(raw, frame_factor)
         .max(ceil_by_factor(min_frames as f64, frame_factor))
         .min(total_frames);
@@ -1354,6 +1364,27 @@ pub fn load_video_source_with_policy(
     policy: FrameSamplingPolicy,
     limits: &VideoLimits,
 ) -> Result<Vec<DynamicImage>, VideoError> {
+    load_video_source_with_policy_and_budget(
+        source,
+        target_fps,
+        target_nframes,
+        policy,
+        limits,
+        None,
+    )
+}
+
+/// Like [`load_video_source_with_policy`], with an optional aggregate budget
+/// for decoded frames. The budget uses four bytes per source pixel and is
+/// checked after sampling is planned but before ffmpeg starts decoding.
+pub fn load_video_source_with_policy_and_budget(
+    source: &VideoSource,
+    target_fps: Option<f64>,
+    target_nframes: Option<usize>,
+    policy: FrameSamplingPolicy,
+    limits: &VideoLimits,
+    max_decoded_bytes: Option<usize>,
+) -> Result<Vec<DynamicImage>, VideoError> {
     if !ffmpeg_available() {
         return Err(VideoError::FfmpegMissing);
     }
@@ -1373,14 +1404,62 @@ pub fn load_video_source_with_policy(
         },
         other => other,
     })?;
+    if let Some(max_decoded_bytes) = max_decoded_bytes {
+        validate_decoded_video_budget(
+            &canonical,
+            meta.width,
+            meta.height,
+            nframes,
+            max_decoded_bytes,
+        )?;
+    }
 
-    let indices = uniform_indices(meta.total_frames, nframes);
+    let indices = frame_indices_with_policy(meta.total_frames, nframes, target_fps, policy);
     let frames = extract_frames_single_pass(source, &indices, meta.fps, limits)?;
 
     if frames.is_empty() {
         return Err(VideoError::EmptyVideo(canonical));
     }
     Ok(frames)
+}
+
+fn frame_indices_with_policy(
+    total_frames: usize,
+    nframes: usize,
+    target_fps: Option<f64>,
+    policy: FrameSamplingPolicy,
+) -> Vec<usize> {
+    if target_fps.is_none() && policy.keep_all_without_target_fps {
+        (0..nframes).collect()
+    } else {
+        uniform_indices(total_frames, nframes)
+    }
+}
+
+fn validate_decoded_video_budget(
+    path: &Path,
+    width: u32,
+    height: u32,
+    frames: usize,
+    max_decoded_bytes: usize,
+) -> Result<usize, VideoError> {
+    let decoded_bytes = inkling_decoded_pixel_bytes(width, height, frames).ok_or_else(|| {
+        VideoError::Extract {
+            path: path.to_path_buf(),
+            message: format!(
+                "decoded frame budget overflow for {frames} frame(s) at {width}x{height}; reduce --max-frames or --target-fps"
+            ),
+        }
+    })?;
+    if decoded_bytes > max_decoded_bytes {
+        return Err(VideoError::Extract {
+            path: path.to_path_buf(),
+            message: format!(
+                "{frames} decoded frame(s) at {width}x{height} require {decoded_bytes} bytes, exceeding the {max_decoded_bytes}-byte budget; reduce --max-frames or --target-fps"
+            ),
+        });
+    }
+    Ok(decoded_bytes)
 }
 
 /// One fd-safe source and its requested sampling rate for Inkling video.
@@ -1852,6 +1931,7 @@ fn extract_frames_single_pass(
         return Ok(Vec::new());
     }
 
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let canonical_path = source.canonical_path().to_path_buf();
 
     // Reset the master fd offset to 0 (no-op for path sources) so the new

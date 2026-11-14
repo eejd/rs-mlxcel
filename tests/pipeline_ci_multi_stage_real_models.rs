@@ -38,7 +38,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::repo_model_dir;
+use common::{repo_model_dir, test_cluster_auth};
 
 use mlxcel::SamplingConfig;
 use mlxcel::distributed::TransportBackend;
@@ -50,7 +50,8 @@ use mlxcel::distributed::pipeline::{
 };
 use mlxcel::server::batch::{BatchObservability, RequestPriority};
 use mlxcel::server::{
-    BatchMetrics, ModelProvider, PipelineParallelRuntimeConfig, ServerConfig, ServerGenerateOptions,
+    BatchMetrics, ModelProvider, PipelineParallelRuntimeConfig, ServerConfig,
+    ServerGenerateOptions, WORKER_EXIT_TIMEOUT,
 };
 
 /// Reserve an ephemeral loopback TCP port and release it so the caller can
@@ -184,6 +185,7 @@ fn assert_multi_stage_coordinator_matches_dense_baseline(
         v
     };
 
+    let auth = test_cluster_auth();
     let coordinator_addr = format!("127.0.0.1:{}", reserve_port());
     let stage_addrs: Vec<String> = (0..num_stages)
         .map(|_| format!("127.0.0.1:{}", reserve_port()))
@@ -209,8 +211,10 @@ fn assert_multi_stage_coordinator_matches_dense_baseline(
             transport_backend: TransportBackend::Tcp,
             stage_assignment: assignments[i].clone(),
             num_stages: num_stages as u32,
+            coordinator_peer: coordinator_addr.clone(),
             upstream_peer: upstream,
             downstream_peer: downstream,
+            auth: Arc::clone(&auth),
         })
         .unwrap();
         stage_handles.push(handle);
@@ -236,6 +240,8 @@ fn assert_multi_stage_coordinator_matches_dense_baseline(
                     transport_backend: TransportBackend::Tcp,
                     bind_address: coordinator_addr,
                     stage_timeout: Duration::from_secs(60),
+                    auth,
+                    vocab_size: None,
                 },
             )),
             ..ServerConfig::default()
@@ -283,6 +289,18 @@ fn assert_multi_stage_coordinator_matches_dense_baseline(
         .generate(prompt.to_string(), options)
         .unwrap();
 
+    // Join both model workers before the stage services and before this
+    // function returns. Dropping a provider only asks its worker to exit;
+    // the worker then frees the model on its own thread, and a test process
+    // that reaches `exit()` meanwhile runs MLX's static destructors under it
+    // (`pure virtual method called`, #2738). The coordinator goes first so
+    // its last stage round-trips complete while the stages are still up.
+    remote_provider
+        .shutdown_and_wait(WORKER_EXIT_TIMEOUT)
+        .expect("remote coordinator worker must exit");
+    dense_provider
+        .shutdown_and_wait(WORKER_EXIT_TIMEOUT)
+        .expect("dense worker must exit");
     drop(remote_provider);
     drop(dense_provider);
     for handle in stage_handles {
@@ -301,8 +319,9 @@ fn assert_multi_stage_coordinator_matches_dense_baseline(
     );
 }
 
-/// 2-host logical smoke: two PP stages as two processes in one runner.
-/// Driven by `scripts/ci/run-pp-two-host-logical.sh`.
+/// 2-host logical smoke: two PP stage services, the remote coordinator and
+/// the dense baseline, all threads of this one test process talking over
+/// loopback TCP. Driven by `scripts/ci/run-pp-two-host-logical.sh`.
 ///
 /// The target model is resolved from `MLXCEL_CI_PP_MODEL` (the env var
 /// the workflow sets after extracting the CI fixture). When the env is

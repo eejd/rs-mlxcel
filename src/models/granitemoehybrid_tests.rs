@@ -340,30 +340,21 @@ fn granite_hybrid_fused_kernel_matches_the_gather_path_at_one_token() {
     );
 }
 
-/// Reproduction for issue #2245: before it, `GraniteMoeHybridMoE::forward`
-/// always took the `SwitchGLU::forward` + `moe_weighted_sum` gather path, so
-/// the fused single-token decode kernel never ran for the family. The
-/// production `forward` must return, at one token, exactly the fused-kernel
-/// computation (bit for bit, since it IS that computation) and not the gather
-/// computation, which the two candidate values below pin. The candidates come
-/// from the block's own router outputs, so the comparison is against the exact
-/// indices and scores `forward` would hand the kernel. Runs only when both
-/// fused MoE ports exist and the `MLXCEL_FUSED_MOE` gate is on, since the
-/// gate is part of the routing under test.
-#[test]
-fn granite_hybrid_forward_routes_one_token_through_the_fused_kernel() {
-    use crate::models::switch_layers::fused_moe_enabled;
-
+/// The two candidate outputs of one granite MoE step at one token: the fused
+/// kernel's and the gather path's, computed from the block's own router so
+/// they use the exact indices and scores `forward_routed` hands either path.
+/// Also returns the input. `None` when this backend has no fused MoE port.
+fn one_token_routing_candidates(
+    moe: &GraniteMoeHybridMoE,
+) -> Option<(
+    mlxcel_core::UniquePtr<mlxcel_core::MlxArray>,
+    Vec<f32>,
+    Vec<f32>,
+)> {
     if !mlxcel_core::fused_moe_kernels_available() {
         eprintln!("skipping: this backend has no fused MoE kernel port (#1803)");
-        return;
+        return None;
     }
-    if !fused_moe_enabled() {
-        eprintln!("skipping: MLXCEL_FUSED_MOE disables the routing this test pins");
-        return;
-    }
-
-    let moe = fused_moe_block();
     let x = mlxcel_core::astype(
         &mlxcel_core::from_slice_f32(
             &values(FUSED_HIDDEN as usize, -0.4, 0.0125),
@@ -372,9 +363,6 @@ fn granite_hybrid_forward_routes_one_token_through_the_fused_kernel() {
         mlxcel_core::dtype::BFLOAT16,
     );
 
-    // The router outputs `forward` computes, replicated with the block's own
-    // router so the candidates use the exact indices and scores the
-    // production step would.
     let logits = moe.router.forward(&x);
     let kth = 0; // two experts, top_k 2: every expert is routed
     let indices = mlxcel_core::argpartition(&logits, kth, -1);
@@ -389,34 +377,82 @@ fn granite_hybrid_forward_routes_one_token_through_the_fused_kernel() {
         .switch_mlp
         .forward_fused_kernel(&x, &topk_indices, &scores)
         .expect("honest affine 4-bit experts of dff 64 must dispatch the fused kernel");
-    let fused_candidate = mlxcel_core::reshape(&fused, &[1, FUSED_HIDDEN]);
-    let gather_candidate = moe_weighted_sum(
+    let fused = mlxcel_core::reshape(&fused, &[1, FUSED_HIDDEN]);
+    let gathered = moe_weighted_sum(
         &moe.switch_mlp.forward(&x, &topk_indices),
         &scores,
         mlxcel_core::dtype::BFLOAT16,
     );
+    let fused = to_f32_vec(&fused);
+    let gathered = to_f32_vec(&gathered);
+    assert!(
+        fused.iter().zip(&gathered).any(|(a, b)| a != b),
+        "the two candidates must differ for this geometry, so a bit-exact match \
+         against one of them is a routing check"
+    );
+    Some((x, fused, gathered))
+}
 
-    let routed = mlxcel_core::utils::array_to_vec_f32(&mlxcel_core::astype(
-        &moe.forward(&x),
-        mlxcel_core::dtype::FLOAT32,
-    ));
-    let fused = mlxcel_core::utils::array_to_vec_f32(&mlxcel_core::astype(
-        &fused_candidate,
-        mlxcel_core::dtype::FLOAT32,
-    ));
-    let gathered = mlxcel_core::utils::array_to_vec_f32(&mlxcel_core::astype(
-        &gather_candidate,
-        mlxcel_core::dtype::FLOAT32,
-    ));
+fn to_f32_vec(a: &mlxcel_core::MlxArray) -> Vec<f32> {
+    mlxcel_core::utils::array_to_vec_f32(&mlxcel_core::astype(a, mlxcel_core::dtype::FLOAT32))
+}
 
+/// Reproduction for issue #2245, restructured for issue #2492. Before #2245
+/// `GraniteMoeHybridMoE::forward` always took the `SwitchGLU::forward` +
+/// `moe_weighted_sum` gather path, so the fused single-token decode kernel
+/// never ran for the family. With the fused arm selected, the routed forward
+/// must return exactly the fused-kernel computation (bit for bit, since it IS
+/// that computation) and not the gather computation. The arm is forced here
+/// rather than read from `MLXCEL_FUSED_MOE`, so the fused routing stays pinned
+/// on every device with a kernel port even when the environment switches the
+/// kernel off, instead of the test skipping.
+#[test]
+fn granite_hybrid_fused_arm_routes_one_token_through_the_fused_kernel() {
+    let moe = fused_moe_block();
+    let Some((x, fused, _)) = one_token_routing_candidates(&moe) else {
+        return;
+    };
+    let routed = to_f32_vec(&moe.forward_routed(&x, true));
     assert!(
         routed.iter().zip(&fused).all(|(a, b)| a == b),
-        "one-token forward must take the fused kernel path, not the gather path"
+        "the fused arm must take the fused kernel path, not the gather path"
     );
+}
+
+/// The other arm of the same step: with the fused arm declined, the routed
+/// forward is exactly the gather computation.
+#[test]
+fn granite_hybrid_gather_arm_routes_one_token_through_the_gather_path() {
+    let moe = fused_moe_block();
+    let Some((x, _, gathered)) = one_token_routing_candidates(&moe) else {
+        return;
+    };
+    let routed = to_f32_vec(&moe.forward_routed(&x, false));
     assert!(
-        routed.iter().zip(&gathered).any(|(a, b)| a != b),
-        "the gather candidate must differ from the fused path for this geometry, \
-         so the bit-exact match above is a routing check"
+        routed.iter().zip(&gathered).all(|(a, b)| a == b),
+        "the gather arm must take the gather path, not the fused kernel"
+    );
+}
+
+/// The production `forward` takes the arm the `MLXCEL_FUSED_MOE` gate selects:
+/// bit-exact with the fused candidate under the default, and with the gather
+/// candidate when the environment switches the kernel off, so the routing the
+/// #2245 fix added stays pinned without skipping under either setting.
+#[test]
+fn granite_hybrid_forward_follows_the_fused_moe_gate() {
+    let moe = fused_moe_block();
+    let Some((x, fused, gathered)) = one_token_routing_candidates(&moe) else {
+        return;
+    };
+    let expected = if crate::models::switch_layers::fused_moe_enabled() {
+        &fused
+    } else {
+        &gathered
+    };
+    let routed = to_f32_vec(&moe.forward(&x));
+    assert!(
+        routed.iter().zip(expected).all(|(a, b)| a == b),
+        "the production forward must take the path the MLXCEL_FUSED_MOE gate selects"
     );
 }
 
@@ -524,4 +560,203 @@ fn granite_flat_rope_theta_wins_over_nested_rope_parameters() {
     config["rope_theta"] = serde_json::json!(500_000);
     let args: ModelArgs = serde_json::from_value(config).unwrap();
     assert_eq!(args.rope_theta, 500_000.0);
+}
+
+pub(crate) fn batching_model() -> super::granitemoehybrid::GraniteMoeHybridModel {
+    batching_model_with_rope(true)
+}
+
+fn batching_model_with_rope(rope: bool) -> super::granitemoehybrid::GraniteMoeHybridModel {
+    use crate::models::embedding_test_support::Rng;
+    use mlxcel_core::dtype;
+    let mut config:ModelArgs=serde_json::from_value(serde_json::json!({"model_type":"granitemoehybrid","vocab_size":16,"hidden_size":8,"intermediate_size":16,"num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":1,"rms_norm_eps":1e-5,"embedding_multiplier":1.3,"attention_multiplier":0.5,"logits_scaling":2.0,"residual_multiplier":0.7,"layer_types":["mamba","attention"],"mamba_n_heads":2,"mamba_d_head":4,"mamba_d_state":32,"mamba_n_groups":1,"mamba_d_conv":4})).unwrap();
+    if !rope {
+        config.position_embedding_type = "nope".into();
+    }
+    let mut weights = WeightMap::new();
+    let mut rng = Rng::new(2571);
+    rng.insert(&mut weights, "model.embed_tokens.weight", &[16, 8], 0.2);
+    weights.insert(
+        "model.norm.weight".into(),
+        mlxcel_core::ones(&[8], dtype::FLOAT32),
+    );
+    weights.insert(
+        "model.layers.0.input_layernorm.weight".into(),
+        mlxcel_core::ones(&[8], dtype::FLOAT32),
+    );
+    weights.insert(
+        "model.layers.0.post_attention_layernorm.weight".into(),
+        mlxcel_core::ones(&[8], dtype::FLOAT32),
+    );
+    weights.insert(
+        "model.layers.0.mamba.norm.weight".into(),
+        mlxcel_core::ones(&[8], dtype::FLOAT32),
+    );
+    rng.insert(
+        &mut weights,
+        "model.layers.0.mamba.in_proj.weight",
+        &[82, 8],
+        0.1,
+    );
+    rng.insert(
+        &mut weights,
+        "model.layers.0.mamba.out_proj.weight",
+        &[8, 8],
+        0.1,
+    );
+    rng.insert(
+        &mut weights,
+        "model.layers.0.mamba.conv1d.weight",
+        &[72, 4, 1],
+        0.1,
+    );
+    weights.insert(
+        "model.layers.0.mamba.dt_bias".into(),
+        mlxcel_core::zeros(&[2], dtype::FLOAT32),
+    );
+    weights.insert(
+        "model.layers.0.mamba.A_log".into(),
+        mlxcel_core::zeros(&[2], dtype::FLOAT32),
+    );
+    weights.insert(
+        "model.layers.0.mamba.D".into(),
+        mlxcel_core::ones(&[2], dtype::FLOAT32),
+    );
+    rng.insert(
+        &mut weights,
+        "model.layers.0.mlp.gate_proj.weight",
+        &[16, 8],
+        0.1,
+    );
+    rng.insert(
+        &mut weights,
+        "model.layers.0.mlp.up_proj.weight",
+        &[16, 8],
+        0.1,
+    );
+    rng.insert(
+        &mut weights,
+        "model.layers.0.mlp.down_proj.weight",
+        &[8, 16],
+        0.1,
+    );
+    weights.insert(
+        "model.layers.1.input_layernorm.weight".into(),
+        mlxcel_core::ones(&[8], dtype::FLOAT32),
+    );
+    weights.insert(
+        "model.layers.1.post_attention_layernorm.weight".into(),
+        mlxcel_core::ones(&[8], dtype::FLOAT32),
+    );
+    rng.insert(
+        &mut weights,
+        "model.layers.1.self_attn.q_proj.weight",
+        &[8, 8],
+        0.1,
+    );
+    rng.insert(
+        &mut weights,
+        "model.layers.1.self_attn.k_proj.weight",
+        &[4, 8],
+        0.1,
+    );
+    rng.insert(
+        &mut weights,
+        "model.layers.1.self_attn.v_proj.weight",
+        &[4, 8],
+        0.1,
+    );
+    rng.insert(
+        &mut weights,
+        "model.layers.1.self_attn.o_proj.weight",
+        &[8, 8],
+        0.1,
+    );
+    rng.insert(
+        &mut weights,
+        "model.layers.1.mlp.gate_proj.weight",
+        &[16, 8],
+        0.1,
+    );
+    rng.insert(
+        &mut weights,
+        "model.layers.1.mlp.up_proj.weight",
+        &[16, 8],
+        0.1,
+    );
+    rng.insert(
+        &mut weights,
+        "model.layers.1.mlp.down_proj.weight",
+        &[8, 16],
+        0.1,
+    );
+    super::granitemoehybrid::GraniteMoeHybridModel::from_weights(config, weights).unwrap()
+}
+#[test]
+fn granitemoehybrid_model_owned_batched_multistep() {
+    let _guard = crate::models::embedding_test_support::mlx_test_guard();
+    crate::models::batched_decode_harness::assert_model_owned_multistep_with_paged_lengths(
+        batching_model,
+        &[0, 3],
+    );
+}
+#[test]
+fn granitemoehybrid_fresh_and_mixed_recurrent_states_match_solo_rows() {
+    use mlxcel_core::cache::SequenceId;
+    use mlxcel_core::generate::LanguageModel;
+    let _guard = crate::models::embedding_test_support::mlx_test_guard();
+    for mixed in [false, true] {
+        let batched = batching_model();
+        let solo = [batching_model(), batching_model()];
+        let ids = [SequenceId::from_raw(1001), SequenceId::from_raw(1002)];
+        let mut caches: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                batched.prepare_sequence_state(*id);
+                LanguageModel::make_caches(&batched)
+            })
+            .collect();
+        let mut single: Vec<_> = solo
+            .iter()
+            .zip(ids)
+            .map(|(m, id)| {
+                m.prepare_sequence_state(id);
+                LanguageModel::make_caches(m)
+            })
+            .collect();
+        if mixed {
+            let prompt = mlxcel_core::from_slice_i32(&[1, 2, 3], &[1, 3]);
+            let _ = batched.forward_with_sequence_id(&prompt, Some(ids[0]), &mut caches[0], None);
+            let _ = solo[0].forward_with_sequence_id(&prompt, Some(ids[0]), &mut single[0], None);
+        }
+        for step in 0..3 {
+            let tokens = [2 + step, 3 + step];
+            let input = mlxcel_core::from_slice_i32(&tokens, &[2, 1]);
+            let mut refs: Vec<_> = caches.iter_mut().map(Vec::as_mut_slice).collect();
+            let actual = batched.forward_batched_with_ids(&input, Some(&ids), &mut refs, None);
+            for row in 0..2 {
+                let input = mlxcel_core::from_slice_i32(&[tokens[row]], &[1, 1]);
+                let expected = solo[row].forward_with_sequence_id(
+                    &input,
+                    Some(ids[row]),
+                    &mut single[row],
+                    None,
+                );
+                let actual = mlxcel_core::utils::slice_axis(&actual, 0, row as i32, row as i32 + 1);
+                let delta = mlxcel_core::max_all(&mlxcel_core::abs(&mlxcel_core::subtract(
+                    &actual, &expected,
+                )));
+                assert!(mlxcel_core::item_f32(&delta) <= 1e-5);
+            }
+        }
+    }
+}
+
+#[test]
+fn granite_hybrid_nope_native_batch_multistep() {
+    let _guard = crate::models::embedding_test_support::mlx_test_guard();
+    crate::models::batched_decode_harness::assert_model_owned_multistep_with_paged_lengths(
+        || batching_model_with_rope(false),
+        &[0, 3],
+    );
 }

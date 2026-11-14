@@ -32,26 +32,27 @@ use mlxcel::cli::speculative_args::{
 use mlxcel::cli::turbo_args::{TurboKvCacheArgs, resolve_kv_cache_mode};
 use mlxcel::cli::ui_compat_args::UiCompatArgs;
 use mlxcel::downloader::{
-    DownloadArgs, DownloadOptions, ModelSourceOptions, download_repo,
+    DownloadArgs, DownloadOptions, ModelSourceOptions, download_repo, resolve_draft_model_source,
     resolve_model_source_with_options, set_offline_mode,
 };
 use mlxcel::lang_bias::LangBiasCliArgs;
 use mlxcel::server::{
-    LlamaModelSourceArgs, ServerStartupInput, env_fallback_apc_block_size,
-    env_fallback_apc_enabled, env_fallback_apc_hash, env_fallback_apc_num_blocks,
-    env_fallback_api_key_files, env_fallback_api_keys, env_fallback_batch_size,
-    env_fallback_cache_type_k, env_fallback_cache_type_v, env_fallback_chat_template_kwargs,
-    env_fallback_cors_credentials, env_fallback_draft_model, env_fallback_embedding_model,
-    env_fallback_endpoint_slots, env_fallback_kv_bits, env_fallback_kv_group_size,
-    env_fallback_kv_quant_scheme, env_fallback_kv_skip_last_layer, env_fallback_lang_bias,
-    env_fallback_lang_bias_include_byte_fragments, env_fallback_log_file, env_fallback_offline,
-    env_fallback_prompt_cache_capacity_bytes, env_fallback_prompt_cache_enabled,
-    env_fallback_prompt_cache_max_entries, env_fallback_prompt_cache_min_prefix,
-    env_fallback_prompt_cache_snapshot_capacity_bytes,
+    LlamaModelSourceArgs, ServerStartupInput, StartupNotice, env_fallback_allowed_origins,
+    env_fallback_apc_block_size, env_fallback_apc_enabled, env_fallback_apc_hash,
+    env_fallback_apc_num_blocks, env_fallback_api_key_files, env_fallback_api_keys,
+    env_fallback_batch_size, env_fallback_cache_type_k, env_fallback_cache_type_v,
+    env_fallback_chat_template_kwargs, env_fallback_cors_credentials, env_fallback_cors_origins,
+    env_fallback_draft_model, env_fallback_embedding_model, env_fallback_endpoint_slots,
+    env_fallback_kv_bits, env_fallback_kv_group_size, env_fallback_kv_quant_scheme,
+    env_fallback_kv_skip_last_layer, env_fallback_lang_bias,
+    env_fallback_lang_bias_include_byte_fragments, env_fallback_log_file,
+    env_fallback_models_autoload, env_fallback_offline, env_fallback_prompt_cache_capacity_bytes,
+    env_fallback_prompt_cache_enabled, env_fallback_prompt_cache_max_entries,
+    env_fallback_prompt_cache_min_prefix, env_fallback_prompt_cache_snapshot_capacity_bytes,
     env_fallback_prompt_cache_snapshot_max_entries, env_fallback_prompt_cache_snapshot_ttl,
     env_fallback_prompt_cache_ttl, env_fallback_reasoning_budget, env_fallback_reranker_model,
     env_fallback_settings_endpoint, env_fallback_ubatch_size, long_cli_flag_was_set,
-    resolve_llama_model_source, start_server, superseded_model_notice,
+    resolve_image_only_mode, resolve_llama_model_source, start_server, superseded_model_notice,
 };
 
 /// mlxcel-server: llama-server compatible HTTP server for MLX inference
@@ -360,9 +361,13 @@ struct ServerArgs {
     models_max: usize,
 
     /// For router server, whether to automatically load models
+    ///
+    /// Also reads `LLAMA_ARG_MODELS_AUTOLOAD` when neither this flag nor
+    /// `--no-models-autoload` is on the command line
+    /// (`env_fallback_models_autoload`); clap's own `env` binding would turn
+    /// that variable into a hard conflict with `--no-models-autoload`.
     #[arg(
         long = "models-autoload",
-        env = "LLAMA_ARG_MODELS_AUTOLOAD",
         default_value_t = true,
         overrides_with = "_no_models_autoload"
     )]
@@ -610,10 +615,12 @@ struct ServerArgs {
     /// `localhost` (which echoes the `Origin` only when its host is
     /// `localhost`, `127.0.0.1` or `::1`). For per-origin matching against a
     /// list, use the mlxcel-native `--allowed-origins` instead; the two are
-    /// mutually exclusive. Also reads `LLAMA_ARG_CORS_ORIGINS`.
+    /// mutually exclusive on the command line. Also reads
+    /// `LLAMA_ARG_CORS_ORIGINS` after parsing (#2664): `--allowed-origins` on
+    /// the command line makes it ignored, and setting it together with
+    /// `MLXCEL_ALLOWED_ORIGINS` is a startup error.
     #[arg(
         long = "cors-origins",
-        env = "LLAMA_ARG_CORS_ORIGINS",
         default_value = "*",
         value_name = "ORIGINS",
         conflicts_with = "allowed_origins"
@@ -701,8 +708,9 @@ struct ServerArgs {
     )]
     draft: usize,
 
-    /// Largest active decode batch at which a prompt-lookup sequence runs
-    /// its own verify round (`--draft-kind prompt-lookup`). Each proposing
+    /// Largest active decode batch at which a prompt-lookup or full-model
+    /// sequence runs its own verify round (`--draft-kind prompt-lookup`, or a
+    /// full-model `--draft-model`). Each proposing
     /// row costs one verify forward on top of the batched step, so on ticks
     /// with more concurrent rows every row takes the plain batched step and
     /// the drafter keeps observing the emitted tokens until the batch
@@ -764,6 +772,23 @@ struct ServerArgs {
         value_name = "PATH_OR_REPO_ID"
     )]
     embedding_model: Option<String>,
+
+    /// Image-generation checkpoint to serve on /v1/images next to the chat model
+    ///
+    /// A local directory or a HuggingFace `owner/name` repo-id (resolved like
+    /// `-m`). Loads on its own worker thread and serves
+    /// POST /v1/images/generations and POST /v1/images/edits (JSON bodies, base64
+    /// PNG responses); `-m` keeps serving chat. Without `-m`, the server starts
+    /// image-only: this checkpoint is the served model, and chat, completion and
+    /// tokenizer routes answer 501. Requests run one at a time. Startup fails
+    /// when the checkpoint is not a supported image-generation family. Also
+    /// reads `MLXCEL_IMAGE_MODEL`. See docs/image-generation.md.
+    #[arg(
+        long = "image-model",
+        env = "MLXCEL_IMAGE_MODEL",
+        value_name = "PATH_OR_REPO_ID"
+    )]
+    image_model: Option<String>,
 
     /// Texts per embedding forward pass (default: 16)
     ///
@@ -893,10 +918,11 @@ struct ServerArgs {
     /// instead of the default permissive policy that reflects any origin.
     /// Unset (default) keeps the permissive behavior. Only affects the
     /// browser-reachable TCP HTTP listener. Also reads
-    /// `MLXCEL_ALLOWED_ORIGINS`.
+    /// `MLXCEL_ALLOWED_ORIGINS` after parsing (#2664): `--cors-origins` on the
+    /// command line makes it ignored, and setting it together with
+    /// `LLAMA_ARG_CORS_ORIGINS` is a startup error.
     #[arg(
         long = "allowed-origins",
-        env = "MLXCEL_ALLOWED_ORIGINS",
         value_delimiter = ',',
         value_name = "ORIGINS"
     )]
@@ -1361,7 +1387,13 @@ struct ServerArgs {
     #[arg(long, value_name = "PATH")]
     distributed_config: Option<PathBuf>,
 
-    /// Role this node plays in the cluster (prefill, decode, pipeline_stage, tensor_parallel_rank, pipeline_tensor_parallel, hybrid)
+    /// Role this node plays in the cluster (prefill, decode, router, pipeline_stage, tensor_parallel_rank, pipeline_tensor_parallel, hybrid).
+    ///
+    /// `prefill`, `decode` and `router` are the disaggregated serving roles;
+    /// each requires `--serving-bind` and a cluster secret
+    /// (`--cluster-secret-file` or its alternatives) and refuses to start
+    /// without one. `hybrid` (the default) is single-node serving and needs
+    /// neither.
     #[arg(long, value_name = "ROLE")]
     node_role: Option<String>,
 
@@ -1374,13 +1406,19 @@ struct ServerArgs {
     peers: Vec<std::net::SocketAddr>,
 
     /// Comma-separated prefill-node addresses. Decode nodes use this to identify
-    /// accepted handoff sources; routers use it to select a prefill target.
+    /// accepted handoff sources; routers use it to select a prefill target and
+    /// accept result frames only from these addresses, so each entry must be
+    /// the address the prefill node connects from (its `--serving-bind`, with
+    /// an unspecified bind IP replaced by its source IP).
     /// Consumed when `--node-role decode` or `--node-role router`.
     #[arg(long, value_delimiter = ',', value_name = "ADDR")]
     prefill_peers: Vec<std::net::SocketAddr>,
 
     /// Comma-separated decode-node addresses. Prefill nodes hand KV state to one
-    /// of these targets; routers use it to route decode continuations.
+    /// of these targets; routers use it to route decode continuations and
+    /// accept result frames only from these addresses, so each entry must be
+    /// the address the decode node connects from (its `--serving-bind`, with
+    /// an unspecified bind IP replaced by its source IP).
     /// Consumed when `--node-role prefill` or `--node-role router`.
     #[arg(long, value_delimiter = ',', value_name = "ADDR")]
     decode_peers: Vec<std::net::SocketAddr>,
@@ -1405,33 +1443,42 @@ struct ServerArgs {
     #[arg(long = "pp-micro-batch-size", default_value_t = 1, value_name = "N")]
     pp_micro_batch_size: usize,
 
-    /// Zero-config pipeline-parallel bring-up: declare the desired number of stages.
+    /// Zero-config pipeline-parallel bring-up: run as the coordinator of N stages.
     ///
-    /// When set (N >= 2), `mlxcel-server` acts as the coordinator and resolves
-    /// peers either from `--cluster-peers` or via `--cluster-discovery=mdns`,
-    /// allocates ports for the coordinator control plane and stage data ports
-    /// if they are not explicitly provided, and emits a deterministic cluster
-    /// TOML to `--cluster-config-out` before starting the server. The flag is
-    /// mutually exclusive with `--distributed-config`.
+    /// With N >= 2, `mlxcel-server` resolves N peer processes (from
+    /// `--cluster-peers`, or from their beacons with
+    /// `--cluster-discovery=mdns`), plans the cluster, and pushes one stage
+    /// assignment (stage index, model identity, layer range, cluster
+    /// topology) to every peer over the authenticated cluster handshake. The
+    /// server starts only after all N peers committed. The coordinator runs
+    /// no stage itself, so `--pp-auto 2` needs two `--pp-peer` processes. The
+    /// planned TOML is written to `--cluster-config-out`. Mutually exclusive
+    /// with `--distributed-config`.
     #[arg(long = "pp-auto", value_name = "N")]
     pp_auto: Option<u32>,
 
-    /// Peer role for zero-config pipeline bring-up: register with the coordinator
-    /// instead of starting a server of our own.
+    /// Zero-config pipeline bring-up: run as a pipeline stage that receives its
+    /// assignment from a `--pp-auto` coordinator.
     ///
-    /// When set, `mlxcel-server` announces its availability (either statically
-    /// by registering against a known coordinator address, or via broadcast
-    /// when `--cluster-discovery=mdns`) and then starts a pipeline stage
-    /// service using the stage assignment the coordinator returns.
+    /// The process listens on `--cluster-control-addr` for the coordinator's
+    /// stage assignment (with `--cluster-discovery=mdns` it also announces
+    /// that address by signed UDP beacon), verifies that the coordinator holds
+    /// the same cluster secret, cluster name, model, and mlxcel version, then
+    /// serves the assigned stage. `--distributed-config` and `--node-id` are
+    /// not needed; given together they skip the wait and use the TOML as is.
+    /// With static discovery `--cluster-control-addr` must name the address
+    /// the coordinator lists in `--cluster-peers`.
     #[arg(long = "pp-peer")]
     pp_peer: bool,
 
-    /// Cluster discovery mechanism: "static" (default) or "mdns" for UDP broadcast.
+    /// Cluster discovery mechanism: "static" (default) or "mdns".
     ///
-    /// "static" consumes `--cluster-peers` verbatim. "mdns" enables opt-in
-    /// LAN peer discovery via UDP broadcast. The name is retained for future
-    /// zeroconf compatibility; today the implementation uses plain UDP so no
-    /// extra dependency is required.
+    /// "static": the coordinator takes `--cluster-peers` verbatim and each
+    /// peer listens on its `--cluster-control-addr`. "mdns": each peer sends
+    /// HMAC-signed UDP beacons to `--cluster-discovery-target` on
+    /// `--cluster-discovery-port` until the coordinator commits its
+    /// assignment; the coordinator accepts beacons signed with the cluster
+    /// secret for its cluster name. Plain UDP, not DNS-SD, despite the name.
     #[arg(
         long = "cluster-discovery",
         default_value = "static",
@@ -1441,37 +1488,75 @@ struct ServerArgs {
 
     /// Human-readable cluster name used to scope discovery and as the TOML header.
     ///
-    /// Defaults to the value embedded in the generated TOML when `--pp-auto`
-    /// runs (currently `mlxcel-cluster`). Peers with a mismatching name are
-    /// ignored by the coordinator during mDNS discovery.
+    /// Defaults to `mlxcel-cluster`. The coordinator ignores beacons for
+    /// another name, and a peer rejects an assignment for another name.
     #[arg(long = "cluster-name", value_name = "NAME")]
     cluster_name: Option<String>,
 
     /// Static peer addresses for zero-config bring-up (host:port, comma-separated).
     ///
-    /// Each peer address should point at the control+data socket that the
-    /// corresponding `mlxcel-server --pp-peer` exposes. Ignored when
-    /// `--cluster-discovery=mdns` fully resolves the expected peer count.
+    /// Each entry is the `--cluster-control-addr` of one `mlxcel-server
+    /// --pp-peer` process. Used with `--cluster-discovery=static`.
     #[arg(long = "cluster-peers", value_delimiter = ',', value_name = "ADDR")]
     cluster_peers: Vec<std::net::SocketAddr>,
 
     /// UDP port for the discovery beacon when `--cluster-discovery=mdns` is used.
+    ///
+    /// The coordinator listens on it (all interfaces) and peers send to it.
+    /// Default: 49555.
     #[arg(long = "cluster-discovery-port", value_name = "PORT")]
     cluster_discovery_port: Option<u16>,
 
-    /// Coordinator control-plane bind address for zero-config bring-up (host:port).
+    /// Where a `--pp-peer` sends its discovery beacons with `--cluster-discovery=mdns`.
     ///
-    /// Kept deliberately distinct from the HTTP listen address so operators do
-    /// not have to co-schedule two services on a single port.
+    /// The limited broadcast `255.255.255.255` (default) leaves only through
+    /// the default-route interface; name a directed subnet broadcast such as
+    /// `192.168.1.255` for a separate cluster NIC or Thunderbolt bridge, or
+    /// the coordinator's IP on a network that drops broadcast (`127.0.0.1`
+    /// for a loopback test). Peer side only; the coordinator just listens.
+    #[arg(
+        long = "cluster-discovery-target",
+        default_value = "255.255.255.255",
+        value_name = "IP"
+    )]
+    cluster_discovery_target: std::net::IpAddr,
+
+    /// Cluster control address (host:port) for zero-config bring-up.
+    ///
+    /// On the `--pp-auto` coordinator: the control-plane bind address stages
+    /// reply to, distinct from the HTTP listen address (default: the `--host`
+    /// IP on port 19000; a loopback IP works only with loopback peers). On a
+    /// `--pp-peer`: the address the stage listens on for its assignment and
+    /// then serves on. Required with a concrete port for static discovery;
+    /// defaults to `0.0.0.0:0` (an OS-assigned port announced by beacon) for
+    /// mdns.
     #[arg(long = "cluster-control-addr", value_name = "ADDR")]
     cluster_control_addr: Option<std::net::SocketAddr>,
 
-    /// Output path for the emitted cluster TOML.
+    /// Output path for the cluster TOML this process writes.
     ///
-    /// Defaults to `<current directory>/.mlxcel/cluster.toml` when
-    /// `--pp-auto` is used and this flag is omitted.
+    /// The coordinator writes its plan here (default
+    /// `<current directory>/.mlxcel/cluster.toml`); a peer writes the
+    /// cluster it received (default `.mlxcel/cluster-<node-id>.toml`).
     #[arg(long = "cluster-config-out", value_name = "PATH")]
     cluster_config_out: Option<PathBuf>,
+
+    /// File holding the pre-shared cluster secret (at least 16 bytes; one
+    /// trailing newline is ignored). Generate it once with
+    /// `openssl rand -hex 32 > cluster.secret` and copy it to every host.
+    ///
+    /// Every distributed role refuses to start without a secret: the pipeline
+    /// roles (`--pp-auto`, `--pp-peer`, and a `--distributed-config` with
+    /// `pipeline_parallel_size >= 2`) and the disaggregated roles
+    /// (`--node-role prefill`, `decode` and `router`). Precedence: this flag,
+    /// then `MLXCEL_CLUSTER_SECRET_FILE` (a path), then
+    /// `MLXCEL_CLUSTER_SECRET` (the value), then `[cluster] secret_file` in
+    /// the cluster TOML. The secret authenticates every stage and role
+    /// connection (mutual HMAC handshake), keys the AES-256-GCM encryption
+    /// and authentication of every frame on those connections, and signs
+    /// discovery beacons.
+    #[arg(long = "cluster-secret-file", value_name = "PATH")]
+    cluster_secret_file: Option<PathBuf>,
 
     /// Plan the cluster topology and emit the TOML without starting workers.
     ///
@@ -2036,6 +2121,9 @@ struct ServerArgs {
 }
 
 fn main() -> anyhow::Result<()> {
+    // reqwest is built without a bundled rustls provider; install ring before
+    // any client exists (the client builders also do this, so it is belt only).
+    mlxcel::http_tls::install_default_crypto_provider();
     // Hidden machine interface for the llama-server b10621 compatibility
     // manifest (issue #1443): `mlxcel-server --dump-flag-surface` prints the
     // complete clap surface, hidden compatibility arguments included, as
@@ -2118,11 +2206,19 @@ fn main() -> anyhow::Result<()> {
     // window) into the environment the patched MLX kernels read (#906). Inert
     // unless MLXCEL_AUTOTUNE is set and a tuned entry exists, never overwrites
     // an operator-set variable, and must run before any MLX op or worker thread.
-    for (var, value) in mlxcel_core::autotune::ops::apply_tuned_cuda_kernel_env(
-        mlxcel_core::autotune::ops::cuda_kernel_knobs::TILE_M_CAP_BLACKWELL,
-    ) {
-        tracing::info!("autotune: applied {var}={value} from the tactic cache");
-    }
+    // Logging starts inside `start_server`, so these go through the startup
+    // notices instead of being dropped (#2722).
+    let autotune_notices: Vec<StartupNotice> =
+        mlxcel_core::autotune::ops::apply_tuned_cuda_kernel_env(
+            mlxcel_core::autotune::ops::cuda_kernel_knobs::TILE_M_CAP_BLACKWELL,
+        )
+        .into_iter()
+        .map(|(var, value)| {
+            StartupNotice::info(format!(
+                "autotune: applied {var}={value} from the tactic cache"
+            ))
+        })
+        .collect();
 
     // The Tokio runtime is built here rather than by `#[tokio::main]` so
     // `--threads-http` can size its worker pool (#1432); llama-server b10621
@@ -2147,7 +2243,11 @@ fn main() -> anyhow::Result<()> {
             // Legacy invocation: no subcommand → boot the HTTP server using the
             // flattened server flags. Backward-compatible with every prior
             // `mlxcel-server -m foo --port 8080 ...` invocation.
-            None => start_server(build_startup_input(cli.server)?.into_startup_config()?).await,
+            None => {
+                let mut input = build_startup_input(cli.server)?;
+                input.startup_notices.splice(0..0, autotune_notices);
+                start_server(input.into_startup_config()?).await
+            }
         }
     })
 }
@@ -2158,7 +2258,31 @@ fn run_download(args: DownloadArgs) -> anyhow::Result<()> {
 }
 
 fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInput> {
-    env_fallback_settings_endpoint(&mut args.settings, long_cli_flag_was_set("settings"));
+    // Native Windows is single-node only (#58): refuse distributed flags
+    // before the model reference is resolved (and possibly downloaded).
+    mlxcel::server::ServerDistributedFlags {
+        pp_auto: args.pp_auto.is_some(),
+        pp_peer: args.pp_peer,
+        distributed_config: args.distributed_config.is_some(),
+        node_role: args.node_role.is_some(),
+        peers: !args.peers.is_empty(),
+        prefill_peers: !args.prefill_peers.is_empty(),
+        decode_peers: !args.decode_peers.is_empty(),
+        serving_bind: args.serving_bind.is_some(),
+        pp_layers: args.pp_layers.is_some(),
+        tp_size: args.tp_size,
+    }
+    .ensure_supported()?;
+    // Lines from the env fallbacks below (warnings, and the INFO line when a
+    // flag takes precedence over a variable) are collected, not logged: no
+    // tracing subscriber exists until `start_server` installs one, which then
+    // logs this list at each line's level (#2697, #2722).
+    let mut startup_notices = Vec::new();
+    env_fallback_settings_endpoint(
+        &mut args.settings,
+        long_cli_flag_was_set("settings"),
+        &mut startup_notices,
+    );
     // Translate `--turbo-boundary-v` into the `MLXCEL_KV_BOUNDARY_V_LAYERS`
     // env var before any caller of `mlxcel-core` constructs a cache.
     // mlxcel-core reads this env var on first cache instantiation, and the
@@ -2173,15 +2297,16 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
     // Axis B (B7): apply `LLAMA_ARG_LANG_BIAS` env-var fallback
     // before resolving, so env-supplied values flow through the same
     // validation and normalization as CLI flags. CLI flag wins on conflict
-    // (see `env_fallback_lang_bias` INFO log).
-    env_fallback_lang_bias(&mut args.lang_bias);
+    // (see the `env_fallback_lang_bias` INFO notice).
+    env_fallback_lang_bias(&mut args.lang_bias, &mut startup_notices);
     // env-var fallback for the byte-fragment opt-in flag.
-    env_fallback_lang_bias_include_byte_fragments(&mut args.lang_bias);
+    env_fallback_lang_bias_include_byte_fragments(&mut args.lang_bias, &mut startup_notices);
     // env-var fallback for the chat-template kwargs default.
-    env_fallback_chat_template_kwargs(&mut args.chat_template_kwargs);
+    env_fallback_chat_template_kwargs(&mut args.chat_template_kwargs, &mut startup_notices);
     env_fallback_reasoning_budget(
         &mut args.reasoning_budget,
         long_cli_flag_was_set("reasoning-budget"),
+        &mut startup_notices,
     );
 
     // Env-var fallbacks for prompt-cache knobs. Detect explicit boolean flags
@@ -2190,23 +2315,38 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
     env_fallback_prompt_cache_enabled(
         &mut args.prompt_cache_enabled,
         long_cli_flag_was_set("prompt-cache-enabled"),
+        &mut startup_notices,
     );
-    env_fallback_prompt_cache_capacity_bytes(&mut args.prompt_cache_capacity_bytes);
-    env_fallback_prompt_cache_max_entries(&mut args.prompt_cache_max_entries);
-    env_fallback_prompt_cache_ttl(&mut args.prompt_cache_ttl);
-    env_fallback_prompt_cache_min_prefix(&mut args.prompt_cache_min_prefix);
+    env_fallback_prompt_cache_capacity_bytes(
+        &mut args.prompt_cache_capacity_bytes,
+        &mut startup_notices,
+    );
+    env_fallback_prompt_cache_max_entries(&mut args.prompt_cache_max_entries, &mut startup_notices);
+    env_fallback_prompt_cache_ttl(&mut args.prompt_cache_ttl, &mut startup_notices);
+    env_fallback_prompt_cache_min_prefix(&mut args.prompt_cache_min_prefix, &mut startup_notices);
     env_fallback_prompt_cache_snapshot_capacity_bytes(
         &mut args.prompt_cache_snapshot_capacity_bytes,
+        &mut startup_notices,
     );
-    env_fallback_prompt_cache_snapshot_max_entries(&mut args.prompt_cache_snapshot_max_entries);
-    env_fallback_prompt_cache_snapshot_ttl(&mut args.prompt_cache_snapshot_ttl);
+    env_fallback_prompt_cache_snapshot_max_entries(
+        &mut args.prompt_cache_snapshot_max_entries,
+        &mut startup_notices,
+    );
+    env_fallback_prompt_cache_snapshot_ttl(
+        &mut args.prompt_cache_snapshot_ttl,
+        &mut startup_notices,
+    );
 
     // env-var fallbacks for the APC knobs (parity with upstream
     // mlx-vlm `APC_*` env vars).
-    env_fallback_apc_enabled(&mut args.apc_enabled, long_cli_flag_was_set("apc-enabled"));
-    env_fallback_apc_block_size(&mut args.apc_block_size);
-    env_fallback_apc_num_blocks(&mut args.apc_num_blocks);
-    env_fallback_apc_hash(&mut args.apc_hash);
+    env_fallback_apc_enabled(
+        &mut args.apc_enabled,
+        long_cli_flag_was_set("apc-enabled"),
+        &mut startup_notices,
+    );
+    env_fallback_apc_block_size(&mut args.apc_block_size, &mut startup_notices);
+    env_fallback_apc_num_blocks(&mut args.apc_num_blocks, &mut startup_notices);
+    env_fallback_apc_hash(&mut args.apc_hash, &mut startup_notices);
 
     // Env-var fallbacks for KV cache type split flags.
     // LLAMA_ARG_CACHE_TYPE_K / LLAMA_ARG_CACHE_TYPE_V are the canonical env
@@ -2217,17 +2357,20 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
     // are not strictly necessary here, clap already reads the env vars.
     // We still call them for consistency with the pattern and to allow future
     // warn-on-conflict logic (e.g. if a separate MLXCEL_* alias is added).
-    env_fallback_cache_type_k(&mut args.turbo.cache_type_k);
-    env_fallback_cache_type_v(&mut args.turbo.cache_type_v);
+    env_fallback_cache_type_k(&mut args.turbo.cache_type_k, &mut startup_notices);
+    env_fallback_cache_type_v(&mut args.turbo.cache_type_v, &mut startup_notices);
     // env-var fallbacks for the continuous-batching KV
     // quantization knobs. The flags themselves live in
     // `mlxcel::cli::batch_quant_args::BatchKvQuantArgs` (flattened above);
     // these helpers honor the warn-on-CLI-conflict pattern shared with the
     // other LLAMA_ARG_* env vars.
-    env_fallback_kv_bits(&mut args.batch_quant.kv_bits);
-    env_fallback_kv_group_size(&mut args.batch_quant.kv_group_size);
-    env_fallback_kv_quant_scheme(&mut args.batch_quant.kv_quant_scheme);
-    env_fallback_kv_skip_last_layer(&mut args.batch_quant.kv_skip_last_layer);
+    env_fallback_kv_bits(&mut args.batch_quant.kv_bits, &mut startup_notices);
+    env_fallback_kv_group_size(&mut args.batch_quant.kv_group_size, &mut startup_notices);
+    env_fallback_kv_quant_scheme(&mut args.batch_quant.kv_quant_scheme, &mut startup_notices);
+    env_fallback_kv_skip_last_layer(
+        &mut args.batch_quant.kv_skip_last_layer,
+        &mut startup_notices,
+    );
 
     // env-var fallbacks for the speculative-decoding selector
     // flags. `clap` already reads `LLAMA_ARG_DRAFT_KIND` /
@@ -2235,23 +2378,25 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
     // the helpers below layer the mlxcel-native `MLXCEL_DRAFT_KIND` /
     // `MLXCEL_DRAFT_BLOCK_SIZE` aliases on top with the same warn-on-conflict
     // pattern shared with the other `MLXCEL_*` / `LLAMA_ARG_*` pairs.
-    env_fallback_draft_kind(&mut args.speculative.draft_kind);
-    env_fallback_draft_block_size(&mut args.speculative.draft_block_size);
+    env_fallback_draft_kind(&mut args.speculative.draft_kind, &mut startup_notices);
+    env_fallback_draft_block_size(&mut args.speculative.draft_block_size, &mut startup_notices);
     mlxcel::cli::speculative_args::env_fallback_draft_max(
         &mut args.draft,
         mlxcel::server::long_cli_flag_was_set("draft")
             || mlxcel::server::long_cli_flag_was_set("draft-max")
             || mlxcel::server::long_cli_flag_was_set("spec-draft-n-max")
             || mlxcel::server::long_cli_flag_was_set("draft-n"),
+        &mut startup_notices,
     );
-    env_fallback_draft_model(&mut args.model_draft);
-    env_fallback_batch_size(&mut args.batch_size);
-    env_fallback_ubatch_size(&mut args.ubatch_size);
-    env_fallback_log_file(&mut args.log_file);
+    env_fallback_draft_model(&mut args.model_draft, &mut startup_notices);
+    env_fallback_batch_size(&mut args.batch_size, &mut startup_notices);
+    env_fallback_ubatch_size(&mut args.ubatch_size, &mut startup_notices);
+    env_fallback_log_file(&mut args.log_file, &mut startup_notices);
     env_fallback_endpoint_slots(
         &mut args.slots,
         long_cli_flag_was_set("slots"),
         long_cli_flag_was_set("no-slots"),
+        &mut startup_notices,
     );
     env_fallback_api_keys(&mut args.api_key);
     env_fallback_api_key_files(&mut args.api_key_file);
@@ -2259,7 +2404,37 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         &mut args.cors_credentials,
         long_cli_flag_was_set("cors-credentials"),
         long_cli_flag_was_set("no-cors-credentials"),
+        &mut startup_notices,
     );
+    // `--cors-origins` and `--allowed-origins` conflict, so their variables
+    // are read after parsing rather than through clap's `env` attribute,
+    // which counted an env value as a conflicting occurrence (#2664).
+    let cors_origins_was_set = long_cli_flag_was_set("cors-origins");
+    let allowed_origins_was_set = long_cli_flag_was_set("allowed-origins");
+    // The notice for an overridden variable is logged by `start_server`
+    // once the subscriber exists; a warning here would reach nothing.
+    startup_notices.extend(env_fallback_cors_origins(
+        &mut args.cors_origins,
+        cors_origins_was_set,
+        allowed_origins_was_set,
+    )?);
+    startup_notices.extend(env_fallback_allowed_origins(
+        &mut args.allowed_origins,
+        allowed_origins_was_set,
+        cors_origins_was_set,
+    )?);
+    // The b10621 `--x` / `--no-x` pairs whose `LLAMA_ARG_*` variables are read
+    // at runtime rather than through clap's `env` attribute (#2609).
+    env_fallback_models_autoload(
+        &mut args.models_autoload,
+        long_cli_flag_was_set("models-autoload"),
+        long_cli_flag_was_set("no-models-autoload"),
+    )?;
+    mlxcel::server::apply_bool_pair_env_bindings(
+        &mut args.cache_compat,
+        &mut args.context_compat,
+        &mut args.slot_compat,
+    )?;
 
     // Axis B (B8): resolve once up-front so CLI errors surface before the
     // server starts listening. Baseline path returns `None` (bit-exact).
@@ -2332,9 +2507,12 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         .resolved_spec_type()
         .map_err(|rejection| anyhow::anyhow!("{rejection}"))?;
     if spec_type.disable_speculation && args.model_draft.is_some() {
-        tracing::warn!(
-            "--spec-type none disables speculative decoding (b10621 semantics); ignoring the configured draft model"
-        );
+        // Collected rather than logged: no subscriber exists yet (#2697).
+        startup_notices.push(StartupNotice::warn(
+            "--spec-type none disables speculative decoding (b10621 semantics); ignoring the \
+             configured draft model"
+                .to_string(),
+        ));
         args.model_draft = None;
     }
     // `none` disables prompt lookup as well (#2255): it needs no draft model,
@@ -2342,9 +2520,11 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
     if spec_type.disable_speculation
         && args.speculative.draft_kind.as_deref() == Some("prompt-lookup")
     {
-        tracing::warn!(
-            "--spec-type none disables speculative decoding (b10621 semantics); ignoring --draft-kind prompt-lookup"
-        );
+        startup_notices.push(StartupNotice::warn(
+            "--spec-type none disables speculative decoding (b10621 semantics); ignoring \
+             --draft-kind prompt-lookup"
+                .to_string(),
+        ));
         args.speculative.draft_kind = None;
     }
     if let Some(kind) = spec_type.draft_kind {
@@ -2406,6 +2586,8 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
     mlxcel::server::configure_private_media_urls(
         mlxcel::server::private_media_urls_allowed_from_env(),
     );
+    mlxcel::server::configure_media_nat64_prefixes_from_env()
+        .map_err(|message| anyhow::anyhow!("{message}"))?;
 
     // b10621 chat-template / reasoning / parsing options (issue #1447):
     // classified before the model reference resolves, like the GGML group, so
@@ -2443,6 +2625,12 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
     // inside a loader (the moondream starmie tokenizer, request-path media
     // URLs) honour --offline too, not just the `-m` resolver.
     set_offline_mode(args.offline);
+    // The side-model environment aliases are folded in before the image-only
+    // decision below, so `MLXCEL_EMBEDDING_MODEL` / `MLXCEL_RERANKER_MODEL`
+    // conflict with `--image-model` exactly as their flags do (#2825).
+    env_fallback_embedding_model(&mut args.embedding_model, &mut startup_notices);
+    env_fallback_reranker_model(&mut args.reranker_model, &mut startup_notices);
+
     // b10621 router mode (#1438): `--models-dir` with no model argument
     // serves the router surface and never resolves a checkpoint here.
     let has_model_source = args.model.is_some()
@@ -2455,6 +2643,38 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
     if webui_enabled && router_mode {
         args.models_autoload = false;
     }
+    // #2825: `--image-model` with no model source serves image generation
+    // alone. A router selector would serve a front that never reaches the
+    // image worker, and the embedding/reranking surfaces belong to a second
+    // workload this mode does not serve, so both combinations are refused.
+    let image_only = {
+        let (embeddings, reranking) = if args.image_model.is_some() && !has_model_source {
+            let resolved = args
+                .embedding_compat
+                .resolve()
+                .map_err(|message| anyhow::anyhow!(message))?;
+            (
+                resolved.embedding_only && !resolved.rerank_only,
+                resolved.rerank_only,
+            )
+        } else {
+            (false, false)
+        };
+        resolve_image_only_mode(
+            args.image_model.is_some(),
+            has_model_source,
+            &[
+                ("--models-dir", args.models_dir.is_some()),
+                ("--models-preset", args.models_preset.is_some()),
+                ("--webui", webui_enabled),
+                ("--embedding-model", args.embedding_model.is_some()),
+                ("--reranker-model", args.reranker_model.is_some()),
+                ("--embeddings", embeddings),
+                ("--reranking", reranking),
+            ],
+        )?
+    };
+    let modelless = router_mode || image_only;
     // The #1438 migration guard, raised BEFORE model resolution so the old
     // store-root combination fails in milliseconds instead of after a
     // multi-gigabyte download. `into_startup_config` re-checks it for
@@ -2467,7 +2687,7 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
              variable; to start the router, drop the model argument"
         );
     }
-    let model_path = if router_mode {
+    let model_path = if modelless {
         PathBuf::new()
     } else {
         let source = resolve_llama_model_source(&LlamaModelSourceArgs {
@@ -2478,7 +2698,10 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
             docker_repo: args.docker_repo.clone(),
         })?;
         if let Some(superseded) = source.superseded_model.as_deref() {
-            tracing::info!("{}", superseded_model_notice(&source.reference, superseded));
+            startup_notices.push(StartupNotice::info(superseded_model_notice(
+                &source.reference,
+                superseded,
+            )));
         }
         resolve_model_source_with_options(
             &source.reference,
@@ -2498,8 +2721,9 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
     // The `--gpu-layers` half of the b10621 GGML classification, deferred
     // until the checkpoint is known: only its layer count distinguishes a full
     // offload (inert, since mlxcel always runs every layer on the accelerator)
-    // from a partial one (issue #1445).
-    if !router_mode {
+    // from a partial one (issue #1445). Image-only mode has no checkpoint for
+    // this to describe, so it is skipped as in router mode.
+    if !modelless {
         args.ggml_compat
             .ensure_inert(read_model_layer_count(&model_path))
             .map_err(|rejection| anyhow::anyhow!("{rejection}"))?;
@@ -2507,7 +2731,6 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
 
     // `--embedding-model` accepts the same path-or-repo-id shapes as `-m`
     // and resolves through the same store lookup / auto-download.
-    env_fallback_embedding_model(&mut args.embedding_model);
     let embedding_model_path = args
         .embedding_model
         .as_deref()
@@ -2525,8 +2748,25 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         })
         .transpose()?;
 
+    // `--image-model` accepts the same path-or-repo-id shapes as `-m`.
+    let image_model_path = args
+        .image_model
+        .as_deref()
+        .map(|value| {
+            resolve_model_source_with_options(
+                std::path::Path::new(value),
+                ModelSourceOptions {
+                    models_dir: args.model_store_root.as_deref(),
+                    revision: args.revision.as_deref(),
+                    token: args.hf_token.as_deref(),
+                    offline: args.offline,
+                    cwd_models_dir: None,
+                },
+            )
+        })
+        .transpose()?;
+
     // `--reranker-model` accepts the same path-or-repo-id shapes as `-m`.
-    env_fallback_reranker_model(&mut args.reranker_model);
     let reranker_model_path = args
         .reranker_model
         .as_deref()
@@ -2541,6 +2781,26 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
                     cwd_models_dir: None,
                 },
             )
+        })
+        .transpose()?;
+
+    // `--draft-model` accepts the same path-or-repo-id shapes as `-m`. The
+    // target's `--revision` is not applied to it.
+    let draft_model_path = args
+        .model_draft
+        .as_deref()
+        .map(|value| {
+            resolve_draft_model_source(
+                value,
+                ModelSourceOptions {
+                    models_dir: args.model_store_root.as_deref(),
+                    revision: None,
+                    token: args.hf_token.as_deref(),
+                    offline: args.offline,
+                    cwd_models_dir: None,
+                },
+            )
+            .with_context(|| format!("resolving --draft-model {}", value.display()))
         })
         .transpose()?;
 
@@ -2583,11 +2843,12 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         ssl_cert_file: args.ssl_cert_file,
         ssl_key_file: args.ssl_key_file,
         cors_origins: args.cors_origins,
+        startup_notices,
         cors_methods: args.cors_methods,
         cors_headers: args.cors_headers,
         cors_credentials: args.cors_credentials,
         no_cors_credentials: args._no_cors_credentials,
-        draft_model_path: args.model_draft,
+        draft_model_path,
         draft_max: args.draft,
         // forward the speculative-decoding selector flags
         // resolved above via env-var fallbacks. Reconciliation into a
@@ -2601,6 +2862,7 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         audio_queue_depth: args.audio_queue_depth,
         audio_request_timeout_secs: args.audio_request_timeout_secs,
         embedding_model_path,
+        image_model_path,
         embedding_batch_size: args.embedding_batch_size,
         embedding_max_length: args.embedding_max_length,
         embedding_queue_depth: args.embedding_queue_depth,
@@ -2626,7 +2888,10 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         slot_save_path: args.slot_save_path,
         router_models_dir: args.models_dir.clone(),
         models_max: args.models_max,
-        models_autoload: args.models_autoload,
+        models_autoload: mlxcel::server::resolve_compat_toggle(
+            args.models_autoload,
+            args._no_models_autoload,
+        ),
         models_preset: args.models_preset.clone(),
         tags: args.tags.clone(),
         model_store_root: args.model_store_root.clone(),
@@ -2701,8 +2966,10 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         cluster_name: args.cluster_name,
         cluster_peers: args.cluster_peers,
         cluster_discovery_port: args.cluster_discovery_port,
+        cluster_discovery_target: args.cluster_discovery_target,
         cluster_control_addr: args.cluster_control_addr,
         cluster_config_out: args.cluster_config_out,
+        cluster_secret_file: args.cluster_secret_file,
         dry_run: args.dry_run,
         tp_size: args.tp_size,
         tp_moe_mode: args.tp_moe_mode,
@@ -2873,6 +3140,24 @@ mod tests {
         }
     }
 
+    /// clap counts an env-sourced value as present and treats `overrides_with`
+    /// partners as direct conflicts, so an `env` binding on either half of a
+    /// pair makes `VAR=... --other-half` a parse error (#2609); a
+    /// `conflicts_with` pair fails the same way (#2664). No `mlxcel-server`
+    /// argument may combine an `env` binding with either (#2618).
+    #[test]
+    fn no_arg_combines_clap_env_with_overrides_with() {
+        use clap::CommandFactory;
+
+        let offenders = mlxcel::cli::env_bound_override_args(&Cli::command());
+        assert!(
+            offenders.is_empty(),
+            "these args bind an env var through clap while overriding, being overridden by, \
+             or conflicting with another arg; read the variable after parsing instead:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     fn parse_server_args(argv: &[&str]) -> ServerArgs {
         let cli = Cli::try_parse_from(argv).expect("mlxcel-server args should parse");
         assert!(
@@ -2914,6 +3199,369 @@ mod tests {
         assert!(enabled.settings, "--settings must propagate through clap");
         let enabled = build_startup_input(enabled).expect("enabled startup input");
         assert!(enabled.settings, "--settings must reach startup input");
+    }
+
+    #[test]
+    fn no_models_autoload_disables_router_autoload() {
+        let _lock = CLI_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("CLI env lock");
+        let _autoload_env = ScopedEnv::unset(&["LLAMA_ARG_MODELS_AUTOLOAD"]);
+
+        let models_dir = tempfile::tempdir().expect("models directory");
+        let models_dir = models_dir.path().to_string_lossy();
+        let default = parse_server_args(&["mlxcel-server", "--models-dir", &models_dir]);
+        let default = build_startup_input(default).expect("default startup input");
+        assert!(default.models_autoload, "router autoload defaults on");
+
+        // `overrides_with` only resets `--models-autoload` to its `true`
+        // default, so clap reports both fields as true here.
+        let disabled = parse_server_args(&[
+            "mlxcel-server",
+            "--models-dir",
+            &models_dir,
+            "--no-models-autoload",
+        ]);
+        let disabled = build_startup_input(disabled).expect("disabled startup input");
+        assert!(
+            !disabled.models_autoload,
+            "--no-models-autoload must disable router autoload"
+        );
+
+        let re_enabled = parse_server_args(&[
+            "mlxcel-server",
+            "--models-dir",
+            &models_dir,
+            "--no-models-autoload",
+            "--models-autoload",
+        ]);
+        let re_enabled = build_startup_input(re_enabled).expect("re-enabled startup input");
+        assert!(
+            re_enabled.models_autoload,
+            "a later --models-autoload must override an earlier --no-models-autoload"
+        );
+    }
+
+    /// #2609: the variable used to be a clap `env` binding, which made any
+    /// value conflict with `--no-models-autoload` at parse time.
+    #[test]
+    fn models_autoload_env_does_not_conflict_with_either_flag() {
+        let _lock = CLI_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("CLI env lock");
+        let models_dir = tempfile::tempdir().expect("models directory");
+        let models_dir = models_dir.path().to_string_lossy();
+
+        for value in ["true", "false"] {
+            let _autoload_env = ScopedEnv::set(&[("LLAMA_ARG_MODELS_AUTOLOAD", value)]);
+            for (flag, expected) in [("--no-models-autoload", false), ("--models-autoload", true)] {
+                let mut args =
+                    parse_server_args(&["mlxcel-server", "--models-dir", &models_dir, flag]);
+                // `build_startup_input` asks `long_cli_flag_was_set`, which
+                // reads the test harness argv, so answer from this argv here.
+                env_fallback_models_autoload(
+                    &mut args.models_autoload,
+                    flag == "--models-autoload",
+                    flag == "--no-models-autoload",
+                )
+                .expect("valid LLAMA_ARG_MODELS_AUTOLOAD");
+                assert_eq!(
+                    mlxcel::server::resolve_compat_toggle(
+                        args.models_autoload,
+                        args._no_models_autoload
+                    ),
+                    expected,
+                    "LLAMA_ARG_MODELS_AUTOLOAD={value} {flag}"
+                );
+            }
+        }
+
+        // The variable alone still reaches the startup input.
+        let _autoload_env = ScopedEnv::set(&[("LLAMA_ARG_MODELS_AUTOLOAD", "false")]);
+        let env_only = parse_server_args(&["mlxcel-server", "--models-dir", &models_dir]);
+        let env_only = build_startup_input(env_only).expect("env-only startup input");
+        assert!(
+            !env_only.models_autoload,
+            "LLAMA_ARG_MODELS_AUTOLOAD=false alone must disable router autoload"
+        );
+    }
+
+    /// #2697: `--spec-type none` drops a configured prompt-lookup drafter
+    /// while the server input is built, before any tracing subscriber
+    /// exists, so the warning has to travel as a startup notice.
+    #[test]
+    fn spec_type_none_warning_is_a_startup_notice() {
+        let _lock = CLI_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("CLI env lock");
+        let models_dir = tempfile::tempdir().expect("models directory");
+        let models_dir = models_dir.path().to_string_lossy();
+        let args = parse_server_args(&[
+            "mlxcel-server",
+            "--models-dir",
+            &models_dir,
+            "--spec-type",
+            "none",
+            "--draft-kind",
+            "prompt-lookup",
+        ]);
+        let input = build_startup_input(args).expect("router startup input");
+        assert!(
+            input.startup_notices.iter().any(|notice| notice
+                .contains("--spec-type none disables speculative decoding")
+                && notice.contains("--draft-kind prompt-lookup")),
+            "{:?}",
+            input.startup_notices
+        );
+    }
+
+    /// Apply both CORS origin variables the way `build_startup_input` does,
+    /// answering "was the flag on the command line" from `argv` with
+    /// [`mlxcel::server::long_cli_flag_in`], the rule `long_cli_flag_was_set`
+    /// applies to the real argv (which here is the test harness's), so the
+    /// `--flag=value` form is detected exactly as in the binary (#2697).
+    ///
+    /// Returns the collected notices that `build_startup_input` hands to
+    /// `start_server` for logging.
+    fn apply_cors_origin_env(
+        args: &mut ServerArgs,
+        argv: &[&str],
+    ) -> anyhow::Result<Vec<StartupNotice>> {
+        let cors_set = mlxcel::server::long_cli_flag_in(argv, "cors-origins");
+        let allowed_set = mlxcel::server::long_cli_flag_in(argv, "allowed-origins");
+        let mut notices = Vec::new();
+        notices.extend(mlxcel::server::env_fallback_cors_origins(
+            &mut args.cors_origins,
+            cors_set,
+            allowed_set,
+        )?);
+        notices.extend(mlxcel::server::env_fallback_allowed_origins(
+            &mut args.allowed_origins,
+            allowed_set,
+            cors_set,
+        )?);
+        Ok(notices)
+    }
+
+    /// #2664: each CORS origin variable used to be a clap `env` binding, so
+    /// clap counted it as a `--cors-origins` / `--allowed-origins` occurrence
+    /// and refused the other flag. The flag now wins over the other side's
+    /// variable.
+    #[test]
+    fn cors_origin_env_does_not_conflict_with_the_other_flag() {
+        let _lock = CLI_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("CLI env lock");
+
+        {
+            let _env = ScopedEnv::set(&[("LLAMA_ARG_CORS_ORIGINS", "http://a.example")]);
+            let argv = [
+                "mlxcel-server",
+                "-m",
+                "models/foo",
+                "--allowed-origins",
+                "http://b.example",
+            ];
+            let mut args = parse_server_args(&argv);
+            let notices =
+                apply_cors_origin_env(&mut args, &argv).expect("flag wins over the variable");
+            assert_eq!(args.allowed_origins, vec!["http://b.example".to_string()]);
+            assert!(
+                notices.len() == 1 && notices[0].contains("LLAMA_ARG_CORS_ORIGINS is ignored"),
+                "the ignored variable must produce a startup notice: {notices:?}"
+            );
+            assert_eq!(
+                args.cors_origins, "*",
+                "LLAMA_ARG_CORS_ORIGINS must be ignored when --allowed-origins is given"
+            );
+        }
+
+        {
+            let _env = ScopedEnv::set(&[("MLXCEL_ALLOWED_ORIGINS", "http://a.example")]);
+            let argv = [
+                "mlxcel-server",
+                "-m",
+                "models/foo",
+                "--cors-origins",
+                "http://b.example",
+            ];
+            let mut args = parse_server_args(&argv);
+            let notices =
+                apply_cors_origin_env(&mut args, &argv).expect("flag wins over the variable");
+            assert_eq!(args.cors_origins, "http://b.example");
+            assert!(
+                notices.len() == 1 && notices[0].contains("MLXCEL_ALLOWED_ORIGINS is ignored"),
+                "the dropped allow-list must produce a startup notice: {notices:?}"
+            );
+            assert!(
+                args.allowed_origins.is_empty(),
+                "MLXCEL_ALLOWED_ORIGINS must be ignored when --cors-origins is given"
+            );
+        }
+    }
+
+    /// #2697: the `--flag=value` spelling of either CORS origin flag wins
+    /// over the other side's variable exactly like the space-separated form,
+    /// and the ignored variable still produces its startup notice. A plain
+    /// `argv.contains("--cors-origins")` check misses this form.
+    #[test]
+    fn cors_origin_equals_form_wins_over_the_other_variable() {
+        let _lock = CLI_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("CLI env lock");
+
+        {
+            let _env = ScopedEnv::set(&[("MLXCEL_ALLOWED_ORIGINS", "http://b.example")]);
+            let argv = [
+                "mlxcel-server",
+                "-m",
+                "models/foo",
+                "--cors-origins=http://a.example",
+            ];
+            let mut args = parse_server_args(&argv);
+            let notices =
+                apply_cors_origin_env(&mut args, &argv).expect("flag wins over the variable");
+            assert_eq!(args.cors_origins, "http://a.example");
+            assert!(
+                args.allowed_origins.is_empty(),
+                "MLXCEL_ALLOWED_ORIGINS must be ignored when --cors-origins=... is given"
+            );
+            assert!(
+                notices.len() == 1 && notices[0].contains("MLXCEL_ALLOWED_ORIGINS is ignored"),
+                "the ignored variable must produce a startup notice: {notices:?}"
+            );
+        }
+
+        {
+            let _env = ScopedEnv::set(&[("LLAMA_ARG_CORS_ORIGINS", "http://b.example")]);
+            let argv = [
+                "mlxcel-server",
+                "-m",
+                "models/foo",
+                "--allowed-origins=http://a.example",
+            ];
+            let mut args = parse_server_args(&argv);
+            let notices =
+                apply_cors_origin_env(&mut args, &argv).expect("flag wins over the variable");
+            assert_eq!(args.allowed_origins, vec!["http://a.example".to_string()]);
+            assert_eq!(
+                args.cors_origins, "*",
+                "LLAMA_ARG_CORS_ORIGINS must be ignored when --allowed-origins=... is given"
+            );
+            assert!(
+                notices.len() == 1 && notices[0].contains("LLAMA_ARG_CORS_ORIGINS is ignored"),
+                "the ignored variable must produce a startup notice: {notices:?}"
+            );
+        }
+    }
+
+    /// Without a flag each variable still applies on its own, with
+    /// `MLXCEL_ALLOWED_ORIGINS` split on `,` as clap's delimiter did.
+    #[test]
+    fn cors_origin_env_applies_without_a_flag() {
+        let _lock = CLI_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("CLI env lock");
+        let argv = ["mlxcel-server", "-m", "models/foo"];
+
+        {
+            let _env = ScopedEnv::set(&[("LLAMA_ARG_CORS_ORIGINS", "localhost")]);
+            let mut args = parse_server_args(&argv);
+            let notices = apply_cors_origin_env(&mut args, &argv).expect("one variable applies");
+            assert!(notices.is_empty(), "{notices:?}");
+            assert_eq!(args.cors_origins, "localhost");
+            assert!(args.allowed_origins.is_empty());
+        }
+
+        {
+            let _env = ScopedEnv::set(&[(
+                "MLXCEL_ALLOWED_ORIGINS",
+                "https://app.example.com,https://admin.example.com",
+            )]);
+            let mut args = parse_server_args(&argv);
+            let notices = apply_cors_origin_env(&mut args, &argv).expect("one variable applies");
+            assert!(notices.is_empty(), "{notices:?}");
+            assert_eq!(
+                args.allowed_origins,
+                vec![
+                    "https://app.example.com".to_string(),
+                    "https://admin.example.com".to_string()
+                ]
+            );
+            assert_eq!(args.cors_origins, "*");
+        }
+    }
+
+    /// Two explicit flags are still refused by clap.
+    #[test]
+    fn cors_origins_and_allowed_origins_flags_still_conflict() {
+        let err = Cli::try_parse_from([
+            "mlxcel-server",
+            "-m",
+            "models/foo",
+            "--cors-origins",
+            "http://a.example",
+            "--allowed-origins",
+            "http://b.example",
+        ])
+        .expect_err("both CORS origin flags must conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// Both variables without either flag is a startup error naming both.
+    ///
+    /// Other tests in this binary call `build_startup_input` without holding
+    /// `CLI_ENV_LOCK`, so setting both variables in this process would fail
+    /// them at random. The check runs in a child copy of this test binary
+    /// whose environment alone carries the two variables.
+    #[test]
+    fn both_cors_origin_envs_without_a_flag_fail_startup() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "tests::both_cors_origin_envs_child",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env("LLAMA_ARG_CORS_ORIGINS", "http://a.example")
+            .env("MLXCEL_ALLOWED_ORIGINS", "http://b.example")
+            .output()
+            .expect("run the child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child startup check failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Child half of `both_cors_origin_envs_without_a_flag_fail_startup`;
+    /// ignored so it only runs with the environment the parent gives it.
+    #[test]
+    #[ignore = "run by both_cors_origin_envs_without_a_flag_fail_startup"]
+    fn both_cors_origin_envs_child() {
+        assert!(
+            std::env::var_os("LLAMA_ARG_CORS_ORIGINS").is_some()
+                && std::env::var_os("MLXCEL_ALLOWED_ORIGINS").is_some(),
+            "run through both_cors_origin_envs_without_a_flag_fail_startup"
+        );
+        let models_dir = tempfile::tempdir().expect("models directory");
+        let models_dir = models_dir.path().to_string_lossy();
+        let args = parse_server_args(&["mlxcel-server", "--models-dir", &models_dir]);
+        let message = build_startup_input(args)
+            .expect_err("both CORS origin variables must fail startup")
+            .to_string();
+        assert!(
+            message.contains("LLAMA_ARG_CORS_ORIGINS")
+                && message.contains("MLXCEL_ALLOWED_ORIGINS"),
+            "the error must name both variables: {message}"
+        );
     }
 
     #[test]
@@ -3087,11 +3735,11 @@ mod tests {
         ]);
 
         let mut args = parse_server_args(&["mlxcel-server", "-m", "models/foo"]);
-        env_fallback_batch_size(&mut args.batch_size);
-        env_fallback_ubatch_size(&mut args.ubatch_size);
-        env_fallback_draft_model(&mut args.model_draft);
-        env_fallback_log_file(&mut args.log_file);
-        env_fallback_endpoint_slots(&mut args.slots, false, false);
+        env_fallback_batch_size(&mut args.batch_size, &mut Vec::new());
+        env_fallback_ubatch_size(&mut args.ubatch_size, &mut Vec::new());
+        env_fallback_draft_model(&mut args.model_draft, &mut Vec::new());
+        env_fallback_log_file(&mut args.log_file, &mut Vec::new());
+        env_fallback_endpoint_slots(&mut args.slots, false, false, &mut Vec::new());
         assert_eq!(args.batch_size, Some(111));
         assert_eq!(args.ubatch_size, Some(22));
         assert_eq!(
@@ -3116,13 +3764,13 @@ mod tests {
             "333",
             "--slots",
         ]);
-        env_fallback_endpoint_slots(&mut cli_args.slots, true, false);
+        env_fallback_endpoint_slots(&mut cli_args.slots, true, false, &mut Vec::new());
         assert_eq!(cli_args.batch_size, Some(333));
         assert!(cli_args.slots);
 
         let mut no_slots_args =
             parse_server_args(&["mlxcel-server", "-m", "models/foo", "--no-slots"]);
-        env_fallback_endpoint_slots(&mut no_slots_args.slots, false, true);
+        env_fallback_endpoint_slots(&mut no_slots_args.slots, false, true, &mut Vec::new());
         assert!(no_slots_args._no_slots);
         assert!(!(no_slots_args.slots && !no_slots_args._no_slots));
     }
@@ -3755,5 +4403,45 @@ mod tests {
                 err.kind()
             );
         }
+    }
+
+    // ── image-only serving (#2825) ─────────────────────────────────────────
+
+    #[test]
+    fn image_model_without_model_leaves_the_chat_path_empty() {
+        let image_model = std::env::temp_dir().to_string_lossy().into_owned();
+        let args = parse_server_args(&["mlxcel-server", "--image-model", image_model.as_str()]);
+        let input = build_startup_input(args).expect("image-only input resolves");
+        assert!(
+            input.model_path.as_os_str().is_empty(),
+            "image-only leaves the chat path empty"
+        );
+        assert!(input.image_model_path.is_some());
+    }
+
+    #[test]
+    fn neither_model_nor_image_model_names_both_ways_to_start() {
+        let args = parse_server_args(&["mlxcel-server"]);
+        let err = build_startup_input(args).expect_err("no model source at all");
+        let message = err.to_string();
+        assert!(message.contains("--model/-m is required"), "{message}");
+        assert!(message.contains("--image-model"), "{message}");
+    }
+
+    #[test]
+    fn image_only_refuses_a_router_selector_naming_both_flags() {
+        let image_model = std::env::temp_dir().to_string_lossy().into_owned();
+        let models_dir = std::env::temp_dir().to_string_lossy().into_owned();
+        let args = parse_server_args(&[
+            "mlxcel-server",
+            "--image-model",
+            image_model.as_str(),
+            "--models-dir",
+            models_dir.as_str(),
+        ]);
+        let err = build_startup_input(args).expect_err("image-only cannot start the router");
+        let message = err.to_string();
+        assert!(message.contains("--image-model"), "{message}");
+        assert!(message.contains("--models-dir"), "{message}");
     }
 }

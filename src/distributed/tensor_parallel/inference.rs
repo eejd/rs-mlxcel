@@ -131,6 +131,13 @@ pub fn ensure_single_rank_runtime(
 
 fn read_model_config(model_dir: &Path) -> Result<Value> {
     let config_path = model_dir.join("config.json");
+    // A Diffusers-style image checkpoint has no top-level `config.json`; point
+    // at `mlxcel generate-image` instead of reporting a missing file.
+    if !config_path.exists()
+        && let Some(redirect) = crate::imagegen::image_checkpoint_redirect_error(model_dir)
+    {
+        return Err(redirect);
+    }
     let config_str = std::fs::read_to_string(&config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let config_str = sanitize_config_json(&config_str);
@@ -175,6 +182,7 @@ fn fallback_architecture(model_type: ModelType) -> &'static str {
         ModelType::Qwen3Next => "qwen3_next",
         ModelType::Qwen35 | ModelType::Qwen35VLM => "qwen3_5",
         ModelType::Qwen35Moe | ModelType::Qwen35MoeVLM => "qwen3_5_moe",
+        ModelType::Qwen4ExpVLM => "qwen4_exp",
         ModelType::Gemma | ModelType::PaliGemmaVLM => "gemma",
         ModelType::Gemma2 => "gemma2",
         ModelType::Gemma3 | ModelType::Gemma3VLM => "gemma3",
@@ -241,6 +249,12 @@ fn fallback_architecture(model_type: ModelType) -> &'static str {
         ModelType::HunyuanMoe => "hunyuan_moe",
         ModelType::HunyuanV1Dense => "hunyuan_v1_dense",
         ModelType::MiMo => "mimo",
+        // Not shardable by the generic transformer plan: the experts live under
+        // `mlp.switch_mlp`, the V projection has its own head width, and the
+        // sliding layers carry a rotating cache and learned sinks, none of
+        // which the shard rules name. This arm only keeps the dispatch table
+        // total; the refusal comes from `validate_supported_runtime`.
+        ModelType::MiMoV2Flash => "mimo_v2_flash",
         // Bailing MoE is not shardable by the generic transformer plan: its
         // attention projection is the fused `attention.query_key_value` rather
         // than separate q/k/v, and its routed experts live under

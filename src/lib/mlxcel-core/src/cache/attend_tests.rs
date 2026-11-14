@@ -26,9 +26,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::*;
-use crate::cache::{
-    KVCacheMode, PagedBlockPool, PagedKvLayout, PagedSequenceState, paged_batch_decode_stats,
-};
+use crate::cache::paged_batch_decode::paged_batch_decode_test_stats;
+use crate::cache::{KVCacheMode, PagedBlockPool, PagedKvLayout, PagedSequenceState};
 use crate::dtype;
 
 const PAGE: usize = 32;
@@ -281,10 +280,10 @@ fn paged_cache_single_token_goes_through_the_pooled_entry() {
     // Prefill both sequences with the same 40 tokens (crosses a page).
     let (q, k, v) = step(&mut rng, 1, 40);
     let (k2, v2) = (ffi::copy(&k), ffi::copy(&v));
-    let before = paged_batch_decode_stats();
+    let before = paged_batch_decode_test_stats();
     let a = paged.attend(&q, k, v, SCALE, None);
     let b = reference(&mut baseline, &q, k2, v2, None);
-    let after = paged_batch_decode_stats();
+    let after = paged_batch_decode_test_stats();
     assert_eq!(to_vec_f32(&a), to_vec_f32(&b), "paged prefill differs");
     assert_eq!(
         after.v2_launches + after.gather_fallbacks,
@@ -297,9 +296,9 @@ fn paged_cache_single_token_goes_through_the_pooled_entry() {
     // fallback, either way a served step) and agrees with the gather path.
     let (q, k, v) = step(&mut rng, 1, 1);
     let (k2, v2) = (ffi::copy(&k), ffi::copy(&v));
-    let before = paged_batch_decode_stats();
+    let before = paged_batch_decode_test_stats();
     let a = paged.attend(&q, k, v, SCALE, None);
-    let after = paged_batch_decode_stats();
+    let after = paged_batch_decode_test_stats();
     assert_eq!(
         after.v2_launches + after.gather_fallbacks,
         before.v2_launches + before.gather_fallbacks + 1,
@@ -319,9 +318,9 @@ fn paged_cache_single_token_goes_through_the_pooled_entry() {
     let (q, k, v) = step(&mut rng, 1, 1);
     let (k2, v2) = (ffi::copy(&k), ffi::copy(&v));
     let mask = crate::utils::create_causal_mask(1, 41);
-    let before = paged_batch_decode_stats();
+    let before = paged_batch_decode_test_stats();
     let a = paged.attend(&q, k, v, SCALE, Some(&mask));
-    let after = paged_batch_decode_stats();
+    let after = paged_batch_decode_test_stats();
     assert_eq!(
         after.v2_launches + after.gather_fallbacks,
         before.v2_launches + before.gather_fallbacks,
@@ -343,10 +342,10 @@ fn batched_paged_decode_is_one_pooled_launch() {
         c.attend(&q, k, v, SCALE, None);
     }
     let (q, k, v) = step(&mut rng, 2, 1);
-    let before = paged_batch_decode_stats();
+    let before = paged_batch_decode_test_stats();
     let mut caches: Vec<&mut KVCache> = vec![&mut c0, &mut c1];
     let out = attend_batched(&q, &k, &v, &mut caches, SCALE, None);
-    let after = paged_batch_decode_stats();
+    let after = paged_batch_decode_test_stats();
     assert_eq!(ffi::array_shape(&out), vec![2, HEADS, 1, DIM]);
     assert_eq!(
         after.v2_launches + after.gather_fallbacks,
@@ -457,10 +456,10 @@ fn batched_paged_one_row_is_one_pooled_launch() {
     paged.attend(&q, k, v, SCALE, None);
 
     let (q, k, v) = step(&mut rng, 1, 1);
-    let before = paged_batch_decode_stats();
+    let before = paged_batch_decode_test_stats();
     let mut caches: Vec<&mut KVCache> = vec![&mut paged];
     let out = attend_batched(&q, &k, &v, &mut caches, SCALE, None);
-    let after = paged_batch_decode_stats();
+    let after = paged_batch_decode_test_stats();
     assert_eq!(ffi::array_shape(&out), vec![1, HEADS, 1, DIM]);
     assert_eq!(
         after.v2_launches + after.gather_fallbacks,
@@ -507,14 +506,14 @@ fn batched_mixed_storage_runs_each_row_on_its_own_route() {
             None,
         );
 
-        let before = paged_batch_decode_stats();
+        let before = paged_batch_decode_test_stats();
         let mut caches: Vec<&mut KVCache> = if paged_first {
             vec![&mut paged, &mut dense]
         } else {
             vec![&mut dense, &mut paged]
         };
         let got = attend_batched(&q, &k, &v, &mut caches, SCALE, None);
-        let after = paged_batch_decode_stats();
+        let after = paged_batch_decode_test_stats();
         assert_eq!(ffi::array_shape(&got), vec![2, HEADS, 1, DIM]);
         assert_eq!(
             after.v2_launches + after.gather_fallbacks,
@@ -547,8 +546,9 @@ fn batched_mixed_storage_runs_each_row_on_its_own_route() {
 use crate::cache::{DECODE_LOOKAHEAD_MAX_SPECULATIVE_APPENDS, DecodeLookaheadAppendScope};
 
 /// The pair Gemma 3's sliding layers spelled out: `update_and_fetch`, then the
-/// causal helper for an unmasked multi-token step whose window fits, else the
-/// SDPA dispatcher with the window as its hint.
+/// causal helper for an unmasked multi-token step (maskless while the window
+/// fits, the window band once the keys outgrow it, #2621), else the SDPA
+/// dispatcher with the window as its hint.
 fn rotating_reference(
     cache: &mut RotatingKVCache,
     q: &MlxArray,
@@ -559,8 +559,13 @@ fn rotating_reference(
     let (ck, cv) = cache.update_and_fetch(k, v);
     let q_len = ffi::array_shape(q)[2];
     let k_len = ffi::array_shape(&ck)[2];
-    if mask.is_none() && q_len > 1 && k_len <= cache.max_size {
-        crate::causal_attention(q, &ck, &cv, SCALE, 0.0, 0)
+    if mask.is_none() && q_len > 1 {
+        let window = if k_len <= cache.max_size {
+            0
+        } else {
+            cache.max_size
+        };
+        crate::causal_attention(q, &ck, &cv, SCALE, 0.0, window)
     } else {
         crate::layers::attention(q, &ck, &cv, SCALE, mask, 0.0, cache.max_size)
     }

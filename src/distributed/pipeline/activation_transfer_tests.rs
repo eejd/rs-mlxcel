@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::*;
@@ -106,8 +106,50 @@ fn test_payload_size_with_mask() {
         is_reverse_path: false,
         seq_len: 1,
         timestamp_ns: 0,
+        reply_nonce: None,
     };
     assert_eq!(msg.payload_size(), tensor.len() + mask.len() + pos.len());
+}
+
+// --- reply_nonce (#2694) ---
+
+#[test]
+fn constructors_leave_reply_nonce_unset_and_builder_sets_it() {
+    assert_eq!(dummy_forward_msg(0, 0).reply_nonce, None);
+    assert_eq!(dummy_reverse_msg(2, 0).reply_nonce, None);
+    let msg = dummy_forward_msg(0, 0).with_reply_nonce(Some(0xDEAD_BEEF));
+    assert_eq!(msg.reply_nonce, Some(0xDEAD_BEEF));
+    assert_eq!(msg.with_reply_nonce(None).reply_nonce, None);
+}
+
+#[test]
+fn reply_nonce_round_trips_through_json() {
+    let msg = dummy_forward_msg(1, 3).with_reply_nonce(Some(u64::MAX));
+    let json = serde_json::to_string(&msg).unwrap();
+    assert!(
+        json.contains("\"reply_nonce\":18446744073709551615"),
+        "{json}"
+    );
+    let back: ActivationMessage = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.reply_nonce, Some(u64::MAX));
+    assert_eq!(back.micro_batch_id, 3);
+    assert_eq!(back.tensor_data, msg.tensor_data);
+
+    let unset = serde_json::to_string(&dummy_forward_msg(0, 0)).unwrap();
+    assert!(unset.contains("\"reply_nonce\":null"), "{unset}");
+    let back: ActivationMessage = serde_json::from_str(&unset).unwrap();
+    assert_eq!(back.reply_nonce, None);
+}
+
+/// A message from a sender that predates the field decodes with `None`.
+#[test]
+fn message_without_reply_nonce_field_decodes_to_none() {
+    let mut value = serde_json::to_value(dummy_forward_msg(0, 0)).unwrap();
+    let object = value.as_object_mut().unwrap();
+    assert!(object.remove("reply_nonce").is_some());
+    let back: ActivationMessage = serde_json::from_value(value).unwrap();
+    assert_eq!(back.reply_nonce, None);
+    assert!(!back.is_reverse_path);
 }
 
 // --- Validation ---
@@ -443,7 +485,7 @@ async fn test_concurrent_micro_batches() {
 }
 
 #[tokio::test]
-async fn test_transport_stage_link_round_trip_and_lifecycle() {
+async fn test_transport_stage_link_round_trip() {
     let router = MockRouter::new();
     let upstream_transport = Arc::new(
         MockTransport::new(
@@ -461,26 +503,6 @@ async fn test_transport_stage_link_round_trip_and_lifecycle() {
         )
         .await,
     );
-
-    let upstream_state = Arc::new(Mutex::new(StageLifecycleState {
-        health: StageHealth::Healthy,
-        ..Default::default()
-    }));
-    let downstream_state = Arc::new(Mutex::new(StageLifecycleState {
-        health: StageHealth::Healthy,
-        ..Default::default()
-    }));
-    downstream_state
-        .lock()
-        .expect("state lock")
-        .mark_request_started();
-
-    install_stage_control_service(upstream_transport.clone(), upstream_state.clone())
-        .await
-        .expect("install upstream control");
-    install_stage_control_service(downstream_transport.clone(), downstream_state.clone())
-        .await
-        .expect("install downstream control");
 
     let link = TransportStageLink::new(0, 1, upstream_transport, downstream_transport)
         .expect("build transport link");
@@ -504,25 +526,4 @@ async fn test_transport_stage_link_round_trip_and_lifecycle() {
     let (from, received) = link.upstream.recv_activation().await.expect("recv reverse");
     assert_eq!(from, "stage-1:9001");
     assert!(received.is_reverse_path);
-
-    let health = link.upstream.probe_health().await.expect("probe health");
-    assert_eq!(health.health, StageHealth::Healthy);
-    assert_eq!(health.in_flight_requests, 1);
-
-    let drained = link.upstream.begin_drain().await.expect("begin drain");
-    assert!(drained.draining);
-
-    let barrier = link.upstream.barrier(42).await.expect("barrier");
-    assert_eq!(barrier.last_barrier_id, Some(42));
-
-    let cancelled = link
-        .upstream
-        .cancel_request(&RequestId::from_string("req-42".to_string()).unwrap())
-        .await
-        .expect("cancel");
-    assert_eq!(cancelled.in_flight_requests, 0);
-
-    let shutdown = link.upstream.shutdown_peer().await.expect("shutdown");
-    assert!(shutdown.shutdown);
-    assert_eq!(shutdown.health, StageHealth::Failed);
 }

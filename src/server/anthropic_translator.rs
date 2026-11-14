@@ -602,13 +602,21 @@ fn convert_tool_choice(choice: Option<&AnthropicToolChoice>) -> Option<ToolChoic
             "auto" => Some(ToolChoice::Mode("auto".to_string())),
             "none" => Some(ToolChoice::Mode("none".to_string())),
             "any" => Some(ToolChoice::Mode("required".to_string())),
-            "tool" => spec.name.as_ref().map(|name| {
-                ToolChoice::Specific(ToolChoiceFunction {
-                    choice_type: "function".to_string(),
-                    function: ToolChoiceFunctionName { name: name.clone() },
-                })
-            }),
-            _ => None,
+            // A missing `name` becomes an empty function name, which
+            // `validate` rejects ("function name must not be empty").
+            "tool" => Some(ToolChoice::Specific(ToolChoiceFunction {
+                choice_type: "function".to_string(),
+                function: ToolChoiceFunctionName {
+                    name: spec.name.clone().unwrap_or_default(),
+                },
+            })),
+            // An unknown type is forwarded as the object the client sent,
+            // serialized to a mode string that `validate` rejects ("Invalid
+            // tool_choice value"). Forwarding the bare type would let
+            // `{"type": "required"}` through as a valid chat mode.
+            other => Some(ToolChoice::Mode(
+                serde_json::json!({ "type": other }).to_string(),
+            )),
         },
     }
 }
@@ -960,6 +968,52 @@ mod tests {
         assert!(tc.validate(t.chat_request.tools.as_deref()).is_err());
     }
 
+    /// `{"type": "tool"}` with no `name` must not collapse to `None` (which the
+    /// route treats as an omitted `tool_choice`, i.e. `auto` with a 200). It
+    /// lands as a named function with an empty name so `validate` rejects it,
+    /// matching the upstream 400.
+    #[test]
+    fn anthropic_tool_choice_tool_without_name_is_rejected() {
+        let req = parse_req(
+            r#"{"model":"m","messages":[],"tool_choice":{"type":"tool"},"tools":[{"name":"f","input_schema":{"type":"object"}}]}"#,
+        );
+        let t = anthropic_request_to_chat(&req);
+        let tc = t
+            .chat_request
+            .tool_choice
+            .as_ref()
+            .expect("a malformed tool_choice must survive translation");
+        let err = tc
+            .validate(t.chat_request.tools.as_deref())
+            .expect_err("a nameless tool choice must fail validation");
+        assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    /// An unknown `tool_choice.type` must not collapse to `None` either. It is
+    /// forwarded as a mode string so `validate` rejects it, matching the
+    /// upstream 400. `required` and `function` are chat-side names, not
+    /// Anthropic types, so they must be rejected too rather than accepted as
+    /// the chat `required` mode or a named function.
+    #[test]
+    fn anthropic_tool_choice_unknown_type_is_rejected() {
+        for choice_type in ["foo", "required", "function"] {
+            let req = parse_req(&format!(
+                r#"{{"model":"m","messages":[],"tool_choice":{{"type":"{choice_type}","name":"f"}},"tools":[{{"name":"f","input_schema":{{"type":"object"}}}}]}}"#
+            ));
+            let t = anthropic_request_to_chat(&req);
+            let tc = t
+                .chat_request
+                .tool_choice
+                .as_ref()
+                .expect("a malformed tool_choice must survive translation");
+            let err = tc
+                .validate(t.chat_request.tools.as_deref())
+                .expect_err("an unknown tool_choice type must fail validation");
+            let want = format!(r#"Invalid tool_choice value: '{{"type":"{choice_type}"}}'"#);
+            assert!(err.contains(&want), "{choice_type}: {err}");
+        }
+    }
+
     #[test]
     fn stop_sequences_propagate_to_sampling_params() {
         let req = parse_req(
@@ -1039,6 +1093,7 @@ mod tests {
         let calls = vec![ParsedToolCall {
             name: "f".to_string(),
             arguments: r#"{"a":1}"#.to_string(),
+            id: None,
         }];
         let blocks = build_content_blocks("", None, Some(&calls), false);
         assert_eq!(blocks.len(), 1);
@@ -1057,6 +1112,7 @@ mod tests {
         let call = ParsedToolCall {
             name: "f".to_string(),
             arguments: "not json".to_string(),
+            id: None,
         };
         let block = parsed_call_to_tool_use(&call);
         match block {

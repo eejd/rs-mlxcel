@@ -39,6 +39,7 @@
 
 use super::{VisionEncoder, VisionEncoderOutput};
 use mlxcel_core::layers::{LayerNorm, UnifiedEmbedding, UnifiedLinear};
+use mlxcel_core::utils::GeluActivation;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 
@@ -51,7 +52,11 @@ use crate::vision::config::{VisionConfig, VisionHiddenActivation};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VisionMlpActivation {
     Exact,
-    PytorchTanh,
+    /// The tanh GELU, declared by the checkpoint or resolved from an omitted
+    /// key on a SigLIP tower, evaluated by the compiled f32 kernel (#2423,
+    /// #2548). Before #2794 a declared `gelu_pytorch_tanh` ran the eager f32
+    /// helper instead; the two agree up to f32 rounding.
+    PytorchTanhCompiled,
     FastSigmoid,
 }
 
@@ -68,7 +73,8 @@ pub(crate) fn select_mlp_activation(
         VisionMlpActivation::FastSigmoid
     } else {
         match hidden_act {
-            VisionHiddenActivation::GeluPytorchTanh => VisionMlpActivation::PytorchTanh,
+            VisionHiddenActivation::GeluPytorchTanh => VisionMlpActivation::PytorchTanhCompiled,
+            VisionHiddenActivation::QuickGelu => VisionMlpActivation::FastSigmoid,
             VisionHiddenActivation::ExactGelu => VisionMlpActivation::Exact,
         }
     }
@@ -84,31 +90,17 @@ pub(crate) struct VisionMLP {
     activation: VisionMlpActivation,
 }
 
-/// Hugging Face's `gelu_pytorch_tanh`, evaluated in F32 to avoid the BF16
-/// `x.pow(3)` overflow that motivated the legacy exact-erf fallback.
-///
-/// Keep this SigLIP/CLIP-specific: changing the global `gelu_approx` helper
-/// would silently alter model families whose checkpoints expect exact GELU.
-fn gelu_pytorch_tanh(x: &MlxArray) -> UniquePtr<MlxArray> {
-    let output_dtype = mlxcel_core::array_dtype(x);
-    let x = mlxcel_core::astype(x, mlxcel_core::dtype::FLOAT32);
-    let half = mlxcel_core::full_f32(&[1], 0.5, mlxcel_core::dtype::FLOAT32);
-    let one = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::dtype::FLOAT32);
-    let sqrt_two_over_pi = mlxcel_core::full_f32(&[1], 0.797_884_6, mlxcel_core::dtype::FLOAT32);
-    let cubic_coefficient = mlxcel_core::full_f32(&[1], 0.044_715, mlxcel_core::dtype::FLOAT32);
-
-    // Multiplication, rather than a generic power operation, is defined for
-    // negative inputs and matches PyTorch's polynomial evaluation order.
-    let squared = mlxcel_core::multiply(&x, &x);
-    let cubed = mlxcel_core::multiply(&squared, &x);
-    let cubic = mlxcel_core::multiply(&cubic_coefficient, &cubed);
-    let inner = mlxcel_core::multiply(&sqrt_two_over_pi, &mlxcel_core::add(&x, &cubic));
-    let cdf = mlxcel_core::multiply(&half, &mlxcel_core::add(&one, &mlxcel_core::tanh(&inner)));
-    let activated = mlxcel_core::multiply(&x, &cdf);
-    if output_dtype == mlxcel_core::dtype::FLOAT32 {
-        activated
-    } else {
-        mlxcel_core::astype(&activated, output_dtype)
+impl VisionMlpActivation {
+    /// The shared `mlxcel_core` formula this activation computes.
+    ///
+    /// `PytorchTanhCompiled` is the tanh form as one compiled f32 kernel;
+    /// `Exact` is erf.
+    fn gelu(self) -> GeluActivation {
+        match self {
+            VisionMlpActivation::Exact => GeluActivation::Erf,
+            VisionMlpActivation::PytorchTanhCompiled => GeluActivation::TanhF32Compiled,
+            VisionMlpActivation::FastSigmoid => GeluActivation::Fast,
+        }
     }
 }
 
@@ -123,11 +115,7 @@ impl VisionMLP {
         if capture {
             diagnostics.push(mlxcel_core::copy(&x));
         }
-        let x = match self.activation {
-            VisionMlpActivation::Exact => mlxcel_core::gelu_approx(&x),
-            VisionMlpActivation::PytorchTanh => gelu_pytorch_tanh(&x),
-            VisionMlpActivation::FastSigmoid => mlxcel_core::utils::gelu_sigmoid(&x),
-        };
+        let x = self.activation.gelu().apply(&x);
         if capture {
             diagnostics.push(mlxcel_core::copy(&x));
         }
@@ -590,10 +578,12 @@ impl SigLipVisionModel {
     }
 
     /// Like [`Self::from_weights_with_quant`] but selects the encoder MLP GELU
-    /// variant. `use_fast_gelu = true` uses the sigmoid `GELU(approx="fast")`
-    /// that the Idefics2 vision tower uses. Otherwise `hidden_act` selects the
-    /// explicit PyTorch tanh approximation, with exact-erf GELU as the
-    /// compatibility default for missing and unknown values.
+    /// variant. `use_fast_gelu = true` forces the sigmoid `GELU(approx="fast")`
+    /// regardless of `hidden_act`. No caller passes `true` since #2794 moved
+    /// Idefics2 and Granite 4 Vision to the Hugging Face tanh GELU; the
+    /// parameter is kept because the entry point is shared with LLM-jp-VL and
+    /// its test support. Otherwise `hidden_act` selects the formula (see
+    /// [`VisionHiddenActivation`]).
     pub fn from_weights_with_quant_and_gelu(
         weights: &WeightMap,
         config: &VisionConfig,
@@ -881,7 +871,7 @@ mod siglip_block_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{VisionMlpActivation, gelu_pytorch_tanh, select_mlp_activation};
+    use super::{VisionMlpActivation, select_mlp_activation};
     use crate::vision::config::VisionHiddenActivation;
 
     #[test]
@@ -890,12 +880,19 @@ mod tests {
             select_mlp_activation(VisionHiddenActivation::ExactGelu, false),
             VisionMlpActivation::Exact
         );
+        // A declared tanh runs the compiled kernel, same as an omitted key
+        // resolved to the SigLIP default (#2794).
         assert_eq!(
             select_mlp_activation(VisionHiddenActivation::GeluPytorchTanh, false),
-            VisionMlpActivation::PytorchTanh
+            VisionMlpActivation::PytorchTanhCompiled
         );
         assert_eq!(
             select_mlp_activation(VisionHiddenActivation::GeluPytorchTanh, true),
+            VisionMlpActivation::FastSigmoid
+        );
+        // CLIP's `quick_gelu` (#2548), declared or the class default.
+        assert_eq!(
+            select_mlp_activation(VisionHiddenActivation::QuickGelu, false),
             VisionMlpActivation::FastSigmoid
         );
     }
@@ -908,7 +905,9 @@ mod tests {
         // process inside `cudaStreamEndCapture` in roughly one run in four.
         let _guard = crate::models::siglip_text::test_guard::lock();
         let input = mlxcel_core::from_slice_f32(&[-3.0, -1.0, 0.0, 1.0, 3.0], &[5]);
-        let output = gelu_pytorch_tanh(&input);
+        let output = VisionMlpActivation::PytorchTanhCompiled
+            .gelu()
+            .apply(&input);
         mlxcel_core::eval(&output);
         let expected = [-0.003_637_433, -0.158_808, 0.0, 0.841_192, 2.996_362_7];
         for (index, expected) in expected.into_iter().enumerate() {

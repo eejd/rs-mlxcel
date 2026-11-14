@@ -123,7 +123,11 @@ pub fn try_minicpm5(text: &str, tools: Option<&[Tool]>) -> Option<ToolCallParseR
                 end,
             } => {
                 push_content(&mut content, &text[cursor..start]);
-                calls.push(ParsedToolCall { name, arguments });
+                calls.push(ParsedToolCall {
+                    name,
+                    arguments,
+                    id: None,
+                });
                 cursor = start + end;
                 search_from = cursor;
             }

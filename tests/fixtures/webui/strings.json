@@ -733,6 +733,18 @@
       "test_id": "common-reload"
     },
     {
+      "key": "route.load_failed.title",
+      "en": "This screen could not be loaded",
+      "ko": "이 화면을 불러오지 못했습니다",
+      "test_id": "route-load-failed-title"
+    },
+    {
+      "key": "route.load_failed.body",
+      "en": "The server did not deliver the code for this screen. Reload the page once the server is reachable; you will need to enter the session key again.",
+      "ko": "서버가 이 화면의 코드를 보내지 못했습니다. 서버에 연결되면 페이지를 새로고침하세요. 세션 키를 다시 입력해야 합니다.",
+      "test_id": "route-load-failed-body"
+    },
+    {
       "key": "common.enter_key",
       "en": "Enter key",
       "ko": "키 입력",
@@ -4471,6 +4483,18 @@
       "test_id": "settings-startup-serving-bind"
     },
     {
+      "key": "settings.startup.cluster_auth",
+      "en": "Cluster authentication",
+      "ko": "클러스터 인증",
+      "test_id": "settings-startup-cluster-auth"
+    },
+    {
+      "key": "settings.startup.cluster_auth.configured",
+      "en": "Configured",
+      "ko": "설정됨",
+      "test_id": "settings-startup-cluster-auth-configured"
+    },
+    {
       "key": "settings.startup.model_is_gemma4_family",
       "en": "Gemma 4 family model",
       "ko": "Gemma 4 계열 모델",
@@ -4529,6 +4553,12 @@
       "en": "Reranking only",
       "ko": "리랭킹 전용",
       "test_id": "settings-startup-embedding-serving-mode-values-rerank-only"
+    },
+    {
+      "key": "settings.startup.embedding_serving_mode.values.image_only",
+      "en": "Image generation only",
+      "ko": "이미지 생성 전용",
+      "test_id": "settings-startup-embedding-serving-mode-values-image-only"
     },
     {
       "key": "settings.startup.preemption_policy.values.longest-first",

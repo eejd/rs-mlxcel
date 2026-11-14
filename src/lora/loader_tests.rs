@@ -193,6 +193,33 @@ fn an_integer_lora_pair_fuses_like_the_same_values_in_f32() {
     assert_eq!(fused_values(&int_pair), expected);
 }
 
+/// A fused weight keeps the base weight's dtype. The delta is computed in
+/// f32, and an uncast `add` promoted a bf16 base to f32, which doubled the
+/// fused projection's bytes and slowed bandwidth-bound decode instead of
+/// removing the adapter's cost (Qwen3-1.7B bf16: 65 -> 27 tok/s).
+#[test]
+fn a_fused_weight_keeps_the_base_dtype() {
+    for dtype in [
+        mlxcel_core::dtype::BFLOAT16,
+        mlxcel_core::dtype::FLOAT16,
+        mlxcel_core::dtype::FLOAT32,
+    ] {
+        let mut base = WeightMap::new();
+        base.insert(
+            "layer.weight".to_string(),
+            mlxcel_core::ones(&[3, 4], dtype),
+        );
+        let adapter = lora_pair("layer", 4, 2, 3);
+
+        let fused = fuse_lora_weights(&base, &adapter, 0.5).expect("fuses");
+        let weight = &fused["layer.weight"];
+        assert_eq!(mlxcel_core::array_dtype(weight), dtype);
+        // ones + 0.5 * rank 2 = 2.0 everywhere, exact in every dtype above.
+        let as_f32 = mlxcel_core::astype(weight, mlxcel_core::dtype::FLOAT32);
+        assert!((tensor_sum(&as_f32) - 24.0).abs() < 1e-6);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Conv1D projection recognition
 // ---------------------------------------------------------------------------

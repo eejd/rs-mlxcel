@@ -59,6 +59,7 @@ pub enum LoadedModel {
     Qwen35VLM(vision::Qwen35VLModel),
     Qwen35Moe(models::Qwen35Model),
     Qwen35MoeVLM(vision::Qwen35VLModel),
+    Qwen4ExpVLM(vision::Qwen4ExpVLModel),
     Qwen2Moe(models::Qwen2MoeModel),
     Gemma(models::GemmaModel),
     Gemma2(models::Gemma2Model),
@@ -184,6 +185,7 @@ pub enum LoadedModel {
     HunyuanMoe(models::HunyuanMoeModel),
     HunyuanV1Dense(models::HunyuanV1DenseModel),
     MiMo(models::MiMoModel),
+    MiMoV2Flash(models::MiMoV2FlashModel),
     BailingMoe(models::BailingMoeModel),
     BailingMoeLinear(models::BailingMoeLinearModel),
     Afmoe(models::AfmoeModel),
@@ -269,6 +271,7 @@ macro_rules! delegate_language_model {
             LoadedModel::Qwen35VLM(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Qwen35Moe(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Qwen35MoeVLM(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Qwen4ExpVLM(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Qwen2Moe(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Gemma(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Gemma2(inner) => LanguageModel::$method(inner, $($arg),*),
@@ -367,6 +370,7 @@ macro_rules! delegate_language_model {
             LoadedModel::HunyuanMoe(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::HunyuanV1Dense(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::MiMo(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::MiMoV2Flash(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::BailingMoe(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::BailingMoeLinear(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Afmoe(inner) => LanguageModel::$method(inner, $($arg),*),
@@ -425,6 +429,10 @@ macro_rules! delegate_language_model {
 }
 
 impl LanguageModel for LoadedModel {
+    fn batched_decode_kind(&self) -> mlxcel_core::generate::BatchedDecodeKind {
+        delegate_language_model!(self, batched_decode_kind())
+    }
+
     fn num_layers(&self) -> usize {
         delegate_language_model!(self, num_layers())
     }
@@ -452,6 +460,10 @@ impl LanguageModel for LoadedModel {
 
     fn kv_cache_layer_modes(&self) -> Option<Vec<mlxcel_core::cache::KVCacheMode>> {
         delegate_language_model!(self, kv_cache_layer_modes())
+    }
+
+    fn kv_cache_storage_modes(&self) -> Option<Vec<Option<mlxcel_core::cache::KVCacheMode>>> {
+        delegate_language_model!(self, kv_cache_storage_modes())
     }
 
     fn forward(
@@ -560,6 +572,13 @@ impl LanguageModel for LoadedModel {
         delegate_language_model!(self, supports_decode_lookahead_rewind())
     }
 
+    // #2567: the engine's lookahead gate and the scheduler's prompt-cache and
+    // handoff gates all read this; a dropped delegation would pipeline and
+    // donate Baichuan-M1's conv state as if its KV cache were the whole state.
+    fn kv_cache_captures_sequence_state(&self) -> bool {
+        delegate_language_model!(self, kv_cache_captures_sequence_state())
+    }
+
     fn rewind_decode_appends(
         &self,
         seq_id: mlxcel_core::cache::SequenceId,
@@ -574,6 +593,56 @@ impl LanguageModel for LoadedModel {
 
     fn prepare_sequence_state(&self, seq_id: mlxcel_core::cache::SequenceId) {
         delegate_language_model!(self, prepare_sequence_state(seq_id))
+    }
+
+    fn try_prepare_sequence_state(
+        &self,
+        seq_id: mlxcel_core::cache::SequenceId,
+    ) -> Result<(), String> {
+        delegate_language_model!(self, try_prepare_sequence_state(seq_id))
+    }
+
+    // The fallible forwards must reach the inner model's overrides (the
+    // remote pipeline model's, #2727); a trait default here would wrap this
+    // wrapper's infallible forward and never see them.
+    fn try_forward_with_sequence_id(
+        &self,
+        input_ids: &mlxcel_core::MlxArray,
+        seq_id: Option<mlxcel_core::cache::SequenceId>,
+        caches: &mut [mlxcel_core::layers::KVCache],
+        mask: Option<&mlxcel_core::MlxArray>,
+    ) -> Result<UniquePtr<mlxcel_core::MlxArray>, String> {
+        delegate_language_model!(
+            self,
+            try_forward_with_sequence_id(input_ids, seq_id, caches, mask)
+        )
+    }
+
+    fn try_forward_last_logits_with_sequence_id(
+        &self,
+        input_ids: &mlxcel_core::MlxArray,
+        seq_id: Option<mlxcel_core::cache::SequenceId>,
+        caches: &mut [mlxcel_core::layers::KVCache],
+        mask: Option<&mlxcel_core::MlxArray>,
+        last_pos: usize,
+    ) -> Result<UniquePtr<mlxcel_core::MlxArray>, String> {
+        delegate_language_model!(
+            self,
+            try_forward_last_logits_with_sequence_id(input_ids, seq_id, caches, mask, last_pos)
+        )
+    }
+
+    fn try_forward_batched_with_ids(
+        &self,
+        input_ids: &mlxcel_core::MlxArray,
+        seq_ids: Option<&[mlxcel_core::cache::SequenceId]>,
+        batch_caches: &mut [&mut [mlxcel_core::layers::KVCache]],
+        mask: Option<&mlxcel_core::MlxArray>,
+    ) -> Result<UniquePtr<mlxcel_core::MlxArray>, String> {
+        delegate_language_model!(
+            self,
+            try_forward_batched_with_ids(input_ids, seq_ids, batch_caches, mask)
+        )
     }
 
     fn release_sequence_state_by_id(&self, seq_id: mlxcel_core::cache::SequenceId) {

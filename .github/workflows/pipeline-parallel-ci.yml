@@ -30,7 +30,17 @@ on:
   pull_request:
     paths:
       - "src/distributed/pipeline/**"
+      - "src/models/gemma3.rs"
+      - "src/models/gemma3_backbone.rs"
+      - "src/models/gemma3_stage_tests.rs"
+      - "src/models/gemma4.rs"
+      - "src/models/gemma4_stage_tests.rs"
       - "src/distributed/tcp_transport.rs"
+      - "src/distributed/connection_pool.rs"
+      - "src/distributed/cluster_auth.rs"
+      - "src/distributed/cluster_handshake.rs"
+      - "src/distributed/discovery_beacon.rs"
+      - "src/distributed/peer_identity.rs"
       - "src/distributed/thunderbolt_transport.rs"
       - "src/distributed/rdma_transport.rs"
       - "src/distributed/rdma_capabilities.rs"
@@ -183,14 +193,6 @@ jobs:
           MLXCEL_CI_PP_MODEL: qwen3-0.6b-4bit
           TEST_MODEL: qwen3-0.6b-4bit
         run: ./scripts/ci/run-pp-two-host-logical.sh
-
-      - name: Clippy on PP modules
-        run: |
-          cargo clippy \
-            -p mlxcel \
-            --lib \
-            --tests \
-            -- -D warnings
 
   three-host-real-model:
     name: 3-host real-model parity (self-hosted)

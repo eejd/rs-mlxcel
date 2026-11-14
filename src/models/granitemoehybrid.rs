@@ -66,10 +66,13 @@
 //! Because the Mamba2 conv/SSM state is recurrent (not per-token positional), the
 //! model owns a mixed per-layer cache (`Mamba2Cache` for Mamba layers, `KVCache`
 //! for attention layers) through [`ModelOwnedSequenceState`] and reports
-//! `supports_batching() == false` (like Jamba / Nemotron-H / LFM2 / Falcon-H1 /
-//! PLaMo 2).
+//! native batched decode by stacking recurrent states and isolating attention
+//! histories per sequence. Mixed initialized recurrent states use row fallback.
 
-use mlxcel_core::generate::LanguageModel;
+use super::recurrent_batch::*;
+use mlxcel_core::batched_decode::{SplitAttention, SplitAttentionShape, forward_split_attention};
+use mlxcel_core::cache::{BatchedAttentionMetadata, CachePool, SequenceId, SequenceStateLayout};
+use mlxcel_core::generate::{BatchedDecodeKind, LanguageModel, route_batched_decode_with_ids};
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, silu, slice_axis};
 use mlxcel_core::weights::WeightMap;
@@ -702,7 +705,50 @@ struct GraniteMoeHybridAttention {
     rope_base: Option<f32>,
 }
 
+impl SplitAttention for GraniteMoeHybridAttention {
+    fn split_shape(&self) -> SplitAttentionShape {
+        SplitAttentionShape {
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            scale: self.scale,
+        }
+    }
+    fn rope_batched(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        offsets: &[i32],
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        match self.rope_base {
+            Some(base) => (
+                mlxcel_core::fast_rope_batched(q, self.head_dim, false, base, 1.0, offsets),
+                mlxcel_core::fast_rope_batched(k, self.head_dim, false, base, 1.0, offsets),
+            ),
+            None => (mlxcel_core::copy(q), mlxcel_core::copy(k)),
+        }
+    }
+}
 impl GraniteMoeHybridAttention {
+    fn forward_batched_decode(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut KVCache],
+    ) -> UniquePtr<MlxArray> {
+        let metadata = BatchedAttentionMetadata::from_kv_caches(
+            caches,
+            &vec![1; caches.len()],
+            &vec![0; caches.len()],
+        )
+        .expect("valid hybrid attention metadata");
+        let q = self.q_proj.forward(x);
+        let k = self.k_proj.forward(x);
+        let v = self.v_proj.forward(x);
+        self.o_proj.forward(&forward_split_attention(
+            self, &q, &k, &v, caches, &metadata, None,
+        ))
+    }
+
     fn forward(
         &self,
         x: &MlxArray,
@@ -783,7 +829,19 @@ pub(crate) struct GraniteMoeHybridMoE {
 }
 
 impl GraniteMoeHybridMoE {
+    /// Production forward: a single token takes the fused decode kernel
+    /// (#268) whenever [`crate::models::switch_layers::fused_moe_enabled`]
+    /// allows it (on by default; `MLXCEL_FUSED_MOE=0` forces the gather
+    /// path).
     pub(crate) fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        self.forward_routed(x, crate::models::switch_layers::fused_moe_enabled())
+    }
+
+    /// [`Self::forward`] with the single-token routing decision passed in, so
+    /// tests can drive each arm explicitly on any device. `try_fused` only
+    /// permits the fused kernel: multi-token input and any config the kernel
+    /// declines still take the gather path.
+    pub(crate) fn forward_routed(&self, x: &MlxArray, try_fused: bool) -> UniquePtr<MlxArray> {
         let orig_shape = mlxcel_core::array_shape(x);
         let hidden_dim = orig_shape[orig_shape.len() - 1];
 
@@ -808,10 +866,10 @@ impl GraniteMoeHybridMoE {
         let topk_logits = mlxcel_core::astype(&topk_logits, mlxcel_core::dtype::FLOAT32);
         let scores = mlxcel_core::softmax(&topk_logits, -1);
 
-        // Apply routed experts. Fused single-token decode kernel (#268) on by
-        // default; MLXCEL_FUSED_MOE=0 forces the proven SwitchGLU +
-        // moe_weighted_sum path (also the automatic fallback when the kernel
-        // does not support the config). Granite routes through softmax over
+        // Apply routed experts. Fused single-token decode kernel (#268) when
+        // the caller's policy allows it (see `forward`); otherwise the proven
+        // SwitchGLU + moe_weighted_sum path (also the automatic fallback when
+        // the kernel does not support the config). Granite routes through softmax over
         // ONLY the top-k logits, which equals softmax-over-all then
         // renormalize over the top-k (norm_topk_prob), so `scores` already
         // carries the full combine weights the kernel needs; the launcher
@@ -819,9 +877,7 @@ impl GraniteMoeHybridMoE {
         // block (the decoder layer sums it with the MoE output) and is
         // unchanged (issue #2245).
         let result = {
-            let fused = if mlxcel_core::array_shape(&x_flat)[0] == 1
-                && crate::models::switch_layers::fused_moe_enabled()
-            {
+            let fused = if mlxcel_core::array_shape(&x_flat)[0] == 1 && try_fused {
                 self.switch_mlp
                     .forward_fused_kernel(&x_flat, &topk_indices, &scores)
                     .map(|out| mlxcel_core::reshape(&out, &[1, hidden_dim]))
@@ -1093,6 +1149,92 @@ pub struct GraniteMoeHybridModel {
 }
 
 impl GraniteMoeHybridModel {
+    pub(crate) fn validate_sequence_states(&self, seq_ids: &[SequenceId]) -> Result<(), String> {
+        self.sequence_state.validate_sequence_states(seq_ids)
+    }
+
+    fn batch_states_uniform(states: &[Vec<GraniteMoeHybridLayerCache>]) -> bool {
+        (0..states[0].len()).all(|idx| {
+            let rows: Vec<_> = states
+                .iter()
+                .filter_map(|row| match &row[idx] {
+                    GraniteMoeHybridLayerCache::Mamba(c) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            rows.is_empty()
+                || (optional_rows_uniform(
+                    &rows
+                        .iter()
+                        .map(|c| c.conv_state.as_deref())
+                        .collect::<Vec<_>>(),
+                ) && optional_rows_uniform(
+                    &rows
+                        .iter()
+                        .map(|c| c.ssm_state.as_deref())
+                        .collect::<Vec<_>>(),
+                ))
+        })
+    }
+    fn forward_native_batch(
+        &self,
+        input_ids: &MlxArray,
+        states: &mut [Vec<GraniteMoeHybridLayerCache>],
+    ) -> UniquePtr<MlxArray> {
+        let batch = states.len();
+        let mut h = mlxcel_core::multiply_scalar(
+            &self.embed_tokens.forward(input_ids),
+            self.embedding_multiplier,
+        );
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let normed = layer.input_layernorm.forward(&h);
+            let output = match &layer.mixer {
+                Mixer::Mamba(mixer) => {
+                    let rows: Vec<_> = states
+                        .iter()
+                        .map(|row| match &row[idx] {
+                            GraniteMoeHybridLayerCache::Mamba(c) => c,
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                    let mut stacked = stack_mamba2(&rows).expect("uniform recurrent states");
+                    let output = mixer.forward(&normed, Some(&mut stacked));
+                    for (row, state) in states.iter_mut().zip(split_mamba2(&stacked, batch)) {
+                        row[idx] = GraniteMoeHybridLayerCache::Mamba(state);
+                    }
+                    output
+                }
+                Mixer::Attention(attn) => {
+                    let mut caches: Vec<_> = states
+                        .iter_mut()
+                        .map(|row| match &mut row[idx] {
+                            GraniteMoeHybridLayerCache::Attention(c) => c,
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                    attn.forward_batched_decode(&normed, &mut caches)
+                }
+            };
+            h = mlxcel_core::add(
+                &h,
+                &mlxcel_core::multiply_scalar(&output, layer.residual_multiplier),
+            );
+            let normed = layer.post_attention_layernorm.forward(&h);
+            let output = layer.feed_forward.forward(&normed);
+            h = mlxcel_core::add(
+                &h,
+                &mlxcel_core::multiply_scalar(&output, layer.residual_multiplier),
+            );
+        }
+        let h = self.norm.forward(&h);
+        let logits = if let Some(head) = &self.lm_head {
+            head.forward(&h)
+        } else {
+            self.embed_tokens.as_linear(&h)
+        };
+        mlxcel_core::divide_scalar(&logits, self.logits_scaling)
+    }
+
     pub fn num_layers(&self) -> usize {
         self.config.num_hidden_layers
     }
@@ -1563,6 +1705,89 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
 // LanguageModel trait implementation.
 
 impl LanguageModel for GraniteMoeHybridModel {
+    fn sequence_state_layout(&self) -> SequenceStateLayout {
+        SequenceStateLayout::model_owned(self.num_layers())
+    }
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
+    }
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_batched_with_ids(input_ids, None, batch_caches, mask)
+    }
+    fn forward_batched_with_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(input_ids);
+        assert_eq!(shape.len(), 2, "hybrid batch input must be rank 2");
+        assert_eq!(
+            shape[0] as usize,
+            batch_caches.len(),
+            "hybrid input batch must match cache rows"
+        );
+        if let Some(ids) = seq_ids {
+            assert_eq!(
+                ids.len(),
+                batch_caches.len(),
+                "one sequence id per row required"
+            );
+        }
+        route_batched_decode_with_ids(self, input_ids, seq_ids, batch_caches, |_| {
+            let ids = seq_ids.expect("model-owned hybrid batch requires sequence ids");
+            self.sequence_state
+                .validate_sequence_states(ids)
+                .unwrap_or_else(|err| panic!("hybrid batch: {err}"));
+            self.sequence_state
+                .with_batched_sequence_states(ids, |states| {
+                    if shape[1] != 1 || mask.is_some() || !Self::batch_states_uniform(states) {
+                        let outputs: Vec<_> = states
+                            .iter_mut()
+                            .enumerate()
+                            .map(|(row, state)| {
+                                let input = mlxcel_core::slice(
+                                    input_ids,
+                                    &[row as i32, 0],
+                                    &[row as i32 + 1, shape[1]],
+                                );
+                                self.forward_with_caches(&input, state)
+                            })
+                            .collect();
+                        return mlxcel_core::concatenate_many(
+                            &outputs.iter().map(|v| &**v).collect::<Vec<_>>(),
+                            0,
+                        );
+                    }
+                    self.forward_native_batch(input_ids, states)
+                })
+                .unwrap_or_else(|err| panic!("hybrid batch: {err}"))
+        })
+    }
+    fn sync_sequence_storage(
+        &self,
+        seq_id: SequenceId,
+        cache_pool: &mut CachePool,
+    ) -> Result<(), String> {
+        self.sequence_state
+            .with_existing_sequence_state(seq_id, |caches| {
+                let lengths: Vec<_> = caches
+                    .iter()
+                    .map(|cache| match cache {
+                        GraniteMoeHybridLayerCache::Attention(kv) => kv.live_len().max(0) as usize,
+                        _ => 0,
+                    })
+                    .collect();
+                cache_pool.sync_paged_state_with_lengths(seq_id, &lengths)
+            })?
+    }
+
     fn forward(
         &self,
         input: &MlxArray,
@@ -1588,12 +1813,23 @@ impl LanguageModel for GraniteMoeHybridModel {
         self.config.num_hidden_layers
     }
 
+    /// No mode table: report the real storage so the server does not fall back to the configured
+    /// table (issue #2790). Attention layers keep an FP16 `KVCache`; Mamba layers none.
+    fn kv_cache_storage_modes(&self) -> Option<Vec<Option<mlxcel_core::cache::KVCacheMode>>> {
+        crate::models::model_owned::table_less_storage_modes(self.config.num_hidden_layers, |idx| {
+            match self.layers.get(idx).map(|layer| &layer.mixer) {
+                Some(Mixer::Attention(_)) => crate::models::model_owned::LayerKv::Fp16Only,
+                _ => crate::models::model_owned::LayerKv::None,
+            }
+        })
+    }
+
     fn eos_token_ids(&self) -> Vec<i32> {
         self.eos_token_ids.clone()
     }
 
     fn supports_batching(&self) -> bool {
-        false // Recurrent Mamba2 state is not compatible with per-sequence KV isolation.
+        true
     }
 
     fn supports_padded_prefill(&self) -> bool {

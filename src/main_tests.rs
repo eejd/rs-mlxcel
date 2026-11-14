@@ -18,7 +18,7 @@ use std::sync::{Mutex, OnceLock};
 
 use super::{
     Cli, Commands, FAMILY_ORDER, PipelineParallelOptions, PromptLookupOptions,
-    TensorParallelOptions, write_supported_models, write_supported_models_json,
+    TensorParallelOptions, ignore_broken_pipe, write_supported_models, write_supported_models_json,
 };
 
 static CLI_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -302,13 +302,38 @@ fn supported_models_header_uses_actual_count() {
 
     let expected = format!(
         "Supported Model Architectures ({}):",
-        mlxcel::models::ALL_MODEL_TYPES.len()
+        mlxcel::models::ALL_MODEL_TYPES.len() + mlxcel::vision::dense::FAMILIES.len()
     );
     assert!(
         out.starts_with(&expected),
         "rendered header should start with {expected:?}, got {:?}",
         out.lines().next().unwrap_or("")
     );
+}
+
+/// A stdout whose reader has already gone away, as in `mlxcel arch | true`.
+struct ClosedPipe;
+
+impl std::io::Write for ClosedPipe {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn arch_json_treats_closed_reader_as_success() {
+    write_supported_models_json(ClosedPipe).unwrap();
+}
+
+#[test]
+fn ignore_broken_pipe_keeps_other_errors() {
+    assert!(ignore_broken_pipe(Err(std::io::ErrorKind::BrokenPipe.into())).is_ok());
+    let err = ignore_broken_pipe(Err(std::io::ErrorKind::StorageFull.into())).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
 }
 
 #[test]
@@ -320,8 +345,42 @@ fn arch_json_output_is_stable_registry_json() {
     let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(value["mlxcel_version"], env!("CARGO_PKG_VERSION"));
     let families = value["families"].as_array().unwrap();
-    assert_eq!(families.len(), mlxcel::models::ALL_MODEL_TYPES.len() + 1);
+    // The registry module pins the exact family count; here the JSON must
+    // carry every family it builds, including the standalone vision ones.
+    let registry = mlxcel::models::registry::build_architecture_registry(env!("CARGO_PKG_VERSION"));
+    assert_eq!(families.len(), registry.families.len());
+    assert!(families.len() > mlxcel::models::ALL_MODEL_TYPES.len());
     assert_eq!(families[0]["id"], "llama");
+    assert!(
+        value["runtime_kinds"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("predict"))
+    );
+    assert!(
+        value["output_kinds"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("dense_map"))
+    );
+    assert!(
+        value["output_kinds"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("keypoints"))
+    );
+    assert!(
+        value["output_kinds"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("masks"))
+    );
+    let sam3 = families
+        .iter()
+        .find(|family| family["id"] == "sam3")
+        .unwrap();
+    assert_eq!(sam3["runtimes"], serde_json::json!(["predict"]));
+    assert_eq!(sam3["output"], "masks");
 
     let qwen3 = families
         .iter()
@@ -375,6 +434,89 @@ fn arch_json_output_is_stable_registry_json() {
     assert_eq!(rt_detr["output"], "boxes");
     assert_eq!(rt_detr["tensor_parallel"], false);
     assert_eq!(rt_detr["pipeline_parallel"], false);
+
+    let pp_doclayout = families
+        .iter()
+        .find(|family| family["id"] == "pp_doclayout_v3")
+        .unwrap();
+    assert_eq!(pp_doclayout["display_name"], "PP-DocLayoutV3");
+    assert_eq!(pp_doclayout["category"], "detection");
+    assert_eq!(
+        pp_doclayout["model_types"],
+        serde_json::json!(["pp_doclayout_v3"])
+    );
+    assert_eq!(pp_doclayout["runtimes"], serde_json::json!(["detect"]));
+    assert_eq!(pp_doclayout["modalities_in"], serde_json::json!(["image"]));
+    assert_eq!(pp_doclayout["output"], "boxes");
+    assert_eq!(pp_doclayout["tensor_parallel"], false);
+    assert_eq!(pp_doclayout["pipeline_parallel"], false);
+
+    let rf_detr = families
+        .iter()
+        .find(|family| family["id"] == "rf-detr")
+        .unwrap();
+    assert_eq!(rf_detr["display_name"], "RF-DETR");
+    assert_eq!(rf_detr["category"], "detection");
+    assert_eq!(rf_detr["model_types"], serde_json::json!(["rf-detr"]));
+    assert_eq!(rf_detr["aliases"], serde_json::json!(["rfdetr"]));
+    assert_eq!(rf_detr["runtimes"], serde_json::json!(["detect"]));
+    assert_eq!(rf_detr["modalities_in"], serde_json::json!(["image"]));
+    assert_eq!(rf_detr["output"], "boxes");
+    assert_eq!(rf_detr["tensor_parallel"], false);
+    assert_eq!(rf_detr["pipeline_parallel"], false);
+}
+
+#[test]
+fn supported_models_output_lists_sapiens2_dense_prediction() {
+    let mut out = String::new();
+    write_supported_models(&mut out).unwrap();
+    let dense = out
+        .split("Dense Prediction:\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n\n").next())
+        .unwrap_or_else(|| panic!("missing Dense Prediction section: {out}"));
+    assert!(
+        dense.lines().any(|line| line == "  - sapiens2"),
+        "missing Sapiens2 dense family: {out}"
+    );
+}
+
+#[test]
+fn predict_requires_exactly_one_image_or_video() {
+    let missing = try_parse_cli(&["mlxcel", "predict", "-m", "model", "-o", "output"]).unwrap_err();
+    assert_eq!(
+        missing.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument
+    );
+
+    let both = try_parse_cli(&[
+        "mlxcel",
+        "predict",
+        "-m",
+        "model",
+        "--image",
+        "image.png",
+        "--video",
+        "video.mp4",
+        "-o",
+        "output",
+    ])
+    .unwrap_err();
+    assert_eq!(both.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+    let cli = parse_cli(&[
+        "mlxcel",
+        "predict",
+        "-m",
+        "model",
+        "--image",
+        "image.png",
+        "-o",
+        "output",
+        "--opts",
+        r#"{"resolution_level":7}"#,
+    ]);
+    assert!(matches!(cli.command, Commands::Predict(_)));
 }
 
 /// Issue #26: the dead `docs/model_implementations.md` reference was
@@ -413,6 +555,23 @@ fn supported_models_output_keeps_muse_glimmer_as_an_architecture_name() {
             "architecture list must not include Muse checkpoint detail {checkpoint_detail:?}: {out}"
         );
     }
+}
+
+/// clap counts an env-sourced value as present and treats `overrides_with`
+/// partners as direct conflicts, so an `env` binding on either half of a pair
+/// makes `VAR=... --other-half` a parse error (#2609). No argument of any
+/// `mlxcel` subcommand may combine the two (#2618), and the same holds for a
+/// `conflicts_with` pair (#2664); read the variable after parsing instead
+/// (`mlxcel::cli::apply_boolish_pair_env`, `env_fallback_cors_origins`).
+#[test]
+fn no_arg_combines_clap_env_with_overrides_with() {
+    let offenders = mlxcel::cli::env_bound_override_args(&Cli::command());
+    assert!(
+        offenders.is_empty(),
+        "these args bind an env var through clap while overriding, being overridden by, or \
+         conflicting with another arg; read the variable after parsing instead:\n{}",
+        offenders.join("\n")
+    );
 }
 
 #[test]
@@ -469,6 +628,287 @@ fn settings_cli_mlxcel_serve_defaults_off_and_explicit_flag_enables() {
         panic!("expected serve command");
     };
     assert!(enabled.settings, "--settings must propagate through clap");
+}
+
+#[test]
+fn mlxcel_serve_no_models_autoload_reaches_the_resolved_toggle() {
+    let resolved = |args: &'static [&'static str]| {
+        let Commands::Serve(serve) = parse_cli(args).command else {
+            panic!("expected serve command");
+        };
+        mlxcel::server::resolve_compat_toggle(serve.models_autoload, serve._no_models_autoload)
+    };
+
+    assert!(resolved(&["mlxcel", "serve", "--models-dir", "models"]));
+    assert!(!resolved(&[
+        "mlxcel",
+        "serve",
+        "--models-dir",
+        "models",
+        "--no-models-autoload",
+    ]));
+    assert!(resolved(&[
+        "mlxcel",
+        "serve",
+        "--models-dir",
+        "models",
+        "--no-models-autoload",
+        "--models-autoload",
+    ]));
+}
+
+/// `LLAMA_ARG_MODELS_AUTOLOAD` used to be a clap `env` binding, which clap
+/// counts as an occurrence that conflicts with `--no-models-autoload` (#2609).
+/// The variable is now read after parsing, and an explicit flag beats it.
+#[test]
+fn mlxcel_serve_models_autoload_env_yields_to_either_flag() {
+    let _lock = CLI_ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("CLI env lock");
+    let resolved = |args: &'static [&'static str]| {
+        let Commands::Serve(mut serve) = parse_cli(args).command else {
+            panic!("expected serve command");
+        };
+        // The binary asks `long_cli_flag_was_set`, which reads the real
+        // process argv; a unit test has to answer from its own argv instead.
+        mlxcel::server::env_fallback_models_autoload(
+            &mut serve.models_autoload,
+            args.contains(&"--models-autoload"),
+            args.contains(&"--no-models-autoload"),
+        )
+        .expect("valid LLAMA_ARG_MODELS_AUTOLOAD");
+        mlxcel::server::resolve_compat_toggle(serve.models_autoload, serve._no_models_autoload)
+    };
+
+    for value in ["true", "false", "1", "0"] {
+        let _env = ScopedEnv::set(&[("LLAMA_ARG_MODELS_AUTOLOAD", value)]);
+        assert!(
+            !resolved(&[
+                "mlxcel",
+                "serve",
+                "--models-dir",
+                "models",
+                "--no-models-autoload",
+            ]),
+            "LLAMA_ARG_MODELS_AUTOLOAD={value} --no-models-autoload must resolve to disabled"
+        );
+        assert!(
+            resolved(&[
+                "mlxcel",
+                "serve",
+                "--models-dir",
+                "models",
+                "--models-autoload",
+            ]),
+            "LLAMA_ARG_MODELS_AUTOLOAD={value} --models-autoload must resolve to enabled"
+        );
+    }
+
+    let _env = ScopedEnv::set(&[("LLAMA_ARG_MODELS_AUTOLOAD", "false")]);
+    assert!(
+        !resolved(&["mlxcel", "serve", "--models-dir", "models"]),
+        "the variable alone must still disable autoload"
+    );
+    let _env = ScopedEnv::set(&[("LLAMA_ARG_MODELS_AUTOLOAD", "true")]);
+    assert!(resolved(&["mlxcel", "serve", "--models-dir", "models"]));
+}
+
+/// Apply both CORS origin variables the way `run_serve` does, answering
+/// "was the flag on the command line" from `args` with
+/// [`mlxcel::server::long_cli_flag_in`], the rule `long_cli_flag_was_set`
+/// applies to the real argv (which here is the test harness's), so the
+/// `--flag=value` form is detected exactly as in the binary (#2697).
+fn serve_with_cors_origin_env(args: &'static [&'static str]) -> crate::ServeArgs {
+    let Commands::Serve(mut serve) = parse_cli(args).command else {
+        panic!("expected serve command");
+    };
+    let cors_set = mlxcel::server::long_cli_flag_in(args, "cors-origins");
+    let allowed_set = mlxcel::server::long_cli_flag_in(args, "allowed-origins");
+    let cors_notice =
+        mlxcel::server::env_fallback_cors_origins(&mut serve.cors_origins, cors_set, allowed_set)
+            .expect("CORS origin variable applies");
+    serve.startup_notices.extend(cors_notice);
+    let allowed_notice = mlxcel::server::env_fallback_allowed_origins(
+        &mut serve.allowed_origins,
+        allowed_set,
+        cors_set,
+    )
+    .expect("allowed origins variable applies");
+    serve.startup_notices.extend(allowed_notice);
+    serve
+}
+
+/// #2664: each CORS origin variable used to be a clap `env` binding, so clap
+/// counted it as a `--cors-origins` / `--allowed-origins` occurrence and
+/// refused the other flag. The flag now wins over the other side's variable.
+#[test]
+fn mlxcel_serve_cors_origin_env_does_not_conflict_with_the_other_flag() {
+    let _lock = CLI_ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("CLI env lock");
+
+    {
+        let _env = ScopedEnv::set(&[("LLAMA_ARG_CORS_ORIGINS", "http://a.example")]);
+        let serve = serve_with_cors_origin_env(&[
+            "mlxcel",
+            "serve",
+            "-m",
+            "models/foo",
+            "--allowed-origins",
+            "http://b.example",
+        ]);
+        assert_eq!(serve.allowed_origins, vec!["http://b.example".to_string()]);
+        assert_eq!(
+            serve.cors_origins, "*",
+            "LLAMA_ARG_CORS_ORIGINS must be ignored when --allowed-origins is given"
+        );
+        assert!(
+            serve.startup_notices.len() == 1
+                && serve.startup_notices[0].contains("LLAMA_ARG_CORS_ORIGINS is ignored"),
+            "the ignored variable must produce a startup notice: {:?}",
+            serve.startup_notices
+        );
+    }
+
+    {
+        let _env = ScopedEnv::set(&[("MLXCEL_ALLOWED_ORIGINS", "http://a.example")]);
+        let serve = serve_with_cors_origin_env(&[
+            "mlxcel",
+            "serve",
+            "-m",
+            "models/foo",
+            "--cors-origins",
+            "http://b.example",
+        ]);
+        assert_eq!(serve.cors_origins, "http://b.example");
+        assert!(
+            serve.allowed_origins.is_empty(),
+            "MLXCEL_ALLOWED_ORIGINS must be ignored when --cors-origins is given"
+        );
+        assert!(
+            serve.startup_notices.len() == 1
+                && serve.startup_notices[0].contains("MLXCEL_ALLOWED_ORIGINS is ignored"),
+            "the dropped allow-list must produce a startup notice: {:?}",
+            serve.startup_notices
+        );
+    }
+
+    {
+        let _env = ScopedEnv::set(&[(
+            "MLXCEL_ALLOWED_ORIGINS",
+            "http://a.example,http://c.example",
+        )]);
+        let serve = serve_with_cors_origin_env(&["mlxcel", "serve", "-m", "models/foo"]);
+        assert_eq!(
+            serve.allowed_origins,
+            vec![
+                "http://a.example".to_string(),
+                "http://c.example".to_string()
+            ],
+            "the variable alone still applies, split on commas"
+        );
+    }
+}
+
+/// #2697: the `--flag=value` spelling of either CORS origin flag wins over
+/// the other side's variable exactly like the space-separated form, and the
+/// ignored variable still produces its startup notice. A plain
+/// `argv.contains("--cors-origins")` check misses this form.
+#[test]
+fn mlxcel_serve_cors_origin_equals_form_wins_over_the_other_variable() {
+    let _lock = CLI_ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("CLI env lock");
+
+    {
+        let _env = ScopedEnv::set(&[("MLXCEL_ALLOWED_ORIGINS", "http://b.example")]);
+        let serve = serve_with_cors_origin_env(&[
+            "mlxcel",
+            "serve",
+            "-m",
+            "models/foo",
+            "--cors-origins=http://a.example",
+        ]);
+        assert_eq!(serve.cors_origins, "http://a.example");
+        assert!(
+            serve.allowed_origins.is_empty(),
+            "MLXCEL_ALLOWED_ORIGINS must be ignored when --cors-origins=... is given"
+        );
+        assert!(
+            serve.startup_notices.len() == 1
+                && serve.startup_notices[0].contains("MLXCEL_ALLOWED_ORIGINS is ignored"),
+            "the ignored variable must produce a startup notice: {:?}",
+            serve.startup_notices
+        );
+    }
+
+    {
+        let _env = ScopedEnv::set(&[("LLAMA_ARG_CORS_ORIGINS", "http://b.example")]);
+        let serve = serve_with_cors_origin_env(&[
+            "mlxcel",
+            "serve",
+            "-m",
+            "models/foo",
+            "--allowed-origins=http://a.example",
+        ]);
+        assert_eq!(serve.allowed_origins, vec!["http://a.example".to_string()]);
+        assert_eq!(
+            serve.cors_origins, "*",
+            "LLAMA_ARG_CORS_ORIGINS must be ignored when --allowed-origins=... is given"
+        );
+        assert!(
+            serve.startup_notices.len() == 1
+                && serve.startup_notices[0].contains("LLAMA_ARG_CORS_ORIGINS is ignored"),
+            "the ignored variable must produce a startup notice: {:?}",
+            serve.startup_notices
+        );
+    }
+}
+
+/// Two explicit flags are still refused by clap.
+#[test]
+fn mlxcel_serve_cors_origins_and_allowed_origins_flags_still_conflict() {
+    let err = Cli::try_parse_from([
+        "mlxcel",
+        "serve",
+        "-m",
+        "models/foo",
+        "--cors-origins",
+        "http://a.example",
+        "--allowed-origins",
+        "http://b.example",
+    ])
+    .expect_err("both CORS origin flags must conflict");
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+}
+
+/// Both variables without either flag fail `mlxcel serve` at startup, before
+/// the model reference is resolved, naming both variables.
+#[test]
+fn mlxcel_serve_both_cors_origin_envs_without_a_flag_fail_startup() {
+    let _lock = CLI_ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("CLI env lock");
+    let _env = ScopedEnv::set(&[
+        ("LLAMA_ARG_CORS_ORIGINS", "http://a.example"),
+        ("MLXCEL_ALLOWED_ORIGINS", "http://b.example"),
+    ]);
+    let Commands::Serve(serve) =
+        parse_cli(&["mlxcel", "serve", "-m", "models/does-not-exist"]).command
+    else {
+        panic!("expected serve command");
+    };
+    let message = crate::commands::run_serve(serve)
+        .expect_err("both CORS origin variables must fail startup")
+        .to_string();
+    assert!(
+        message.contains("LLAMA_ARG_CORS_ORIGINS") && message.contains("MLXCEL_ALLOWED_ORIGINS"),
+        "the error must name both variables: {message}"
+    );
 }
 
 #[test]
@@ -865,11 +1305,11 @@ fn serve_canonical_llama_envs_and_endpoint_precedence_parse_together() {
     let Commands::Serve(mut args) = cli.command else {
         panic!("expected serve command");
     };
-    mlxcel::server::env_fallback_batch_size(&mut args.batch_size);
-    mlxcel::server::env_fallback_ubatch_size(&mut args.ubatch_size);
-    mlxcel::server::env_fallback_draft_model(&mut args.draft_model);
-    mlxcel::server::env_fallback_log_file(&mut args.log_file);
-    mlxcel::server::env_fallback_endpoint_slots(&mut args.slots, false, false);
+    mlxcel::server::env_fallback_batch_size(&mut args.batch_size, &mut Vec::new());
+    mlxcel::server::env_fallback_ubatch_size(&mut args.ubatch_size, &mut Vec::new());
+    mlxcel::server::env_fallback_draft_model(&mut args.draft_model, &mut Vec::new());
+    mlxcel::server::env_fallback_log_file(&mut args.log_file, &mut Vec::new());
+    mlxcel::server::env_fallback_endpoint_slots(&mut args.slots, false, false, &mut Vec::new());
     assert_eq!(args.batch_size, Some(111));
     assert_eq!(args.ubatch_size, Some(22));
     assert_eq!(
@@ -899,7 +1339,7 @@ fn serve_canonical_llama_envs_and_endpoint_precedence_parse_together() {
     let Commands::Serve(mut cli_args) = cli_override.command else {
         panic!("expected serve command");
     };
-    mlxcel::server::env_fallback_endpoint_slots(&mut cli_args.slots, true, false);
+    mlxcel::server::env_fallback_endpoint_slots(&mut cli_args.slots, true, false, &mut Vec::new());
     assert_eq!(cli_args.batch_size, Some(333));
     assert!(cli_args.slots);
 
@@ -908,7 +1348,12 @@ fn serve_canonical_llama_envs_and_endpoint_precedence_parse_together() {
     let Commands::Serve(mut no_slots_args) = no_slots.command else {
         panic!("expected serve command");
     };
-    mlxcel::server::env_fallback_endpoint_slots(&mut no_slots_args.slots, false, true);
+    mlxcel::server::env_fallback_endpoint_slots(
+        &mut no_slots_args.slots,
+        false,
+        true,
+        &mut Vec::new(),
+    );
     assert!(no_slots_args._no_slots);
     assert!(!(no_slots_args.slots && !no_slots_args._no_slots));
 }
@@ -1661,5 +2106,29 @@ fn supported_models_output_lists_iquest_coder_under_the_llama_family() {
         llama_section.contains("IQuest-Coder V1"),
         "IQuest-Coder must be visible in `mlxcel arch`, which is how an operator \
          answers \"is this checkpoint supported?\": {llama_section}"
+    );
+}
+
+#[test]
+fn cli_tracing_filter_defaults_to_warn_and_honors_rust_log() {
+    use tracing_subscriber::filter::LevelFilter;
+
+    assert_eq!(
+        super::cli_tracing_filter(None).max_level_hint(),
+        Some(LevelFilter::WARN),
+        "an unset RUST_LOG must still surface WARN and ERROR on stderr"
+    );
+
+    let debug = OsString::from("debug");
+    assert_eq!(
+        super::cli_tracing_filter(Some(debug.as_os_str())).max_level_hint(),
+        Some(LevelFilter::DEBUG),
+        "a set RUST_LOG must keep its directive"
+    );
+
+    let error = OsString::from("error");
+    assert_eq!(
+        super::cli_tracing_filter(Some(error.as_os_str())).max_level_hint(),
+        Some(LevelFilter::ERROR)
     );
 }

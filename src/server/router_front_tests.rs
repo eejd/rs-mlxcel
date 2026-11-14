@@ -30,23 +30,36 @@ use axum::http::{Method, Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+use crate::distributed::cluster_auth::{ClusterAuth, ClusterSecret};
+use crate::distributed::disaggregated::ResultPhase;
 use crate::distributed::tcp_transport::TcpTransportConfig;
 
 const DEFAULT_ROUTER_TEST_TEMPLATE: &str =
     "{% for message in messages %}{{ message.content }}{% endfor %}";
 
-async fn router_test_state_with_config_and_template(
-    mut config: ServerConfig,
-    template: &str,
-) -> Arc<RouterState> {
-    let transport = Arc::new(
+fn test_auth() -> Arc<ClusterAuth> {
+    Arc::new(ClusterAuth::new(&ClusterSecret::random()))
+}
+
+/// Bind a loopback transport the way every disaggregated role does: with the
+/// cluster secret (`RouterState::build` refuses anything else).
+async fn bind_authenticated(auth: Arc<ClusterAuth>) -> Arc<TcpTransport> {
+    Arc::new(
         TcpTransport::bind(TcpTransportConfig {
             bind_address: "127.0.0.1:0".to_string(),
+            auth: Some(auth),
             ..TcpTransportConfig::default()
         })
         .await
         .expect("bind router test transport"),
-    );
+    )
+}
+
+async fn router_test_state_with_config_and_template(
+    mut config: ServerConfig,
+    template: &str,
+) -> Arc<RouterState> {
+    let transport = bind_authenticated(test_auth()).await;
     let reply_to = transport.local_addr().expect("router transport address");
     if config.prefill_peers.is_empty() {
         config.prefill_peers = vec!["127.0.0.1:9".parse().expect("prefill address")];
@@ -129,6 +142,126 @@ async fn response_json(response: Response) -> Value {
         .await
         .expect("read response body");
     serde_json::from_slice(&bytes).expect("JSON response")
+}
+
+// ---------------------------------------------------------------------------
+// Result demux admission (#2692)
+// ---------------------------------------------------------------------------
+
+/// Build a router state over `transport` with the given prefill peers and the
+/// default template and stub tokenizer.
+fn build_router_state(
+    transport: Arc<TcpTransport>,
+    prefill_peers: Vec<SocketAddr>,
+) -> Result<RouterState> {
+    let reply_to = transport.local_addr().expect("router transport address");
+    RouterState::build(
+        Arc::new(ServerConfig {
+            prefill_peers,
+            ..ServerConfig::default()
+        }),
+        transport,
+        reply_to,
+        Arc::new(ChatTemplateProcessor::with_template(
+            DEFAULT_ROUTER_TEST_TEMPLATE.to_string(),
+        )),
+        Arc::new(MlxcelTokenizer::stub()),
+        PathBuf::from("router-test-model"),
+    )
+}
+
+/// The router never trusts its caller to have bound the transport with the
+/// secret: an unauthenticated transport is refused at build time.
+#[tokio::test]
+async fn build_refuses_an_unauthenticated_transport() {
+    let plain = Arc::new(
+        TcpTransport::bind(TcpTransportConfig {
+            bind_address: "127.0.0.1:0".to_string(),
+            ..TcpTransportConfig::default()
+        })
+        .await
+        .expect("bind plain transport"),
+    );
+    let err = build_router_state(plain, vec!["127.0.0.1:9".parse().unwrap()])
+        .err()
+        .expect("an unauthenticated transport must be refused")
+        .to_string();
+    assert!(err.contains("cluster secret"), "{err}");
+}
+
+/// Only the configured prefill and decode peer addresses may deliver result
+/// frames; the comparison is on the canonical IP and the port.
+#[tokio::test]
+async fn accepts_result_from_only_configured_peers() {
+    let state = build_router_state(
+        bind_authenticated(test_auth()).await,
+        vec!["127.0.0.1:9".parse().unwrap()],
+    )
+    .expect("build router state");
+    assert!(state.accepts_result_from("127.0.0.1:9"));
+    assert!(state.accepts_result_from("[::ffff:127.0.0.1]:9"));
+    assert!(!state.accepts_result_from("127.0.0.1:10"));
+    assert!(!state.accepts_result_from("not-an-addr"));
+}
+
+/// Two authenticated members hold the secret, but only the one whose listener
+/// address is a configured peer reaches a request's channel; the other's frame
+/// for the same request id is dropped.
+#[tokio::test]
+async fn result_demux_drops_frames_from_unconfigured_senders() {
+    let auth = test_auth();
+    let configured = bind_authenticated(Arc::clone(&auth)).await;
+    let stranger = bind_authenticated(Arc::clone(&auth)).await;
+    let configured_addr: SocketAddr = configured
+        .local_addr()
+        .expect("configured peer address")
+        .parse()
+        .expect("socket address");
+    let state = Arc::new(
+        build_router_state(bind_authenticated(auth).await, vec![configured_addr])
+            .expect("build router state"),
+    );
+    let router_addr = state.transport.local_addr().expect("router address");
+
+    let request_id = state.next_id.fetch_add(1, Ordering::Relaxed);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    state.pending.lock().unwrap().insert(request_id, tx);
+    spawn_result_demux(Arc::clone(&state));
+
+    let frame_from = |tokens: &str| ResultFrame {
+        request_id,
+        phase: ResultPhase::FirstToken,
+        tokens: vec![tokens.to_string()],
+        start_sequence: 0,
+        done: true,
+        error: None,
+        generated_tokens: Some(1),
+        prompt_cache_enabled: None,
+    };
+    stranger
+        .send(&router_addr, frame_from("injected").encode().unwrap())
+        .await
+        .expect("stranger send");
+    // The stranger's frame is dropped: nothing reaches the channel.
+    let dropped = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+    assert!(
+        dropped.is_err(),
+        "unconfigured sender's frame was delivered: {dropped:?}"
+    );
+
+    configured
+        .send(&router_addr, frame_from("legit").encode().unwrap())
+        .await
+        .expect("configured send");
+    let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("configured peer's frame must be delivered")
+        .expect("channel open");
+    assert_eq!(delivered.tokens, vec!["legit".to_string()]);
+
+    stranger.shutdown().await.unwrap();
+    configured.shutdown().await.unwrap();
+    state.transport.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -337,6 +470,52 @@ async fn router_chat_maps_template_rejection_to_bad_request() {
 }
 
 #[tokio::test]
+async fn router_completion_prompt_rejection_precedes_handoff() {
+    for (prompt, expected_message) in [
+        (json!([]), "empty prompt arrays"),
+        (json!(["first", "second"]), "multiple prompts"),
+        (
+            json!(" \n\t"),
+            "Request must include at least one non-empty message content or media input.",
+        ),
+        (
+            json!([" \n\t"]),
+            "Request must include at least one non-empty message content or media input.",
+        ),
+    ] {
+        for stream in [false, true] {
+            let state = router_test_state().await;
+            let next_id = state.next_id.load(Ordering::Relaxed);
+            let response = post_router_json_with_state(
+                state.clone(),
+                "/v1/completions",
+                json!({"model": "test-model", "prompt": prompt, "stream": stream}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = error_body(response).await;
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected_message),
+                "{body}"
+            );
+            assert_eq!(state.next_id.load(Ordering::Relaxed), next_id, "no handoff");
+            assert!(
+                state.pending.lock().unwrap().is_empty(),
+                "no pending request"
+            );
+            assert!(
+                state.prefill_hits.lock().unwrap().is_empty(),
+                "no prefill dispatch"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn router_completion_existing_unsupported_option_guards_are_unchanged() {
     let cases = [
         (
@@ -354,9 +533,13 @@ async fn router_completion_existing_unsupported_option_guards_are_unchanged() {
     ];
 
     for (body, expected_message) in cases {
-        let response = post_router_json("/v1/completions", body).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(error_message(response).await, expected_message);
+        for prompt in [json!("hello"), json!(["hello"]), json!(""), json!([""])] {
+            let mut body = body.clone();
+            body["prompt"] = prompt;
+            let response = post_router_json("/v1/completions", body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(error_message(response).await, expected_message);
+        }
     }
 }
 
@@ -430,6 +613,7 @@ fn text_only_router_rejects_declared_media_even_when_resolution_drops_it() {
 fn prefers_authoritative_count_over_frame_count() {
     let outcome = HandoffOutcome {
         generated_tokens: Some(10),
+        prompt_cache_enabled: None,
     };
     // Three multi-byte characters surfaced as 3 text pieces, but the worker
     // generated 10 model tokens (byte-fallback expansion).
@@ -443,6 +627,7 @@ fn prefers_authoritative_count_over_frame_count() {
 fn falls_back_to_frame_count_when_no_authoritative_count() {
     let outcome = HandoffOutcome {
         generated_tokens: None,
+        prompt_cache_enabled: None,
     };
     assert_eq!(resolve_completion_tokens(&outcome, 7, 16), 7);
 }
@@ -454,6 +639,7 @@ fn falls_back_to_frame_count_when_no_authoritative_count() {
 fn fallback_frame_count_clamped_to_max_tokens() {
     let outcome = HandoffOutcome {
         generated_tokens: None,
+        prompt_cache_enabled: None,
     };
     // Frame count exceeds the budget; the fallback must not report more than allowed.
     assert_eq!(resolve_completion_tokens(&outcome, 9999, 16), 16);
@@ -466,6 +652,7 @@ fn fallback_frame_count_clamped_to_max_tokens() {
 fn clamps_authoritative_count_to_max_tokens() {
     let outcome = HandoffOutcome {
         generated_tokens: Some(9999),
+        prompt_cache_enabled: None,
     };
     assert_eq!(resolve_completion_tokens(&outcome, 4, 16), 16);
 }
@@ -476,6 +663,7 @@ fn clamps_authoritative_count_to_max_tokens() {
 fn authoritative_count_at_budget_is_length() {
     let outcome = HandoffOutcome {
         generated_tokens: Some(16),
+        prompt_cache_enabled: None,
     };
     let max_tokens = 16;
     let completion_tokens = resolve_completion_tokens(&outcome, 16, max_tokens);
@@ -495,9 +683,11 @@ fn authoritative_count_fixes_finish_reason_flip() {
     let frame_counted = 15; // emitted-piece under-count
     let authoritative = HandoffOutcome {
         generated_tokens: Some(16),
+        prompt_cache_enabled: None,
     };
     let no_count = HandoffOutcome {
         generated_tokens: None,
+        prompt_cache_enabled: None,
     };
 
     let fixed = resolve_completion_tokens(&authoritative, frame_counted, max_tokens);
@@ -527,6 +717,8 @@ fn chat_completion_json_includes_usage() {
         "stop",
         12,
         5,
+        false,
+        false,
     );
     assert_eq!(body["usage"]["prompt_tokens"], serde_json::json!(12));
     assert_eq!(body["usage"]["completion_tokens"], serde_json::json!(5));
@@ -560,6 +752,8 @@ fn chat_completion_json_usage_present_with_reasoning() {
         "stop",
         8,
         3,
+        false,
+        false,
     );
     assert_eq!(
         body["choices"][0]["message"]["reasoning_content"],
@@ -584,6 +778,8 @@ fn chat_completion_json_omits_reasoning_alias_when_disabled() {
         "stop",
         8,
         3,
+        false,
+        false,
     );
     let message = body["choices"][0]["message"].as_object().unwrap();
     assert_eq!(message["reasoning_content"], "thinking...");
@@ -621,13 +817,86 @@ fn chat_chunk_reasoning_honors_alias_policy() {
 /// `ChatCompletionChunk::usage_with_cache`) and the caller-supplied counts.
 #[test]
 fn chat_chunk_usage_shape() {
-    let chunk = chat_chunk_usage("chatcmpl-3", "qwen3", 20, 7);
+    let chunk = chat_chunk_usage("chatcmpl-3", "qwen3", 20, 7, false);
     assert_eq!(chunk["id"], serde_json::json!("chatcmpl-3"));
     assert_eq!(chunk["object"], serde_json::json!("chat.completion.chunk"));
     assert_eq!(chunk["choices"], serde_json::json!([]));
     assert_eq!(chunk["usage"]["prompt_tokens"], serde_json::json!(20));
     assert_eq!(chunk["usage"]["completion_tokens"], serde_json::json!(7));
     assert_eq!(chunk["usage"]["total_tokens"], serde_json::json!(27));
+}
+
+/// Issue #2695: every router usage object carries
+/// `prompt_tokens_details.cached_tokens == 0` exactly when the prompt cache is
+/// enabled, the same rule single node applies (`with_cached_tokens` and
+/// `usage_with_cache` keyed on whether the prompt-cache store exists), and
+/// omits the field otherwise. Covers both chat builders and both completion
+/// builders.
+fn router_usage_objects(cache_enabled: bool) -> Vec<(&'static str, Value)> {
+    let chat = chat_completion_json(
+        "chatcmpl-c",
+        "qwen3",
+        "hi",
+        "",
+        crate::server::ReasoningAliasField::Reasoning,
+        "stop",
+        9,
+        2,
+        cache_enabled,
+        false,
+    );
+    let chat_chunk = chat_chunk_usage("chatcmpl-c", "qwen3", 9, 2, cache_enabled);
+    let completion = serde_json::to_value(completion_response(
+        "cmpl-c".to_string(),
+        "qwen3".to_string(),
+        "hi".to_string(),
+        9,
+        2,
+        "stop",
+        cache_enabled,
+    ))
+    .unwrap();
+    let completion_chunk = serde_json::to_value(completion_usage_chunk(
+        "cmpl-c".to_string(),
+        "qwen3".to_string(),
+        9,
+        2,
+        cache_enabled,
+    ))
+    .unwrap();
+    vec![
+        ("chat_completion_json", chat["usage"].clone()),
+        ("chat_chunk_usage", chat_chunk["usage"].clone()),
+        ("completion_response", completion["usage"].clone()),
+        ("completion_usage_chunk", completion_chunk["usage"].clone()),
+    ]
+}
+
+#[test]
+fn router_usage_reports_zero_cached_tokens_when_prompt_cache_enabled() {
+    for (builder, usage) in router_usage_objects(true) {
+        assert_eq!(
+            usage,
+            json!({
+                "prompt_tokens": 9,
+                "completion_tokens": 2,
+                "total_tokens": 11,
+                "prompt_tokens_details": {"cached_tokens": 0}
+            }),
+            "{builder}"
+        );
+    }
+}
+
+#[test]
+fn router_usage_omits_prompt_tokens_details_when_prompt_cache_disabled() {
+    for (builder, usage) in router_usage_objects(false) {
+        assert_eq!(
+            usage,
+            json!({"prompt_tokens": 9, "completion_tokens": 2, "total_tokens": 11}),
+            "{builder}"
+        );
+    }
 }
 
 /// A request that omits `stream_options` entirely (the common case: most
@@ -800,14 +1069,7 @@ fn kimi_k3_router_tokenizer(dir: &std::path::Path) -> MlxcelTokenizer {
 }
 
 async fn router_test_state_with_tokenizer(tokenizer: MlxcelTokenizer) -> Arc<RouterState> {
-    let transport = Arc::new(
-        TcpTransport::bind(TcpTransportConfig {
-            bind_address: "127.0.0.1:0".to_string(),
-            ..TcpTransportConfig::default()
-        })
-        .await
-        .expect("bind router test transport"),
-    );
+    let transport = bind_authenticated(test_auth()).await;
     let reply_to = transport.local_addr().expect("router transport address");
     let config = ServerConfig {
         prefill_peers: vec!["127.0.0.1:9".parse().expect("prefill address")],
@@ -877,4 +1139,661 @@ async fn router_refuses_the_kimi_k3_native_chat_format() {
         message.contains("Kimi K3 native chat format"),
         "expected the K3 refusal, got: {message}"
     );
+}
+
+// ── Router response parity through the real routes (#2715) ──────────────────
+
+/// A fake prefill node: answers every prefill request with a first-token frame
+/// carrying `tokens[0]` and, when `Some`, the worker's `prompt_cache_enabled`
+/// report, then, when `tokens` has more, one terminal continuation frame with
+/// the rest, as a decode node would send it (the router reads only the first
+/// token of a first-token frame). The frames are written as wire JSON rather
+/// than built from [`ResultFrame`] so a `None` leaves the key out exactly as a
+/// prefill node predating the field does.
+async fn spawn_fake_prefill(
+    auth: Arc<ClusterAuth>,
+    tokens: &'static [&'static str],
+    prompt_cache_enabled: Option<bool>,
+) -> (Arc<TcpTransport>, SocketAddr) {
+    let node = bind_authenticated(auth).await;
+    let addr: SocketAddr = node
+        .local_addr()
+        .expect("fake prefill address")
+        .parse()
+        .expect("socket address");
+    let server = Arc::clone(&node);
+    tokio::spawn(async move {
+        while let Ok((_from, message)) = server.recv().await {
+            let Ok((operation, payload)) = control_parts(message) else {
+                continue;
+            };
+            if operation != PrefillRequestFrame::OPERATION {
+                continue;
+            }
+            let request = PrefillRequestFrame::decode(&payload).expect("prefill request");
+            let (first, rest) = tokens.split_at(tokens.len().min(1));
+            let mut frame = json!({
+                "request_id": request.request_id,
+                "phase": "first_token",
+                "tokens": first,
+                "start_sequence": 0,
+                "done": rest.is_empty(),
+                "error": null,
+                "generated_tokens": first.len(),
+            });
+            if let Some(flag) = prompt_cache_enabled {
+                frame["prompt_cache_enabled"] = json!(flag);
+            }
+            let mut frames = vec![frame];
+            if !rest.is_empty() {
+                frames.push(json!({
+                    "request_id": request.request_id,
+                    "phase": "continuation",
+                    "tokens": rest,
+                    "start_sequence": 1,
+                    "done": true,
+                    "error": null,
+                    "generated_tokens": rest.len(),
+                }));
+            }
+            for frame in frames {
+                let message = crate::distributed::transport::TransportMessage::Control {
+                    operation: ResultFrame::OPERATION.to_string(),
+                    payload: bytes::Bytes::from(serde_json::to_vec(&frame).expect("frame JSON")),
+                };
+                let _ = server.send(&request.reply_to, message).await;
+            }
+        }
+    });
+    (node, addr)
+}
+
+/// [`build_router_state`] with a caller-built config, for a router whose prefill
+/// peer must share its cluster secret.
+fn build_router_state_with_config(
+    transport: Arc<TcpTransport>,
+    config: ServerConfig,
+) -> Result<RouterState> {
+    let reply_to = transport.local_addr().expect("router transport address");
+    RouterState::build(
+        Arc::new(config),
+        transport,
+        reply_to,
+        Arc::new(ChatTemplateProcessor::with_template(
+            DEFAULT_ROUTER_TEST_TEMPLATE.to_string(),
+        )),
+        Arc::new(MlxcelTokenizer::stub()),
+        PathBuf::from("router-test-model"),
+    )
+}
+
+/// A router whose only prefill peer is a [`spawn_fake_prefill`] node, with the
+/// router's own prompt cache switched by `router_cache_enabled`.
+async fn router_with_fake_prefill(
+    tokens: &'static [&'static str],
+    worker_cache: Option<bool>,
+    router_cache_enabled: bool,
+) -> (Arc<RouterState>, Arc<TcpTransport>) {
+    let auth = test_auth();
+    let (prefill, prefill_addr) = spawn_fake_prefill(Arc::clone(&auth), tokens, worker_cache).await;
+    let mut config = ServerConfig {
+        prefill_peers: vec![prefill_addr],
+        ..ServerConfig::default()
+    };
+    config.prompt_cache.enabled = router_cache_enabled;
+    let state = Arc::new(
+        build_router_state_with_config(bind_authenticated(auth).await, config)
+            .expect("build router state"),
+    );
+    spawn_result_demux(Arc::clone(&state));
+    (state, prefill)
+}
+
+/// The JSON `data:` payloads of an SSE body, `[DONE]` excluded.
+async fn sse_payloads(response: Response) -> Vec<Value> {
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("read SSE body");
+    String::from_utf8(bytes.to_vec())
+        .expect("UTF-8 SSE body")
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).expect("SSE JSON payload"))
+        .collect()
+}
+
+fn routed_chat_body(stream: bool) -> Value {
+    json!({
+        "model": "router-test-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 8,
+        "stream": stream,
+        "stream_options": {"include_usage": true}
+    })
+}
+
+fn routed_completion_body(stream: bool) -> Value {
+    json!({
+        "model": "router-test-model",
+        "prompt": "hi",
+        "max_tokens": 8,
+        "stream": stream,
+        "stream_options": {"include_usage": true}
+    })
+}
+
+/// The `usage` object of all four router response shapes for one request
+/// served by a fake prefill node: chat and completions, non-stream body and
+/// streamed usage chunk.
+async fn routed_usage_objects(
+    worker_cache: Option<bool>,
+    router_cache_enabled: bool,
+) -> Vec<(&'static str, Value)> {
+    let (state, prefill) =
+        router_with_fake_prefill(&["hi"], worker_cache, router_cache_enabled).await;
+    let chat = response_json(
+        post_router_json_with_state(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            routed_chat_body(false),
+        )
+        .await,
+    )
+    .await;
+    let chat_chunks = sse_payloads(
+        post_router_json_with_state(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            routed_chat_body(true),
+        )
+        .await,
+    )
+    .await;
+    let completion = response_json(
+        post_router_json_with_state(
+            Arc::clone(&state),
+            "/v1/completions",
+            routed_completion_body(false),
+        )
+        .await,
+    )
+    .await;
+    let completion_chunks = sse_payloads(
+        post_router_json_with_state(
+            Arc::clone(&state),
+            "/v1/completions",
+            routed_completion_body(true),
+        )
+        .await,
+    )
+    .await;
+    prefill.shutdown().await.unwrap();
+    state.transport.shutdown().await.unwrap();
+
+    let usage_chunk = |chunks: &[Value]| {
+        chunks
+            .iter()
+            .find(|c| !c["usage"].is_null())
+            .unwrap_or_else(|| panic!("no usage chunk in {chunks:?}"))["usage"]
+            .clone()
+    };
+    vec![
+        ("chat", chat["usage"].clone()),
+        ("chat stream", usage_chunk(&chat_chunks)),
+        ("completions", completion["usage"].clone()),
+        ("completions stream", usage_chunk(&completion_chunks)),
+    ]
+}
+
+/// Assert every usage object of one served request against the expected
+/// `prompt_tokens_details` presence.
+fn assert_prompt_tokens_details(usages: &[(&str, Value)], expect_present: bool, case: &str) {
+    for (route, usage) in usages {
+        assert!(usage["prompt_tokens"].is_u64(), "{case} {route}: {usage}");
+        let details = usage.get("prompt_tokens_details");
+        if expect_present {
+            assert_eq!(
+                details,
+                Some(&json!({"cached_tokens": 0})),
+                "{case} {route}: {usage}"
+            );
+        } else {
+            assert_eq!(details, None, "{case} {route}: {usage}");
+        }
+    }
+}
+
+/// #2715: a worker that reports its prompt cache off wins over the router's
+/// enabled flag, so no route reports `prompt_tokens_details`.
+#[tokio::test]
+async fn prompt_tokens_details_omitted_when_the_worker_cache_is_off() {
+    let usages = routed_usage_objects(Some(false), true).await;
+    assert_prompt_tokens_details(&usages, false, "worker Some(false), router on");
+}
+
+/// #2715: a worker that reports its prompt cache on wins over the router's
+/// disabled flag, so every route reports `cached_tokens: 0`.
+#[tokio::test]
+async fn prompt_tokens_details_present_when_the_worker_cache_is_on() {
+    let usages = routed_usage_objects(Some(true), false).await;
+    assert_prompt_tokens_details(&usages, true, "worker Some(true), router off");
+}
+
+/// #2715: a prefill node predating the field sends no report, so the router's
+/// own flag decides, as before.
+#[tokio::test]
+async fn prompt_tokens_details_falls_back_to_the_router_flag_for_an_older_worker() {
+    let usages = routed_usage_objects(None, true).await;
+    assert_prompt_tokens_details(&usages, true, "worker None, router on");
+    let usages = routed_usage_objects(None, false).await;
+    assert_prompt_tokens_details(&usages, false, "worker None, router off");
+}
+
+/// #2715: the router's non-stream chat reply goes through single node's
+/// no-tools shaping, so the SentencePiece leading space of `" Café"` is
+/// trimmed exactly as single node trims it. The streamed reply is not
+/// shaped on either side, so its concatenated content keeps the space.
+#[tokio::test]
+async fn router_non_stream_chat_content_is_shaped_like_single_node() {
+    let (state, prefill) = router_with_fake_prefill(&[" Café"], None, true).await;
+    let body = response_json(
+        post_router_json_with_state(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            routed_chat_body(false),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        json!("Café"),
+        "{body}"
+    );
+    assert_eq!(body["choices"][0]["finish_reason"], json!("stop"), "{body}");
+
+    let chunks = sse_payloads(
+        post_router_json_with_state(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            routed_chat_body(true),
+        )
+        .await,
+    )
+    .await;
+    let streamed: String = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    assert_eq!(streamed, " Café");
+
+    prefill.shutdown().await.unwrap();
+    state.transport.shutdown().await.unwrap();
+}
+
+/// #2715: `--skip-chat-parsing` returns the handoff text verbatim, as single
+/// node returns `result.text` before any shaping; otherwise the reply is the
+/// single-node no-tools shaping, thinking split included.
+#[test]
+fn shape_router_chat_reply_matches_the_single_node_shaping() {
+    use crate::server::ReasoningFormat;
+    let skipped = shape_router_chat_reply(" Café", true, false, false, ReasoningFormat::DeepSeek);
+    assert_eq!(skipped.content, " Café");
+    assert_eq!(skipped.reasoning_content, None);
+
+    let shaped = shape_router_chat_reply(" Café", false, false, false, ReasoningFormat::DeepSeek);
+    assert_eq!(shaped.content, "Café");
+    assert_eq!(shaped.reasoning_content, None);
+
+    let raw = "<think>add them</think>\n\n4";
+    for format in [
+        ReasoningFormat::None,
+        ReasoningFormat::DeepSeek,
+        ReasoningFormat::DeepSeekLegacy,
+    ] {
+        assert_eq!(
+            shape_router_chat_reply(raw, false, false, false, format),
+            crate::server::routes::chat::shape_plain_chat_reply(raw, false, false, format),
+            "{format:?}"
+        );
+    }
+    let split = shape_router_chat_reply(raw, false, false, false, ReasoningFormat::DeepSeek);
+    assert_eq!(split.content, "4");
+    assert_eq!(split.reasoning_content.as_deref(), Some("add them"));
+}
+
+// ── `reasoning_only` parity with single node (#2729) ────────────────────────
+
+/// A routed chat body whose `max_tokens` is `max_tokens`, so a fake prefill
+/// peer that sends exactly that many tokens exhausts the budget.
+fn routed_chat_body_with_budget(stream: bool, max_tokens: usize) -> Value {
+    let mut body = routed_chat_body(stream);
+    body["max_tokens"] = json!(max_tokens);
+    body
+}
+
+/// The streamed chunk that carries `finish_reason`.
+fn finish_chunk(chunks: &[Value]) -> &Value {
+    chunks
+        .iter()
+        .find(|c| c["choices"][0]["finish_reason"].is_string())
+        .unwrap_or_else(|| panic!("no finish chunk in {chunks:?}"))
+}
+
+/// An unclosed thinking block that runs out of tokens: single node marks the
+/// non-stream message `reasoning_only: true` (`log_if_reasoning_only`), and
+/// the router's reply must carry the same flag.
+#[tokio::test]
+async fn router_non_stream_chat_marks_reasoning_only() {
+    const TOKENS: &[&str] = &["<think>", "still", " thinking"];
+    let (state, prefill) = router_with_fake_prefill(TOKENS, None, true).await;
+    let body = response_json(
+        post_router_json_with_state(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            routed_chat_body_with_budget(false, TOKENS.len()),
+        )
+        .await,
+    )
+    .await;
+    let message = &body["choices"][0]["message"];
+    assert_eq!(message["content"], json!(""), "{body}");
+    assert_eq!(
+        message["reasoning_content"],
+        json!("still thinking"),
+        "{body}"
+    );
+    assert_eq!(
+        body["choices"][0]["finish_reason"],
+        json!("length"),
+        "{body}"
+    );
+    assert_eq!(message["reasoning_only"], json!(true), "{body}");
+
+    prefill.shutdown().await.unwrap();
+    state.transport.shutdown().await.unwrap();
+}
+
+/// The streaming counterpart: single node sets `delta.reasoning_only: true`
+/// on the finish chunk (`stream_reasoning_only`), and so must the router.
+#[tokio::test]
+async fn router_stream_finish_chunk_marks_reasoning_only() {
+    const TOKENS: &[&str] = &["<think>", "still", " thinking"];
+    let (state, prefill) = router_with_fake_prefill(TOKENS, None, true).await;
+    let chunks = sse_payloads(
+        post_router_json_with_state(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            routed_chat_body_with_budget(true, TOKENS.len()),
+        )
+        .await,
+    )
+    .await;
+    let content: String = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"]["content"].as_str())
+        .collect();
+    let reasoning: String = chunks
+        .iter()
+        .filter_map(|c| c["choices"][0]["delta"]["reasoning_content"].as_str())
+        .collect();
+    assert_eq!(content, "", "{chunks:?}");
+    assert_eq!(reasoning, "still thinking", "{chunks:?}");
+    let finish = finish_chunk(&chunks);
+    assert_eq!(finish["choices"][0]["finish_reason"], json!("length"));
+    assert_eq!(
+        finish["choices"][0]["delta"]["reasoning_only"],
+        json!(true),
+        "{finish}"
+    );
+
+    prefill.shutdown().await.unwrap();
+    state.transport.shutdown().await.unwrap();
+}
+
+/// A closed thinking block followed by an answer is not reasoning-only on
+/// single node, so the router leaves the field out of both replies.
+#[tokio::test]
+async fn router_reasoning_only_absent_when_an_answer_follows() {
+    const TOKENS: &[&str] = &["<think>", "add them", "</think>", "4"];
+    let (state, prefill) = router_with_fake_prefill(TOKENS, None, true).await;
+    let body = response_json(
+        post_router_json_with_state(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            routed_chat_body(false),
+        )
+        .await,
+    )
+    .await;
+    let message = &body["choices"][0]["message"];
+    assert_eq!(message["content"], json!("4"), "{body}");
+    assert_eq!(message["reasoning_content"], json!("add them"), "{body}");
+    assert!(message.get("reasoning_only").is_none(), "{body}");
+
+    let chunks = sse_payloads(
+        post_router_json_with_state(
+            Arc::clone(&state),
+            "/v1/chat/completions",
+            routed_chat_body(true),
+        )
+        .await,
+    )
+    .await;
+    let finish = finish_chunk(&chunks);
+    assert!(
+        finish["choices"][0]["delta"]
+            .get("reasoning_only")
+            .is_none(),
+        "{finish}"
+    );
+
+    prefill.shutdown().await.unwrap();
+    state.transport.shutdown().await.unwrap();
+}
+
+// ── Peer liveness at startup and before a 503 (#2763) ───────────────────────
+
+/// A loopback address nothing listens on: bind an ephemeral port, then release
+/// it, so a connect to it is refused at once.
+fn closed_loopback_addr() -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve loopback port");
+    listener.local_addr().expect("reserved address")
+}
+
+/// A non-streaming chat request the router accepts for routing.
+fn routed_chat_request() -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&routed_chat_body(false)).expect("serialize request"),
+        ))
+        .expect("build request")
+}
+
+/// The registry status of the router's only prefill node.
+fn prefill_status(state: &RouterState) -> Option<NodeStatus> {
+    state.registry.get_node("prefill-0").map(|node| node.status)
+}
+
+/// The monitor's first cycle runs when it starts, not one interval later, so a
+/// peer that is not listening is marked down well inside the first interval.
+#[tokio::test]
+async fn first_health_probe_runs_at_startup() {
+    let state = Arc::new(
+        build_router_state(
+            bind_authenticated(test_auth()).await,
+            vec![closed_loopback_addr()],
+        )
+        .expect("build router state"),
+    );
+    assert_eq!(prefill_status(&state), Some(NodeStatus::Online));
+
+    spawn_health_monitor(Arc::clone(&state));
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while prefill_status(&state) != Some(NodeStatus::Unreachable) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first health probe did not mark the closed peer down within 1 s of the \
+             monitor starting (status {:?})",
+            prefill_status(&state)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    state.transport.shutdown().await.unwrap();
+}
+
+/// A prefill peer that is listening while the registry still says
+/// `Unreachable` (a monitor cycle raced its startup) serves the request: the
+/// admission check re-probes it instead of answering 503, on both routes. The
+/// monitor is not running, so only the admission path can restore the node.
+#[tokio::test]
+async fn admission_reprobes_a_peer_marked_down_before_refusing() {
+    for (path, body) in [
+        ("/v1/chat/completions", routed_chat_body(false)),
+        ("/v1/completions", routed_completion_body(false)),
+    ] {
+        let (state, prefill) = router_with_fake_prefill(&["hi"], None, false).await;
+        assert!(
+            state
+                .registry
+                .set_node_status("prefill-0", NodeStatus::Unreachable)
+        );
+
+        let response = post_router_json_with_state(Arc::clone(&state), path, body).await;
+        let status = response.status();
+        assert_ne!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{path}: refused although the peer is listening: {}",
+            error_message(response).await
+        );
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(
+            prefill_status(&state),
+            Some(NodeStatus::Online),
+            "{path}: the re-probe did not restore the peer"
+        );
+
+        prefill.shutdown().await.unwrap();
+        state.transport.shutdown().await.unwrap();
+    }
+}
+
+/// With the only prefill peer still down, a burst of concurrent requests is
+/// refused with the unchanged 503 and shares the re-probe: the shared probe's
+/// connect counter stays within one attempt per `ON_DEMAND_PROBE_MIN_INTERVAL`
+/// of wall time the burst took.
+#[tokio::test]
+async fn admission_reprobe_is_bounded() {
+    let state = Arc::new(
+        build_router_state(
+            bind_authenticated(test_auth()).await,
+            vec![closed_loopback_addr()],
+        )
+        .expect("build router state"),
+    );
+    assert!(
+        state
+            .registry
+            .set_node_status("prefill-0", NodeStatus::Unreachable)
+    );
+    let app = create_router_app(Arc::clone(&state));
+
+    let started = std::time::Instant::now();
+    let responses =
+        futures::future::join_all((0..20).map(|_| app.clone().oneshot(routed_chat_request())))
+            .await;
+    let elapsed = started.elapsed();
+
+    for response in responses {
+        let response = response.expect("router response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error_message(response).await,
+            "all serving nodes are at capacity or unreachable; retry shortly"
+        );
+    }
+    let attempts = state.peer_probe.connect_attempts();
+    let windows = elapsed.as_nanos() / health::ON_DEMAND_PROBE_MIN_INTERVAL.as_nanos();
+    let allowed = 1 + u64::try_from(windows).expect("window count fits u64");
+    assert!(attempts >= 1, "the refusal path never re-probed the peer");
+    assert!(
+        attempts <= allowed,
+        "{attempts} connect attempts for 20 concurrent requests in {elapsed:?}; \
+         at most {allowed} allowed (one per {:?})",
+        health::ON_DEMAND_PROBE_MIN_INTERVAL
+    );
+    assert_eq!(prefill_status(&state), Some(NodeStatus::Unreachable));
+
+    // Spacing: the burst's re-probe finished no later than the end of the
+    // burst, so a request issued while the burst started under 250 ms ago adds
+    // no connect attempt. Asserted only when the measured time shows the
+    // window was open; refused connects are instant, so it normally is.
+    let after_burst = state.peer_probe.connect_attempts();
+    let response = app
+        .clone()
+        .oneshot(routed_chat_request())
+        .await
+        .expect("router response");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    if started.elapsed() < health::ON_DEMAND_PROBE_MIN_INTERVAL {
+        assert_eq!(
+            state.peer_probe.connect_attempts(),
+            after_burst,
+            "a request inside the 250 ms window re-probed again"
+        );
+    }
+
+    // Past the window, the next request probes each down node exactly once.
+    tokio::time::sleep(health::ON_DEMAND_PROBE_MIN_INTERVAL + Duration::from_millis(150)).await;
+    let before = state.peer_probe.connect_attempts();
+    let response = app
+        .clone()
+        .oneshot(routed_chat_request())
+        .await
+        .expect("router response");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        state.peer_probe.connect_attempts(),
+        before + 1,
+        "one re-probe per down node after the window"
+    );
+
+    state.transport.shutdown().await.unwrap();
+}
+
+/// The transition is decided from the registry status after the connect, not
+/// from the caller's snapshot: a snapshot that says `Unreachable` for a node the
+/// registry now has `Online` still marks a refusing node down.
+#[tokio::test]
+async fn probe_decides_transition_from_current_registry_status() {
+    let state = Arc::new(
+        build_router_state(
+            bind_authenticated(test_auth()).await,
+            vec![closed_loopback_addr()],
+        )
+        .expect("build router state"),
+    );
+    let mut snapshot = state.registry.get_node("prefill-0").expect("prefill node");
+    assert_eq!(snapshot.status, NodeStatus::Online);
+    snapshot.status = NodeStatus::Unreachable;
+
+    let alive = health::probe_node(
+        &state,
+        &snapshot,
+        health::ON_DEMAND_PROBE_TIMEOUT,
+        health::ProbeTrigger::Admission,
+    )
+    .await;
+
+    assert!(!alive);
+    assert_eq!(prefill_status(&state), Some(NodeStatus::Unreachable));
+
+    state.transport.shutdown().await.unwrap();
 }

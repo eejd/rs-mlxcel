@@ -181,6 +181,22 @@ CompiledArrayFn compile_shapeless_audited(
 
 } // namespace
 
+bool native_env_read(rust::Str name, rust::Vec<uint8_t>& value) {
+    const char* raw = std::getenv(std::string(name).c_str());
+    if (raw == nullptr) {
+        return false;
+    }
+    value.clear();
+    for (const char* c = raw; *c != 0; ++c) {
+        value.push_back(static_cast<uint8_t>(*c));
+    }
+    return true;
+}
+
+int32_t mlx_env_get_var_int(rust::Str name, int32_t default_value) {
+    return mlx::core::env::get_var(std::string(name).c_str(), default_value);
+}
+
 rust::String shapeless_compile_audit_report() {
     std::ostringstream out;
     out << "site\tcalls\tsignatures\twarmed\tstatus\n";
@@ -490,8 +506,19 @@ std::unique_ptr<MlxArray> from_bytes(rust::Slice<const uint8_t> data, rust::Slic
             return make_array_typed<mlx::core::float16_t>(data.data(), mlx_shape, mlx_dtype);
         case 12:  // BFLOAT16: reinterpret 2-byte bf16, not per-byte uint8 casts
             return make_array_typed<mlx::core::bfloat16_t>(data.data(), mlx_shape, mlx_dtype);
+        case 2:  // UINT16: reinterpret 2-byte integers, not per-byte uint8 casts
+            return make_array_typed<uint16_t>(data.data(), mlx_shape, mlx_dtype);
+        case 6:  // INT16: reinterpret 2-byte integers, not per-byte uint8 casts
+            return make_array_typed<int16_t>(data.data(), mlx_shape, mlx_dtype);
+        case 0:  // BOOL
         case 1:  // UINT8
+        case 5:  // INT8
         default:
+            // Reads one element per byte, so only 1-byte dtypes may reach this
+            // branch. FLOAT64 (11) and COMPLEX64 (13) have no typed branch; the
+            // Rust side rejects them before calling from_bytes
+            // (validate_raw_tensor), since this function cannot return an error
+            // through the cxx bridge.
             return std::make_unique<MlxArray>(array(data.data(), mlx_shape, mlx_dtype));
     }
 }
@@ -617,6 +644,14 @@ rust::Vec<int32_t> array_shape(const MlxArray& arr) {
     return result;
 }
 
+rust::Vec<int64_t> array_strides(const MlxArray& arr) {
+    rust::Vec<int64_t> result;
+    for (auto s : arr.inner.strides()) {
+        result.push_back(s);
+    }
+    return result;
+}
+
 int32_t array_dtype(const MlxArray& arr) {
     return from_dtype(arr.inner.dtype());
 }
@@ -661,29 +696,57 @@ size_t array_nbytes(const MlxArray& arr) {
 // has evaluated it, so converting on the host costs no extra graph node.
 namespace {
 
+// Read-only host view of an evaluated array's bytes, for the scalar and byte
+// readers below. `array::data<T>()` cannot tell a reader from a writer (its
+// const overload casts to the non-const one), so on Windows ROCm it marks the
+// buffer's pinned host shadow dirty and the next kernel reading the buffer
+// paid a full host-to-device copy, once per sampled token read through
+// `item_i32`. `rocm::host_read_ptr` refreshes the shadow when it is stale and
+// leaves the buffer clean (lablup/mlxcel#2643). On every other backend it is
+// `data<void>()`. The caller evaluates `a` first and never writes through the
+// pointer.
+const void* host_read_data(const array& a) {
+#ifdef MLXCEL_BRIDGE_ROCM_BACKEND
+    return mlx::core::rocm::host_read_ptr(a);
+#else
+    return a.data<void>();
+#endif
+}
+
+// `array::item<T>()` with the read-only host access above: the same size
+// check and eval, then one element read.
+template <typename T>
+T read_item(array& a) {
+    if (a.size() != 1) {
+        throw std::invalid_argument("item can only be called on arrays of size 1.");
+    }
+    a.eval();
+    return *static_cast<const T*>(host_read_data(a));
+}
+
 template <typename Out>
 Out item_scalar(const MlxArray& arr) {
     auto& a = const_cast<array&>(arr.inner);
     switch (a.dtype().val()) {
-        case bool_.val(): return static_cast<Out>(a.item<bool>());
-        case uint8.val(): return static_cast<Out>(a.item<uint8_t>());
-        case uint16.val(): return static_cast<Out>(a.item<uint16_t>());
-        case uint32.val(): return static_cast<Out>(a.item<uint32_t>());
-        case uint64.val(): return static_cast<Out>(a.item<uint64_t>());
-        case int8.val(): return static_cast<Out>(a.item<int8_t>());
-        case int16.val(): return static_cast<Out>(a.item<int16_t>());
-        case int32.val(): return static_cast<Out>(a.item<int32_t>());
-        case int64.val(): return static_cast<Out>(a.item<int64_t>());
+        case bool_.val(): return static_cast<Out>(read_item<bool>(a));
+        case uint8.val(): return static_cast<Out>(read_item<uint8_t>(a));
+        case uint16.val(): return static_cast<Out>(read_item<uint16_t>(a));
+        case uint32.val(): return static_cast<Out>(read_item<uint32_t>(a));
+        case uint64.val(): return static_cast<Out>(read_item<uint64_t>(a));
+        case int8.val(): return static_cast<Out>(read_item<int8_t>(a));
+        case int16.val(): return static_cast<Out>(read_item<int16_t>(a));
+        case int32.val(): return static_cast<Out>(read_item<int32_t>(a));
+        case int64.val(): return static_cast<Out>(read_item<int64_t>(a));
         case float16.val():
-            return static_cast<Out>(static_cast<float>(a.item<float16_t>()));
-        case float32.val(): return static_cast<Out>(a.item<float>());
-        case float64.val(): return static_cast<Out>(a.item<double>());
+            return static_cast<Out>(static_cast<float>(read_item<float16_t>(a)));
+        case float32.val(): return static_cast<Out>(read_item<float>(a));
+        case float64.val(): return static_cast<Out>(read_item<double>(a));
         case bfloat16.val():
-            return static_cast<Out>(static_cast<float>(a.item<bfloat16_t>()));
+            return static_cast<Out>(static_cast<float>(read_item<bfloat16_t>(a)));
         case complex64.val():
             // Only the real part survives a scalar read; the imaginary part has
             // nowhere to go in any of these return types.
-            return static_cast<Out>(a.item<complex64_t>().real());
+            return static_cast<Out>(read_item<complex64_t>(a).real());
         default:
             throw std::invalid_argument(
                 "item_scalar: unhandled dtype; add it to the dispatch above");
@@ -714,7 +777,7 @@ rust::Vec<uint8_t> array_to_raw_bytes(const MlxArray& arr) {
     mlx::core::eval(a);
 
     size_t nbytes = a.nbytes();
-    const auto* data = reinterpret_cast<const uint8_t*>(a.data<void>());
+    const auto* data = static_cast<const uint8_t*>(host_read_data(a));
 
     rust::Vec<uint8_t> result;
     result.reserve(nbytes);
@@ -743,7 +806,7 @@ rust::Vec<uint8_t> array_evaluated_bytes(const MlxArray& arr) {
     }
 
     size_t nbytes = a.nbytes();
-    const auto* data = reinterpret_cast<const uint8_t*>(a.data<void>());
+    const auto* data = static_cast<const uint8_t*>(host_read_data(a));
 
     rust::Vec<uint8_t> result;
     result.reserve(nbytes);
@@ -790,7 +853,7 @@ rust::Vec<uint8_t> try_array_to_raw_bytes(const MlxArray& arr) {
     mlx::core::eval(a);
 
     size_t nbytes = a.nbytes();
-    const auto* data = reinterpret_cast<const uint8_t*>(a.data<void>());
+    const auto* data = static_cast<const uint8_t*>(host_read_data(a));
 
     rust::Vec<uint8_t> result;
     result.reserve(nbytes);
@@ -1084,6 +1147,14 @@ std::unique_ptr<MlxArray> mean_all(const MlxArray& a) {
     });
 }
 
+std::unique_ptr<MlxArray> sum_axis_native_dtype(const MlxArray& a, int32_t axis, bool keepdims) {
+    return std::make_unique<MlxArray>(mlx::core::sum(a.inner, axis, keepdims));
+}
+
+std::unique_ptr<MlxArray> mean_axis_native_dtype(const MlxArray& a, int32_t axis, bool keepdims) {
+    return std::make_unique<MlxArray>(mlx::core::mean(a.inner, axis, keepdims));
+}
+
 std::unique_ptr<MlxArray> mean_axis(const MlxArray& a, int32_t axis, bool keepdims) {
     return reduce_axis_in_f32(a.inner, axis, keepdims,
         [](const mlx::core::array& x, int ax, bool kd, mlx::core::StreamOrDevice s) {
@@ -1333,15 +1404,6 @@ std::unique_ptr<MlxArray> concatenate(rust::Slice<const MlxArray* const> arrays,
         arrs.push_back(a->inner);
     }
     return std::make_unique<MlxArray>(mlx::core::concatenate(arrs, axis));
-}
-
-rust::Vec<std::unique_ptr<MlxArray>> split(const MlxArray& a, int32_t num_splits, int32_t axis) {
-    auto splits = mlx::core::split(a.inner, num_splits, axis);
-    rust::Vec<std::unique_ptr<MlxArray>> result;
-    for (auto& s : splits) {
-        result.push_back(std::make_unique<MlxArray>(std::move(s)));
-    }
-    return result;
 }
 
 std::unique_ptr<MlxArray> slice(const MlxArray& a,
@@ -1860,39 +1922,16 @@ std::unique_ptr<MlxArray> compiled_gpt_oss_swiglu_activation(
     return std::make_unique<MlxArray>(std::move(result[0]));
 }
 
-// Compiled GELU: x * 0.5 * (1 + erf(x / sqrt(2)))
-// Used by: StarCoder2
-namespace {
-    static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_gelu() {
-        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
-            const auto& x = inputs[0];
-            auto sqrt2 = array(std::sqrt(2.0f));
-            auto half = array(0.5f);
-            auto one = array(1.0f);
-            auto erf_val = mlx::core::erf(mlx::core::divide(x, sqrt2));
-            auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
-            auto result = mlx::core::multiply(x, scale);
-            return {mlx::core::astype(result, x.dtype())};
-        };
-        return compile_shapeless_audited("compiled_gelu", fn);
-    }
-}
-
-std::unique_ptr<MlxArray> compiled_gelu(const MlxArray& x) {
-    static auto compiled_fn = get_compiled_gelu();
-    auto result = compiled_fn({x.inner});
-    return std::make_unique<MlxArray>(std::move(result[0]));
-}
-
-// Compiled GELU approx: erf-based GELU (x * 0.5 * (1 + erf(x / sqrt(2))))
-// Uses erf instead of tanh for numerical stability with bf16 inputs.
-// Used by: legacy/tests
+// Compiled `gelu_approx`: despite the name this is the exact erf GELU,
+// x * 0.5 * (1 + erf(x / sqrt(2))), i.e. MLX `nn.gelu` / `nn.GELU()`. It is
+// NOT MLX `nn.gelu_approx` (the tanh form); for that use `gelu_tanh` or
+// `compiled_geglu_approx_activation`. See `gelu_approx()` below for why the
+// name and the formula disagree (#2423).
+// Used by: tests only (no production Rust caller).
 namespace {
     static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_gelu_approx() {
         auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
             const auto& x = inputs[0];
-            // Use erf-based GELU for numerical stability with bf16 inputs.
-            // See gelu_approx() below for detailed explanation.
             auto sqrt2 = array(std::sqrt(2.0f));
             auto half = array(0.5f);
             auto one = array(1.0f);
@@ -1907,6 +1946,31 @@ namespace {
 
 std::unique_ptr<MlxArray> compiled_gelu_approx(const MlxArray& x) {
     static auto compiled_fn = get_compiled_gelu_approx();
+    auto result = compiled_fn({x.inner});
+    return std::make_unique<MlxArray>(std::move(result[0]));
+}
+
+// Compiled `gelu_tanh_f32`: the tanh GELU evaluated in f32 and cast back,
+// with the upcast and the downcast inside the compiled region, so the eager
+// chain of about eleven elementwise passes becomes one fused kernel. Same
+// formula and op order as `gelu_tanh_f32`; the fused kernel may contract a
+// multiply-add into an FMA, so it can differ from the eager helper by f32
+// rounding. Kept separate from `gelu_tanh_f32` because the call sites folded
+// onto that helper are pinned bit-for-bit to the private copies they replaced.
+// Used by: Rust `GeluActivation::TanhF32Compiled` (#2423).
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_gelu_tanh_f32() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& x = inputs[0];
+            auto result = gelu_tanh_approx(mlx::core::astype(x, mlx::core::float32));
+            return {mlx::core::astype(result, x.dtype())};
+        };
+        return compile_shapeless_audited("compiled_gelu_tanh_f32", fn);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_gelu_tanh_f32(const MlxArray& x) {
+    static auto compiled_fn = get_compiled_gelu_tanh_f32();
     auto result = compiled_fn({x.inner});
     return std::make_unique<MlxArray>(std::move(result[0]));
 }
@@ -1966,36 +2030,45 @@ std::unique_ptr<MlxArray> compiled_geglu_approx_activation(
     return std::make_unique<MlxArray>(std::move(result[0]));
 }
 
-// Compiled gelu_topk: sparse GELU with dynamic threshold.
-// Matches Python: gelu_approx(max(0, x - (mean + std * multiplier)))
+// Compiled gelu_topk: sparse GELU with dynamic threshold,
+// gelu_tanh(max(0, x - (mean + std * multiplier))).
+// Bit-exact with mlx-lm's `gelu_topk` (#2795): every intermediate stays in the
+// input dtype. The f32 multiplier is cast to `x.dtype()` like mlx-lm's
+// `std_multiplier.astype(inputs_std.dtype)`, the zero and the GELU constants are
+// built in `x.dtype()` like Python's weak scalars, and the activation follows
+// `nn.gelu_approx` op for op: `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 *
+// x**3)))` with the cube as one `power` (one rounding). The shared
+// `gelu_tanh_approx` helper computes the cube as `x*x*x` (two roundings), so it
+// is not used here. Before #2795 the strong f32 multiplier and zero promoted the
+// whole tape to f32, which disagreed with mlx-lm on about 4% of bf16 elements.
+// The XLA Gemma3n emitter (`sparse_gelu_stages`) mirrors this bf16 carrier.
 // Used by: Gemma3n MLP layers with activation_sparsity > 0
 namespace {
     static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_gelu_topk() {
         auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
             const auto& x = inputs[0];
-            const auto& std_multiplier = inputs[1];
+            const auto dtype = x.dtype();
+            auto std_multiplier = mlx::core::astype(inputs[1], dtype);
 
-            // mean and std along last axis
+            // mean and std along last axis (mlx-lm: mx.mean, mx.std)
             auto mean = mlx::core::mean(x, /* axis */ -1, /* keepdims */ true);
-            auto diff = mlx::core::subtract(x, mean);
-            auto var = mlx::core::mean(mlx::core::square(diff), -1, true);
-            auto stddev = mlx::core::sqrt(var);
+            auto stddev = mlx::core::std(x, /* axis */ -1, /* keepdims */ true);
 
             // cutoff = mean + std * multiplier
             auto cutoff = mlx::core::add(mean, mlx::core::multiply(stddev, std_multiplier));
 
-            // zeroed = max(x - cutoff, 0)
-            auto shifted = mlx::core::subtract(x, cutoff);
-            auto zeroed = mlx::core::maximum(shifted, array(0.0f));
+            // z = max(0, x - cutoff)
+            auto z = mlx::core::maximum(array(0, dtype), mlx::core::subtract(x, cutoff));
 
-            // gelu_approx via erf
-            auto sqrt2 = array(std::sqrt(2.0f));
-            auto half = array(0.5f);
-            auto one = array(1.0f);
-            auto erf_val = mlx::core::erf(mlx::core::divide(zeroed, sqrt2));
-            auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
-            auto result = mlx::core::multiply(zeroed, scale);
-            return {mlx::core::astype(result, x.dtype())};
+            // nn.gelu_approx: 0.5 * z * (1 + tanh(sqrt(2/pi) * (z + 0.044715 * z**3)))
+            auto cube = mlx::core::power(z, array(3, dtype));
+            auto inner = mlx::core::multiply(
+                array(0.7978845608028654f, dtype),  // sqrt(2/pi)
+                mlx::core::add(z, mlx::core::multiply(array(0.044715f, dtype), cube)));
+            auto half_z = mlx::core::multiply(array(0.5f, dtype), z);
+            auto result = mlx::core::multiply(
+                half_z, mlx::core::add(array(1.0f, dtype), mlx::core::tanh(inner)));
+            return {result};
         };
         return compile_shapeless_audited("compiled_gelu_topk", fn);
     }
@@ -2965,15 +3038,15 @@ std::unique_ptr<MlxArray> compiled_swiglu_mlp_forward_fp16(
 }
 
 // GELU MLP forward for non-quantized (FP16/BF16) weights:
-//   down_proj(gelu(gate_proj(x)) * up_proj(x))
+//   down_proj(gelu_tanh(gate_proj(x)) * up_proj(x))
 //
 // Matmul operations run outside the compile boundary because
 // mlx::core::compile with matmul+transpose can produce incorrect results
 // when the compiled graph is reused across layers with different weights.
-// The GeGLU activation (gelu(gate) * up) uses the compiled geglu kernel
-// which correctly fuses element-wise ops only.
+// The GeGLU activation (gelu_tanh(gate) * up) uses the compiled tanh geglu
+// kernel which correctly fuses element-wise ops only.
 //
-// Used by: Gemma, Gemma4 and other GELU-gated FP models
+// Used by: Gemma v1, Gemma4 dense MLP and the Gemma4 assistant drafter
 std::unique_ptr<MlxArray> compiled_gelu_mlp_forward_fp16(
     const MlxArray& x,
     const MlxArray& gate_weight,
@@ -2993,8 +3066,11 @@ std::unique_ptr<MlxArray> compiled_gelu_mlp_forward_fp16(
     auto up = mlx::core::matmul(x.inner, up_t);
     if (up_bias) up = mlx::core::add(up, up_bias->inner);
 
-    // GeGLU activation: gelu(gate) * up — compiled element-wise fusion
-    static auto compiled_act = get_compiled_geglu();
+    // GeGLU activation: gelu_tanh(gate) * up, compiled element-wise fusion.
+    // Every caller is a Gemma MLP whose checkpoint declares
+    // `gelu_pytorch_tanh`, so this uses the same tanh GeGLU as the quantized
+    // `compiled_gelu_approx_mlp_forward` (erf before #2548).
+    static auto compiled_act = get_compiled_geglu_approx();
     auto activated = compiled_act({gate, up});
 
     // down_proj(activated) = activated @ down_w.T [+ bias]
@@ -3279,8 +3355,8 @@ std::unique_ptr<MlxArray> gelu(const MlxArray& a) {
     // gelu(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
     //
     // The f32 constants promote a half-precision input, so the result is cast
-    // back to the input dtype before it is returned. `compiled_gelu` has always
-    // done this; leaving it out here let the f32 activation reach the next
+    // back to the input dtype before it is returned, as the compiled GELU
+    // helpers do; leaving it out here let the f32 activation reach the next
     // projection, where MLX promotes the f16 weight to f32 to match it. See
     // `gelu_approx` for the measurement.
     auto sqrt2 = array(std::sqrt(2.0f));
@@ -3293,17 +3369,25 @@ std::unique_ptr<MlxArray> gelu(const MlxArray& a) {
 }
 
 std::unique_ptr<MlxArray> gelu_approx(const MlxArray& a) {
-    // Use erf-based exact GELU instead of the original tanh approximation.
+    // Despite its name this is the exact erf GELU, x * 0.5 * (1 + erf(x / sqrt(2))),
+    // which is MLX `nn.gelu` / `nn.GELU()` / `nn.GELU(approx="none")`. It is
+    // NOT MLX `nn.gelu_approx`, and it does NOT match `nn.GELU(approx="precise")`:
+    // in MLX both "precise" and "tanh" select the tanh approximation
+    // 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3))). A call site porting one of
+    // those must use `gelu_tanh` / `gelu_tanh_f32` (Rust `GeluActivation::Tanh`
+    // / `TanhF32`) instead (#2423).
     //
-    // The tanh approximation 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))
-    // produced NaN for negative bf16 inputs in the SigLIP vision encoder MLP
-    // because power(x, 3.0f) uses exp(3*log(x)) which is undefined for x<0.
-    // Even with x*x*x the MLX lazy graph fuses operations that can overflow
-    // bf16 intermediates within the large SigLIP computation graph (4096 patches).
+    // History: this function once computed the tanh form with power(x, 3.0f),
+    // which produced NaN for negative bf16 inputs in the SigLIP vision MLP, and
+    // it was switched to erf. That NaN came from `power`, which MLX evaluates
+    // as exp(3*log(x)); the `x*x*x` form in `gelu_tanh_approx`
+    // (mlx_cxx_internal.h) does not take a log. Re-tested in #2423 on the
+    // 4096-patch bf16 SigLIP tower of gemma-3-4b-it-4bit (27 MLPs of
+    // [1, 4096, 4304], max |pre-activation| 161) in the input dtype and in f32:
+    // zero NaN and zero Inf either way
+    // (docs/benchmark_results/gelu-erf-vs-tanh-2026-10-23.md). The name is kept
+    // because most of its roughly 80 call sites genuinely port an erf GELU.
     //
-    // The erf-based GELU: x * 0.5 * (1 + erf(x / sqrt(2))) is numerically
-    // stable for all inputs and matches Python nn.GELU(approx="precise")
-    // output within floating-point tolerance.
     // The erf math stays in f32 (that is what the constants above buy), but the
     // result is cast back to the input dtype, matching `compiled_gelu_approx`.
     // Without the cast a f16 activation leaves this function as f32, the residual
@@ -3318,6 +3402,24 @@ std::unique_ptr<MlxArray> gelu_approx(const MlxArray& a) {
     auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
     auto result = mlx::core::multiply(a.inner, scale);
     return std::make_unique<MlxArray>(mlx::core::astype(result, a.inner.dtype()));
+}
+
+std::unique_ptr<MlxArray> gelu_tanh(const MlxArray& a) {
+    // MLX `nn.gelu_approx` / `nn.GELU(approx="precise" | "tanh")`, evaluated in
+    // the input dtype exactly as MLX does (its Python scalars are weak types).
+    // Shares `gelu_tanh_approx` with every fused GeGLU path, so a model that
+    // selects tanh here computes the same formula as the Gemma GeGLU kernels.
+    return std::make_unique<MlxArray>(gelu_tanh_approx(a.inner));
+}
+
+std::unique_ptr<MlxArray> gelu_tanh_f32(const MlxArray& a) {
+    // Hugging Face `gelu_pytorch_tanh` evaluated in f32 and cast back to the
+    // input dtype. Same formula and op order as `gelu_tanh`; the f32 evaluation
+    // is what the SigLIP / Molmo2 / Qwen3-VL eager encoders and their StableHLO
+    // twins were qualified against, so those call sites keep it.
+    auto dtype = a.inner.dtype();
+    auto result = gelu_tanh_approx(mlx::core::astype(a.inner, mlx::core::float32));
+    return std::make_unique<MlxArray>(mlx::core::astype(result, dtype));
 }
 
 std::unique_ptr<MlxArray> relu(const MlxArray& a) {
@@ -3339,6 +3441,17 @@ std::unique_ptr<MlxArray> leaky_relu(const MlxArray& a, float negative_slope) {
 }
 
 // Sorting and searching.
+std::unique_ptr<MlxArray> searchsorted(
+    const MlxArray& sorted_sequence,
+    const MlxArray& values,
+    bool right) {
+    return std::make_unique<MlxArray>(
+        mlx::core::searchsorted(
+            sorted_sequence.inner,
+            values.inner,
+            right ? "right" : "left"));
+}
+
 std::unique_ptr<MlxArray> argsort(const MlxArray& a, int32_t axis) {
     return std::make_unique<MlxArray>(mlx::core::argsort(a.inner, axis));
 }
@@ -3795,6 +3908,33 @@ namespace {
     using CompiledFn =
         std::function<std::vector<array>(const std::vector<array>&)>;
 
+    static CompiledFn& get_compiled_sapiens2_rope() {
+        // Intentionally leaked for the same lifetime reason as the keyed
+        // compiled-function cache below: MLX's process-wide CompilerCache is
+        // destroyed before ordinary function-local statics at process exit.
+        static CompiledFn& compiled = *new CompiledFn(mlx::core::compile(
+            [](const std::vector<array>& inputs) -> std::vector<array> {
+                const auto& x = inputs[0];
+                const auto& sin = inputs[1];
+                const auto& cos = inputs[2];
+                const auto dtype = x.dtype();
+                const auto shape = x.shape();
+                const int32_t half = shape[3] / 2;
+
+                auto xf = mlx::core::reshape(
+                    mlx::core::astype(x, mlx::core::float32),
+                    {shape[0], shape[1], shape[2], 2, half});
+                auto reversed = mlx::core::flip(xf, 3);
+                auto out = mlx::core::add(
+                    mlx::core::multiply(xf, cos),
+                    mlx::core::multiply(reversed, sin));
+                out = mlx::core::reshape(out, shape);
+                return {mlx::core::astype(out, dtype)};
+            },
+            /*shapeless=*/false));
+        return compiled;
+    }
+
     static CompiledFn& get_compiled_proportional_rope(int head_dim) {
         static std::mutex& mu = *new std::mutex();
         // Intentionally leaked: compiled function destruction calls back into
@@ -3826,6 +3966,40 @@ namespace {
             key, mlx::core::compile(fn, /*shapeless=*/false));
         return iter->second;
     }
+}
+
+std::unique_ptr<MlxArray> compiled_sapiens2_rope(
+    const MlxArray& x,
+    const MlxArray& sin,
+    const MlxArray& cos
+) {
+    const auto x_shape = x.inner.shape();
+    if (x_shape.size() != 4 || x_shape[3] <= 0 || x_shape[3] % 2 != 0) {
+        throw std::invalid_argument(
+            "compiled_sapiens2_rope expects rank-4 input with a positive even last dimension");
+    }
+    const auto sin_shape = sin.inner.shape();
+    const auto cos_shape = cos.inner.shape();
+    const int32_t half = x_shape[3] / 2;
+    if (sin.inner.dtype() != mlx::core::float32 ||
+        sin_shape != mlx::core::Shape({1, 1, x_shape[2], 2, half})) {
+        throw std::invalid_argument(
+            "compiled_sapiens2_rope expects a float32 packed sine table");
+    }
+    if (cos.inner.dtype() != mlx::core::float32 ||
+        cos_shape != mlx::core::Shape({1, 1, x_shape[2], 1, half})) {
+        throw std::invalid_argument(
+            "compiled_sapiens2_rope expects a float32 packed cosine table");
+    }
+    const auto dtype = x.inner.dtype();
+    if (dtype != mlx::core::float32 && dtype != mlx::core::float16 &&
+        dtype != mlx::core::bfloat16) {
+        throw std::invalid_argument(
+            "compiled_sapiens2_rope expects a floating point input");
+    }
+    auto& compiled_fn = get_compiled_sapiens2_rope();
+    auto result = compiled_fn({x.inner, sin.inner, cos.inner});
+    return std::make_unique<MlxArray>(std::move(result[0]));
 }
 
 std::unique_ptr<MlxArray> compiled_proportional_rope(
@@ -4087,6 +4261,59 @@ std::unique_ptr<MlxArray> fast_layer_norm(
     ));
 }
 
+std::unique_ptr<MlxArray> fast_rms_norm_vjp_for_test(
+    const MlxArray& x,
+    const MlxArray& weight,
+    const MlxArray& cotan,
+    float eps,
+    int32_t wrt
+) {
+    if (wrt < 0 || wrt > 1) {
+        throw std::invalid_argument(
+            "fast_rms_norm_vjp_for_test: wrt must be 0 (x) or 1 (weight), got " +
+            std::to_string(wrt));
+    }
+    auto fun = [eps](const std::vector<array>& in) {
+        return std::vector<array>{mlx::core::fast::rms_norm(in[0], in[1], eps)};
+    };
+    auto grads = mlx::core::vjp(fun, {x.inner, weight.inner}, {cotan.inner}).second;
+    return std::make_unique<MlxArray>(grads[wrt]);
+}
+
+std::unique_ptr<MlxArray> fast_layer_norm_vjp_for_test(
+    const MlxArray& x,
+    const MlxArray* weight,
+    const MlxArray& bias,
+    const MlxArray& cotan,
+    float eps,
+    int32_t wrt
+) {
+    if (wrt < 0 || wrt > 2) {
+        throw std::invalid_argument(
+            "fast_layer_norm_vjp_for_test: wrt must be 0 (x), 1 (weight) or 2 (bias), got " +
+            std::to_string(wrt));
+    }
+    if (weight) {
+        auto fun = [eps](const std::vector<array>& in) {
+            return std::vector<array>{mlx::core::fast::layer_norm(in[0], in[1], in[2], eps)};
+        };
+        auto grads =
+            mlx::core::vjp(fun, {x.inner, weight->inner, bias.inner}, {cotan.inner}).second;
+        return std::make_unique<MlxArray>(grads[wrt]);
+    }
+    // No weight: differentiate with respect to x and the bias only.
+    if (wrt == 1) {
+        throw std::invalid_argument(
+            "fast_layer_norm_vjp_for_test: wrt 1 (weight) needs a weight");
+    }
+    auto fun = [eps](const std::vector<array>& in) {
+        return std::vector<array>{
+            mlx::core::fast::layer_norm(in[0], std::nullopt, in[1], eps)};
+    };
+    auto grads = mlx::core::vjp(fun, {x.inner, bias.inner}, {cotan.inner}).second;
+    return std::make_unique<MlxArray>(grads[wrt == 0 ? 0 : 1]);
+}
+
 int32_t sdpa_attention_dtype(const MlxArray& q, const MlxArray& k, const MlxArray& v) {
     return from_dtype(sdpa_attention_dtype_for_inputs(q.inner, k.inner, v.inner));
 }
@@ -4111,12 +4338,12 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention(
         mask_mode = "array";
     }
     return std::make_unique<MlxArray>(mlx::core::fast::scaled_dot_product_attention(
-        q.inner, k.inner, v.inner, scale, mask_mode, mask_opt
+        q.inner, k.inner, v.inner, scale, /*window_size=*/-1, mask_mode, mask_opt
     ));
 }
 
-// Fast SDPA with optional sinks (per-head attention bias for first position)
-// Used by: GptOss
+// Fast SDPA with optional attention sinks: an extra per-head logit added to the softmax denominator, with no value row
+// Used by: GptOss, Laguna, DeepSeekV4, FalconOcr, OpenAIPrivacyFilter
 std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_with_sinks(
     const MlxArray& q,
     const MlxArray& k,
@@ -4139,7 +4366,7 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_with_sinks(
         sinks_opt = sdpa_mask_for_inputs(sinks->inner, q.inner, k.inner, v.inner);
     }
     return std::make_unique<MlxArray>(mlx::core::fast::scaled_dot_product_attention(
-        q.inner, k.inner, v.inner, scale, mask_mode, mask_opt, sinks_opt
+        q.inner, k.inner, v.inner, scale, /*window_size=*/-1, mask_mode, mask_opt, sinks_opt
     ));
 }
 
@@ -4151,7 +4378,7 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_causal(
     float scale
 ) {
     return std::make_unique<MlxArray>(mlx::core::fast::scaled_dot_product_attention(
-        q.inner, k.inner, v.inner, scale, "causal", std::nullopt
+        q.inner, k.inner, v.inner, scale, /*window_size=*/-1, "causal", std::nullopt
     ));
 }
 
@@ -4553,7 +4780,7 @@ void fused_causal_prefill_attention(
     k = mlx::core::fast::rope(k, rope_dims, false, rope_base, 1.0f, 0);
 
     auto attn = mlx::core::fast::scaled_dot_product_attention(
-        q, k, v, scale, "causal", std::nullopt);
+        q, k, v, scale, /*window_size=*/-1, "causal", std::nullopt);
 
     attn = transpose(attn, {0, 2, 1, 3});
     attn = reshape(attn, {batch_size, seq_len, q_cols});
@@ -5036,6 +5263,57 @@ rust::Vec<uint64_t> rocm_dequant_cache_stats() {
     }
 #endif
     return out;
+}
+
+rust::Vec<uint64_t> rocm_host_shadow_stats() {
+    rust::Vec<uint64_t> out;
+#ifdef MLXCEL_BRIDGE_ROCM_BACKEND
+    const auto s = mlx::core::rocm::host_shadow_stats();
+    out.push_back(static_cast<uint64_t>(s.bytes));
+    out.push_back(s.downloads);
+    out.push_back(s.uploads);
+#else
+    for (int i = 0; i < 3; ++i) {
+        out.push_back(0);
+    }
+#endif
+    return out;
+}
+
+namespace {
+
+// Shared checks of the two test-only host accessors below (lablup/mlxcel#2643).
+array& checked_f32_element(const MlxArray& arr, size_t index, const char* who) {
+    auto& a = const_cast<array&>(arr.inner);
+    if (a.dtype() != float32) {
+        throw std::invalid_argument(std::string(who) + ": float32 array required");
+    }
+    // Layout flags are only set once the array has data, so evaluate before
+    // reading them: an unevaluated broadcast would otherwise pass the check
+    // and the index below would run past its smaller allocation.
+    a.eval();
+    if (!a.flags().row_contiguous) {
+        throw std::invalid_argument(
+            std::string(who) + ": row-contiguous array required");
+    }
+    if (index >= a.size()) {
+        throw std::out_of_range(std::string(who) + ": index out of range");
+    }
+    return a;
+}
+
+}  // namespace
+
+float host_read_f32_for_test(const MlxArray& arr, size_t index) {
+    const array& a = checked_f32_element(arr, index, "host_read_f32_for_test");
+    return static_cast<const float*>(host_read_data(a))[index];
+}
+
+void host_write_f32_for_test(const MlxArray& arr, size_t index, float value) {
+    array& a = checked_f32_element(arr, index, "host_write_f32_for_test");
+    // The mutable path every CPU writer in MLX takes; on Windows ROCm it marks
+    // the shadow dirty so the next kernel reading the buffer flushes it.
+    a.data<float>()[index] = value;
 }
 
 void set_rocm_port_warp_size_for_tests(int32_t warp_size) {
@@ -7544,6 +7822,52 @@ std::unique_ptr<MlxArray> quantize_weights_scales(const MlxArray& w, int32_t gro
 std::unique_ptr<MlxArray> quantize_weights_biases(const MlxArray& w, int32_t group_size, int32_t bits) {
     auto result = mlx::core::quantize(w.inner, group_size, bits);
     return std::make_unique<MlxArray>(std::move(result[2]));
+}
+
+// Used by Qwen4-Exp only. Typed scalars retain the reference's bf16 arithmetic.
+std::unique_ptr<MlxArray> qwen4_hyper_activate(const MlxArray& x, int32_t count) {
+    using namespace mlx::core;
+    static auto fn = compile_shapeless_audited("qwen4_hyper_activate", [](const std::vector<array>& in) {
+        auto y = divide(in[0], in[1]);
+        return std::vector<array>{multiply(y, sigmoid(y))};
+    });
+    return std::make_unique<MlxArray>(fn({x.inner, array(float(count), x.inner.dtype())})[0]);
+}
+
+std::unique_ptr<MlxArray> qwen4_hyper_gate(const MlxArray& x, int32_t count) {
+    using namespace mlx::core;
+    static auto fn = compile_shapeless_audited("qwen4_hyper_gate", [](const std::vector<array>& in) {
+        return std::vector<array>{multiply(array(2.0f, in[0].dtype()), sigmoid(divide(in[0], in[1])))};
+    });
+    return std::make_unique<MlxArray>(fn({x.inner, array(float(count), x.inner.dtype())})[0]);
+}
+
+std::unique_ptr<MlxArray> qwen4_hyper_mix(const MlxArray& projected, const MlxArray& normed) {
+    using namespace mlx::core;
+    static auto fn = compile_shapeless_audited("qwen4_hyper_mix", [](const std::vector<array>& in) {
+        return std::vector<array>{mean(multiply(sigmoid(in[0]), in[1]), -2, false)};
+    });
+    return std::make_unique<MlxArray>(fn({projected.inner, normed.inner})[0]);
+}
+
+std::unique_ptr<MlxArray> qwen4_hyper_inject(const MlxArray& branch, const MlxArray& weights, const MlxArray& hyper) {
+    using namespace mlx::core;
+    static auto fn = compile_shapeless_audited("qwen4_hyper_inject", [](const std::vector<array>& in) {
+        return std::vector<array>{add(in[2], multiply(in[0], in[1]))};
+    });
+    return std::make_unique<MlxArray>(fn({branch.inner, weights.inner, hyper.inner})[0]);
+}
+
+std::unique_ptr<MlxArray> compiled_scaled_rms_norm(const MlxArray& x, const MlxArray& scale, float eps) {
+    static auto compiled_fn = compile_shapeless_audited("compiled_scaled_rms_norm",
+        [](const std::vector<array>& inputs) -> std::vector<array> {
+            using namespace mlx::core;
+            auto y = astype(inputs[0], float32);
+            auto inv = rsqrt(add(mean(square(y), -1, true), inputs[2]));
+            return {astype(multiply(multiply(y, inv), inputs[1]), inputs[0].dtype())};
+        });
+    auto out = compiled_fn({x.inner, scale.inner, mlx::core::array(eps)});
+    return std::make_unique<MlxArray>(std::move(out[0]));
 }
 
 }  // namespace mlx_cxx

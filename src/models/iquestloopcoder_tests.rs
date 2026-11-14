@@ -874,7 +874,7 @@ fn wrapper_declares_model_owned_state_and_no_dense_caches() {
          keys its bail on exactly this value"
     );
     assert_eq!(layout.num_layers, 2);
-    assert!(!wrapper.supports_batching());
+    assert!(wrapper.supports_batching());
     assert!(!wrapper.supports_padded_prefill());
     assert!(
         !wrapper.supports_snapshot_reuse(),
@@ -942,4 +942,25 @@ fn reset_runtime_state_clears_the_fallback_caches() {
         );
         assert_eq!(caches[0].pass2.offset, 0);
     });
+}
+
+#[test]
+fn model_owned_batched_multistep() {
+    crate::models::batched_decode_harness::assert_model_owned_multistep(|| {
+        IQuestLoopCoderWrapper::new(tiny_model(&tiny_args(4, 2)))
+    });
+}
+
+// Issue #2798: the pass-2 ring window is validated, not only checked for zero.
+#[test]
+fn rejects_loop_window_sizes_a_rotating_cache_cannot_take() {
+    for window in [0usize, i32::MAX as usize + 1] {
+        let mut args: ModelArgs = serde_json::from_str(LOOP_40B_CONFIG).unwrap();
+        args.loop_window_size = window;
+        let err = args
+            .validate()
+            .expect_err("an unusable loop window must fail the load");
+        assert!(err.contains("IQuest Loop Coder loop_window_size"), "{err}");
+        assert!(err.contains(&format!("got {window}")), "{err}");
+    }
 }

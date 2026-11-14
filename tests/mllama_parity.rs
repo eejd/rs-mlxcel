@@ -30,7 +30,7 @@ mod common;
 use std::path::PathBuf;
 
 use common::repo_model_dir;
-use mlxcel::models::mllama::text::MllamaTextModel;
+use mlxcel::models::mllama::text::{CrossAttentionInput, CrossKvSlot, MllamaTextModel};
 use mlxcel::models::mllama::{MllamaConfig, MllamaTextConfig};
 use mlxcel::models::{ModelType, get_model_type};
 use mlxcel::vision::MllamaVLModel;
@@ -251,13 +251,14 @@ fn cross_states() -> UniquePtr<MlxArray> {
     mlxcel_core::from_slice_f32(&fill(n, 42), &[1, KV_LEN, HIDDEN])
 }
 
-/// Tolerance for the one comparison in this file whose two sides reassociate a
+/// Tolerance for the comparisons in this file whose two sides reassociate a
 /// parallel reduction differently, so exact f32 equality is not a property the
-/// code can have. See `sub_max_real_tiles_keep_the_legacy_real_rows_byte_identical`.
+/// code can have. See `sub_max_real_tiles_keep_the_legacy_real_rows_byte_identical`
+/// and `ragged_multi_image_states_concatenate_real_rows`.
 ///
 /// Do not tighten this back to `0.0`. The sibling assertion in
 /// `src/models/mllama/text.rs` was moved off exact equality for the same reason
-/// in #953, and this file's case was missed at the time.
+/// in #953, and this file's cases were missed at the time.
 const TILE_SELECTION_REASSOCIATION_TOL: f32 = 1e-6;
 
 /// Max absolute elementwise difference between two arrays.
@@ -271,7 +272,10 @@ fn max_abs_diff(a: &MlxArray, b: &MlxArray) -> f32 {
 fn forward(model: &MllamaTextModel, cross: Option<&MlxArray>) -> UniquePtr<MlxArray> {
     let ids = input_ids();
     let mut caches = model.make_caches();
-    let logits = model.forward(Some(&ids), None, &mut caches, None, cross, None, None);
+    // A fresh request's K/V slots: one per decoder layer, all unfilled.
+    let mut cross_kv: Vec<CrossKvSlot> = (0..model.num_layers()).map(|_| None).collect();
+    let cross = cross.map(|states| CrossAttentionInput::new(states, &mut cross_kv));
+    let logits = model.forward(Some(&ids), None, &mut caches, None, cross);
     mlxcel_core::eval(&logits);
     logits
 }
@@ -617,10 +621,11 @@ fn ragged_multi_image_states_concatenate_real_rows() {
     let media0 = states_rows(&full, 0, V_PATCHES);
     let media1 = states_rows(&full, 4 * V_PATCHES, 6 * V_PATCHES);
     let expected = mlxcel_core::concatenate(&media0, &media1, 1);
-    assert_eq!(
-        max_abs_diff(&sub, &expected),
-        0.0,
-        "ragged selection must keep each image's real rows in media-major order"
+    let diff = max_abs_diff(&sub, &expected);
+    assert!(
+        diff <= TILE_SELECTION_REASSOCIATION_TOL,
+        "ragged selection must keep each image's real rows in media-major order, got \
+         max|delta|={diff} over the {TILE_SELECTION_REASSOCIATION_TOL} reassociation tolerance"
     );
 }
 

@@ -13,11 +13,11 @@ use std::time::Instant;
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 
-use crate::aux::{
+use crate::aux_manifest::{AuxiliaryArtifactContract, ensure_qualified_auxiliary_artifact};
+use crate::auxiliary::{
     AuxiliaryInput, AuxiliaryOutput, AuxiliaryTensorDType, AuxiliaryWeight, AuxiliaryWeightDType,
     AuxiliaryWeightStorage, IreeAuxiliaryModule,
 };
-use crate::aux_manifest::{AuxiliaryArtifactContract, ensure_qualified_auxiliary_artifact};
 #[cfg(feature = "diagnostics")]
 use crate::emitter::YOUTU_VL_DIAGNOSTIC_ABI_VERSION;
 #[cfg(feature = "diagnostics")]
@@ -138,7 +138,7 @@ fn tensor_locations(
         let tensors = SafeTensors::deserialize(&mmap)
             .map_err(|error| format!("parse {}: {error}", shard.display()))?;
         for name in tensors.names() {
-            if !required.contains(name.as_str()) {
+            if !required.contains(name) {
                 continue;
             }
             if let Some(previous) = locations.insert(name.to_string(), shard.clone()) {

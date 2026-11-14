@@ -398,6 +398,11 @@ impl ServingCoordinator {
         // once here and reject each such request cheaply below with a clean
         // per-request error, rather than doing (and discarding) prefill work.
         let handoff_supported = scheduler.handoff_supported();
+        // Whether this node has a prompt-cache store, reported on every
+        // successful first-token frame so the router's `usage` follows the
+        // worker rather than the router's own flag (#2715). Fixed for the
+        // node's lifetime, like `handoff_supported`.
+        let prompt_cache_enabled = scheduler.has_prompt_cache_store();
         if !handoff_supported {
             tracing::warn!(
                 "prefill role: this model uses a model-owned paged sequence-state backend, \
@@ -464,6 +469,7 @@ impl ServingCoordinator {
                             .to_string(),
                     ),
                     generated_tokens: None,
+                    prompt_cache_enabled: None,
                 };
                 let encoded = match err_result.encode() {
                     Ok(encoded) => encoded,
@@ -521,6 +527,7 @@ impl ServingCoordinator {
                         done: true,
                         error: Some(format!("prefill failed: {e}")),
                         generated_tokens: None,
+                        prompt_cache_enabled: None,
                     };
                     let encoded = match err_result.encode() {
                         Ok(encoded) => encoded,
@@ -567,6 +574,9 @@ impl ServingCoordinator {
                 tokens: drained.tokens,
                 start_sequence: 0,
                 done: drained.done || frame.is_none(),
+                // The node's prompt-cache report rides only a successful
+                // first-token frame (#2715).
+                prompt_cache_enabled: drained.error.is_none().then_some(prompt_cache_enabled),
                 error: drained.error,
                 generated_tokens: Some(prefill_generated),
             };
@@ -653,6 +663,7 @@ impl ServingCoordinator {
                                      decode allowlist; rejecting the KV handoff"
                                 )),
                                 generated_tokens: None,
+                                prompt_cache_enabled: None,
                             };
                             if let Ok(encoded) = err_result.encode() {
                                 let _ = self.transport.send(&request.reply_to, encoded).await;
@@ -682,6 +693,7 @@ impl ServingCoordinator {
                         done: true,
                         error: Some(format!("decode handoff to {decode_peer} failed: {e}")),
                         generated_tokens: None,
+                        prompt_cache_enabled: None,
                     };
                     if let Ok(encoded) = err_result.encode() {
                         let _ = self.transport.send(&request.reply_to, encoded).await;
@@ -712,6 +724,38 @@ impl ServingCoordinator {
         Ok(())
     }
 
+    /// Wait for the next [`DecodeMetaFrame`] on the decode role's transport,
+    /// skipping frames that are not one. `Ok(None)` when the transport's
+    /// inbound channel closed. Everything the decode loop processes enters
+    /// through here, so a test can prove a frame never reaches the role
+    /// without a scheduler (#2655).
+    pub(crate) async fn next_decode_meta(&self) -> Result<Option<DecodeMetaFrame>> {
+        loop {
+            let message = match self.transport.recv().await {
+                Ok((_from, message)) => message,
+                Err(_) => return Ok(None),
+            };
+            let (operation, payload) = match control_parts(message) {
+                Ok(parts) => parts,
+                Err(e) => {
+                    tracing::warn!("decode role: ignoring non-control frame before KV: {e}");
+                    continue;
+                }
+            };
+            if operation != DecodeMetaFrame::OPERATION {
+                tracing::warn!(
+                    "decode role: ignoring unexpected control op '{operation}' \
+                     (expected '{}')",
+                    DecodeMetaFrame::OPERATION
+                );
+                continue;
+            }
+            return DecodeMetaFrame::decode(&payload)
+                .context("decode role: decode metadata frame")
+                .map(Some);
+        }
+    }
+
     /// Live decode role loop (#126 B3b2a): reconstruct networked handoffs and
     /// return the continuation over the network.
     ///
@@ -730,27 +774,9 @@ impl ServingCoordinator {
         scheduler: &mut BatchScheduler,
     ) -> Result<()> {
         loop {
-            let message = match self.transport.recv().await {
-                Ok((_from, message)) => message,
-                Err(_) => break,
+            let Some(meta) = self.next_decode_meta().await? else {
+                break;
             };
-            let (operation, payload) = match control_parts(message) {
-                Ok(parts) => parts,
-                Err(e) => {
-                    tracing::warn!("decode role: ignoring non-control frame before KV: {e}");
-                    continue;
-                }
-            };
-            if operation != DecodeMetaFrame::OPERATION {
-                tracing::warn!(
-                    "decode role: ignoring unexpected control op '{operation}' \
-                     (expected '{}')",
-                    DecodeMetaFrame::OPERATION
-                );
-                continue;
-            }
-            let meta =
-                DecodeMetaFrame::decode(&payload).context("decode role: decode metadata frame")?;
 
             // The KV handoff frame follows its metadata frame on the wire.
             let (_from, bytes) = self
@@ -807,6 +833,7 @@ impl ServingCoordinator {
                         // Only the terminal frame carries the count; intermediate
                         // continuation frames leave it None.
                         generated_tokens: None,
+                        prompt_cache_enabled: None,
                     };
                     self.transport
                         .send(&meta.reply_to, result.encode()?)
@@ -840,6 +867,7 @@ impl ServingCoordinator {
                 done: true,
                 error: drained.error,
                 generated_tokens: decode_generated,
+                prompt_cache_enabled: None,
             };
             self.transport
                 .send(&meta.reply_to, result.encode()?)
@@ -1031,6 +1059,25 @@ pub(crate) fn serve_decode_role_blocking(
             ServingCoordinator::new(ServingMode::DecodeOnly, Box::new(transport), peer);
         coordinator.run_decode_role(scheduler, handoffs).await
     })
+}
+
+/// The transport config a disaggregated role binds for its role transport
+/// (#2655): the node's `--serving-bind` address with cluster authentication
+/// on, so every inbound connection runs the cluster handshake before a frame
+/// reaches the role loop and every outbound connection (the prefill node's
+/// handoff, each role's result frames) authenticates itself to its peer.
+///
+/// Used by: the model worker (`run_disaggregated_serving_role`) and the
+/// coordinator tests, which build the config exactly as the worker does.
+pub(crate) fn disaggregated_role_transport_config(
+    bind: SocketAddr,
+    cluster_auth: Arc<crate::distributed::ClusterAuth>,
+) -> TcpTransportConfig {
+    TcpTransportConfig {
+        bind_address: bind.to_string(),
+        auth: Some(cluster_auth),
+        ..TcpTransportConfig::default()
+    }
 }
 
 /// Drive the prefill serving role over a real network transport on a fresh

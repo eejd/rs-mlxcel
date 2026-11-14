@@ -15,6 +15,12 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+/// Custom-kernel launches and PTX cache layout helpers for the CUDA JIT disk
+/// cache tests. Most targets that include `tests/common` use none of it.
+#[cfg(feature = "cuda")]
+#[allow(dead_code)]
+pub mod cuda_kernels;
+
 /// Where a real-model test finds its checkpoint.
 ///
 /// Every caller treats a missing directory as "skip this test", so pointing at
@@ -46,8 +52,8 @@ pub fn apply_server_mlx_cache_defaults() {
     mlxcel_core::hardware::apply_cuda_sdpa_cache_default();
 }
 
-#[allow(dead_code)]
-pub fn repo_model_dir(name: &str) -> PathBuf {
+/// The checkpoint roots `repo_model_dir` searches, in order.
+fn model_roots() -> Vec<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut roots: Vec<PathBuf> = ["models", "models/mlx", "models/mlx-big"]
         .iter()
@@ -57,27 +63,57 @@ pub fn repo_model_dir(name: &str) -> PathBuf {
         roots.push(parent.join("mlxcel-internal").join("models"));
         roots.push(parent.join("mlxcel-internal").join("models").join("mlx"));
     }
+    roots
+}
 
-    for root in &roots {
-        let candidate = root.join(name);
-        if candidate.exists() {
-            return candidate;
+#[allow(dead_code)]
+pub fn repo_model_dir(name: &str) -> PathBuf {
+    repo_model_dir_any(&[name])
+}
+
+/// `repo_model_dir` over several acceptable checkpoint names: each name is
+/// tried against every root before the next name, so the first name has
+/// priority wherever it lives. Use it when one test can run on any of a few
+/// equivalent checkpoints that different machines store under different names
+/// (`llama-3.2-1b-instruct-4bit` in most of `tests/`, `llama-3.2-1b-4bit` on
+/// the GB10 host, issue #1558). `MLXCEL_REQUIRE_MODELS` panics only when no
+/// name resolves anywhere.
+#[allow(dead_code)]
+pub fn repo_model_dir_any(names: &[&str]) -> PathBuf {
+    assert!(
+        !names.is_empty(),
+        "repo_model_dir_any needs at least one checkpoint name"
+    );
+    let roots = model_roots();
+    for name in names {
+        for root in &roots {
+            let candidate = root.join(name);
+            if candidate.exists() {
+                return candidate;
+            }
         }
     }
 
     if std::env::var("MLXCEL_REQUIRE_MODELS").is_ok_and(|v| v != "0") {
         panic!(
-            "MLXCEL_REQUIRE_MODELS is set and checkpoint {name:?} resolves nowhere. Tried: {}",
-            roots
+            "MLXCEL_REQUIRE_MODELS is set and checkpoint {} resolves nowhere. Tried: {}",
+            names
                 .iter()
-                .map(|r| r.join(name).display().to_string())
+                .map(|n| format!("{n:?}"))
+                .collect::<Vec<_>>()
+                .join(" or "),
+            names
+                .iter()
+                .flat_map(|n| roots.iter().map(move |r| r.join(n).display().to_string()))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
     }
 
     // Unchanged fallback: the caller's `exists()` check turns this into a skip.
-    manifest_dir.join("models").join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("models")
+        .join(names[0])
 }
 
 /// Candidate locations for one of the crate's binaries, most authoritative
@@ -215,4 +251,89 @@ pub fn extract_generated_body(stdout: &str) -> Option<&str> {
     let rest = &stdout[start..];
     let end = rest.find("\n\n[")?;
     Some(&rest[..end])
+}
+
+/// A fresh random cluster secret shared by every pipeline role of one test
+/// (#2637). Nothing is committed: each run generates its own.
+#[allow(dead_code)]
+pub fn test_cluster_auth() -> std::sync::Arc<mlxcel::distributed::ClusterAuth> {
+    std::sync::Arc::new(mlxcel::distributed::ClusterAuth::new(
+        &mlxcel::distributed::ClusterSecret::random(),
+    ))
+}
+
+/// A fresh random cluster secret written to a temporary file, for tests that
+/// launch disaggregated, pipeline, or router roles as real `mlxcel-server`
+/// processes (#2655). Every role of one test gets the same file through
+/// `--cluster-secret-file`; an in-test transport that talks to those roles
+/// takes [`Self::auth`]. The file is deleted with the value. Nothing is
+/// committed: each test run generates its own secret.
+///
+/// The file holds 64 hex characters, like `openssl rand -hex 32`, and a
+/// spawned server uses those characters verbatim as the key
+/// (`ClusterSecret::from_file`). [`Self::secret`] and [`Self::auth`] are built
+/// from the same bytes, so an in-test client and the spawned roles always
+/// derive the same key (#2695).
+#[allow(dead_code)]
+pub struct TestClusterSecretFile {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+    secret: mlxcel::distributed::ClusterSecret,
+}
+
+#[allow(dead_code)]
+impl TestClusterSecretFile {
+    pub fn new() -> Self {
+        let dir = tempfile::tempdir().expect("temp dir for the test cluster secret");
+        let path = dir.path().join("cluster.secret");
+        let contents = mlxcel::distributed::ClusterSecret::random().to_hex();
+        // Owner-only from the moment it exists, as an operator's secret file
+        // should be, so spawned roles do not warn about a group- or
+        // world-readable secret.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options
+            .open(&path)
+            .expect("create the test cluster secret file");
+        std::io::Write::write_all(&mut file, contents.as_bytes())
+            .expect("write the test cluster secret");
+        drop(file);
+        let secret = mlxcel::distributed::ClusterSecret::from_bytes(contents.into_bytes())
+            .expect("a 64-character hex string is a valid cluster secret");
+        Self {
+            _dir: dir,
+            path,
+            secret,
+        }
+    }
+
+    /// Path to pass as `--cluster-secret-file`.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The same path as a `&str` argument for `Command::args`.
+    pub fn path_arg(&self) -> &str {
+        self.path.to_str().expect("temp dir paths are valid UTF-8")
+    }
+
+    /// The secret exactly as a spawned server resolves it from [`Self::path`].
+    pub fn secret(&self) -> &mlxcel::distributed::ClusterSecret {
+        &self.secret
+    }
+
+    /// The authenticator an in-test transport uses to talk to the spawned
+    /// roles.
+    pub fn auth(&self) -> std::sync::Arc<mlxcel::distributed::ClusterAuth> {
+        std::sync::Arc::new(mlxcel::distributed::ClusterAuth::new(&self.secret))
+    }
+}
+
+#[allow(dead_code)]
+impl Default for TestClusterSecretFile {
+    fn default() -> Self {
+        Self::new()
+    }
 }

@@ -43,6 +43,7 @@ async fn run_bench_on(
         iterations,
         warmup: 16,
         label: label.to_string(),
+        round_trip: false,
     };
     measure_activation_transfer(transport, peer, &config)
         .await
@@ -104,6 +105,7 @@ async fn rdma_vs_tcp_activation_transfer() {
         prefer_thunderbolt: false,
         tcp_config: None,
         max_negotiation_failures: 4,
+        auth: None,
     })
     .await
     .unwrap();
@@ -114,6 +116,7 @@ async fn rdma_vs_tcp_activation_transfer() {
         prefer_thunderbolt: false,
         tcp_config: None,
         max_negotiation_failures: 4,
+        auth: None,
     })
     .await
     .unwrap();

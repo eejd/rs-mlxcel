@@ -27,3 +27,18 @@
 
 #[path = "../../mlxcel-core/build_support/mlx_pin.rs"]
 pub mod mlx_pin;
+
+// The native Windows CUDA layout and delay-load selection (#58), hosted here
+// for the same reason: its unit tests then run in seconds on any platform.
+#[path = "../../mlxcel-core/build_support/windows_cuda.rs"]
+pub mod windows_cuda;
+
+// The native Windows ROCm SDK layout and `amdgpu-arch` parsing (#2601). It
+// reuses `windows_cuda::cmake_path`, which is why both live at the crate root.
+#[path = "../../mlxcel-core/build_support/windows_rocm.rs"]
+pub mod windows_rocm;
+
+// The Cargo-profile decision that compiles the CUDA JIT PTX disk cache's
+// test-only hooks into debug and test-fast builds only (#2765).
+#[path = "../../mlxcel-core/build_support/ptx_cache_test_hooks.rs"]
+pub mod ptx_cache_test_hooks;

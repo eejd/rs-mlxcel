@@ -116,6 +116,10 @@ impl GotOcrVlModel {
 }
 
 impl LanguageModel for GotOcrVlModel {
+    fn batched_decode_kind(&self) -> mlxcel_core::generate::BatchedDecodeKind {
+        self.text_model.batched_decode_kind()
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
@@ -208,6 +212,10 @@ impl LanguageModel for GotOcrVlModel {
 
     fn kv_cache_layer_modes(&self) -> Option<Vec<KVCacheMode>> {
         LanguageModel::kv_cache_layer_modes(&self.text_model)
+    }
+
+    fn kv_cache_storage_modes(&self) -> Option<Vec<Option<KVCacheMode>>> {
+        LanguageModel::kv_cache_storage_modes(&self.text_model)
     }
 
     fn num_layers(&self) -> usize {

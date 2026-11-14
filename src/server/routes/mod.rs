@@ -33,6 +33,7 @@ pub mod detokenize;
 pub mod embeddings;
 pub mod feature_disabled;
 pub mod health;
+pub mod images;
 pub mod infill;
 pub mod lora_adapters;
 pub mod metrics;
@@ -44,10 +45,14 @@ pub mod props;
 pub mod realtime;
 pub mod rerank;
 pub mod responses;
+mod responses_auto_compact;
+pub mod responses_compact;
+mod responses_compact_media;
 pub mod settings;
 pub mod slots;
 pub mod stream;
 pub mod tokenize;
+pub(crate) mod tool_call_stream;
 pub mod transcription_compat;
 
 #[cfg(test)]
@@ -80,6 +85,7 @@ pub use detokenize::detokenize;
 pub use embeddings::{create_embeddings, native_embeddings};
 pub use feature_disabled::feature_disabled;
 pub use health::health_check;
+pub use images::{create_image_edit, create_image_generation};
 pub use infill::infill;
 pub use lora_adapters::{get_lora_adapters, post_lora_adapters};
 pub use metrics::metrics;
@@ -90,6 +96,7 @@ pub use prompt_inspection::{apply_template, chat_input_tokens, responses_input_t
 pub use props::{post_props, props};
 pub use rerank::create_rerank;
 pub use responses::{cancel_response, create_response, delete_response, retrieve_response};
+pub use responses_compact::compact_response;
 pub use settings::{get_settings, patch_settings};
 pub use slots::{slot_action, slots};
 pub use stream::{stream_delete, stream_get, streams_lookup};
@@ -98,6 +105,19 @@ pub use tokenize::tokenize;
 /// Explain a terminal generation-unavailable state without exposing worker or
 /// channel implementation details.
 pub(crate) fn chat_unavailable_message(state: &AppState) -> Option<String> {
+    // `--image-model` with no `-m` serves image generation alone (#2825).
+    // Its own wording is used rather than the embedding-only sentence below,
+    // because the remedy (add `-m`, or a second server) differs from dropping
+    // a restriction flag.
+    if state.config.embedding_serving_mode == crate::server::config::EmbeddingServingMode::ImageOnly
+    {
+        return Some(
+            "This server was started with --image-model and no -m and serves only \
+             /v1/images/generations and /v1/images/edits; generation is disabled. Add -m <chat \
+             model> to serve generation from the same process, or start a second server."
+                .to_string(),
+        );
+    }
     // b10621's `--embeddings` / `--reranking` restrict the server to that
     // workload, so generation is refused even when a chat model is loaded next
     // to the side model (#1452). The flag is named in the body, because
@@ -167,6 +187,22 @@ pub(crate) fn chat_unavailable_message(state: &AppState) -> Option<String> {
 /// provider state.
 pub(crate) fn chat_not_available(state: &AppState) -> Option<ErrorResponse> {
     chat_unavailable_message(state).map(ErrorResponse::not_implemented)
+}
+
+/// The same refusal, but only on an image-only server (#2825).
+///
+/// `/tokenize`, `/detokenize` and `/apply-template` are not generation routes,
+/// so they stay available in every other mode, including `-m --image-model`.
+/// In image-only mode there is no tokenizer or chat template behind them, and
+/// running on the empty tokenizer would return wrong answers rather than an
+/// error.
+pub(crate) fn chat_not_available_image_only(state: &AppState) -> Option<ErrorResponse> {
+    if state.config.embedding_serving_mode == crate::server::config::EmbeddingServingMode::ImageOnly
+    {
+        chat_not_available(state)
+    } else {
+        None
+    }
 }
 
 /// Map generation dispatch failures consistently across OpenAI-compatible

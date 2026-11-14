@@ -22,8 +22,13 @@
 // - Mixed cache: MambaCache for M blocks, KVCache for * blocks
 // - relu^2 activation for MLP/MoE
 
-use crate::models::switch_layers::validate_expert_quantization_params;
-use mlxcel_core::generate::LanguageModel;
+use super::recurrent_batch::*;
+use crate::models::switch_layers::{
+    SwitchLinear, gather_sort, scatter_unsort, validate_expert_quantization_params,
+};
+use mlxcel_core::batched_decode::{SplitAttention, SplitAttentionShape, forward_split_attention};
+use mlxcel_core::cache::{BatchedAttentionMetadata, CachePool, SequenceId, SequenceStateLayout};
+use mlxcel_core::generate::{BatchedDecodeKind, LanguageModel, route_batched_decode_with_ids};
 use mlxcel_core::layers::{KVCache, Linear, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, relu_squared, silu, slice_axis, stack_arrays};
 use mlxcel_core::weights::WeightMap;
@@ -639,6 +644,8 @@ impl NemotronHMamba2Mixer {
         }
         if seq_len == 1
             && mlxcel_core::ssm_kernel_available()
+            && is_affine_quantized(&self.in_proj)
+            && is_affine_quantized(&self.out_proj)
             && cache
                 .as_ref()
                 .is_some_and(|c| c.conv_state.is_some() && c.ssm_state.is_some())
@@ -1166,7 +1173,44 @@ struct NemotronHAttention {
     scale: f32,
 }
 
+impl SplitAttention for NemotronHAttention {
+    fn split_shape(&self) -> SplitAttentionShape {
+        SplitAttentionShape {
+            num_heads: self.n_heads as i32,
+            num_kv_heads: self.n_kv_heads as i32,
+            head_dim: self.head_dim as i32,
+            scale: self.scale,
+        }
+    }
+    fn rope_batched(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        _offsets: &[i32],
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        (mlxcel_core::copy(q), mlxcel_core::copy(k))
+    }
+}
 impl NemotronHAttention {
+    fn forward_batched_decode(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut KVCache],
+    ) -> UniquePtr<MlxArray> {
+        let metadata = BatchedAttentionMetadata::from_kv_caches(
+            caches,
+            &vec![1; caches.len()],
+            &vec![0; caches.len()],
+        )
+        .expect("valid hybrid attention metadata");
+        let q = self.q_proj.forward(x);
+        let k = self.k_proj.forward(x);
+        let v = self.v_proj.forward(x);
+        self.o_proj.forward(&forward_split_attention(
+            self, &q, &k, &v, caches, &metadata, None,
+        ))
+    }
+
     fn forward(
         &self,
         x: &MlxArray,
@@ -1242,6 +1286,21 @@ impl NemotronHMLP {
     }
 }
 
+/// Whether `l` is an affine-quantized linear, the only kind the fused Mamba2
+/// decode kernel (`fused_mamba2_forward`) multiplies: it calls
+/// `quantized_matmul` in affine mode. An nvfp4 export (issue #2665) has no
+/// biases and takes the unfused path, whose `UnifiedLinear::forward` passes
+/// the layer's own mode. Issue #2698 built NVFP4 support into this call and
+/// into `fused_moe_forward` and measured it on gfx1151 with
+/// `Nemotron-Cascade-2-30B-A3B-nvfp4`: decode 61.0 against 61.9 tok/s after
+/// a 512-token prompt and 59.8 against 60.3 after 2048 (medians of three,
+/// fused against unfused), so it was not kept. The fused calls halve the
+/// per-step graph build (about 0.5 against 1.0 to 1.3 ms), but the engine's
+/// decode loop already overlaps the build with the previous step's GPU work.
+fn is_affine_quantized(l: &UnifiedLinear) -> bool {
+    matches!(l, UnifiedLinear::Quantized { weight, .. } if weight.mode == "affine" && weight.biases.is_some())
+}
+
 /// Helper to extract raw weight/scales/biases pointers from UnifiedLinear
 /// Returns null pointers for non-quantized linear layers
 trait QuantizedWeightPtrs {
@@ -1295,13 +1354,13 @@ impl QuantConfigAccessors for UnifiedLinear {
     }
 }
 
-/// Extract (weight, scales, biases) raw pointers from a QuantizedSwitchLinear.
-/// Returns null pointers for the absent fields in the Regular variant.
-fn switch_linear_ptrs(
-    sl: &QuantizedSwitchLinear,
-) -> (*const MlxArray, *const MlxArray, *const MlxArray) {
+/// Extract (weight, scales, biases) raw pointers from an expert plane.
+/// Returns null pointers for the fields a plane does not carry: scales and
+/// biases of a non-quantized plane, biases of a block-float (nvfp4, mxfp4)
+/// one.
+fn switch_linear_ptrs(sl: &SwitchLinear) -> (*const MlxArray, *const MlxArray, *const MlxArray) {
     match sl {
-        QuantizedSwitchLinear::Quantized {
+        SwitchLinear::Quantized {
             weight,
             scales,
             biases,
@@ -1309,9 +1368,11 @@ fn switch_linear_ptrs(
         } => (
             weight.as_ref().unwrap() as *const MlxArray,
             scales.as_ref().unwrap() as *const MlxArray,
-            biases.as_ref().unwrap() as *const MlxArray,
+            biases
+                .as_ref()
+                .map_or(std::ptr::null(), |b| b.as_ref().unwrap() as *const MlxArray),
         ),
-        QuantizedSwitchLinear::Regular { weight } => (
+        SwitchLinear::Regular { weight } => (
             weight.as_ref().unwrap() as *const MlxArray,
             std::ptr::null(),
             std::ptr::null(),
@@ -1319,89 +1380,39 @@ fn switch_linear_ptrs(
     }
 }
 
-// QuantizedSwitchLinear and SwitchMLP for MoE (using gather_qmm).
-// Kept local: uses weights.remove() (ownership), different naming (QuantizedSwitchLinear)
-enum QuantizedSwitchLinear {
-    Quantized {
-        weight: UniquePtr<MlxArray>, // [num_experts, out_features, packed_in_features]
-        scales: UniquePtr<MlxArray>, // [num_experts, out_features, groups]
-        biases: UniquePtr<MlxArray>, // [num_experts, out_features, groups]
-        group_size: i32,
-        bits: i32,
-    },
-    Regular {
-        weight: UniquePtr<MlxArray>, // [num_experts, out_features, in_features]
-    },
-}
-
-impl QuantizedSwitchLinear {
-    fn forward(
-        &self,
-        x: &MlxArray,
-        indices: &MlxArray,
-        sorted_indices: bool,
-    ) -> UniquePtr<MlxArray> {
-        match self {
-            Self::Quantized {
-                weight,
-                scales,
-                biases,
-                group_size,
-                bits,
-            } => {
-                let biases_ptr = biases.as_ref().unwrap() as *const MlxArray;
-                let indices_ptr = indices as *const MlxArray;
-                unsafe {
-                    mlxcel_core::gather_qmm(
-                        x,
-                        weight,
-                        scales,
-                        biases_ptr,
-                        std::ptr::null(),
-                        indices_ptr,
-                        true,
-                        *group_size,
-                        *bits,
-                        sorted_indices,
-                        "affine",
-                        std::ptr::null(),
-                    )
-                }
-            }
-            Self::Regular { weight } => {
-                let wt = mlxcel_core::swap_axes(weight, -1, -2);
-                unsafe {
-                    mlxcel_core::gather_mm(
-                        x,
-                        &wt,
-                        std::ptr::null(),
-                        indices as *const _,
-                        sorted_indices,
-                    )
-                }
-            }
-        }
-    }
-}
-
+/// The routed experts: `fc2(relu2(fc1(x)))` through `gather_qmm` (quantized
+/// planes in any mode `SwitchLinear` loads: affine, nvfp4, mxfp4, mxfp8) or
+/// `gather_mm` (bf16 planes).
 struct SwitchMLP {
-    fc1: QuantizedSwitchLinear,
-    fc2: QuantizedSwitchLinear,
+    fc1: SwitchLinear,
+    fc2: SwitchLinear,
 }
 
 impl SwitchMLP {
     fn forward(&self, x: &MlxArray, indices: &MlxArray) -> UniquePtr<MlxArray> {
         // x: [tokens, hidden], indices: [tokens, top_k]
-        // Expand x to [tokens, 1, 1, hidden] for gather_qmm
+        let indices_shape = mlxcel_core::array_shape(indices);
         let x_shape = mlxcel_core::array_shape(x);
+        // [tokens, 1, 1, hidden], the gather layout.
         let x_exp = mlxcel_core::reshape(x, &[x_shape[0], 1, 1, x_shape[1]]);
 
-        // Note: sorted_indices optimization skipped for simplicity
-        let sorted = false;
+        // A prefill sorts its (token, expert) pairs by expert, as mlx-lm's
+        // SwitchMLP does at 64 pairs and up, so each expert's rows are
+        // contiguous and the backends take their sorted gather kernels (on
+        // ROCm the expert-batched ones, issue #2665). Decode keeps the
+        // unsorted layout.
+        if indices_shape[0] * indices_shape[1] >= 64 {
+            let (sorted_x, sorted_idx, inv_order) = gather_sort(&x_exp, indices);
+            let rhs = mlxcel_core::astype(&sorted_idx, mlxcel_core::dtype::UINT32);
+            let h = self.fc1.forward(&sorted_x, &rhs, true);
+            let h = relu_squared(&h);
+            let out = self.fc2.forward(&h, &rhs, true);
+            return scatter_unsort(&out, &inv_order, &indices_shape);
+        }
 
-        let h = self.fc1.forward(&x_exp, indices, sorted);
+        let h = self.fc1.forward(&x_exp, indices, false);
         let h = relu_squared(&h);
-        let out = self.fc2.forward(&h, indices, sorted);
+        let out = self.fc2.forward(&h, indices, false);
 
         // Squeeze middle dimension: [tokens, top_k, 1, hidden] -> [tokens, top_k, hidden]
         mlxcel_core::squeeze_axis(&out, -2)
@@ -1483,22 +1494,25 @@ impl NemotronHMoE {
 
         // Try fused MoE forward (quantized path only, no latent projection)
         let result = if use_fused {
-            if let (
-                QuantizedSwitchLinear::Quantized {
-                    weight: fc1_w,
-                    scales: fc1_s,
-                    biases: fc1_b,
-                    group_size,
-                    bits,
-                },
-                QuantizedSwitchLinear::Quantized {
-                    weight: fc2_w,
-                    scales: fc2_s,
-                    biases: fc2_b,
-                    ..
-                },
-            ) = (&self.switch_mlp.fc1, &self.switch_mlp.fc2)
+            // The fused kernels decode affine planes only, both with fc1's
+            // packing; an nvfp4 (or other block-float) plane, which has no
+            // biases, or an fc2 packed differently from fc1 takes the
+            // gather_qmm path in `forward_nonfused`.
+            if let (Some(fc1), Some(fc2)) = (
+                self.switch_mlp
+                    .fc1
+                    .quantized_parts()
+                    .filter(|p| p.mode == "affine"),
+                self.switch_mlp
+                    .fc2
+                    .quantized_parts()
+                    .filter(|p| p.mode == "affine"),
+            ) && fc1.bits == fc2.bits
+                && fc1.group_size == fc2.group_size
             {
+                let (fc1_w, fc1_s, fc1_b) = (fc1.weight, fc1.scales, fc1.biases);
+                let (fc2_w, fc2_s, fc2_b) = (fc2.weight, fc2.scales, fc2.biases);
+                let (group_size, bits) = (&fc1.group_size, &fc1.bits);
                 // Get shared expert weight pointers (nullable)
                 let (sup_w, sup_s, sup_b, sdn_w, sdn_s, sdn_b) =
                     if let Some(ref shared) = self.shared_experts {
@@ -1670,6 +1684,105 @@ impl Drop for NemotronHModel {
 }
 
 impl NemotronHModel {
+    fn batch_states_uniform(states: &[Vec<NemotronLayerCache>]) -> bool {
+        (0..states[0].len()).all(|idx| {
+            let rows: Vec<_> = states
+                .iter()
+                .filter_map(|row| match &row[idx] {
+                    NemotronLayerCache::Mamba(c) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            rows.is_empty()
+                || (optional_rows_uniform(
+                    &rows
+                        .iter()
+                        .map(|c| c.conv_state.as_deref())
+                        .collect::<Vec<_>>(),
+                ) && optional_rows_uniform(
+                    &rows
+                        .iter()
+                        .map(|c| c.ssm_state.as_deref())
+                        .collect::<Vec<_>>(),
+                ))
+        })
+    }
+    fn forward_native_batch(
+        &self,
+        input_ids: &MlxArray,
+        states: &mut [Vec<NemotronLayerCache>],
+    ) -> UniquePtr<MlxArray> {
+        let batch = states.len();
+        let mut h = self.embeddings.forward(input_ids);
+        let mut cache_idx = 0;
+        for layer in &self.layers {
+            let normed = layer.norm.forward(&h);
+            let output = match &layer.mixer {
+                NemotronHMixer::Mamba(mixer) => {
+                    let rows: Vec<_> = states
+                        .iter()
+                        .map(|row| match &row[cache_idx] {
+                            NemotronLayerCache::Mamba(c) => c,
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                    let mut stacked = NemotronMambaCache {
+                        conv_state: stack_optional_rows(
+                            &rows
+                                .iter()
+                                .map(|c| c.conv_state.as_deref())
+                                .collect::<Vec<_>>(),
+                        )
+                        .into_option(),
+                        ssm_state: stack_optional_rows(
+                            &rows
+                                .iter()
+                                .map(|c| c.ssm_state.as_deref())
+                                .collect::<Vec<_>>(),
+                        )
+                        .into_option(),
+                    };
+                    let output = mixer.forward(&normed, Some(&mut stacked));
+                    let conv = split_rows(
+                        stacked
+                            .conv_state
+                            .as_ref()
+                            .expect("updated convolution state"),
+                        batch,
+                    );
+                    let ssm = split_rows(
+                        stacked.ssm_state.as_ref().expect("updated SSM state"),
+                        batch,
+                    );
+                    for ((row, conv), ssm) in states.iter_mut().zip(conv).zip(ssm) {
+                        row[cache_idx] = NemotronLayerCache::Mamba(NemotronMambaCache {
+                            conv_state: Some(conv),
+                            ssm_state: Some(ssm),
+                        });
+                    }
+                    cache_idx += 1;
+                    output
+                }
+                NemotronHMixer::Attention(attn) => {
+                    let mut caches: Vec<_> = states
+                        .iter_mut()
+                        .map(|row| match &mut row[cache_idx] {
+                            NemotronLayerCache::Attention(c) => c,
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                    let output = attn.forward_batched_decode(&normed, &mut caches);
+                    cache_idx += 1;
+                    output
+                }
+                NemotronHMixer::MLP(mlp) => mlp.forward(&normed),
+                NemotronHMixer::MoE(moe) => moe.forward(&normed),
+            };
+            h = mlxcel_core::add(&h, &output);
+        }
+        self.lm_head.forward(&self.norm_f.forward(&h))
+    }
+
     /// Loaded normalized dimensions for single-slot request admission.
     pub(crate) fn request_memory_config(&self) -> (&NemotronHConfig, u64) {
         let dtype = match &self.embeddings {
@@ -2615,21 +2728,40 @@ impl NemotronHModel {
                             mlxcel_core::zeros(&[n_routed as i32], mlxcel_core::dtype::FLOAT32)
                         });
 
-                    // Switch MLP (quantized or regular)
-                    let fc1_weight = weights
-                        .remove(&format!("{}.switch_mlp.fc1.weight", mixer_prefix))
-                        .ok_or(format!("Missing switch_mlp.fc1.weight for layer {}", i))?;
-                    let fc1_scales =
-                        weights.remove(&format!("{}.switch_mlp.fc1.scales", mixer_prefix));
-                    let fc1_biases =
-                        weights.remove(&format!("{}.switch_mlp.fc1.biases", mixer_prefix));
-                    let fc2_weight = weights
-                        .remove(&format!("{}.switch_mlp.fc2.weight", mixer_prefix))
-                        .ok_or(format!("Missing switch_mlp.fc2.weight for layer {}", i))?;
-                    let fc2_scales =
-                        weights.remove(&format!("{}.switch_mlp.fc2.scales", mixer_prefix));
-                    let fc2_biases =
-                        weights.remove(&format!("{}.switch_mlp.fc2.biases", mixer_prefix));
+                    // Switch MLP (quantized in any mode, or regular). The mode
+                    // follows from the planes as for the dense layers: affine
+                    // carries `.biases`, nvfp4 / mxfp4 / mxfp8 carry uint8
+                    // scales and none (issue #2665). The declared pair is
+                    // bounded first, as before (issue #958); a bf16 expert
+                    // plane carries no packing and stays loadable at any pair.
+                    let switch_linear = |fc: &str| -> Result<SwitchLinear, String> {
+                        let fc_prefix = format!("{mixer_prefix}.switch_mlp.{fc}");
+                        if !weights.contains_key(&format!("{fc_prefix}.weight")) {
+                            return Err(format!("Missing switch_mlp.{fc}.weight for layer {i}"));
+                        }
+                        if weights.contains_key(&format!("{fc_prefix}.scales")) {
+                            validate_expert_quantization_params(&fc_prefix, group_size, bits)?;
+                            if !weights.contains_key(&format!("{fc_prefix}.biases"))
+                                && !weights
+                                    .get(&format!("{fc_prefix}.scales"))
+                                    .is_some_and(|s| {
+                                        mlxcel_core::array_dtype(s) == mlxcel_core::dtype::UINT8
+                                    })
+                            {
+                                return Err(format!(
+                                    "Missing switch_mlp.{fc}.biases for layer {i}"
+                                ));
+                            }
+                        }
+                        SwitchLinear::from_weights(&weights, &fc_prefix, group_size, bits)
+                    };
+                    let fc1 = switch_linear("fc1")?;
+                    let fc2 = switch_linear("fc2")?;
+                    for fc in ["fc1", "fc2"] {
+                        for leaf in ["weight", "scales", "biases"] {
+                            weights.remove(&format!("{mixer_prefix}.switch_mlp.{fc}.{leaf}"));
+                        }
+                    }
 
                     // Shared experts (optional, quantized)
                     // An optional projection is absent only when its weight is.
@@ -2679,55 +2811,7 @@ impl NemotronHModel {
                             routed_scaling_factor: config.routed_scaling_factor.unwrap_or(1.0),
                             norm_topk_prob: config.norm_topk_prob.unwrap_or(false),
                         },
-                        switch_mlp: SwitchMLP {
-                            // `QuantizedSwitchLinear` has no named constructor:
-                            // the variant is built as a struct literal here, so
-                            // the bound goes with each literal rather than into
-                            // a loader (issue #958). This type never reaches
-                            // `reconcile_quantization_layout` and hands the
-                            // stored pair to `gather_qmm`. Only the quantized
-                            // arms are gated; a bf16 expert plane carries no
-                            // packing and must stay loadable at any declared
-                            // pair.
-                            fc1: if let Some(scales) = fc1_scales {
-                                validate_expert_quantization_params(
-                                    &format!("{}.switch_mlp.fc1", mixer_prefix),
-                                    group_size,
-                                    bits,
-                                )?;
-                                QuantizedSwitchLinear::Quantized {
-                                    weight: fc1_weight,
-                                    scales,
-                                    biases: fc1_biases.ok_or(format!(
-                                        "Missing switch_mlp.fc1.biases for layer {}",
-                                        i
-                                    ))?,
-                                    group_size,
-                                    bits,
-                                }
-                            } else {
-                                QuantizedSwitchLinear::Regular { weight: fc1_weight }
-                            },
-                            fc2: if let Some(scales) = fc2_scales {
-                                validate_expert_quantization_params(
-                                    &format!("{}.switch_mlp.fc2", mixer_prefix),
-                                    group_size,
-                                    bits,
-                                )?;
-                                QuantizedSwitchLinear::Quantized {
-                                    weight: fc2_weight,
-                                    scales,
-                                    biases: fc2_biases.ok_or(format!(
-                                        "Missing switch_mlp.fc2.biases for layer {}",
-                                        i
-                                    ))?,
-                                    group_size,
-                                    bits,
-                                }
-                            } else {
-                                QuantizedSwitchLinear::Regular { weight: fc2_weight }
-                            },
-                        },
+                        switch_mlp: SwitchMLP { fc1, fc2 },
                         shared_experts,
                         fc1_latent_proj,
                         fc2_latent_proj,
@@ -3050,6 +3134,98 @@ fn load_linear(
 
 // LanguageModel trait implementation.
 impl LanguageModel for NemotronHModel {
+    fn sequence_state_layout(&self) -> SequenceStateLayout {
+        SequenceStateLayout::model_owned(self.num_layers())
+    }
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
+    }
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_batched_with_ids(input_ids, None, batch_caches, mask)
+    }
+    fn forward_batched_with_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(input_ids);
+        assert_eq!(shape.len(), 2, "hybrid batch input must be rank 2");
+        assert_eq!(
+            shape[0] as usize,
+            batch_caches.len(),
+            "hybrid input batch must match cache rows"
+        );
+        if let Some(ids) = seq_ids {
+            assert_eq!(
+                ids.len(),
+                batch_caches.len(),
+                "one sequence id per row required"
+            );
+        }
+        route_batched_decode_with_ids(self, input_ids, seq_ids, batch_caches, |_| {
+            let ids = seq_ids.expect("model-owned hybrid batch requires sequence ids");
+            self.sequence_state
+                .validate_sequence_states(ids)
+                .unwrap_or_else(|err| panic!("hybrid batch: {err}"));
+            self.sequence_state
+                .with_batched_sequence_states(ids, |states| {
+                    if shape[1] != 1 || mask.is_some() || !Self::batch_states_uniform(states) {
+                        let outputs: Vec<_> = states
+                            .iter_mut()
+                            .enumerate()
+                            .map(|(row, state)| {
+                                let input = mlxcel_core::slice(
+                                    input_ids,
+                                    &[row as i32, 0],
+                                    &[row as i32 + 1, shape[1]],
+                                );
+                                self.forward_with_caches(&input, state)
+                            })
+                            .collect();
+                        return mlxcel_core::concatenate_many(
+                            &outputs.iter().map(|v| &**v).collect::<Vec<_>>(),
+                            0,
+                        );
+                    }
+                    self.forward_native_batch(input_ids, states)
+                })
+                .unwrap_or_else(|err| panic!("hybrid batch: {err}"))
+        })
+    }
+    fn sync_sequence_storage(
+        &self,
+        seq_id: SequenceId,
+        cache_pool: &mut CachePool,
+    ) -> Result<(), String> {
+        self.sequence_state
+            .with_existing_sequence_state(seq_id, |caches| {
+                let mut cache_idx = 0;
+                let lengths: Vec<_> = self
+                    .block_types
+                    .iter()
+                    .map(|kind| {
+                        if !kind.needs_cache() {
+                            return 0;
+                        }
+                        let len = match &caches[cache_idx] {
+                            NemotronLayerCache::Attention(kv) => kv.live_len().max(0) as usize,
+                            _ => 0,
+                        };
+                        cache_idx += 1;
+                        len
+                    })
+                    .collect();
+                cache_pool.sync_paged_state_with_lengths(seq_id, &lengths)
+            })?
+    }
+
     fn forward(
         &self,
         input: &MlxArray,
@@ -3081,8 +3257,20 @@ impl LanguageModel for NemotronHModel {
         self.config.num_hidden_layers
     }
 
+    /// No mode table: report the real storage so the server does not fall back to the configured
+    /// table (issue #2790). Attention blocks keep an FP16 `KVCache`; Mamba, MLP and MoE blocks
+    /// none.
+    fn kv_cache_storage_modes(&self) -> Option<Vec<Option<mlxcel_core::cache::KVCacheMode>>> {
+        crate::models::model_owned::table_less_storage_modes(self.config.num_hidden_layers, |idx| {
+            match self.block_types.get(idx) {
+                Some(BlockType::Attention) => crate::models::model_owned::LayerKv::Fp16Only,
+                _ => crate::models::model_owned::LayerKv::None,
+            }
+        })
+    }
+
     fn supports_batching(&self) -> bool {
-        false // NemotronH is a hybrid Mamba+Transformer, internal caches not compatible with per-sequence KV isolation
+        true
     }
 
     fn prepare_sequence_state(&self, seq_id: mlxcel_core::cache::SequenceId) {

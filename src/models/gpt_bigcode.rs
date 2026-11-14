@@ -54,8 +54,10 @@
 //!   reaches the checkpoint and there is nothing to strip at load. The
 //!   santacoder export carries 292 tensors, none of them matching that shape.
 
-use mlxcel_core::generate::LanguageModel;
+use mlxcel_core::batched_decode::{SplitAttention, SplitAttentionShape, forward_split_attention};
+use mlxcel_core::generate::{BatchedDecodeKind, LanguageModel, route_batched_decode};
 use mlxcel_core::layers::{KVCache, LayerNorm, UnifiedEmbedding, UnifiedLinear};
+use mlxcel_core::utils::GeluActivation;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -127,6 +129,12 @@ pub struct ModelArgs {
 
     #[serde(default)]
     pub quantization: Option<Quantization>,
+
+    /// The MLP GELU, a Hugging Face `ACT2FN` name. `null` or absent means
+    /// `gelu_pytorch_tanh`, the `GPTBigCodeConfig` default. Resolved by
+    /// [`ModelArgs::activation`].
+    #[serde(default)]
+    pub activation_function: Option<String>,
 }
 
 /// A `config.json` token-id field, which may be a single int or a list of ints.
@@ -264,7 +272,30 @@ impl ModelArgs {
                 "GPT-BigCode n_inner ({intermediate}) must be between 1 and {MAX_N_INNER}"
             ));
         }
+        self.activation()?;
         Ok(())
+    }
+
+    /// The MLP activation the checkpoint declares in `activation_function`.
+    ///
+    /// Hugging Face builds the MLP as `ACT2FN[config.activation_function]`,
+    /// so the config decides; an omitted key is the `GPTBigCodeConfig`
+    /// default `gelu_pytorch_tanh`. mlx-lm departs from Hugging Face here by
+    /// always applying `nn.gelu` (erf), which mlxcel ran before #2794. The
+    /// tanh names run as the compiled f32 kernel. A non-GELU name is an error.
+    pub fn activation(&self) -> Result<GeluActivation, String> {
+        let name = self
+            .activation_function
+            .as_deref()
+            .unwrap_or("gelu_pytorch_tanh");
+        GeluActivation::from_hf_name(name)
+            .map(GeluActivation::in_f32_compiled)
+            .ok_or_else(|| {
+                format!(
+                    "GPT-BigCode: unsupported activation_function {name:?}; expected a GELU \
+                     variant (gelu, gelu_new, gelu_fast, gelu_pytorch_tanh, quick_gelu)"
+                )
+            })
     }
 
     pub fn head_dim(&self) -> usize {
@@ -550,23 +581,43 @@ impl Attention {
     }
 }
 
+impl SplitAttention for Attention {
+    fn split_shape(&self) -> SplitAttentionShape {
+        SplitAttentionShape {
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            scale: self.scale,
+        }
+    }
+    fn rope_batched(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        _offsets: &[i32],
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        (mlxcel_core::copy(q), mlxcel_core::copy(k))
+    }
+}
+
 // MLP (GELU, no gate/up pattern, width from n_inner).
 
 pub struct MLP {
     pub c_fc: UnifiedLinear,
     pub c_proj: UnifiedLinear,
+    /// Resolved once at load from `activation_function`.
+    pub activation: GeluActivation,
 }
 
 impl MLP {
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         let h = self.c_fc.forward(x);
-        // Upstream applies `nn.gelu`, the erf-based exact GELU, which is what
-        // `mlxcel_core::utils::gelu_approx` evaluates in this tree (see its own
-        // doc comment). The checkpoint config names `gelu_pytorch_tanh`, whose
-        // tanh approximation differs from the erf form by under 1e-3; matching
-        // upstream keeps this port comparable against the mlx-lm reference,
-        // which is the same choice `src/models/gpt2.rs` makes.
-        let h = mlxcel_core::utils::gelu_approx(&h);
+        // Hugging Face applies `ACT2FN[config.activation_function]`, so the
+        // checkpoint config decides (`gelu_pytorch_tanh` for every published
+        // export and the class default). mlx-lm always applies `nn.gelu`
+        // (erf) and departs from Hugging Face; mlxcel follows Hugging Face
+        // (#2794). See `ModelArgs::activation`.
+        let h = self.activation.apply(&h);
         self.c_proj.forward(&h)
     }
 
@@ -597,7 +648,13 @@ impl MLP {
             bits,
         )?;
 
-        Ok(Self { c_fc, c_proj })
+        let activation = args.activation()?;
+
+        Ok(Self {
+            c_fc,
+            c_proj,
+            activation,
+        })
     }
 }
 
@@ -624,6 +681,33 @@ impl TransformerBlock {
         let normed = self.ln_2.forward(&h);
         let mlp_out = self.mlp.forward(&normed);
         mlxcel_core::add(&h, &mlp_out)
+    }
+
+    pub fn forward_batched(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut KVCache],
+        layer_idx: usize,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let normed = self.ln_1.forward(x);
+        let qkv = self.attn.c_attn.forward(&normed);
+        let d = self.attn.num_heads * self.attn.head_dim;
+        let kd = self.attn.num_kv_heads * self.attn.head_dim;
+        let q = mlxcel_core::slice_last_dim(&qkv, 0, d);
+        let k = mlxcel_core::slice_last_dim(&qkv, d, d + kd);
+        let v = mlxcel_core::slice_last_dim(&qkv, d + kd, d + 2 * kd);
+        let seq_len = mlxcel_core::array_shape(&q)[1];
+        let metadata = crate::models::batched_decode_cache::uniform_layer_metadata(
+            caches,
+            seq_len,
+            0,
+            "GPT-BigCode",
+            layer_idx,
+        );
+        let attn = forward_split_attention(&self.attn, &q, &k, &v, caches, &metadata, mask);
+        let h = mlxcel_core::add(x, &self.attn.c_proj.forward(&attn));
+        mlxcel_core::add(&h, &self.mlp.forward(&self.ln_2.forward(&h)))
     }
 
     pub fn from_weights(
@@ -719,6 +803,40 @@ impl GptBigCodeModel {
 
         let h = self.ln_f.forward(&h);
 
+        match &self.lm_head {
+            Some(head) => head.forward(&h),
+            None => self.wte.as_linear(&h),
+        }
+    }
+
+    pub fn forward_batched_impl(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(input_ids);
+        let batch = shape[0] as usize;
+        let seq_len = *shape.last().unwrap_or(&0);
+        let mut positions = Vec::with_capacity(batch * seq_len as usize);
+        for caches in batch_caches.iter() {
+            let offset = caches.first().map(|cache| cache.offset).unwrap_or(0);
+            positions.extend(position_ids(offset, seq_len, self.n_positions));
+        }
+        let position_index = mlxcel_core::from_slice_i32(&positions, &[batch as i32, seq_len]);
+        let mut h = mlxcel_core::add(
+            &self.wte.forward(input_ids),
+            &self.wpe.forward(&position_index),
+        );
+        for layer_idx in 0..self.h.len() {
+            let mut caches = crate::models::batched_decode_cache::collect_layer_caches(
+                batch_caches,
+                "GPT-BigCode",
+                layer_idx,
+            );
+            h = self.h[layer_idx].forward_batched(&h, &mut caches, layer_idx, mask);
+        }
+        let h = self.ln_f.forward(&h);
         match &self.lm_head {
             Some(head) => head.forward(&h),
             None => self.wte.as_linear(&h),
@@ -830,6 +948,20 @@ impl LanguageModel for GptBigCodeModel {
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         GptBigCodeModel::forward(self, input_ids, caches, mask)
+    }
+
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
+    }
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        route_batched_decode(self, input_ids, batch_caches, |caches| {
+            self.forward_batched_impl(input_ids, caches, mask)
+        })
     }
 
     fn make_caches(&self) -> Vec<KVCache> {

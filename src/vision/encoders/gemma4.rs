@@ -17,9 +17,12 @@
 //! Used by: Gemma4 VLM
 
 use mlxcel_core::layers::{RMSNorm, UnifiedLinear};
+use mlxcel_core::utils::GeluActivation;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
+
+use crate::vision::weights::load_dense_param;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct VisionRopeParameters {
@@ -69,6 +72,15 @@ pub struct Gemma4VisionConfig {
     pub use_clipped_linears: bool,
     #[serde(default)]
     pub standardize: bool,
+    /// GeGLU activation of the vision MLP. Every shipped checkpoint either
+    /// declares `gelu_pytorch_tanh` or omits the key, which the Hugging Face
+    /// `Gemma4VisionConfig` default resolves to the same value.
+    #[serde(default = "default_vision_hidden_activation")]
+    pub hidden_activation: String,
+}
+
+fn default_vision_hidden_activation() -> String {
+    "gelu_pytorch_tanh".to_string()
 }
 
 fn default_rope_parameters() -> VisionRopeParameters {
@@ -82,6 +94,22 @@ fn default_rms_norm_eps() -> f32 {
 }
 
 impl Gemma4VisionConfig {
+    /// The GELU the vision GeGLU applies, from `hidden_activation` (#2423).
+    ///
+    /// mlx-vlm and Hugging Face both use the tanh form for the shipped value;
+    /// it is evaluated in f32 and cast back, as the SigLIP tanh path is, in one
+    /// compiled kernel so the switch from erf does not add prefill time.
+    fn mlp_activation(&self) -> Result<GeluActivation, String> {
+        GeluActivation::from_hf_name(&self.hidden_activation)
+            .map(GeluActivation::in_f32_compiled)
+            .ok_or_else(|| {
+                format!(
+                    "Gemma 4 vision_config.hidden_activation `{}` is not a GELU variant",
+                    self.hidden_activation
+                )
+            })
+    }
+
     pub fn rope_theta(&self) -> f32 {
         self.rope_parameters.rope_theta
     }
@@ -311,6 +339,7 @@ struct VisionMLP {
     gate_proj: ClippableLinear,
     up_proj: ClippableLinear,
     down_proj: ClippableLinear,
+    activation: GeluActivation,
 }
 
 impl VisionMLP {
@@ -343,13 +372,14 @@ impl VisionMLP {
                 group_size,
                 bits,
             )?,
+            activation: config.mlp_activation()?,
         })
     }
 
     fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         let gate = self.gate_proj.forward(x);
         let up = self.up_proj.forward(x);
-        let activated = mlxcel_core::gelu_approx(&gate);
+        let activated = self.activation.apply(&gate);
         self.down_proj
             .forward(&mlxcel_core::multiply(&activated, &up))
     }
@@ -578,10 +608,14 @@ impl VisionPatchEmbedder {
         group_size: i32,
         bits: i32,
     ) -> Result<Self, String> {
-        let table = copy_weight(weights, &format!("{}.position_embedding_table", prefix))?;
-        let shape = mlxcel_core::array_shape(&table);
-        let pos_size = shape[1];
-        let hidden_size = shape[2];
+        let pos_size = config.position_embedding_size as i32;
+        let hidden_size = config.hidden_size as i32;
+        let table = load_dense_param(
+            weights,
+            &format!("{prefix}.position_embedding_table"),
+            &[2, pos_size, hidden_size],
+            Some((group_size, bits)),
+        )?;
 
         let x_table = mlxcel_core::slice(&table, &[0, 0, 0], &[1, pos_size, hidden_size]);
         let y_table = mlxcel_core::slice(&table, &[1, 0, 0], &[2, pos_size, hidden_size]);
@@ -744,3 +778,7 @@ impl Gemma4VisionModel {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "gemma4_activation_tests.rs"]
+mod activation_tests;

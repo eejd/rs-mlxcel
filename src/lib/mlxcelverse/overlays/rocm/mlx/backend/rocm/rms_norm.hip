@@ -10,9 +10,18 @@
 
 #include <hip/hip_runtime.h>
 
+#include <climits>
+#include <string>
+
 namespace mlx::core {
 
 namespace rocm {
+
+// The 64-bit row of this block under row_grid().
+static __device__ inline int64_t row_grid_index() {
+  return static_cast<int64_t>(blockIdx.x) +
+      static_cast<int64_t>(blockIdx.y) * gridDim.x;
+}
 
 // Warp reduce for sum
 __device__ float warp_reduce_sum_rms(float val) {
@@ -102,8 +111,12 @@ __global__ void rms_norm_kernel(
     T* out,
     float eps,
     uint32_t axis_size,
-    int64_t w_stride) {
-  size_t row = blockIdx.x;
+    int64_t w_stride,
+    int64_t n_rows) {
+  int64_t row = row_grid_index();
+  if (row >= n_rows) {
+    return;
+  }
   rms_norm_row<T, BLOCK_DIM, N_READS>(
       x + (int64_t)row * axis_size, w, out + (int64_t)row * axis_size, eps,
       axis_size, w_stride);
@@ -123,10 +136,14 @@ __global__ void rms_norm_strided_kernel(
     int64_t w_stride,
     int n_row_dims,
     hip_array<int, 4> row_shape,
-    hip_array<int64_t, 4> row_strides) {
-  size_t row = blockIdx.x;
+    hip_array<int64_t, 4> row_strides,
+    int64_t n_rows) {
+  int64_t row = row_grid_index();
+  if (row >= n_rows) {
+    return;
+  }
   int64_t x_off = 0;
-  int r = row;
+  int64_t r = row;
   for (int d = n_row_dims - 1; d >= 0; --d) {
     x_off += (int64_t)(r % row_shape[d]) * row_strides[d];
     r /= row_shape[d];
@@ -144,8 +161,12 @@ __global__ void rms_norm_vjp_kernel(
     T* gw,
     float eps,
     int32_t axis_size,
-    int64_t w_stride) {
-  size_t row = blockIdx.x;
+    int64_t w_stride,
+    int64_t n_rows) {
+  int64_t row = row_grid_index();
+  if (row >= n_rows) {
+    return;
+  }
   
   x += row * axis_size;
   g += row * axis_size;
@@ -217,6 +238,42 @@ __global__ void rms_norm_vjp_kernel(
   }
 }
 
+// One block per row, split over grid x and y (lablup/mlxcel#2619, the ROCm side
+// of ml-explore/mlx#4717). HIP refuses gridDim.x * blockDim.x >= 2^32, so grid x
+// stops at UINT32_MAX / block_dim and the remaining rows spill into y; below
+// that cap the grid is dim3(n_rows) as before. Kernels recover the row with
+// row_grid_index() and return when it is >= n_rows.
+static inline dim3 row_grid(int64_t n_rows, int block_dim) {
+  const int64_t max_blocks_x = static_cast<int64_t>(UINT32_MAX) / block_dim;
+  int64_t grid_x = std::max<int64_t>(1, std::min(n_rows, max_blocks_x));
+  int64_t grid_y = (n_rows + grid_x - 1) / grid_x;
+  return dim3(static_cast<uint32_t>(grid_x), static_cast<uint32_t>(grid_y), 1);
+}
+
+// lablup/mlxcel#2633: the VJP shapes gw_temp and the column-reduce plans with
+// 32-bit dimensions (Shape holds int32), so it cannot reduce more than INT_MAX
+// rows. Say so instead of wrapping the row count.
+static inline void check_vjp_rows(const char* name, int64_t n_rows) {
+  if (n_rows > static_cast<int64_t>(INT_MAX)) {
+    throw std::invalid_argument(
+        std::string("[") + name + "] " + std::to_string(n_rows) +
+        " rows exceed INT_MAX, the most rows the weight and bias gradient "
+        "reductions take");
+  }
+}
+
+// lablup/mlxcel#2633: the gradient of a weight or bias over zero rows is zero.
+static inline void fill_zeros(
+    array& out, rocm::CommandEncoder& encoder, const Stream& s) {
+  if (out.size() == 0) {
+    out.set_data(mlx::core::rocm::malloc_async(0, encoder));
+    return;
+  }
+  array zero(0, out.dtype());
+  encoder.add_temporary(zero);
+  fill_gpu(zero, out, s);
+}
+
 } // namespace rocm
 
 namespace fast {
@@ -267,8 +324,13 @@ void RMSNorm::eval_gpu(
     out.copy_shared_buffer(x);
   }
 
+  // Zero rows (lablup/mlxcel#2633): row_grid(0) is not a valid launch.
+  if (out.size() == 0) {
+    return;
+  }
+
   const array& xk = strided ? xin : x;
-  int32_t n_rows = (int32_t)(out.size() / axis_size);
+  int64_t n_rows = out.size() / axis_size;
   int64_t w_stride = (w.ndim() == 1) ? w.strides()[0] : 0;
 
   int n_row_dims = ndim - 1;
@@ -293,15 +355,15 @@ void RMSNorm::eval_gpu(
     if (strided) {
       encoder.add_kernel_node(
           &rocm::rms_norm_strided_kernel<DT, BLOCK_DIM, N_READS>,
-          dim3(n_rows), dim3(BLOCK_DIM), 0,
+          rocm::row_grid(n_rows, BLOCK_DIM), dim3(BLOCK_DIM), 0,
           gpu_ptr<DT>(xk), gpu_ptr<DT>(w), gpu_ptr<DT>(out),
-          eps_, axis_size, w_stride, n_row_dims, row_shape, row_strides);
+          eps_, axis_size, w_stride, n_row_dims, row_shape, row_strides, n_rows);
     } else {
       encoder.add_kernel_node(
           &rocm::rms_norm_kernel<DT, BLOCK_DIM, N_READS>,
-          dim3(n_rows), dim3(BLOCK_DIM), 0,
+          rocm::row_grid(n_rows, BLOCK_DIM), dim3(BLOCK_DIM), 0,
           gpu_ptr<DT>(xk), gpu_ptr<DT>(w), gpu_ptr<DT>(out),
-          eps_, axis_size, w_stride);
+          eps_, axis_size, w_stride, n_rows);
     }
   };
   switch (out.dtype()) {
@@ -317,6 +379,12 @@ void RMSNormVJP::eval_gpu(
     std::vector<array>& outputs) {
   auto& s = stream();
   auto& encoder = rocm::get_command_encoder(s);
+
+  // Before any copy: a gradient reduction past INT_MAX rows cannot be planned.
+  if (inputs[0].size() > 0 && inputs[1].ndim() != 0) {
+    rocm::check_vjp_rows(
+        "RMSNormVJP", inputs[0].size() / inputs[0].shape().back());
+  }
 
   // Ensure row contiguity
   auto check_input = [&s](const array& x, bool& copied) {
@@ -357,13 +425,22 @@ void RMSNormVJP::eval_gpu(
     encoder.add_temporary(g);
   }
 
+  // Zero rows (lablup/mlxcel#2633): gx is empty and the weight gradient is a
+  // sum over no rows.
+  if (x.size() == 0) {
+    if (has_w) {
+      rocm::fill_zeros(gw, encoder, s);
+    }
+    return;
+  }
+
   int32_t axis_size = x.shape().back();
-  int32_t n_rows = x.data_size() / axis_size;
+  int64_t n_rows = x.data_size() / axis_size;
   int64_t w_stride = (w.ndim() == 1) ? w.strides()[0] : 0;
 
   // Allocate a temporary to store the gradients for w
   array gw_temp =
-      (has_w) ? array({n_rows, x.shape().back()}, gw.dtype(), nullptr, {}) : w;
+      (has_w) ? array({static_cast<int>(n_rows), x.shape().back()}, gw.dtype(), nullptr, {}) : w;
   if (has_w) {
     if (!g_in_gx && donate_g) {
       gw_temp.copy_shared_buffer(g);
@@ -387,26 +464,26 @@ void RMSNormVJP::eval_gpu(
       case float32:
         encoder.add_kernel_node(
             &rocm::rms_norm_vjp_kernel<float, true, BLOCK_DIM, N_READS>,
-            dim3(n_rows), dim3(BLOCK_DIM), 0,
+            rocm::row_grid(n_rows, BLOCK_DIM), dim3(BLOCK_DIM), 0,
             gpu_ptr<float>(x), gpu_ptr<float>(w), gpu_ptr<float>(g),
             gpu_ptr<float>(gx), gpu_ptr<float>(gw_temp),
-            eps_, axis_size, w_stride);
+            eps_, axis_size, w_stride, n_rows);
         break;
       case float16:
         encoder.add_kernel_node(
             &rocm::rms_norm_vjp_kernel<__half, true, BLOCK_DIM, N_READS>,
-            dim3(n_rows), dim3(BLOCK_DIM), 0,
+            rocm::row_grid(n_rows, BLOCK_DIM), dim3(BLOCK_DIM), 0,
             gpu_ptr<__half>(x), gpu_ptr<__half>(w), gpu_ptr<__half>(g),
             gpu_ptr<__half>(gx), gpu_ptr<__half>(gw_temp),
-            eps_, axis_size, w_stride);
+            eps_, axis_size, w_stride, n_rows);
         break;
       case bfloat16:
         encoder.add_kernel_node(
             &rocm::rms_norm_vjp_kernel<hip_bfloat16, true, BLOCK_DIM, N_READS>,
-            dim3(n_rows), dim3(BLOCK_DIM), 0,
+            rocm::row_grid(n_rows, BLOCK_DIM), dim3(BLOCK_DIM), 0,
             gpu_ptr<hip_bfloat16>(x), gpu_ptr<hip_bfloat16>(w), gpu_ptr<hip_bfloat16>(g),
             gpu_ptr<hip_bfloat16>(gx), gpu_ptr<hip_bfloat16>(gw_temp),
-            eps_, axis_size, w_stride);
+            eps_, axis_size, w_stride, n_rows);
         break;
       default:
         throw std::runtime_error("Unsupported type for rms_norm_vjp");
@@ -417,30 +494,30 @@ void RMSNormVJP::eval_gpu(
         float* gw_null = nullptr;
         encoder.add_kernel_node(
             &rocm::rms_norm_vjp_kernel<float, false, BLOCK_DIM, N_READS>,
-            dim3(n_rows), dim3(BLOCK_DIM), 0,
+            rocm::row_grid(n_rows, BLOCK_DIM), dim3(BLOCK_DIM), 0,
             gpu_ptr<float>(x), gpu_ptr<float>(w), gpu_ptr<float>(g),
             gpu_ptr<float>(gx), gw_null,
-            eps_, axis_size, w_stride);
+            eps_, axis_size, w_stride, n_rows);
         break;
       }
       case float16: {
         __half* gw_null = nullptr;
         encoder.add_kernel_node(
             &rocm::rms_norm_vjp_kernel<__half, false, BLOCK_DIM, N_READS>,
-            dim3(n_rows), dim3(BLOCK_DIM), 0,
+            rocm::row_grid(n_rows, BLOCK_DIM), dim3(BLOCK_DIM), 0,
             gpu_ptr<__half>(x), gpu_ptr<__half>(w), gpu_ptr<__half>(g),
             gpu_ptr<__half>(gx), gw_null,
-            eps_, axis_size, w_stride);
+            eps_, axis_size, w_stride, n_rows);
         break;
       }
       case bfloat16: {
         hip_bfloat16* gw_null = nullptr;
         encoder.add_kernel_node(
             &rocm::rms_norm_vjp_kernel<hip_bfloat16, false, BLOCK_DIM, N_READS>,
-            dim3(n_rows), dim3(BLOCK_DIM), 0,
+            rocm::row_grid(n_rows, BLOCK_DIM), dim3(BLOCK_DIM), 0,
             gpu_ptr<hip_bfloat16>(x), gpu_ptr<hip_bfloat16>(w), gpu_ptr<hip_bfloat16>(g),
             gpu_ptr<hip_bfloat16>(gx), gw_null,
-            eps_, axis_size, w_stride);
+            eps_, axis_size, w_stride, n_rows);
         break;
       }
       default:
@@ -451,7 +528,7 @@ void RMSNormVJP::eval_gpu(
   // Reduce gw_temp to gw if we have weights
   if (has_w) {
     ReductionPlan plan(
-        ReductionOpType::ContiguousStridedReduce, {n_rows}, {axis_size});
+        ReductionOpType::ContiguousStridedReduce, {static_cast<int>(n_rows)}, {axis_size});
     col_reduce(encoder, gw_temp, gw, Reduce::ReduceType::Sum, {0}, plan);
   }
 }

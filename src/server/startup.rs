@@ -18,7 +18,7 @@
 //! chat-template resolution, model warmup, and socket binding out of
 //! `server/mod.rs` so the server root can focus on shared types and state.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -30,9 +30,9 @@ use crate::distributed::pipeline::{
     resolve_in_process_pipeline_num_layers,
 };
 use crate::distributed::{
-    ClusterConfig, ClusterDiscoveryMode, ClusterInitPlan, ClusterInitRequest, NodeRegistry,
-    NodeRole, TransportBackend, plan_cluster, resolve_model_shard_plan, shard_config_from_cli,
-    validate_supported_runtime, write_plan_toml,
+    ClusterAuth, ClusterConfig, ClusterDiscoveryMode, ClusterInitPlan, ClusterInitRequest,
+    ClusterSecretSources, NodeRegistry, NodeRole, TransportBackend, plan_cluster,
+    resolve_model_shard_plan, shard_config_from_cli, validate_supported_runtime, write_plan_toml,
 };
 
 #[cfg(feature = "webui")]
@@ -257,6 +257,11 @@ pub struct ServerStartupConfig {
     /// next to the chat model. Forwarded to
     /// [`super::config::ServerConfig::embedding_model_path`].
     pub embedding_model_path: Option<PathBuf>,
+    /// `--image-model`: image-generation checkpoint served on
+    /// `/v1/images/generations` and `/v1/images/edits` next to the chat model.
+    /// Read only at startup, so it is not mirrored into `ServerConfig` (and
+    /// stays out of the runtime-settings schema).
+    pub image_model_path: Option<PathBuf>,
     /// `--embedding-batch-size`. Forwarded to
     /// [`super::config::ServerConfig::embedding_batch_size`].
     pub embedding_batch_size: usize,
@@ -404,10 +409,22 @@ pub struct ServerStartupConfig {
     pub cluster_peers: Vec<SocketAddr>,
     /// Optional UDP port for the discovery beacon.
     pub cluster_discovery_port: Option<u16>,
-    /// Optional coordinator control-plane bind address.
+    /// Where a `--pp-peer` process sends its discovery beacons in mdns mode
+    /// (`--cluster-discovery-target`): the limited broadcast by default, a
+    /// directed subnet broadcast, or the coordinator's unicast IP.
+    pub cluster_discovery_target: IpAddr,
+    /// Control-plane address: the coordinator's control bind address on
+    /// `--pp-auto`, the stage listen address on `--pp-peer`.
     pub cluster_control_addr: Option<SocketAddr>,
-    /// Optional output path for the emitted cluster TOML.
+    /// Optional output path for the emitted cluster TOML (coordinator and
+    /// peer each write their own copy).
     pub cluster_config_out: Option<PathBuf>,
+    /// Path to the pre-shared cluster secret file (`--cluster-secret-file`),
+    /// the highest-precedence secret source (#2637). Every pipeline role
+    /// refuses to start without a secret from this flag,
+    /// `MLXCEL_CLUSTER_SECRET_FILE`, `MLXCEL_CLUSTER_SECRET`, or the cluster
+    /// TOML's `secret_file`.
+    pub cluster_secret_file: Option<PathBuf>,
     /// When `true`, plan the cluster and exit before starting workers.
     pub dry_run: bool,
 
@@ -520,16 +537,19 @@ pub struct ServerStartupConfig {
     /// Unsupported K/V combinations are rejected at startup.
     pub kv_cache_mode: mlxcel_core::cache::KVCacheMode,
 
-    /// Operator-facing notices explaining why [`Self::kv_cache_mode`] or
-    /// [`Self::batch_kv_quant`] differ from what was requested (issue #1350).
-    ///
-    /// `ServerStartupInput::into_startup_config` resolves the requested mode
-    /// against the model family, but it runs before
-    /// [`initialize_server_logging`] installs a tracing subscriber, so a
-    /// `tracing::warn!` there is written to nothing. The notices are carried
-    /// here and emitted by [`start_server`] once logging exists. Empty when the
-    /// requested mode was used as-is.
-    pub kv_cache_mode_notices: Vec<String>,
+    /// Operator-facing lines raised before [`initialize_server_logging`]
+    /// installs a tracing subscriber (#2697, #2722), so a `tracing::` macro at
+    /// the point they arise is written to nothing. They come from the
+    /// binaries' `build_startup_input` and `env_fallback_*` helpers (an
+    /// invalid or ignored environment variable, such as an unparseable
+    /// `LLAMA_ARG_KV_BITS` or a CORS origin variable a flag overrode, #2664,
+    /// and the INFO line saying a CLI flag took precedence over a variable)
+    /// and from `ServerStartupInput::into_startup_config` (for example the
+    /// KV cache mode substituted for this model family, #1350).
+    /// [`start_server`] logs every entry at its own level through
+    /// [`log_startup_notices`] right after the subscriber exists, ahead of the
+    /// router-mode branch. Empty when nothing needed reporting.
+    pub startup_notices: Vec<super::StartupNotice>,
 
     /// resolved batch KV cache quantization configuration
     /// (uniform `mx.quantize` or TurboQuant variant) for the
@@ -697,6 +717,7 @@ impl Default for ServerStartupConfig {
             audio_queue_depth: crate::server::config::DEFAULT_AUDIO_QUEUE_DEPTH,
             audio_request_timeout_secs: crate::server::config::DEFAULT_AUDIO_REQUEST_TIMEOUT_SECS,
             embedding_model_path: None,
+            image_model_path: None,
             embedding_batch_size: crate::server::config::DEFAULT_EMBEDDING_BATCH_SIZE,
             embedding_max_length: None,
             embedding_queue_depth: crate::server::config::DEFAULT_EMBEDDING_QUEUE_DEPTH,
@@ -791,8 +812,10 @@ impl Default for ServerStartupConfig {
             cluster_name: None,
             cluster_peers: Vec::new(),
             cluster_discovery_port: None,
+            cluster_discovery_target: IpAddr::V4(Ipv4Addr::BROADCAST),
             cluster_control_addr: None,
             cluster_config_out: None,
+            cluster_secret_file: None,
             dry_run: false,
             tp_size: 1,
             tp_moe_mode: "expert_parallel".to_string(),
@@ -817,7 +840,7 @@ impl Default for ServerStartupConfig {
             chat_template_kwargs: None,
             prompt_cache: super::prompt_cache::PromptCacheConfig::default(),
             kv_cache_mode: mlxcel_core::cache::KVCacheMode::Fp16,
-            kv_cache_mode_notices: Vec::new(),
+            startup_notices: Vec::new(),
             batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig::default(),
             max_kv_size: None,
             context_shift: false,
@@ -1239,6 +1262,12 @@ fn warn_on_insecure_video_allowlist(allowlist: &[PathBuf]) {
 pub(crate) fn detect_model_media_support(model_path: &Path) -> ModelMediaSupport {
     use crate::models::ModelType;
 
+    // Image-only serving (empty path, #2825) has no chat checkpoint, and an
+    // empty path would resolve to the working directory. No media support.
+    if model_path.as_os_str().is_empty() {
+        return ModelMediaSupport::none();
+    }
+
     // b10621's `--no-mmproj` / `--no-mmproj-auto` refuses every media part,
     // whatever the checkpoint could do (issue #1451).
     if crate::server::media_admission_disabled() {
@@ -1330,6 +1359,78 @@ fn xla_backend_requested_from_env() -> bool {
     std::env::var("MLXCEL_BACKEND")
         .ok()
         .is_some_and(|backend| backend.eq_ignore_ascii_case("xla"))
+}
+
+/// Which distributed flags a server launch sets (native Windows gate, #58).
+///
+/// Both server CLIs fill this from their arguments before resolving the model,
+/// so a repo id is not downloaded only to be refused; `start_server` checks the
+/// built [`ServerStartupConfig`] again for programmatic callers.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ServerDistributedFlags {
+    pub pp_auto: bool,
+    pub pp_peer: bool,
+    pub distributed_config: bool,
+    pub node_role: bool,
+    pub peers: bool,
+    pub prefill_peers: bool,
+    pub decode_peers: bool,
+    pub serving_bind: bool,
+    pub pp_layers: bool,
+    pub tp_size: usize,
+}
+
+impl ServerDistributedFlags {
+    /// The first requested distributed flag, by its CLI name, or `None` for a
+    /// single-node server.
+    pub fn first_requested(&self) -> Option<&'static str> {
+        [
+            (self.pp_auto, "--pp-auto"),
+            (self.pp_peer, "--pp-peer"),
+            (self.distributed_config, "--distributed-config"),
+            (self.node_role, "--node-role"),
+            (self.peers, "--peers"),
+            (self.prefill_peers, "--prefill-peers"),
+            (self.decode_peers, "--decode-peers"),
+            (self.serving_bind, "--serving-bind"),
+            (self.pp_layers, "--pp-layers"),
+            (self.tp_size > 1, "--tp-size"),
+        ]
+        .into_iter()
+        .find_map(|(requested, flag)| requested.then_some(flag))
+    }
+
+    /// Fail when a distributed flag is set on a platform without distributed
+    /// inference (native Windows).
+    pub fn ensure_supported(&self) -> Result<()> {
+        match self.first_requested() {
+            Some(flag) => crate::distributed::ensure_distributed_supported(flag),
+            None => Ok(()),
+        }
+    }
+}
+
+impl From<&ServerStartupConfig> for ServerDistributedFlags {
+    fn from(startup: &ServerStartupConfig) -> Self {
+        Self {
+            pp_auto: startup.pp_auto.is_some(),
+            pp_peer: startup.pp_peer,
+            distributed_config: startup.distributed_config.is_some(),
+            node_role: startup.node_role.is_some(),
+            peers: !startup.peers.is_empty(),
+            prefill_peers: !startup.prefill_peers.is_empty(),
+            decode_peers: !startup.decode_peers.is_empty(),
+            serving_bind: startup.serving_bind.is_some(),
+            pp_layers: startup.pp_layers.is_some(),
+            tp_size: startup.tp_size,
+        }
+    }
+}
+
+/// The first distributed flag this startup requests, by its CLI name.
+#[cfg(test)]
+fn server_distributed_request(startup: &ServerStartupConfig) -> Option<&'static str> {
+    ServerDistributedFlags::from(startup).first_requested()
 }
 
 fn muse_glimmer_distributed_requested(startup: &ServerStartupConfig) -> bool {
@@ -1631,6 +1732,33 @@ fn resolve_decode_storage_backend() -> crate::server::DecodeStorageBackend {
     }
 }
 
+/// Derive the disaggregated serving role from `--node-role` (#126 B2). The
+/// role string is validated in `resolve_distributed_startup`, so a parse
+/// failure here falls back to the single-node `Hybrid` default rather than
+/// erroring a second time. Absent `--node-role` is `Hybrid` (the
+/// byte-identical single-node path). "router" is special-cased before the
+/// `NodeRole` parse: the router has no `NodeRole` variant but does have a
+/// `ServingMode` variant.
+fn resolve_serving_mode(
+    startup: &ServerStartupConfig,
+) -> crate::distributed::disaggregated::ServingMode {
+    use crate::distributed::disaggregated::ServingMode;
+    if startup
+        .node_role
+        .as_deref()
+        .map(|r| r.eq_ignore_ascii_case("router"))
+        .unwrap_or(false)
+    {
+        return ServingMode::Router;
+    }
+    startup
+        .node_role
+        .as_deref()
+        .and_then(|role| role.parse::<NodeRole>().ok())
+        .map(ServingMode::from_node_role)
+        .unwrap_or(ServingMode::Hybrid)
+}
+
 pub(super) fn build_server_config(
     startup: &ServerStartupConfig,
     api_keys: crate::server::ApiKeys,
@@ -1652,28 +1780,7 @@ pub(super) fn build_server_config(
     );
     let max_kv_size = resolve_context_kv_cap(context_size, startup.max_kv_size);
     let sampling_defaults = resolve_generation_sampling_defaults(startup);
-    // Derive the disaggregated serving role from `--node-role` (#126 B2). The
-    // role string was already validated in `resolve_distributed_startup`, so a
-    // parse failure here falls back to the single-node `Hybrid` default rather
-    // than erroring a second time. Absent `--node-role` is `Hybrid` (the
-    // byte-identical single-node path).
-    // Special-case "router" before the NodeRole parse: the router has no
-    // NodeRole variant but does have a ServingMode variant.
-    let serving_mode = if startup
-        .node_role
-        .as_deref()
-        .map(|r| r.eq_ignore_ascii_case("router"))
-        .unwrap_or(false)
-    {
-        crate::distributed::disaggregated::ServingMode::Router
-    } else {
-        startup
-            .node_role
-            .as_deref()
-            .and_then(|role| role.parse::<NodeRole>().ok())
-            .map(crate::distributed::disaggregated::ServingMode::from_node_role)
-            .unwrap_or(crate::distributed::disaggregated::ServingMode::Hybrid)
-    };
+    let serving_mode = resolve_serving_mode(startup);
 
     ServerConfig {
         // Populated by `start_server` after the AIP_* environment variables
@@ -1857,6 +1964,9 @@ pub(super) fn build_server_config(
         prefill_peers: startup.prefill_peers.clone(),
         decode_peers: startup.decode_peers.clone(),
         serving_bind: startup.serving_bind,
+        // Resolved by `start_server` from the cluster secret sources before
+        // any bind or load (#2655); the builder itself reads no secret.
+        cluster_auth: None,
         // serve-level diffusion knobs (#217 phase 3); consumed only by the
         // DiffusionGemma worker loop.
         max_denoising_steps: startup.max_denoising_steps,
@@ -1908,6 +2018,12 @@ pub(super) fn resolve_generation_sampling_defaults(
 /// detection error (unreadable config) returns `false`, preserving the baseline.
 fn detect_gemma4_family(model_path: &Path) -> bool {
     use crate::models::ModelType;
+
+    // Image-only serving has no chat checkpoint (#2825), and an empty path
+    // would resolve to the working directory.
+    if model_path.as_os_str().is_empty() {
+        return false;
+    }
     matches!(
         crate::models::get_model_type(model_path),
         Ok(ModelType::Gemma4 | ModelType::Gemma4VLM | ModelType::Gemma4Unified)
@@ -2314,7 +2430,7 @@ fn log_endpoints(startup: &ServerStartupConfig, addr: &str) {
         tracing::info!("  GET  {prefix}/slots                - Slot status");
     }
     if startup.slot_save_path.is_some() {
-        tracing::info!("  POST {prefix}/slots/:id_slot       - Slot save/restore/erase");
+        tracing::info!("  POST {prefix}/slots/{{id_slot}}       - Slot save/restore/erase");
     }
     tracing::info!("  GET  {prefix}/health               - Health check");
     if startup.webui_enabled {
@@ -2379,10 +2495,87 @@ fn parse_startup_listen_addr(startup: &ServerStartupConfig) -> Result<SocketAddr
         .context("failed to parse local listen address for distributed config")
 }
 
+/// Resolve the cluster secret a disaggregated role needs, or `None` for the
+/// single-node `Hybrid` mode, which binds no role transport. Fails closed:
+/// a `PrefillOnly`, `DecodeOnly` or `Router` node with no secret from any
+/// source is a startup error naming the role and every source (#2655). Runs
+/// before any listener is bound or weights are loaded.
+pub(super) fn resolve_disaggregated_cluster_auth(
+    sources: &ClusterSecretSources,
+    mode: crate::distributed::disaggregated::ServingMode,
+) -> Result<Option<Arc<ClusterAuth>>> {
+    use crate::distributed::disaggregated::ServingMode;
+    let role_flag = match mode {
+        ServingMode::Hybrid => return Ok(None),
+        ServingMode::PrefillOnly => "prefill",
+        ServingMode::DecodeOnly => "decode",
+        ServingMode::Router => "router",
+    };
+    match sources.resolve()? {
+        Some(secret) => Ok(Some(Arc::new(ClusterAuth::new(&secret)))),
+        None => anyhow::bail!(
+            "the disaggregated {role_flag} role (--node-role {role_flag}) requires a cluster \
+             secret so the router, prefill and decode role transports can authenticate each \
+             other, and none was configured: {}",
+            crate::distributed::CLUSTER_SECRET_SOURCES_HELP
+        ),
+    }
+}
+
+/// The `[cluster] secret_file` of the cluster TOML named by
+/// `--distributed-config`, if any, so a disaggregated role launched with a
+/// TOML shares the pipeline roles' lowest-precedence secret source.
+fn toml_cluster_secret_file(startup: &ServerStartupConfig) -> Result<Option<PathBuf>> {
+    match startup.distributed_config.as_deref() {
+        Some(path) => Ok(ClusterConfig::from_file(path)?.cluster.secret_file),
+        None => Ok(None),
+    }
+}
+
+/// Resolve the cluster secret a pipeline role needs, or `None` when the
+/// cluster config describes no pipeline (single-node and non-PP topologies
+/// need no secret). Fails closed: a pipeline depth of 2 or more with no
+/// secret from any source is a startup error naming every source (#2637).
+fn resolve_pipeline_cluster_auth(
+    sources: &ClusterSecretSources,
+    cluster_config: &ClusterConfig,
+) -> Result<Option<Arc<ClusterAuth>>> {
+    if cluster_config.cluster.pipeline_parallel_size <= 1 {
+        return Ok(None);
+    }
+    match sources.resolve()? {
+        Some(secret) => Ok(Some(Arc::new(ClusterAuth::new(&secret)))),
+        None => anyhow::bail!(
+            "distributed pipeline roles (pipeline_parallel_size = {}) require a cluster secret so \
+             stage connections and discovery beacons can be authenticated, and none was \
+             configured: {}",
+            cluster_config.cluster.pipeline_parallel_size,
+            crate::distributed::CLUSTER_SECRET_SOURCES_HELP
+        ),
+    }
+}
+
+/// The coordinator node of a pipeline cluster: the first node that is not a
+/// pipeline stage. Remote stages accept commands only from its address.
+fn pipeline_coordinator_address(cluster_config: &ClusterConfig) -> Result<String> {
+    cluster_config
+        .nodes
+        .iter()
+        .find(|node| !node.role.is_pipeline())
+        .map(|node| node.address.to_string())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cluster config defines pipeline_stage nodes but no coordinator node (a node \
+                 whose role is not a pipeline stage, for example `hybrid`)"
+            )
+        })
+}
+
 fn resolve_remote_pipeline_topology(
     startup: &ServerStartupConfig,
     cluster_config: &ClusterConfig,
     local_id: &str,
+    auth: Option<&Arc<ClusterAuth>>,
 ) -> Result<(
     Option<PipelineParallelRuntimeConfig>,
     Option<RemoteStageServiceConfig>,
@@ -2391,6 +2584,12 @@ fn resolve_remote_pipeline_topology(
     if pipeline_depth <= 1 {
         return Ok((None, None));
     }
+    let auth = auth.ok_or_else(|| {
+        anyhow::anyhow!(
+            "internal: remote pipeline topology resolved without a cluster secret; {}",
+            crate::distributed::CLUSTER_SECRET_SOURCES_HELP
+        )
+    })?;
     anyhow::ensure!(
         startup.pp_layers.is_none(),
         "remote pipeline startup is configured via cluster topology; remove --pp-layers"
@@ -2466,8 +2665,10 @@ fn resolve_remote_pipeline_topology(
                 transport_backend: cluster_config.cluster.transport_backend,
                 stage_assignment,
                 num_stages: pipeline_depth,
+                coordinator_peer: pipeline_coordinator_address(cluster_config)?,
                 upstream_peer,
                 downstream_peer,
+                auth: Arc::clone(auth),
             }),
         ));
     }
@@ -2489,6 +2690,8 @@ fn resolve_remote_pipeline_topology(
                 transport_backend: cluster_config.cluster.transport_backend,
                 bind_address: local_node.address.to_string(),
                 stage_timeout: std::time::Duration::from_secs(30),
+                auth: Arc::clone(auth),
+                vocab_size: crate::read_vocab_size(&startup.model_path),
             },
         )),
         None,
@@ -2561,37 +2764,201 @@ fn build_cluster_init_request(startup: &ServerStartupConfig) -> Result<ClusterIn
         static_peers: startup.cluster_peers.clone(),
         data_port_base,
         output_toml_path: startup.cluster_config_out.clone(),
+        secret_file: pp_auto_secret_file_reference(&ClusterSecretSources::from_env(
+            startup.cluster_secret_file.as_deref(),
+            None,
+        ))?,
     })
 }
 
-/// Run the zero-config bring-up path: resolve peers (static or
-/// mDNS broadcast), emit a deterministic cluster TOML, and rewrite the
-/// startup config so the downstream distributed resolution path sees a
-/// normal `distributed_config` + `node_id` tuple.
+/// The `[cluster] secret_file` the `--pp-auto` coordinator records in the
+/// generated TOML: the secret's file path made absolute against the current
+/// directory. `ClusterConfig::from_file` resolves a relative `secret_file`
+/// against the TOML's own directory (by default `./.mlxcel/`), so recording
+/// the path as typed on the command line (relative to the CWD) would send
+/// every reader of the TOML to the wrong file. `None` when the secret came
+/// from `MLXCEL_CLUSTER_SECRET` (no file to reference).
+fn pp_auto_secret_file_reference(sources: &ClusterSecretSources) -> Result<Option<PathBuf>> {
+    sources
+        .file_path()
+        .map(|path| {
+            std::path::absolute(path).with_context(|| {
+                format!(
+                    "failed to make the cluster secret file path {} absolute",
+                    path.display()
+                )
+            })
+        })
+        .transpose()
+}
+
+/// Resolve the secret the `--pp-auto` coordinator needs, or fail closed with
+/// an error naming every source. Called before any discovery socket is
+/// bound, so a coordinator without a secret never touches the network.
+fn resolve_pp_auto_cluster_auth(sources: &ClusterSecretSources) -> Result<ClusterAuth> {
+    let secret = sources.resolve()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--pp-auto requires a cluster secret so peers can be authenticated, and none was \
+             configured: {}",
+            crate::distributed::CLUSTER_SECRET_SOURCES_HELP
+        )
+    })?;
+    Ok(ClusterAuth::new(&secret))
+}
+
+/// Resolve the secret a `--pp-peer` process needs, or fail closed naming
+/// every source. Called before the assignment listener or the beacon socket
+/// is bound.
+fn resolve_pp_peer_cluster_auth(sources: &ClusterSecretSources) -> Result<ClusterAuth> {
+    let secret = sources.resolve()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--pp-peer requires a cluster secret so the coordinator's stage assignment can be \
+             authenticated, and none was configured: {}",
+            crate::distributed::CLUSTER_SECRET_SOURCES_HELP
+        )
+    })?;
+    Ok(ClusterAuth::new(&secret))
+}
+
+/// Stages reply to the coordinator's control address, so a loopback control
+/// address cannot serve a peer on another host. Checked right after
+/// discovery, before any assignment is pushed.
+fn ensure_peers_can_reach_control_addr(
+    control_addr: SocketAddr,
+    peers: &[SocketAddr],
+) -> Result<()> {
+    if !control_addr.ip().is_loopback() {
+        return Ok(());
+    }
+    let remote: Vec<String> = peers
+        .iter()
+        .filter(|peer| !peer.ip().is_loopback())
+        .map(ToString::to_string)
+        .collect();
+    anyhow::ensure!(
+        remote.is_empty(),
+        "coordinator control address {control_addr} is a loopback address but peer(s) {} are \
+         not; stages reply to the control address, so pass --cluster-control-addr \
+         <LAN-IP:PORT> or --host 0.0.0.0 (the control address defaults to the --host IP)",
+        remote.join(", ")
+    );
+    Ok(())
+}
+
+/// `--dry-run` plans a cluster and exits, which only a `--pp-auto`
+/// coordinator can do. A `--pp-peer` waiting for an assignment would commit
+/// one and then hit the dry-run bail, leaving the coordinator with a dead
+/// stage, so refuse the combination before any socket is bound.
+fn ensure_pp_peer_not_dry_run(startup: &ServerStartupConfig) -> Result<()> {
+    anyhow::ensure!(
+        !startup.dry_run,
+        "--dry-run cannot be combined with --pp-peer: a peer commits the stage assignment it \
+         receives and then exits, which would leave the coordinator with a dead stage; run \
+         --dry-run on the --pp-auto coordinator instead"
+    );
+    Ok(())
+}
+
+/// The listen address of a `--pp-peer` process: `--cluster-control-addr`,
+/// required with a concrete port in static mode (it must equal the
+/// coordinator's `--cluster-peers` entry), defaulting to `0.0.0.0:0` in mdns
+/// mode where the beacon advertises whatever port the OS assigns.
+fn resolve_pp_peer_listen_addr(
+    startup: &ServerStartupConfig,
+    discovery: ClusterDiscoveryMode,
+) -> Result<SocketAddr> {
+    match discovery {
+        ClusterDiscoveryMode::Static => startup
+            .cluster_control_addr
+            .filter(|addr| addr.port() != 0)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--pp-peer with --cluster-discovery=static requires --cluster-control-addr \
+                     <IP:PORT> with a concrete port: the coordinator's --cluster-peers entry for \
+                     this host must name the same address"
+                )
+            }),
+        _ => Ok(startup.cluster_control_addr.unwrap_or_else(|| {
+            SocketAddr::new(
+                crate::distributed::stage_assignment::unspecified_for(
+                    startup.cluster_discovery_target,
+                ),
+                0,
+            )
+        })),
+    }
+}
+
+/// Default output path for the cluster TOML a peer writes after its
+/// assignment: `.mlxcel/cluster-<node_id>.toml` under the current directory,
+/// so two peers on one host do not overwrite each other.
+fn default_peer_cluster_config_path(node_id: &str) -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".mlxcel")
+        .join(format!("cluster-{node_id}.toml"))
+}
+
+/// Run the zero-config bring-up path and rewrite the startup config so the
+/// downstream distributed resolution path sees a normal
+/// `distributed_config` + `node_id` tuple.
 ///
-/// Returns `Some(plan)` when the path was taken so the caller can honour
-/// `--dry-run`. Returns `None` for a no-op when neither `--pp-auto` nor
-/// `--pp-peer` is set.
+/// Coordinator (`--pp-auto N`): resolve N peers (static list or discovery
+/// beacons), plan the cluster, push and commit a stage assignment to every
+/// peer over the authenticated channel, then write the TOML. Peer
+/// (`--pp-peer`): listen on `--cluster-control-addr` (beaconing in mdns
+/// mode) until the coordinator commits an assignment, then write the
+/// received cluster to `--cluster-config-out`. `--distributed-config` with
+/// `--pp-peer` keeps the manual path: no assignment wait.
+///
+/// Returns `Some(plan)` on the coordinator so the caller can honour
+/// `--dry-run`; `None` otherwise.
 async fn run_zero_config_bring_up(
     startup: &mut ServerStartupConfig,
 ) -> Result<Option<ClusterInitPlan>> {
     if startup.pp_auto.is_some() {
         let request = build_cluster_init_request(startup)?;
+        // Fail closed before touching the network: the coordinator needs the
+        // secret for discovery beacons now and for stage connections later.
+        let auth = resolve_pp_auto_cluster_auth(&ClusterSecretSources::from_env(
+            startup.cluster_secret_file.as_deref(),
+            None,
+        ))?;
+        // Bind the receiver to the unspecified address: a UDP socket bound to
+        // a unicast IP does not receive datagrams sent to a broadcast
+        // address on Linux or macOS.
         let resolved_peers = crate::distributed::discover_peers(
             request.discovery,
             &request.cluster_name,
-            request.coordinator_control_addr.ip(),
+            crate::distributed::stage_assignment::unspecified_for(
+                request.coordinator_control_addr.ip(),
+            ),
             request.discovery_port,
             &request.static_peers,
             request.pp_stages as usize,
             request
                 .discovery_timeout
                 .unwrap_or(crate::distributed::DEFAULT_DISCOVERY_TIMEOUT),
+            Some(&auth),
         )
         .await?;
+        ensure_peers_can_reach_control_addr(request.coordinator_control_addr, &resolved_peers)?;
         let mut planned_request = request;
         planned_request.static_peers = resolved_peers;
         let plan = plan_cluster(&planned_request)?;
+
+        if startup.dry_run {
+            tracing::info!("--dry-run: planned the cluster without assigning stages to the peers");
+        } else {
+            crate::distributed::push_stage_assignments(
+                &plan,
+                planned_request.coordinator_control_addr,
+                &startup.model_path,
+                &auth,
+                crate::distributed::ASSIGNMENT_ACK_TIMEOUT,
+            )
+            .await?;
+        }
 
         let output_path = startup
             .cluster_config_out
@@ -2615,15 +2982,89 @@ async fn run_zero_config_bring_up(
     }
 
     if startup.pp_peer {
+        if startup.distributed_config.is_some() {
+            // Manual override: the operator copied the coordinator's TOML.
+            anyhow::ensure!(
+                startup.node_id.is_some(),
+                "--pp-peer with --distributed-config requires --node-id naming this host's \
+                 pipeline_stage node in the TOML; drop --distributed-config to receive the \
+                 assignment from the coordinator instead"
+            );
+            return Ok(None);
+        }
+        ensure_pp_peer_not_dry_run(startup)?;
+        let discovery = parse_discovery_mode(&startup.cluster_discovery)?;
+        let listen_addr = resolve_pp_peer_listen_addr(startup, discovery)?;
+        // Fail closed before any socket is bound.
+        let auth = resolve_pp_peer_cluster_auth(&ClusterSecretSources::from_env(
+            startup.cluster_secret_file.as_deref(),
+            None,
+        ))?;
+        let committed =
+            crate::distributed::await_stage_assignment(crate::distributed::PeerJoinConfig {
+                listen_addr,
+                discovery,
+                discovery_port: startup
+                    .cluster_discovery_port
+                    .unwrap_or(crate::distributed::DEFAULT_DISCOVERY_PORT),
+                discovery_target: startup.cluster_discovery_target,
+                cluster_name: startup
+                    .cluster_name
+                    .clone()
+                    .unwrap_or_else(|| "mlxcel-cluster".to_string()),
+                node_id_hint: startup.node_id.clone(),
+                model_dir: startup.model_path.clone(),
+                auth: Arc::new(auth),
+                assignment_timeout: crate::distributed::PEER_ASSIGNMENT_TIMEOUT,
+                commit_timeout: crate::distributed::ASSIGNMENT_COMMIT_TIMEOUT,
+            })
+            .await?;
+
+        // The assignment channel only commits `stage-<i>` ids; re-check here
+        // because the id becomes part of a file name on this host.
         anyhow::ensure!(
-            startup.distributed_config.is_some(),
-            "--pp-peer currently requires --distributed-config pointing at the coordinator-emitted cluster TOML. \
-             Future work will remove this once the coordinator push-assigns stages (follow-up)."
+            !committed.node_id.is_empty()
+                && committed
+                    .node_id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "coordinator assigned node id {:?}, which is not a plain identifier",
+            committed.node_id
         );
-        anyhow::ensure!(
-            startup.node_id.is_some(),
-            "--pp-peer requires --node-id so the coordinator can map this host to a pipeline stage"
+        let output_path = startup
+            .cluster_config_out
+            .clone()
+            .unwrap_or_else(|| default_peer_cluster_config_path(&committed.node_id));
+        if let Some(parent) = output_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create directory for cluster TOML: {parent:?}")
+            })?;
+        }
+        // Not `render_deterministic_toml`: its header promises a byte-identical
+        // file on rerunning the bring-up command, which is the coordinator's
+        // command, not this peer's (#2694).
+        let toml = crate::distributed::render_peer_assignment_toml(&committed.cluster);
+        std::fs::write(&output_path, toml)
+            .with_context(|| format!("failed to write received cluster TOML: {output_path:?}"))?;
+        if let Some(requested) = startup.node_id.as_deref()
+            && requested != committed.node_id
+        {
+            tracing::info!(
+                "--node-id {requested} overridden by the coordinator's assignment {}",
+                committed.node_id
+            );
+        }
+        tracing::info!(
+            "Stage assignment {} (stage {}) from coordinator {} written to {}",
+            committed.node_id,
+            committed.stage_index,
+            committed.coordinator_identity,
+            output_path.display()
         );
+        startup.distributed_config = Some(output_path);
+        startup.node_id = Some(committed.node_id);
     }
 
     Ok(None)
@@ -2640,8 +3081,13 @@ async fn resolve_distributed_startup(
             .as_deref()
             .or_else(|| cluster_config.nodes.first().map(|n| n.id.as_str()))
             .unwrap_or("node-0");
+        let sources = ClusterSecretSources::from_env(
+            startup.cluster_secret_file.as_deref(),
+            cluster_config.cluster.secret_file.as_deref(),
+        );
+        let auth = resolve_pipeline_cluster_auth(&sources, &cluster_config)?;
         let (pipeline_runtime, remote_stage_service) =
-            resolve_remote_pipeline_topology(startup, &cluster_config, local_id)?;
+            resolve_remote_pipeline_topology(startup, &cluster_config, local_id, auth.as_ref())?;
         let registry = crate::distributed::initialize_distributed(
             &cluster_config,
             local_id,
@@ -2694,6 +3140,79 @@ async fn resolve_distributed_startup(
     })
 }
 
+/// A stage service that runs on its own thread and must be joined before the
+/// process returns from `main`.
+///
+/// `exited` borrows the handle so the same value can be shut down after the
+/// select completes; `shutdown` consumes it because the join is the end of
+/// the service's life.
+trait StageServiceHandle: Send + 'static {
+    fn local_addr(&self) -> &str;
+    fn exited(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+    fn shutdown(self) -> Result<()>;
+}
+
+impl StageServiceHandle for RemoteStageServiceHandle {
+    fn local_addr(&self) -> &str {
+        RemoteStageServiceHandle::local_addr(self)
+    }
+
+    fn exited(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(RemoteStageServiceHandle::exited(self))
+    }
+
+    fn shutdown(self) -> Result<()> {
+        RemoteStageServiceHandle::shutdown(self)
+    }
+}
+
+/// Wait for the first of a shutdown signal or the stage service exiting on
+/// its own, then shut the service down and return the signal error if there
+/// was one.
+///
+/// The shutdown always runs, so a signal handler that cannot be installed
+/// does not leave the stage thread unjoined (`pure virtual method called` at
+/// exit on a CPU build, #2738). `RemoteStageServiceHandle::shutdown` joins
+/// that thread, so it runs on the blocking pool rather than on a tokio worker
+/// (#2745).
+async fn wait_for_stage_shutdown<H, S>(mut handle: H, signal: S) -> Result<()>
+where
+    H: StageServiceHandle,
+    S: std::future::Future<Output = std::io::Result<()>>,
+{
+    let local_addr = handle.local_addr().to_string();
+    let signal_result = tokio::select! {
+        signal = signal => {
+            match &signal {
+                Ok(()) => tracing::info!(
+                    "Shutting down remote pipeline stage service on {local_addr}"
+                ),
+                Err(err) => tracing::error!(
+                    "failed to wait for the shutdown signal on {local_addr}: {err}; shutting down"
+                ),
+            }
+            signal.context("failed to wait for shutdown signal")
+        }
+        _ = handle.exited() => {
+            tracing::error!(
+                "Remote pipeline stage service on {local_addr} exited on its own; shutting down"
+            );
+            Ok(())
+        }
+    };
+    let shutdown = tokio::task::spawn_blocking(move || handle.shutdown())
+        .await
+        .unwrap_or_else(|join_err| {
+            Err(anyhow::anyhow!(
+                "remote stage shutdown task failed: {join_err}"
+            ))
+        });
+    match signal_result {
+        Err(err) => Err(err),
+        Ok(()) => shutdown,
+    }
+}
+
 async fn serve_remote_pipeline_stage(service_config: RemoteStageServiceConfig) -> Result<()> {
     let bind_address = service_config.bind_address.clone();
     let stage_index = service_config.stage_assignment.stage_index;
@@ -2709,14 +3228,11 @@ async fn serve_remote_pipeline_stage(service_config: RemoteStageServiceConfig) -
         upstream,
         downstream
     );
-    tokio::signal::ctrl_c()
-        .await
-        .context("failed to wait for shutdown signal")?;
-    tracing::info!(
-        "Shutting down remote pipeline stage service on {}",
-        handle.local_addr()
-    );
-    handle.shutdown()
+    // A service that dies on its own (a neighbour rejected the cluster
+    // handshake, the model failed to load, the transport closed) must take
+    // the process down with its error instead of parking here as a zombie a
+    // supervisor would never restart (#2637).
+    wait_for_stage_shutdown(handle, tokio::signal::ctrl_c()).await
 }
 
 /// Install the configured `--surgery <FILE>` YAML pipeline into the
@@ -2891,11 +3407,45 @@ pub(super) fn resolve_prompt_cache_store(
     }
 }
 
+/// Log the lines that were collected before a subscriber existed
+/// ([`ServerStartupConfig::startup_notices`], #2697), each at its own level
+/// (#2722). Called by [`start_server`] right after
+/// [`initialize_server_logging`], ahead of the router-mode branch, so both
+/// router and single-model servers report an invalid or overridden
+/// environment variable.
+pub(crate) fn log_startup_notices(startup: &ServerStartupConfig) {
+    for notice in &startup.startup_notices {
+        match notice.level {
+            super::StartupNoticeLevel::Info => tracing::info!("{}", notice.message),
+            super::StartupNoticeLevel::Warn => tracing::warn!("{}", notice.message),
+            super::StartupNoticeLevel::Error => tracing::error!("{}", notice.message),
+        }
+    }
+}
+
 /// Start the server with the given startup configuration.
 ///
 /// Shared entry point used by both `mlxcel serve` and `mlxcel-server`.
 pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     initialize_server_logging(&startup)?;
+    log_startup_notices(&startup);
+
+    // `--image-model` with no `-m` (#2825): no chat checkpoint exists, so
+    // `model_path` is empty. Every consumer of it below is either skipped or
+    // guarded so the router branch, model facts and media detection cannot
+    // read the working directory in place of a checkpoint.
+    let image_only =
+        startup.embedding_serving_mode == crate::server::config::EmbeddingServingMode::ImageOnly;
+    if image_only {
+        // The tensor- and pipeline-parallel planners read the chat checkpoint
+        // to derive a shard plan, and there is none here. Refuse rather than
+        // silently start a single-rank server.
+        anyhow::ensure!(
+            startup.tp_size == 1 && startup.pp_layers.is_none() && startup.pp_auto.is_none(),
+            "tensor and pipeline parallelism require a chat model loaded with -m; \
+             --image-model without -m serves image generation only"
+        );
+    }
 
     // Vertex AI (GCP) custom-container compat (b10621, #1456): resolved
     // purely from the AIP_* environment variables, before anything binds or
@@ -2981,12 +3531,9 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         check_sampler_order(startup.samplers.as_deref(), startup.sampler_seq.as_deref())?;
 
     // issue #1350: the KV cache mode was resolved against the model family in
-    // `into_startup_config`, which runs before the subscriber above exists.
-    // Report the substitution now, so the log states the mode the caches are
-    // really built with rather than the one that was asked for.
-    for notice in &startup.kv_cache_mode_notices {
-        tracing::warn!("{notice}");
-    }
+    // `into_startup_config`, which runs before the subscriber exists; any
+    // substitution was already reported by `log_startup_notices`, so this
+    // line states the mode the caches are really built with.
     tracing::info!(
         kv_cache_mode = %startup.kv_cache_mode,
         kv_bits = startup.batch_kv_quant.bits,
@@ -2999,10 +3546,11 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     // wiring); the chat provider skips its worker for this model type, the
     // text warmup is skipped, and the chat routes answer 501 naming the
     // socket.
-    let is_voicechat = matches!(
-        crate::models::get_model_type(&startup.model_path),
-        Ok(crate::models::ModelType::NemotronVoiceChat)
-    );
+    let is_voicechat = !image_only
+        && matches!(
+            crate::models::get_model_type(&startup.model_path),
+            Ok(crate::models::ModelType::NemotronVoiceChat)
+        );
 
     // Issue #688 (M1/M2 hardening): disable CUDA graph capture for hazard-family
     // models (Gemma 4) here, on the main startup thread, before any generation or
@@ -3018,8 +3566,10 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     // `serve_remote_pipeline_stage` branch below) all load `startup.model_path`.
     // Unaffected model families and an explicit `MLX_USE_CUDA_GRAPHS` operator
     // override are left untouched.
-    crate::loading::maybe_disable_cuda_graphs_for_model_for_path(&startup.model_path);
-    validate_muse_glimmer_unsupported_startup(&startup)?;
+    if !image_only {
+        crate::loading::maybe_disable_cuda_graphs_for_model_for_path(&startup.model_path);
+        validate_muse_glimmer_unsupported_startup(&startup)?;
+    }
 
     super::media::configure_image_input_limits(super::media::ImageInputLimits {
         max_payload_bytes: startup.max_image_payload_size,
@@ -3040,6 +3590,7 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     // Zero-config multi-machine pipeline bring-up. Runs before
     // the tensor-parallel / pipeline-parallel validators so the emitted TOML
     // passes through the existing distributed resolution path unchanged.
+    ServerDistributedFlags::from(&startup).ensure_supported()?;
     let zero_config_plan = run_zero_config_bring_up(&mut startup).await?;
     if startup.dry_run {
         if let Some(plan) = zero_config_plan.as_ref() {
@@ -3076,7 +3627,11 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
 
     validate_parallel_context_startup(&startup)?;
     validate_pipeline_parallel_startup(&startup)?;
-    let tp_support = resolve_tensor_parallel_runtime_support(&startup)?;
+    let tp_support = if image_only {
+        None
+    } else {
+        Some(resolve_tensor_parallel_runtime_support(&startup)?)
+    };
 
     // One line naming what the context and batch flags actually resolved to.
     // Until #1450 none of these was logged anywhere: `--ctx-size` reached a
@@ -3168,6 +3723,9 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
                 "{summary}"
             );
         }
+        // What MLX reads for the variables written at startup, including the
+        // graph capture switch `start_server` wrote above (#2803).
+        mlxcel_core::native_env::log_effective_native_env();
     }
 
     // Invalid explicit request caps fail startup, rather than silently disabling admission.
@@ -3214,10 +3772,27 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         );
     }
 
+    // Disaggregated roles fail closed without a cluster secret (#2655),
+    // before any peer probe, listener bind, or weight load. `Hybrid` (the
+    // single-node default) resolves to `None` without reading any source.
+    let serving_mode = resolve_serving_mode(&startup);
+    let toml_secret_file = match serving_mode {
+        crate::distributed::disaggregated::ServingMode::Hybrid => None,
+        _ => toml_cluster_secret_file(&startup)?,
+    };
+    let cluster_auth = resolve_disaggregated_cluster_auth(
+        &ClusterSecretSources::from_env(
+            startup.cluster_secret_file.as_deref(),
+            toml_secret_file.as_deref(),
+        ),
+        serving_mode,
+    )?;
+
     // -- Distributed mode initialization --
     let distributed = resolve_distributed_startup(&startup).await?;
 
     let mut config = build_server_config(&startup, api_keys);
+    config.cluster_auth = cluster_auth;
 
     // Vertex AI compat routes (#1456): recorded on the config so the router
     // mounts them, and the predict path is refused now, before the model
@@ -3234,7 +3809,9 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     config.pipeline_parallel_runtime = distributed
         .pipeline_runtime
         .or(config.pipeline_parallel_runtime.take());
-    config.no_batch |= tp_support.force_no_batch;
+    if let Some(tp_support) = tp_support {
+        config.no_batch |= tp_support.force_no_batch;
+    }
     if config.tensor_parallel.tp_size > 1 {
         if config.no_batch {
             tracing::info!(
@@ -3269,7 +3846,18 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     if let Some(service_config) = distributed.remote_stage_service {
         return serve_remote_pipeline_stage(service_config).await;
     }
-    let (tokenizer, chat_template) = load_chat_front(&startup)?;
+    // Image-only serving has no checkpoint for a tokenizer or a chat template;
+    // every route that would read them refuses in this mode (#2825). The
+    // router branch below is unreachable here because a router selector is a
+    // startup error alongside `--image-model` without `-m`.
+    let (tokenizer, chat_template) = if image_only {
+        (
+            crate::tokenizer::MlxcelTokenizer::empty(),
+            ChatTemplateProcessor::default(),
+        )
+    } else {
+        load_chat_front(&startup)?
+    };
 
     // `--dry-sequence-breaker` carries b10621's string value domain since
     // #1485; the effective set (default set, replacement values, or the
@@ -3290,10 +3878,19 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         let addr = config.serving_bind.ok_or_else(|| {
             anyhow::anyhow!("the router (--node-role router) requires --serving-bind <host:port>")
         })?;
+        // The router's role transport authenticates every connection with
+        // the cluster secret (#2655); `cluster_auth` is `Some` here because
+        // the resolver above fails closed for the router role, and
+        // `RouterState::build` enforces it again by refusing a transport bound
+        // without the secret. The pool's router profile keeps a refused
+        // connect to a dead prefill node from delaying failover by the
+        // default backoff (#2712).
         let transport = std::sync::Arc::new(
             crate::distributed::tcp_transport::TcpTransport::bind(
                 crate::distributed::tcp_transport::TcpTransportConfig {
                     bind_address: addr.to_string(),
+                    auth: config.cluster_auth.clone(),
+                    pool_config: crate::distributed::connection_pool::PoolConfig::router(),
                     ..Default::default()
                 },
             )
@@ -3338,22 +3935,189 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     let batch_metrics = Arc::new(BatchMetrics::new());
     let batch_observability = Arc::new(BatchObservability::new());
 
-    let prompt_cache_store =
-        resolve_prompt_cache_store(&mut config, &startup.model_path, &batch_metrics);
+    // The id an image-only server answers to: the first `--alias` entry, else
+    // the image checkpoint's directory name. The chat provider, `AppState`'s
+    // display id and the image provider all report this one value (#2825).
+    let served_image_id = startup.model_alias.clone().unwrap_or_else(|| {
+        startup
+            .image_model_path
+            .as_deref()
+            .map(side_model_id_for_path)
+            .unwrap_or_default()
+    });
+
+    let prompt_cache_store = if image_only {
+        // No chat worker exists to donate or adopt a prefix (#2825).
+        None
+    } else {
+        resolve_prompt_cache_store(&mut config, &startup.model_path, &batch_metrics)
+    };
 
     // `--timeout` is validated inside `new_with_server_config_and_prompt_cache` and
     // the resolved `Duration` is stashed on `ModelProvider`, where it flows into the drain loops.
     // A zero value triggers a logged warning and falls back to the 300 s default.
-    let model_provider = Arc::new(ModelProvider::new_with_server_config_and_prompt_cache(
-        startup.model_path.clone(),
-        startup.adapter_path.clone(),
-        &config,
-        prompt_cache_store.clone(),
-        batch_metrics.clone(),
-        batch_observability.clone(),
-    )?);
+    let model_provider = Arc::new(if image_only {
+        ModelProvider::new_without_chat_model_for_image(
+            served_image_id.clone(),
+            "Chat generation is disabled: this server was started with --image-model and no -m \
+             and serves only /v1/images/generations and /v1/images/edits"
+                .to_string(),
+            &config,
+            batch_metrics.clone(),
+            batch_observability.clone(),
+        )?
+    } else {
+        ModelProvider::new_with_server_config_and_prompt_cache(
+            startup.model_path.clone(),
+            startup.adapter_path.clone(),
+            &config,
+            prompt_cache_store.clone(),
+            batch_metrics.clone(),
+            batch_observability.clone(),
+        )?
+    });
 
-    if startup.warmup {
+    // From here on the worker owns a model (or is loading one). Every exit
+    // below, the side-model resolution errors included, goes through the join
+    // inside `serve_with_model_provider`, which shuts down the side workers
+    // first and then this chat worker, so the process never returns from
+    // `main` while a worker still frees MLX state (#2738, #2745).
+    serve_with_model_provider(
+        startup,
+        ChatServeInputs {
+            config,
+            is_voicechat,
+            chat_template,
+            tokenizer,
+            batch_metrics,
+            batch_observability,
+            prompt_cache_store,
+            webui_policy,
+            model_provider,
+        },
+    )
+    .await
+}
+
+/// What `start_server` has resolved by the time the chat model worker exists,
+/// handed to [`serve_with_model_provider`] as one value.
+struct ChatServeInputs {
+    config: ServerConfig,
+    is_voicechat: bool,
+    chat_template: ChatTemplateProcessor,
+    tokenizer: crate::tokenizer::MlxcelTokenizer,
+    batch_metrics: Arc<BatchMetrics>,
+    batch_observability: Arc<BatchObservability>,
+    prompt_cache_store: Option<Arc<crate::server::prompt_cache::PromptCacheStore>>,
+    #[cfg(feature = "webui")]
+    webui_policy: Option<super::webui::security::WebUiSecurityPolicy>,
+    #[cfg(not(feature = "webui"))]
+    webui_policy: Option<()>,
+    model_provider: Arc<ModelProvider>,
+}
+
+/// The second half of `start_server`: warmup, side models, `AppState` and the
+/// listener.
+///
+/// Every return, the `?` early exits included, reaches the exit join below.
+/// The side models are registered in `side_workers` as they are created, so a
+/// resolution error after an earlier side worker loaded still shuts that
+/// worker down before the chat worker (#2745).
+async fn serve_with_model_provider(
+    startup: ServerStartupConfig,
+    inputs: ChatServeInputs,
+) -> Result<()> {
+    let model_provider_for_exit = Arc::clone(&inputs.model_provider);
+    let mut side_workers = Vec::new();
+    let served = serve_with_side_model_workers(startup, inputs, &mut side_workers).await;
+    join_model_workers_before_exit(
+        side_workers,
+        model_provider_for_exit,
+        served,
+        super::WORKER_EXIT_TIMEOUT,
+    )
+    .await
+}
+
+/// A side worker whose thread must be joined before the process exits.
+///
+/// The closure owns one `Arc` clone of the provider, so the worker outlives
+/// the `AppState` that also holds it and `shutdown_and_wait` can run after
+/// the HTTP server has stopped.
+struct SideWorkerExit {
+    name: &'static str,
+    shutdown: Box<dyn FnOnce(std::time::Duration) -> Result<()> + Send>,
+}
+
+impl SideWorkerExit {
+    fn new<P>(name: &'static str, provider: P) -> Self
+    where
+        P: SideWorkerProvider,
+    {
+        Self {
+            name,
+            shutdown: Box::new(move |timeout| provider.shutdown_and_wait(timeout)),
+        }
+    }
+}
+
+/// The one operation the exit path needs from a side provider, so audio,
+/// embedding, image, rerank and realtime providers share one collector.
+trait SideWorkerProvider: Send + 'static {
+    fn shutdown_and_wait(self, timeout: std::time::Duration) -> Result<()>;
+}
+
+impl SideWorkerProvider for Arc<dyn crate::server::audio_model::AudioModelProvider> {
+    fn shutdown_and_wait(self, timeout: std::time::Duration) -> Result<()> {
+        self.as_ref().shutdown_and_wait(timeout)
+    }
+}
+
+impl SideWorkerProvider for Arc<dyn crate::server::embedding_model::EmbeddingModelProvider> {
+    fn shutdown_and_wait(self, timeout: std::time::Duration) -> Result<()> {
+        self.as_ref().shutdown_and_wait(timeout)
+    }
+}
+
+impl SideWorkerProvider for Arc<dyn crate::server::image_model::ImageModelProvider> {
+    fn shutdown_and_wait(self, timeout: std::time::Duration) -> Result<()> {
+        self.as_ref().shutdown_and_wait(timeout)
+    }
+}
+
+impl SideWorkerProvider for Arc<dyn crate::server::rerank_model::RerankModelProvider> {
+    fn shutdown_and_wait(self, timeout: std::time::Duration) -> Result<()> {
+        self.as_ref().shutdown_and_wait(timeout)
+    }
+}
+
+impl SideWorkerProvider for Arc<crate::server::realtime_engine::RealtimeVoiceChatEngine> {
+    fn shutdown_and_wait(self, timeout: std::time::Duration) -> Result<()> {
+        self.as_ref().shutdown_and_wait(timeout)
+    }
+}
+
+async fn serve_with_side_model_workers(
+    startup: ServerStartupConfig,
+    inputs: ChatServeInputs,
+    side_workers: &mut Vec<SideWorkerExit>,
+) -> Result<()> {
+    let ChatServeInputs {
+        config,
+        is_voicechat,
+        chat_template,
+        tokenizer,
+        batch_metrics,
+        batch_observability,
+        prompt_cache_store,
+        webui_policy,
+        model_provider,
+    } = inputs;
+    let image_only =
+        config.embedding_serving_mode == crate::server::config::EmbeddingServingMode::ImageOnly;
+    // Warmup generates a chat token, and image-only has no chat worker to run
+    // it on (#2825).
+    if startup.warmup && !image_only {
         run_startup_warmup(&startup.model_path, model_provider.as_ref());
     }
 
@@ -3446,7 +4210,11 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         } else {
             config.audio_request_timeout_secs
         });
-    let audio_model: Option<Arc<dyn crate::server::audio_model::AudioModelProvider>> =
+    let audio_model: Option<Arc<dyn crate::server::audio_model::AudioModelProvider>> = if image_only
+    {
+        // Empty model path: no checkpoint to classify (#2825).
+        None
+    } else {
         match crate::models::get_model_type(&startup.model_path) {
             Ok(crate::models::ModelType::Whisper) => {
                 tracing::info!(
@@ -3483,7 +4251,11 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
                 }
             }
             _ => None,
-        };
+        }
+    };
+    if let Some(provider) = &audio_model {
+        side_workers.push(SideWorkerExit::new("audio", Arc::clone(provider)));
+    }
 
     // Realtime VoiceChat wiring (#1376): load the checkpoint on the engine's
     // own thread and block until it is ready, so `/health` is truthful once
@@ -3508,6 +4280,9 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     } else {
         None
     };
+    if let Some(engine) = &realtime_engine {
+        side_workers.push(SideWorkerExit::new("realtime", Arc::clone(engine)));
+    }
 
     // Embedding wiring (#1353): `--embedding-model` loads a second checkpoint
     // on its own worker thread; without it, an `-m` that detects as an
@@ -3552,16 +4327,33 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     // choice into this one.
     crate::embeddings::set_pooling_override(startup.pooling);
     let embedding_model = resolve_embedding_provider(&startup, &config, &served_chat_id)?;
+    if let Some(provider) = &embedding_model {
+        side_workers.push(SideWorkerExit::new("embedding", Arc::clone(provider)));
+    }
+    // `--image-model` is an explicit side model: failing to load it is fatal,
+    // so a command line that asked for image routes never serves 501 for them.
+    let image_model = resolve_image_provider(&startup)?;
+    if let Some(provider) = &image_model {
+        side_workers.push(SideWorkerExit::new("image", Arc::clone(provider)));
+    }
     // Rerank wiring (#1356) follows the same rule, with one addition: a
     // generative reranker's checkpoint is indistinguishable from a chat
     // model's, so `--reranker-model` is the only way to reach it and naming
     // the same path in `-m` and `--reranker-model` loads it once on the rerank
     // worker instead of being an error.
     let rerank_model = resolve_rerank_provider(&startup, &config, &served_chat_id)?;
+    if let Some(provider) = &rerank_model {
+        side_workers.push(SideWorkerExit::new("rerank", Arc::clone(provider)));
+    }
     // A mode flag that resolved no worker is a command line that cannot do
     // what it asked for, so it fails here rather than answering 501 to every
     // request for the life of the process (#1452).
-    check_serving_mode(&config, embedding_model.is_some(), rerank_model.is_some())?;
+    check_serving_mode(
+        &config,
+        embedding_model.is_some(),
+        rerank_model.is_some(),
+        image_model.is_some(),
+    )?;
 
     let state = AppState::with_observability(
         model_provider,
@@ -3580,6 +4372,7 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     .with_conversation_store(conversation_store)
     .with_audio_model(audio_model)
     .with_embedding_model(embedding_model)
+    .with_image_model(image_model)
     .with_rerank_model(rerank_model)
     .with_realtime_engine(realtime_engine);
     #[cfg(feature = "webui")]
@@ -3591,6 +4384,120 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     };
 
     serve_http(&startup, app).await
+}
+
+/// Join the side workers and then the chat model worker before
+/// `start_server` returns (#2738, #2745).
+///
+/// The side workers run first, each with whatever remains of `timeout`, so
+/// one deadline covers the whole teardown. A side-worker shutdown failure is
+/// logged with `warn!` and never replaces the error that ended serving: a
+/// side model was optional, and reporting it instead of the real failure
+/// (a bind error, an unloadable `--image-model`) would hide why the process
+/// is exiting. The chat worker is joined next by
+/// [`join_model_worker_before_exit`], which owns the error precedence.
+async fn join_model_workers_before_exit(
+    side_workers: Vec<SideWorkerExit>,
+    model_provider: Arc<ModelProvider>,
+    served: Result<()>,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    if !side_workers.is_empty() {
+        let side_join = tokio::task::spawn_blocking(move || {
+            let mut all_exited = true;
+            for worker in side_workers {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                match (worker.shutdown)(remaining) {
+                    Ok(()) => {}
+                    Err(ref err) => {
+                        all_exited = false;
+                        tracing::warn!(
+                            worker = worker.name,
+                            "side model worker did not exit cleanly before process exit: {err:#}"
+                        );
+                    }
+                }
+            }
+            all_exited
+        })
+        .await;
+        match side_join {
+            Ok(true) => tracing::info!("side model workers exited before process exit"),
+            Ok(false) => {}
+            Err(join_err) => {
+                tracing::warn!("side model worker shutdown task failed: {join_err}");
+            }
+        }
+    }
+    let remaining = timeout.saturating_sub(started.elapsed());
+    join_model_worker_before_exit(model_provider, served, remaining).await
+}
+
+/// Join the chat model worker before `start_server` returns (#2738).
+///
+/// `serve_http` returns only once the listener is gone (a bind or TLS error,
+/// or the accept loop ending), and the side-model resolution steps can fail
+/// while the chat worker is still loading. Either way the worker may still
+/// hold the model, and returning from `main` would run the C runtime's static
+/// destructors while the worker frees MLX arrays on its own thread, which
+/// aborts with `pure virtual method called` on the CPU backend. The wait runs
+/// on the blocking pool so it does not stall the HTTP runtime's workers. The
+/// error that ended serving is logged before the wait starts, so a bind or
+/// TLS failure during a long model load reads as a failure in the log rather
+/// than a silent wait; it is still returned unchanged for `main` to print. A
+/// shutdown failure is logged and never replaces that error.
+///
+/// `timeout` is the whole budget for this join; callers pass
+/// [`super::WORKER_EXIT_TIMEOUT`]. Model load has no cancellation point, so a
+/// timeout means the worker is still running: the `warn!` and the returned
+/// error say so, and that a CPU build may abort with `pure virtual method
+/// called` at exit if the worker does not finish first.
+async fn join_model_worker_before_exit(
+    model_provider: Arc<ModelProvider>,
+    served: Result<()>,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    if let Err(ref err) = served {
+        tracing::error!("server stopped: {err:#}; waiting for the model worker to exit");
+    }
+    let shutdown = tokio::task::spawn_blocking(move || model_provider.shutdown_and_wait(timeout))
+        .await
+        .unwrap_or_else(|join_err| {
+            Err(anyhow::anyhow!(
+                "model worker shutdown task failed: {join_err}"
+            ))
+        });
+    let timed_out = shutdown
+        .as_ref()
+        .err()
+        .and_then(|err| err.downcast_ref::<super::model_provider::WorkerShutdownError>())
+        .is_some_and(|err| {
+            matches!(
+                err,
+                super::model_provider::WorkerShutdownError::Timeout { .. }
+            )
+        });
+    let shutdown = if timed_out {
+        let err = shutdown
+            .err()
+            .unwrap_or_else(|| unreachable!("checked above"));
+        Err(anyhow::anyhow!(
+            "{err:#}; the model worker is still running, and a CPU build may abort with `pure virtual method called` at exit"
+        ))
+    } else {
+        shutdown
+    };
+    match shutdown {
+        Ok(()) => tracing::info!("model worker exited before process exit"),
+        Err(ref err) => {
+            tracing::warn!("model worker did not exit cleanly before process exit: {err:#}")
+        }
+    }
+    match (served, shutdown) {
+        (Ok(()), shutdown) => shutdown,
+        (Err(err), _) => Err(err),
+    }
 }
 
 /// Refuse a `--embeddings` / `--reranking` command line that resolved no
@@ -3605,12 +4512,14 @@ pub(crate) fn check_serving_mode(
     config: &ServerConfig,
     has_embedding: bool,
     has_rerank: bool,
+    has_image: bool,
 ) -> Result<()> {
     use crate::server::config::EmbeddingServingMode;
     match config.embedding_serving_mode {
         EmbeddingServingMode::Any => Ok(()),
         EmbeddingServingMode::EmbeddingOnly if has_embedding => Ok(()),
         EmbeddingServingMode::RerankOnly if has_rerank => Ok(()),
+        EmbeddingServingMode::ImageOnly if has_image => Ok(()),
         EmbeddingServingMode::EmbeddingOnly => anyhow::bail!(
             "--embeddings restricts this server to embedding requests, but no embedding \
              checkpoint was loaded: pass an embedding checkpoint to -m, or name one with \
@@ -3622,6 +4531,10 @@ pub(crate) fn check_serving_mode(
              pass a sequence-classifier checkpoint to -m, or name a reranker with \
              --reranker-model <path>. The Qwen3 and Qwen3-VL generative rerankers are only \
              reachable through --reranker-model."
+        ),
+        EmbeddingServingMode::ImageOnly => anyhow::bail!(
+            "--image-model without -m restricts this server to image generation, but no image \
+             checkpoint was loaded: pass --image-model <path> (or set MLXCEL_IMAGE_MODEL)."
         ),
     }
 }
@@ -3643,8 +4556,12 @@ pub(crate) fn resolve_embedding_source(
     model_path: &Path,
     embedding_model_path: Option<&Path>,
 ) -> Result<EmbeddingSource> {
-    let primary_is_embedding = crate::models::get_model_type(model_path)
-        .is_ok_and(crate::model_metadata::is_embedding_model_type);
+    // An empty model path (image-only serving, #2825) names no primary
+    // checkpoint, and `get_model_type` would otherwise read the working
+    // directory.
+    let primary_is_embedding = !model_path.as_os_str().is_empty()
+        && crate::models::get_model_type(model_path)
+            .is_ok_and(crate::model_metadata::is_embedding_model_type);
     match (embedding_model_path, primary_is_embedding) {
         (Some(explicit), true) => anyhow::bail!(
             "two embedding models: -m {} is an embedding checkpoint and --embedding-model {} \
@@ -3669,6 +4586,53 @@ fn side_model_id_for_path(path: &Path) -> String {
         .filter(|name| !name.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Spawn the image worker for `--image-model`, if given.
+///
+/// The checkpoint is classified from its JSON metadata and built on the worker
+/// thread. An unrecognized directory, a family this build cannot run, and a load
+/// failure are all startup errors.
+fn resolve_image_provider(
+    startup: &ServerStartupConfig,
+) -> Result<Option<Arc<dyn crate::server::image_model::ImageModelProvider>>> {
+    let Some(path) = startup.image_model_path.as_deref() else {
+        return Ok(None);
+    };
+    // Image-only serving reports the first `--alias` entry as the served id;
+    // the two-model shape keeps the checkpoint's directory name (#2825).
+    let model_id = if startup.embedding_serving_mode
+        == crate::server::config::EmbeddingServingMode::ImageOnly
+    {
+        startup
+            .model_alias
+            .clone()
+            .unwrap_or_else(|| side_model_id_for_path(path))
+    } else {
+        side_model_id_for_path(path)
+    };
+    tracing::info!(
+        path = %path.display(),
+        model_id = %model_id,
+        "Loading image model for /v1/images/generations and /v1/images/edits"
+    );
+    let provider = crate::server::image_worker::ImageWorkerProvider::load(
+        path,
+        model_id,
+        crate::server::image_worker::DEFAULT_IMAGE_QUEUE_DEPTH,
+        std::time::Duration::from_secs(
+            crate::server::image_worker::DEFAULT_IMAGE_REQUEST_TIMEOUT_SECS,
+        ),
+    )
+    .with_context(|| format!("failed to load --image-model {}", path.display()))?;
+    let info = provider.info();
+    tracing::info!(
+        family = info.family,
+        supports_edit = info.supports_edit,
+        size_multiple = info.size_multiple,
+        "Image model ready on /v1/images/generations"
+    );
+    Ok(Some(Arc::new(provider)))
 }
 
 /// Spawn the embedding worker for the resolved source, if any.
@@ -3761,8 +4725,12 @@ pub(crate) fn resolve_rerank_source(
     model_path: &Path,
     reranker_model_path: Option<&Path>,
 ) -> Result<RerankSource> {
-    let primary_is_reranker = crate::models::get_model_type(model_path)
-        .is_ok_and(crate::model_metadata::is_reranker_model_type);
+    // An empty model path (image-only serving, #2825) names no primary
+    // checkpoint, and `get_model_type` would otherwise read the working
+    // directory.
+    let primary_is_reranker = !model_path.as_os_str().is_empty()
+        && crate::models::get_model_type(model_path)
+            .is_ok_and(crate::model_metadata::is_reranker_model_type);
     match (reranker_model_path, primary_is_reranker) {
         // The same directory in both flags is the rerank-only shape: `-m` is
         // required, and a generative reranker is only reachable through

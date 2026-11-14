@@ -24,6 +24,8 @@ pub mod distributed;
 pub mod downloader;
 pub mod embeddings;
 pub mod execution;
+pub mod http_tls;
+pub mod imagegen;
 pub mod lang_bias;
 pub mod lora;
 pub mod models;
@@ -31,8 +33,10 @@ pub mod multimodal;
 pub mod reasoning_display;
 pub mod rerank;
 pub mod server;
+pub(crate) mod sha256_hex;
 #[cfg(feature = "surgery")]
 pub mod surgery;
+pub mod token_classification;
 pub mod tokenizer;
 pub mod vision;
 
@@ -76,9 +80,6 @@ pub use execution::runtime::{
 pub use execution::sampling;
 pub use mlxcel_core::generate;
 pub use mlxcel_core::generate::{GenerationStats, LanguageModel, SamplingConfig};
-// Deprecated with the classic draft-model loop (#2176), removed in v0.8.0.
-#[allow(deprecated)]
-pub use mlxcel_core::speculative::SpeculativeGenerator;
 pub use mlxcel_core::speculative::prompt_lookup::{
     DraftPolicy, PromptLookupConfig, prompt_lookup_unsupported_reason, supports_prompt_lookup,
 };
@@ -153,7 +154,7 @@ pub use loading::{
 pub use loading::{
     context_window_from_config, load_model, load_model_with_adapter, load_model_with_adapter_specs,
     load_model_with_tensor_parallel, load_qwen3_omni_speech, read_eos_token_ids,
-    read_generation_config_defaults, read_model_context_window,
+    read_generation_config_defaults, read_model_context_window, read_vocab_size,
 };
 
 /// Pin f32 GEMMs to full precision for this test process (issues #1065,

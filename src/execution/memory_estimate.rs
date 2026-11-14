@@ -38,6 +38,12 @@
 //!   `MLX_ROCM_MAX_INFLIGHT_MB` budget the ROCm backend lets committed but
 //!   unfinished command batches hold, parsed by
 //!   [`rocm_inflight_reserve_bytes`]. Every other build adds 0.
+//! - **Host shadows** (Windows ROCm builds only, issue #2643) — the pinned
+//!   host copies the allocator keeps for GPU buffers the CPU touches, sized by
+//!   [`rocm_host_shadow_reserve_bytes`]. They draw from the RAM Windows sees,
+//!   not from device memory, so the term is compared against
+//!   `GlobalMemoryStatusEx` on its own (`host_shadow_fits`) instead of being
+//!   added to `total_bytes`; `fits` requires both. Every other build adds 0.
 //!
 //! The result feeds three callers that all use this exact function:
 //!
@@ -49,7 +55,8 @@
 //!
 //! On Linux/CPU MLX returns zero for most allocator metrics, so the
 //! "available unified memory" figure on Linux falls back to OS RAM via
-//! `/proc/meminfo::MemAvailable`. On Apple Silicon it uses the cached
+//! `/proc/meminfo::MemAvailable` (on Windows, `GlobalMemoryStatusEx`). On
+//! Apple Silicon it uses the cached
 //! `HardwareCapabilities::unified_memory_gb` value (sysctl `hw.memsize`).
 //!
 //! Used by: `mlxcel inspect`, `mlxcel generate`, `mlxcel serve`,
@@ -354,18 +361,34 @@ pub struct MemoryEstimate {
     /// [`Self::runtime_headroom_bytes`]; surfaced separately for `mlxcel
     /// inspect`.
     pub backend_inflight_bytes: u64,
+    /// Pinned host bytes the Windows ROCm allocator's host shadows can hold
+    /// for this load (issue #2643): per sequence, one f32 logits row plus the
+    /// int32 token ids of the context, see [`rocm_host_shadow_reserve_bytes`].
+    /// Shadows are `hipHostMalloc` memory bounded by the RAM Windows sees, not
+    /// by the device limit `available_bytes` reflects, so this term is **not**
+    /// part of `total_bytes`; it has its own comparison in
+    /// [`Self::host_shadow_fits`]. 0 on Linux and on every other backend.
+    pub host_shadow_bytes: u64,
+    /// The RAM the shadows draw from: available physical memory from
+    /// `GlobalMemoryStatusEx`. 0 when there is no shadow term or the query
+    /// failed.
+    pub host_ram_available_bytes: u64,
+    /// `host_shadow_bytes <= host_ram_available_bytes`, or `true` when there is
+    /// no shadow term. Folded into [`Self::fits`].
+    pub host_shadow_fits: bool,
     /// `weights + kv_cache + runtime_headroom`.
     pub total_bytes: u64,
     /// Best-known available unified memory in bytes. On Apple Silicon
     /// this is `HardwareCapabilities::unified_memory_gb << 30`. On
     /// Linux/CUDA it falls back to `/proc/meminfo::MemAvailable` (or
-    /// `MemTotal` when the former is missing). On any platform a
+    /// `MemTotal` when the former is missing), and on Windows to
+    /// `GlobalMemoryStatusEx`'s available physical memory. On any platform a
     /// nonzero `MLXCEL_MEMORY_LIMIT` / MLX allocator soft limit caps
     /// this figure — the preflight is meaningful even with no OS
     /// query because operators can pin a budget explicitly.
     pub available_bytes: u64,
-    /// `total_bytes <= available_bytes`. The preflight uses this
-    /// directly.
+    /// `total_bytes <= available_bytes` and [`Self::host_shadow_fits`]. The
+    /// preflight uses this directly.
     pub fits: bool,
     /// Where `weights_bytes` came from.
     pub weights_source: WeightsSource,
@@ -416,6 +439,12 @@ pub struct InspectReport {
     pub headroom_factor: f64,
     pub budget_bytes: u64,
     pub total_bytes: u64,
+    /// Windows ROCm only (issue #2643): pinned host-shadow bytes, the host RAM
+    /// they are compared against, and that comparison. Zero, zero and `true`
+    /// everywhere else.
+    pub host_shadow_bytes: u64,
+    pub host_ram_available_bytes: u64,
+    pub host_shadow_fits: bool,
     pub fits: bool,
 }
 
@@ -483,6 +512,9 @@ impl InspectReport {
             headroom_factor: est.headroom_factor,
             budget_bytes: est.available_bytes,
             total_bytes: est.total_bytes,
+            host_shadow_bytes: est.host_shadow_bytes,
+            host_ram_available_bytes: est.host_ram_available_bytes,
+            host_shadow_fits: est.host_shadow_fits,
             fits: est.fits,
         }
     }
@@ -503,6 +535,19 @@ impl MemoryEstimate {
     pub fn overflow_bytes(&self) -> u64 {
         self.total_bytes.saturating_sub(self.available_bytes)
     }
+
+    /// `host_shadow_bytes` minus `host_ram_available_bytes` when the pinned
+    /// host shadows do not fit the host RAM (Windows ROCm, issue #2643).
+    /// Returns 0 when they fit and when there is no shadow term.
+    #[must_use]
+    pub fn host_shadow_overflow_bytes(&self) -> u64 {
+        if self.host_shadow_fits {
+            0
+        } else {
+            self.host_shadow_bytes
+                .saturating_sub(self.host_ram_available_bytes)
+        }
+    }
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -521,7 +566,8 @@ impl MemoryEstimate {
 ///   header (no tensor data is touched),
 /// - one read of `MLXCEL_HEADROOM_FACTOR` (when set),
 /// - one read of `MLX_ROCM_MAX_INFLIGHT_MB` on ROCm builds,
-/// - one read of `/proc/meminfo` on Linux to derive available memory.
+/// - one read of `/proc/meminfo` on Linux, or one `GlobalMemoryStatusEx`
+///   call on Windows, to derive available memory.
 ///
 /// Side-effect-free with respect to MLX state: no allocations on the
 /// MLX allocator, no GPU device touched, safe to call before
@@ -567,8 +613,10 @@ pub fn estimate_total_memory(
         weights_bytes.saturating_add(kv_cache_bytes),
         headroom_factor,
     );
-    let activation_bytes = activation_dims_from_path(model_dir)
-        .map(|dims| compute_activation_bytes(&dims, ctx_len, batch, resolve_activation_mult()))
+    let activation_dims = activation_dims_from_path(model_dir);
+    let activation_bytes = activation_dims
+        .as_ref()
+        .map(|dims| compute_activation_bytes(dims, ctx_len, batch, resolve_activation_mult()))
         .unwrap_or(0);
     // ROCm only: the in-flight working set the backend allows on top of the
     // steady state (issue #2155). It tracks the `MLX_ROCM_MAX_INFLIGHT_MB`
@@ -583,9 +631,23 @@ pub fn estimate_total_memory(
         .saturating_add(kv_cache_bytes)
         .saturating_add(runtime_headroom_bytes);
 
+    // ── Host shadows (Windows ROCm) ──────────────────────────────────────────
+    // Pinned host copies of the GPU buffers the CPU touches (issue #2643).
+    // They come from the RAM Windows sees, a smaller pool than the device
+    // carve-out `available_bytes` reflects on an APU, so they are compared
+    // against that RAM on their own rather than added to `total_bytes`. Every
+    // other build reserves 0 and `host_shadow_fits` is true.
+    let host_shadow_bytes = host_shadow::backend_host_shadow_reserve_bytes(
+        activation_dims.as_ref().map_or(0, |dims| dims.vocab),
+        ctx_len,
+        batch,
+    );
+    let host_ram_available = host_shadow::host_ram_available_bytes(host_shadow_bytes);
+    let host_shadow_fits = host_shadow::host_shadow_fits(host_shadow_bytes, host_ram_available);
+
     // ── Available memory ─────────────────────────────────────────────────────
     let available_bytes = resolve_available_memory(get_hardware());
-    let fits = total_bytes <= available_bytes;
+    let fits = total_bytes <= available_bytes && host_shadow_fits;
 
     MemoryEstimate {
         weights_bytes,
@@ -593,6 +655,9 @@ pub fn estimate_total_memory(
         runtime_headroom_bytes,
         activation_bytes,
         backend_inflight_bytes,
+        host_shadow_bytes,
+        host_ram_available_bytes: host_ram_available.unwrap_or(0),
+        host_shadow_fits,
         total_bytes,
         available_bytes,
         fits,
@@ -672,6 +737,15 @@ fn backend_inflight_reserve_bytes() -> u64 {
 fn backend_inflight_reserve_bytes() -> u64 {
     0
 }
+
+// The host-shadow term of Windows ROCm builds (issue #2643): the reserve, the
+// host RAM it is compared against and the comparison, gated at compile time
+// like `backend_inflight_reserve_bytes`.
+#[path = "memory_estimate_host_shadow.rs"]
+mod host_shadow;
+pub use host_shadow::{
+    HOST_SHADOW_LOGIT_BYTES, HOST_SHADOW_TOKEN_BYTES, rocm_host_shadow_reserve_bytes,
+};
 
 /// Resolve the per-process headroom factor.
 ///
@@ -837,7 +911,8 @@ fn resolve_weight_bytes(model_dir: &Path) -> (u64, WeightsSource) {
 ///    populated by `sysctl(hw.memsize)` on macOS.
 /// 4. `/proc/meminfo::MemAvailable` (then `MemTotal`) on Linux —
 ///    fallback when running on dev hardware without Apple Silicon
-///    detection. Mirrors what `free -b` shows.
+///    detection. Mirrors what `free -b` shows. On Windows the same step
+///    reads `GlobalMemoryStatusEx`'s available physical memory (#2602).
 /// 5. `0` when nothing is detectable. The preflight then reports
 ///    `fits = false` for any nonzero `total_bytes`, which is the safe
 ///    direction.
@@ -860,7 +935,11 @@ fn resolve_available_memory(hw: &HardwareCapabilities) -> u64 {
             {
                 read_linux_available_memory_bytes()
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(windows)]
+            {
+                read_windows_available_memory_bytes()
+            }
+            #[cfg(not(any(target_os = "linux", windows)))]
             {
                 None
             }
@@ -882,7 +961,7 @@ fn resolve_available_memory_from(
     env_limit: Option<u64>,
     mlx_limit: impl FnOnce() -> u64,
     unified_memory_gb: u32,
-    linux_available: impl FnOnce() -> Option<u64>,
+    os_available: impl FnOnce() -> Option<u64>,
 ) -> u64 {
     if let Some(env_limit) = env_limit {
         return env_limit;
@@ -894,7 +973,7 @@ fn resolve_available_memory_from(
     if unified_memory_gb > 0 {
         return u64::from(unified_memory_gb) * 1024 * 1024 * 1024;
     }
-    linux_available().unwrap_or(0)
+    os_available().unwrap_or(0)
 }
 
 fn resolve_env_memory_limit_bytes() -> Option<u64> {
@@ -923,8 +1002,8 @@ fn parse_optional_memory_size_bytes(raw: &str) -> Option<u64> {
 ///
 /// Both are reported in KiB. Returns bytes. Anchored on `linux` because
 /// `/proc/meminfo` is Linux-specific; the macOS path goes through
-/// `HardwareCapabilities` and the Windows path returns 0 (the preflight
-/// then trips on any nonzero total, which is the safe direction).
+/// `HardwareCapabilities` and Windows has
+/// [`read_windows_available_memory_bytes`].
 #[cfg(target_os = "linux")]
 fn read_linux_available_memory_bytes() -> Option<u64> {
     let content = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -942,6 +1021,50 @@ fn read_linux_available_memory_bytes() -> Option<u64> {
     }
     let kib = avail_kib.or(total_kib)?;
     Some(kib.saturating_mul(1024))
+}
+
+/// Available physical memory from `GlobalMemoryStatusEx` (`ullAvailPhys`),
+/// the Windows counterpart of `MemAvailable` (#2602). Without it a CPU-only
+/// or unknown-backend Windows estimate had no OS figure and resolved to 0.
+/// One kernel32 call on a fixed-layout struct, so it is declared here rather
+/// than pulled in through a crate.
+#[cfg(windows)]
+fn read_windows_available_memory_bytes() -> Option<u64> {
+    /// `MEMORYSTATUSEX` from `sysinfoapi.h`.
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+
+    let mut status = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    // SAFETY: `status` is a live, writable `MEMORYSTATUSEX` with `dwLength`
+    // set to its size, which is all the call requires; it writes only within
+    // the struct and keeps no pointer to it.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (ok != 0 && status.avail_phys > 0).then_some(status.avail_phys)
 }
 
 #[cfg(target_os = "linux")]
@@ -1082,6 +1205,7 @@ fn inspect_registry_id(model_type: ModelType) -> &'static str {
         ModelType::Qwen35VLM => "qwen3_5_vlm",
         ModelType::Qwen35Moe => "qwen3_5_moe",
         ModelType::Qwen35MoeVLM => "qwen3_5_moe_vlm",
+        ModelType::Qwen4ExpVLM => "qwen4_exp_vlm",
         ModelType::Gemma => "gemma",
         ModelType::Gemma2 => "gemma2",
         ModelType::Gemma3 => "gemma3",
@@ -1178,6 +1302,7 @@ fn inspect_registry_id(model_type: ModelType) -> &'static str {
         ModelType::HunyuanMoe => "hunyuan_moe",
         ModelType::HunyuanV1Dense => "hunyuan_v1_dense",
         ModelType::MiMo => "mimo",
+        ModelType::MiMoV2Flash => "mimo_v2_flash",
         ModelType::BailingMoe => "bailing_moe",
         ModelType::BailingMoeLinear => "bailing_moe_linear",
         ModelType::Afmoe => "afmoe",
@@ -1653,6 +1778,19 @@ pub fn format_estimate(model_dir: &Path, est: &MemoryEstimate) -> String {
         "  Available:       {}",
         format_bytes(est.available_bytes),
     );
+    if est.host_shadow_bytes > 0 {
+        // Pinned host memory, so it is set against the host RAM, not the
+        // device figure above (issue #2643).
+        let _ = writeln!(
+            out,
+            "  Host shadows:    {}  (pinned host copies of CPU-touched buffers; host RAM available {})",
+            format_bytes(est.host_shadow_bytes),
+            match est.host_ram_available_bytes {
+                0 => "unknown".to_string(),
+                ram => format_bytes(ram),
+            },
+        );
+    }
 
     let _ = writeln!(out);
     if est.fits {
@@ -1661,15 +1799,120 @@ pub fn format_estimate(model_dir: &Path, est: &MemoryEstimate) -> String {
             "  FITS: {} of headroom",
             format_bytes(est.slack_bytes()),
         );
-    } else {
+    } else if est.total_bytes > est.available_bytes {
         let _ = writeln!(
             out,
             "  DOES NOT FIT: {} over budget",
             format_bytes(est.overflow_bytes()),
         );
+    } else {
+        let _ = writeln!(
+            out,
+            "  DOES NOT FIT: host shadows {} over the host RAM",
+            format_bytes(est.host_shadow_overflow_bytes()),
+        );
     }
 
     out
+}
+
+// ── Preflight verdict ────────────────────────────────────────────────────────
+
+/// Remediation tail `mlxcel serve` appends to the `--estimate-memory` abort.
+///
+/// A `serve` operator can shrink the context window or the batch, so the
+/// wording differs from [`GENERATE_PREFLIGHT_REMEDIATION`]. Passed to
+/// [`enforce_preflight`] by the call site and asserted by the message tests, so
+/// the shipped text and the pinned text cannot drift apart. Issue #1699.
+pub const SERVE_PREFLIGHT_REMEDIATION: &str =
+    "a smaller --ctx-size, smaller --max-batch-size, or a smaller model.";
+
+/// Remediation tail `mlxcel generate` appends to the `--estimate-memory` abort.
+///
+/// `generate` has no `--ctx-size` or `--max-batch-size` to shrink; the lever is
+/// the token budget. See [`SERVE_PREFLIGHT_REMEDIATION`]. Issue #1699.
+pub const GENERATE_PREFLIGHT_REMEDIATION: &str = "a smaller --max-tokens / a smaller model.";
+
+/// Render the `--force` warning printed when the preflight says the load is
+/// over budget but the caller asked to continue anyway.
+///
+/// Shared by `mlxcel serve` and `mlxcel generate` so the two commands cannot
+/// drift apart on wording. Issue #1699.
+///
+/// Used by: [`enforce_preflight`] (on behalf of `src/commands/serve.rs` and
+/// `src/commands/generate.rs`).
+#[must_use]
+fn preflight_over_budget_warning(est: &MemoryEstimate) -> String {
+    if est.total_bytes <= est.available_bytes {
+        return format!(
+            "WARNING: --estimate-memory preflight says the pinned host shadows of this load exceed the host RAM by {}. \
+             Continuing because --force was set.",
+            format_bytes(est.host_shadow_overflow_bytes()),
+        );
+    }
+    format!(
+        "WARNING: --estimate-memory preflight says this load is over budget by {}. \
+         Continuing because --force was set.",
+        format_bytes(est.overflow_bytes()),
+    )
+}
+
+/// Render the `--estimate-memory` abort message for an over-budget load.
+///
+/// `remediation` is the caller-specific tail after the shared override hint
+/// (`--force` / `--no-memory-check`): pass
+/// [`SERVE_PREFLIGHT_REMEDIATION`] or [`GENERATE_PREFLIGHT_REMEDIATION`].
+/// Everything before it is shared so the two commands stay consistent.
+///
+/// Used by: [`enforce_preflight`] (on behalf of `src/commands/serve.rs` and
+/// `src/commands/generate.rs`).
+#[must_use]
+fn preflight_over_budget_error(est: &MemoryEstimate, remediation: &str) -> String {
+    if est.total_bytes <= est.available_bytes {
+        // Only the host-shadow comparison failed (Windows ROCm, issue #2643):
+        // the device fits, the pinned host copies do not.
+        return format!(
+            "--estimate-memory: pinned host shadows {} exceed the available host RAM {} by {}. \
+             Pass --force (or --no-memory-check) to override, or rerun with {remediation}",
+            format_bytes(est.host_shadow_bytes),
+            format_bytes(est.host_ram_available_bytes),
+            format_bytes(est.host_shadow_overflow_bytes()),
+        );
+    }
+    format!(
+        "--estimate-memory: total {} exceeds available {} by {}. \
+         Pass --force (or --no-memory-check) to override, or rerun with {remediation}",
+        format_bytes(est.total_bytes),
+        format_bytes(est.available_bytes),
+        format_bytes(est.overflow_bytes()),
+    )
+}
+
+/// Apply the already-computed `--estimate-memory` verdict.
+///
+/// Returns `Ok(())` when the estimate fits, warns and returns `Ok(())` when it
+/// does not fit and `force_memory` is set, and returns the abort error from
+/// `preflight_over_budget_error` otherwise. The estimate banner is the
+/// caller's responsibility; this only handles the verdict.
+///
+/// Used by: `src/commands/serve.rs` (`run_serve_memory_preflight`),
+/// `src/commands/generate.rs` (`run_memory_preflight`).
+pub fn enforce_preflight(
+    est: &MemoryEstimate,
+    force_memory: bool,
+    remediation: &str,
+) -> anyhow::Result<()> {
+    if est.fits {
+        return Ok(());
+    }
+    if force_memory {
+        eprintln!("{}", preflight_over_budget_warning(est));
+        return Ok(());
+    }
+    Err(anyhow::Error::msg(preflight_over_budget_error(
+        est,
+        remediation,
+    )))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1745,6 +1988,133 @@ mod tests {
     }
 
     #[test]
+    fn preflight_error_message_is_pinned_per_remediation() {
+        // Issue #1699: this text used to be copy-pasted into `serve.rs` and
+        // `generate.rs`. The shared renderer must reproduce both variants
+        // byte-for-byte so operators (and docs) keep matching log lines.
+        let est = MemoryEstimate {
+            total_bytes: 20 * GIB,
+            available_bytes: 16 * GIB,
+            fits: false,
+            ..over_budget_fixture()
+        };
+
+        let serve = preflight_over_budget_error(&est, SERVE_PREFLIGHT_REMEDIATION);
+        assert_eq!(
+            serve,
+            "--estimate-memory: total 20.00 GiB (21474836480 bytes) exceeds available \
+             16.00 GiB (17179869184 bytes) by 4.00 GiB (4294967296 bytes). \
+             Pass --force (or --no-memory-check) to override, or rerun with \
+             a smaller --ctx-size, smaller --max-batch-size, or a smaller model."
+        );
+
+        let generate = preflight_over_budget_error(&est, GENERATE_PREFLIGHT_REMEDIATION);
+        assert_eq!(
+            generate,
+            "--estimate-memory: total 20.00 GiB (21474836480 bytes) exceeds available \
+             16.00 GiB (17179869184 bytes) by 4.00 GiB (4294967296 bytes). \
+             Pass --force (or --no-memory-check) to override, or rerun with \
+             a smaller --max-tokens / a smaller model."
+        );
+
+        // The constants are what the commands actually pass, so pinning them to
+        // the literal tails is what keeps shipped text and this test in sync.
+        assert_eq!(
+            SERVE_PREFLIGHT_REMEDIATION,
+            "a smaller --ctx-size, smaller --max-batch-size, or a smaller model."
+        );
+        assert_eq!(
+            GENERATE_PREFLIGHT_REMEDIATION,
+            "a smaller --max-tokens / a smaller model."
+        );
+
+        // Shared prefix, different remediation only. If this ever stops being
+        // a strict prefix relationship, the two commands have diverged again.
+        let shared = serve
+            .strip_suffix(SERVE_PREFLIGHT_REMEDIATION)
+            .expect("serve remediation suffix");
+        assert_eq!(
+            shared,
+            generate
+                .strip_suffix(GENERATE_PREFLIGHT_REMEDIATION)
+                .expect("generate remediation suffix")
+        );
+    }
+
+    #[test]
+    fn preflight_warning_message_is_pinned() {
+        let est = MemoryEstimate {
+            total_bytes: 20 * GIB,
+            available_bytes: 16 * GIB,
+            fits: false,
+            ..over_budget_fixture()
+        };
+        assert_eq!(
+            preflight_over_budget_warning(&est),
+            "WARNING: --estimate-memory preflight says this load is over budget by \
+             4.00 GiB (4294967296 bytes). Continuing because --force was set."
+        );
+    }
+
+    #[test]
+    fn enforce_preflight_passes_when_the_estimate_fits() {
+        let est = MemoryEstimate {
+            total_bytes: 8 * GIB,
+            available_bytes: 16 * GIB,
+            fits: true,
+            ..over_budget_fixture()
+        };
+        assert!(enforce_preflight(&est, false, "anything").is_ok());
+        assert!(enforce_preflight(&est, true, "anything").is_ok());
+    }
+
+    #[test]
+    fn enforce_preflight_warns_under_force_and_aborts_otherwise() {
+        let est = MemoryEstimate {
+            total_bytes: 20 * GIB,
+            available_bytes: 16 * GIB,
+            fits: false,
+            ..over_budget_fixture()
+        };
+        assert!(
+            enforce_preflight(&est, true, "a smaller model.").is_ok(),
+            "--force must keep the run alive"
+        );
+        let err = enforce_preflight(&est, false, "a smaller model.")
+            .expect_err("over budget without --force must abort");
+        assert_eq!(
+            err.to_string(),
+            preflight_over_budget_error(&est, "a smaller model.")
+        );
+    }
+
+    /// Minimal over-budget-capable fixture; the pinned-message tests only care
+    /// about the byte figures they override explicitly.
+    fn over_budget_fixture() -> MemoryEstimate {
+        MemoryEstimate {
+            weights_bytes: 0,
+            kv_cache_bytes: 0,
+            runtime_headroom_bytes: 0,
+            activation_bytes: 0,
+            backend_inflight_bytes: 0,
+            host_shadow_bytes: 0,
+            host_ram_available_bytes: 0,
+            host_shadow_fits: true,
+            total_bytes: 0,
+            available_bytes: 0,
+            fits: true,
+            weights_source: WeightsSource::Fallback,
+            kv_source: KvSource::Unavailable,
+            kv_detail: String::new(),
+            headroom_factor: DEFAULT_HEADROOM_FACTOR,
+            ctx_len: 1,
+            batch: 1,
+            quant: QuantHint::Default,
+            kv_dtype_int8: false,
+        }
+    }
+
+    #[test]
     fn compute_runtime_headroom_disabled_below_or_at_one() {
         assert_eq!(compute_runtime_headroom(1024, 1.0), 0);
         assert_eq!(compute_runtime_headroom(1024, 0.5), 0);
@@ -1772,6 +2142,10 @@ mod tests {
 
     #[test]
     fn inspect_report_copies_estimate_contract() {
+        // The estimate reads `MLX_ROCM_MAX_INFLIGHT_MB` on ROCm builds, and the
+        // in-flight tests set it (to a saturating value among others) under
+        // this lock, so a reader must hold it too.
+        let _env = crate::test_support::env_lock::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let cfg = serde_json::json!({
             "model_type": "llama",
@@ -1871,6 +2245,9 @@ mod tests {
             runtime_headroom_bytes: 20,
             activation_bytes: 4,
             backend_inflight_bytes: 0,
+            host_shadow_bytes: 0,
+            host_ram_available_bytes: 0,
+            host_shadow_fits: true,
             total_bytes: 120,
             available_bytes: 128,
             fits: true,
@@ -1902,6 +2279,9 @@ mod tests {
 
     #[test]
     fn estimate_uses_exact_safetensors_when_index_present() {
+        // Reads `MLX_ROCM_MAX_INFLIGHT_MB` on ROCm builds; see
+        // `inspect_report_copies_estimate_contract`.
+        let _env = crate::test_support::env_lock::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         write_minimal_config(tmp.path());
         // 7 B FP16 ≈ 14 GB.
@@ -2301,6 +2681,9 @@ mod tests {
 
     #[test]
     fn estimate_total_includes_activation_reserve() {
+        // Reads `MLX_ROCM_MAX_INFLIGHT_MB` on ROCm builds; see
+        // `inspect_report_copies_estimate_contract`.
+        let _env = crate::test_support::env_lock::env_lock();
         let tmp = tempfile::tempdir().unwrap();
         write_minimal_config(tmp.path());
         let est = estimate_total_memory(tmp.path(), 8192, 4, QuantHint::Default, false);
@@ -2623,6 +3006,9 @@ mod tests {
             runtime_headroom_bytes: 0,
             activation_bytes: 1_000_000_000,
             backend_inflight_bytes: 0,
+            host_shadow_bytes: 0,
+            host_ram_available_bytes: 0,
+            host_shadow_fits: true,
             total_bytes: 0,
             available_bytes: 25_000_000_000,
             fits: true,
@@ -2652,6 +3038,9 @@ mod tests {
             runtime_headroom_bytes: 0,
             activation_bytes: 1_000_000_000,
             backend_inflight_bytes: 0,
+            host_shadow_bytes: 0,
+            host_ram_available_bytes: 0,
+            host_shadow_fits: true,
             total_bytes: 0,
             available_bytes: 16_000_000_000,
             fits: false,
@@ -2774,6 +3163,36 @@ mod tests {
             !probed,
             "the allocator cap must not be read behind an env limit"
         );
+    }
+
+    // Windows (#2602): step 4 is `GlobalMemoryStatusEx` there. On a Windows
+    // ROCm APU the allocator cap is the WDDM carve-out (80% of the 107.87 GiB
+    // hipMemGetInfo reports on gfx1151), far above the OS-visible RAM.
+
+    #[test]
+    fn on_a_windows_apu_the_allocator_cap_wins_over_os_ram() {
+        assert_eq!(
+            resolve_available_memory_from(None, || 86 * GIB, 0, || Some(31 * GIB)),
+            86 * GIB
+        );
+    }
+
+    #[test]
+    fn without_an_allocator_cap_the_windows_os_probe_is_used() {
+        // CPU-only or unknown-backend Windows builds report no cap.
+        assert_eq!(
+            resolve_available_memory_from(None, || 0, 0, || Some(31 * GIB)),
+            31 * GIB
+        );
+        assert_eq!(resolve_available_memory_from(None, || 0, 0, || None), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_probe_reports_available_physical_memory() {
+        let available = read_windows_available_memory_bytes()
+            .expect("GlobalMemoryStatusEx reports available physical memory");
+        assert!(available > 0);
     }
 
     #[test]

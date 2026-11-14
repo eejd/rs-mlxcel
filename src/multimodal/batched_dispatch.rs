@@ -14,13 +14,15 @@
 
 //! Shared per-row batched dispatch for vision-language wrappers.
 //!
-//! Several VLM wrappers (Qwen2-VL, Qwen2.5-VL, Qwen3-VL, Qwen3-VL-MoE, and
-//! Gemma 4) need an identical override on
+//! Several VLM wrappers need an identical override on
 //! [`LanguageModel::forward_batched_with_ids`] so each row of a
 //! batched call reaches the text model's seq-aware forward path with its
 //! own `seq_id`. Without the override, the trait default discards `seq_ids`
-//! before they reach the model — the bug fixed for Qwen VL and
-//! for Gemma 4.
+//! before they reach the model. Qwen VL now has a native identified decode
+//! path and calls this helper only for conditional fallbacks. The GLM-4V,
+//! GLM-4V-MoE, Hunyuan-VL, ERNIE-4.5-MoE-VL, PaddleOCR-VL and Cohere Compass
+//! towers do the same. Gemma 4 VLM and Unified likewise retain it only for
+//! multimodal prefill and conditional state fallbacks around native decode.
 //!
 //! The helper is generic over `M: LanguageModel` so families with different
 //! per-sequence state (Qwen MRoPE deltas, Gemma 4 sliding-window caches)
@@ -50,9 +52,15 @@ use mlxcel_core::{MlxArray, UniquePtr};
 /// slot — there is no fast-path skip back to `forward()`.
 ///
 /// Used by:
-/// - Qwen2VLModel, Qwen25VLModel, Qwen3VLModel, Qwen3VLMoeModel
-///   (Qwen VL families — fixed).
-/// - Gemma4VLModel (Gemma 4 mixed-length batching —).
+/// - Qwen2VLModel, Qwen25VLModel, Qwen3VLModel, Qwen3VLMoeModel and
+///   Qwen3OmniMoeModel (conditional fallback around their native decode).
+/// - Glm4vTextModel (shared by GLM-4V and GLM-OCR), Glm4vMoeTextModel,
+///   HunyuanVlTextModel, Ernie45MoeVlTextModel, PaddleOcrTextModel and
+///   CohereCompassTextModel (prefill, missing-id and conditional state
+///   fallbacks around their native decode).
+/// - Gemma4VLModel and Gemma4UnifiedModel (multimodal prefill and pending
+///   per-layer-input fallbacks around their native text decode).
+/// - BaichuanModel (per-row K/V convolution state keyed by sequence, #2567).
 ///
 /// Not used by Qwen35VLModel: that family's text model already implements
 /// a native batched-with-ids fast path (per-row dispatch and a true batched-

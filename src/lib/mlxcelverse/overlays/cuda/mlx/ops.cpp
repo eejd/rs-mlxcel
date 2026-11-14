@@ -2,7 +2,7 @@
 //
 // CUDA patch: Mixed-precision binary operation dispatch for bf16
 //
-// Modified from upstream MLX 243bdf09c0cccbb85ca6a686dab3cc0102cf1f7e mlx/ops.cpp
+// Modified from upstream MLX 7ca40033132dae444d45f7fc3daae57e24c13f6c mlx/ops.cpp
 //
 // Changes:
 //   - Added bf16_mixed_astype() helper that skips astype conversion when the
@@ -125,7 +125,7 @@ array indices_or_default(
           << " Got indices with invalid dtype. Indices must be integral.";
       throw std::invalid_argument(msg.str());
     }
-    return astype(indices.value(), uint32);
+    return astype(indices.value(), uint32, s);
   }
 
   Shape shape(x.shape().begin(), x.shape().end() - 2);
@@ -362,8 +362,7 @@ array as_strided(
       dtype,
       std::make_shared<AsStrided>(
           to_stream(s), std::move(shape), std::move(strides), offset),
-      // Force the input array to be contiguous.
-      {flatten(std::move(a), s)});
+      {std::move(a)});
 }
 
 array copy(array a, StreamOrDevice s /* = {} */) {
@@ -2686,6 +2685,31 @@ array min(
   return min(a, std::vector<int>{axis}, keepdims, s);
 }
 
+std::tuple<array, array>
+minmax(const array& a, bool keepdims, StreamOrDevice s /* = {}*/) {
+  std::vector<int> axes(a.ndim());
+  std::iota(axes.begin(), axes.end(), 0);
+  return {min(a, axes, keepdims, s), max(a, axes, keepdims, s)};
+}
+
+std::tuple<array, array> minmax(
+    const array& a,
+    const std::vector<int>& axes,
+    bool keepdims /* = false */,
+    StreamOrDevice s /* = {}*/) {
+  return {min(a, axes, keepdims, s), max(a, axes, keepdims, s)};
+}
+
+std::tuple<array, array> minmax(
+    const array& a,
+    int axis,
+    bool keepdims /* = false */,
+    StreamOrDevice s /* = {} */) {
+  return {
+      min(a, std::vector<int>{axis}, keepdims, s),
+      max(a, std::vector<int>{axis}, keepdims, s)};
+}
+
 array argmin(const array& a, bool keepdims, StreamOrDevice s /* = {} */) {
   auto result = argmin(flatten(a, s), 0, true, s);
   if (keepdims) {
@@ -3786,7 +3810,7 @@ array gather(
   }
 
   // Broadcast and cast indices if necessary
-  auto inputs = broadcast_arrays(indices);
+  auto inputs = broadcast_arrays(indices, s);
   for (auto& idx : inputs) {
     idx = astype(idx, dtype, s);
   }
@@ -3924,8 +3948,9 @@ array take(const array& a, int index, int axis, StreamOrDevice s /* = {} */) {
         "[take] Cannot do a non-empty take from an array with zero elements.");
   }
 
-  // Handle negative axis
+  // Handle negative axis and index
   axis = axis < 0 ? a.ndim() + axis : axis;
+  index = index < 0 ? a.shape(axis) + index : index;
 
   Shape starts(a.ndim(), 0);
   Shape stops = a.shape();
@@ -4064,7 +4089,7 @@ array scatter(
   }
 
   // Broadcast and cast indices if necessary
-  auto inputs = broadcast_arrays(indices);
+  auto inputs = broadcast_arrays(indices, s);
 
   Shape idx_shape;
   if (!inputs.empty()) {
@@ -4978,7 +5003,10 @@ array quantized_matmul(
   std::vector<array> inputs;
   if (qmode == QuantizationMode::Affine) {
     inputs = {
-        astype(x, dtype), w, astype(scales, dtype), astype(*biases, dtype)};
+        astype(x, dtype, s),
+        w,
+        astype(scales, dtype, s),
+        astype(*biases, dtype, s)};
   } else {
     inputs = {x, w, scales};
   }
@@ -5242,7 +5270,7 @@ affine_quantize(const array& w, int group_size, int bits, StreamOrDevice s_) {
       scales = where(mask, scales, negative(scales, s), s);
       array edge = where(mask, w_min, w_max, s);
       array q0 = round(divide(edge, scales, s), s);
-      scales = where(not_equal(q0, zero, s), divide(edge, q0, s), scales);
+      scales = where(not_equal(q0, zero, s), divide(edge, q0, s), scales, s);
       biases = where(equal(q0, zero, s), zero, edge, s);
     }
 
@@ -6617,10 +6645,15 @@ std::vector<array> depends(
   std::vector<array> all_inputs = inputs;
   all_inputs.insert(all_inputs.end(), dependencies.begin(), dependencies.end());
 
-  // Compute the stream. Maybe do it in a smarter way at some point in the
-  // future.
-  Stream s = (inputs[0].has_primitive()) ? inputs[0].primitive().stream()
-                                         : to_stream({});
+  // Use the stream of the first input or dependency that has one.
+  std::optional<Stream> found;
+  for (auto& in : all_inputs) {
+    if (in.has_primitive()) {
+      found = in.primitive().stream();
+      break;
+    }
+  }
+  Stream s = found ? *found : to_stream({});
   // Make the output info
   std::vector<Shape> shapes;
   std::vector<Dtype> dtypes;
@@ -6724,12 +6757,14 @@ array number_of_elements(
     }
     return array(inverted ? 1.0 / numel : numel, dtype);
   }
-  return stop_gradient(array(
-      Shape{},
-      dtype,
-      std::make_shared<NumberOfElements>(
-          to_stream(s), std::move(axes), inverted, dtype),
-      {a}));
+  return stop_gradient(
+      array(
+          Shape{},
+          dtype,
+          std::make_shared<NumberOfElements>(
+              to_stream(s), std::move(axes), inverted, dtype),
+          {a}),
+      s);
 }
 
 array conjugate(const array& a, StreamOrDevice s /* = {} */) {
@@ -6957,7 +6992,7 @@ array real(const array& a, StreamOrDevice s /* = {} */) {
 
 array imag(const array& a, StreamOrDevice s /* = {} */) {
   if (!issubdtype(a.dtype(), complexfloating)) {
-    return zeros_like(a);
+    return zeros_like(a, s);
   }
   return array(a.shape(), float32, std::make_shared<Imag>(to_stream(s)), {a});
 }

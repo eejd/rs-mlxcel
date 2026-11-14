@@ -68,6 +68,7 @@ use super::llama3::Llama3Model;
 /// source of the stop token) and the standard `quantization` block that an
 /// mlx-community conversion adds.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(remote = "Self")]
 pub struct ModelArgs {
     #[serde(default = "default_model_type")]
     pub model_type: String,
@@ -114,6 +115,8 @@ pub struct ModelArgs {
     #[serde(default)]
     pub quantization: Option<Quantization>,
 }
+
+mlxcel_core::impl_rope_lifting_deserialize!(ModelArgs);
 
 /// A `config.json` token-id field, which may be a single int or a list of ints.
 ///
@@ -432,6 +435,8 @@ impl ModelArgs {
                 }),
             tie_word_embeddings: self.tie_word_embeddings,
             rope_traditional: true,
+            // Helium reports its own stop ids rather than through this config.
+            eos_token_id: None,
             // Helium's own loader owns the model directory, and this conversion
             // does not see it. The `rope_scaling` diagnostics this labels can
             // never fire here anyway: `rope_scaling` is `None` above.
@@ -908,6 +913,10 @@ impl HeliumModel {
 // LanguageModel trait implementation.
 
 impl LanguageModel for HeliumModel {
+    fn batched_decode_kind(&self) -> mlxcel_core::generate::BatchedDecodeKind {
+        mlxcel_core::generate::BatchedDecodeKind::Native
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,

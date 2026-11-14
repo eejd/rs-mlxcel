@@ -160,6 +160,14 @@ pub struct CreateResponseRequest {
     #[serde(default)]
     pub service_tier: Option<String>,
 
+    /// `context_management` (issue #2397): `[{"type": "compaction",
+    /// "compact_threshold": N}]` opts into automatic compaction. Kept as raw
+    /// JSON so a malformed entry is a 400 from
+    /// `routes::responses_auto_compact::parse_context_management`, not an
+    /// extractor rejection; `None` or `[]` leaves the request unchanged.
+    #[serde(default)]
+    pub context_management: Option<serde_json::Value>,
+
     /// Sampling parameters that overlap with chat completions
     /// (`top_k`, `min_p`, repetition penalties, DRY, frequency/presence,
     /// `seed`, `stop`, `thinking_budget*`).
@@ -246,6 +254,11 @@ pub enum ResponseInputItem {
     /// Reasoning trace from a prior turn (rehydrated). Phase 1 records
     /// the text but does not push it through the thinking-token machinery.
     Reasoning { content: Vec<ReasoningContentPart> },
+    /// Compaction capsule from `POST /v1/responses/compact` (issue #2397).
+    /// The translator replaces it, and every non-instruction item before
+    /// it, with the capsule's summary and retained items; see
+    /// [`crate::server::responses_compaction::resolve_compaction`].
+    Compaction { encrypted_content: String },
 }
 
 /// Wire form of [`ResponseInputItem`] once `type` is known to be present.
@@ -269,6 +282,9 @@ enum TaggedInputItem {
     },
     Reasoning {
         content: Vec<ReasoningContentPart>,
+    },
+    Compaction {
+        encrypted_content: String,
     },
 }
 
@@ -305,6 +321,9 @@ impl TryFrom<serde_json::Value> for ResponseInputItem {
                 Self::FunctionCallOutput { call_id, output }
             }
             TaggedInputItem::Reasoning { content } => Self::Reasoning { content },
+            TaggedInputItem::Compaction { encrypted_content } => {
+                Self::Compaction { encrypted_content }
+            }
         })
     }
 }

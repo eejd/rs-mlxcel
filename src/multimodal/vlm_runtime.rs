@@ -30,13 +30,15 @@ use crate::kimi_vl_prompt::{InsertedKimiVlTokens, insert_kimi_vl_media_tokens};
 use crate::locateanything_prompt::{
     expand_locateanything_image_markers, insert_locateanything_image_tokens,
 };
-use crate::minicpmo_prompt::{
-    prepare_minicpmo_prompt_tokens, prepare_minicpmo_prompt_tokens_with_image_feature_sizes,
-};
+use crate::minicpmo_prompt::prepare_minicpmo_prompt_tokens;
 use crate::moondream2_prompt::{Moondream2PromptMode, prepare_moondream2_prompt_tokens};
 use crate::moondream3_prompt::{Moondream3PromptMode, prepare_moondream3_prompt_tokens};
+use crate::multimodal::gemma3_vlm_prompt::{
+    cached_newline_runs, expand_image_blocks_with_newline_fusion, has_image_block_wrapper,
+};
 use crate::multimodal::got_ocr_prompt::prepare_got_prompt_tokens;
 use crate::multimodal::llmjp_vl_prompt::{insert_llmjp_image_tokens, text_token_count};
+use crate::multimodal::minicpmv46_prompt::prepare_minicpmv46_prompt_tokens;
 use crate::phi3v_prompt::prepare_phi3v_prompt_tokens;
 use crate::phi4_siglip_prompt::prepare_phi4_siglip_prompt_tokens;
 use crate::phi4mm_prompt::{expand_phi4mm_placeholders, prepare_phi4mm_prompt_tokens};
@@ -931,6 +933,7 @@ pub fn qwen_video_runtime(model: &LoadedModel) -> Option<&dyn crate::qwen_vl::Qw
         LoadedModel::Qwen3VL(model) => Some(model),
         LoadedModel::Qwen3VLMoe(model) => Some(model),
         LoadedModel::Qwen35VLM(model) | LoadedModel::Qwen35MoeVLM(model) => Some(model),
+        LoadedModel::Qwen4ExpVLM(model) => Some(model),
         _ => None,
     }
 }
@@ -1389,9 +1392,11 @@ where
                 }),
             }))
         }
-        // MiniCPM-V 4.6 shares the same prompt token format as MiniCPM-O
-        // (`<image><unk>...<unk></image>`) but uses Qwen3.5 text backbone +
-        // the VitMerger+Merger vision pipeline instead of the resampler.
+        // MiniCPM-V 4.6 reuses MiniCPM-O's `<image>`/`</image>` bounds, but its
+        // block is `<image_id>{i}</image_id><image>` + `<|image_pad|>` * N +
+        // `</image>` followed by `\n` (`MiniCPMV4_6Processor`, see
+        // `minicpmv46_prompt`), and it runs a Qwen3.5 text backbone with the
+        // VitMerger+Merger vision pipeline instead of the resampler.
         VlmRuntimeRef::MiniCPMV46(minicpmv46) => {
             let processed_images = minicpmv46.processor.preprocess(images);
             let image_feature_sizes: Vec<usize> = processed_images
@@ -1403,12 +1408,9 @@ where
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            let prepared = prepare_minicpmo_prompt_tokens_with_image_feature_sizes(
-                prompt,
-                &image_feature_sizes,
-                &mut encode,
-            )
-            .map_err(|err| anyhow::anyhow!("{}", err))?;
+            let prepared =
+                prepare_minicpmv46_prompt_tokens(prompt, &image_feature_sizes, &mut encode)
+                    .map_err(|err| anyhow::anyhow!("{}", err))?;
             *prompt_tokens = prepared.tokens;
 
             let input_ids_arr = prompt_ids_array(prompt_tokens);
@@ -1904,12 +1906,14 @@ where
             let (pixel_values, tiles_per_image) = internvl.processor.preprocess_with_tiles(images);
 
             let preparation = insert_internvl_image_tokens(
+                prompt,
                 prompt_tokens,
                 &tiles_per_image,
                 internvl.num_image_token,
                 internvl.img_start_token_id,
                 internvl.image_context_token_id,
                 internvl.img_end_token_id,
+                &mut encode,
             )
             .map(|stats| VlmPreparationSummary::InternVL {
                 image_blocks: stats.image_blocks,
@@ -2079,11 +2083,12 @@ where
             // Llama 3.2 Vision keeps image features out of the token stream and
             // consults them through gated cross-attention. Preprocess the
             // image(s), run the tower + projector, and stash the resulting
-            // cross-attention states in the model so the subsequent forward()
-            // decode steps attend to them. No merged embeddings are produced
-            // (the `<|image|>` placeholder already sits in the prompt), so
-            // return `None` and let the standard forward path pick up the
-            // stashed state.
+            // cross-attention states in the model's fallback slot; the server
+            // binds that slot to the request's sequence id right after this
+            // returns (#2567), so the sequence's prefill and decode steps
+            // attend to it. No merged embeddings are produced (the `<|image|>`
+            // placeholder already sits in the prompt), so return `None` and let
+            // the standard forward path pick up the bound state.
             let _ = active_caches;
             let _ = image_cache_keys;
             let inputs = mllama.processor.process(images);
@@ -2196,13 +2201,42 @@ where
                 })
             })?;
 
-            // LFM2-VL runs every image in one preparation pass; skip the
-            // opportunistic vision cache for this first integration.
-            let _ = active_caches;
-            let _ = image_cache_keys;
+            let lfm2_keys: Option<Vec<Option<CacheKey>>> = if active_caches.is_some() {
+                let mut patch_ranges = Vec::with_capacity(layouts.len());
+                let mut offset = 0i32;
+                for layout in &layouts {
+                    let count: i32 = layout.views.iter().map(|&(h, w)| h * w).sum();
+                    patch_ranges.push((offset, count));
+                    offset += count;
+                }
+                Some(resolve_per_image_keys(
+                    image_cache_keys,
+                    layouts.len(),
+                    |idx| {
+                        let (start, count) = patch_ranges[idx];
+                        if count <= 0 {
+                            return None;
+                        }
+                        let patches = mlxcel_core::slice(
+                            &pixel_values,
+                            &[0, start, 0],
+                            &[1, start + count, lfm2vl.patch_dim],
+                        );
+                        Some(image_hash_from_pixels(&patches))
+                    },
+                ))
+            } else {
+                None
+            };
 
             let input_ids_arr = prompt_ids_array(prompt_tokens);
-            let embeddings = lfm2vl.get_input_embeddings(&input_ids_arr, &pixel_values, &layouts);
+            let embeddings = lfm2vl.get_input_embeddings_with_cache(
+                &input_ids_arr,
+                &pixel_values,
+                &layouts,
+                lfm2_keys.as_deref(),
+                active_caches.map(|c| &c.single),
+            );
 
             Ok(Some(PreparedVlmEmbeddings {
                 embeddings,
@@ -2736,8 +2770,24 @@ where
         }
         VlmRuntimeRef::Standard(vision_module) => {
             let preparation = match model.image_token_block_info() {
-                Some(info) => apply_image_token_blocks(prompt_tokens, info, images.len())?
-                    .map(VlmPreparationSummary::ImageBlocks),
+                Some(info) => {
+                    // Gemma 3 wraps each block in `\n\n`, which the reference
+                    // tokenizer fuses with a neighbouring template newline
+                    // (issue #2547). The newline-run table is probed once per
+                    // model (#2761); layouts without a wrapper never probe it.
+                    let newline_runs: &[i32] = if has_image_block_wrapper(&info) {
+                        cached_newline_runs(&vision_module.newline_runs, &mut encode)
+                    } else {
+                        &[]
+                    };
+                    expand_image_blocks_with_newline_fusion(
+                        prompt_tokens,
+                        &info,
+                        images.len(),
+                        newline_runs,
+                    )?
+                    .map(VlmPreparationSummary::ImageBlocks)
+                }
                 None => None,
             };
 

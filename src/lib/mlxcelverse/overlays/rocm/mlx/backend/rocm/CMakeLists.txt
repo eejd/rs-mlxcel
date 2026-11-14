@@ -25,6 +25,19 @@ if(NOT CMAKE_HIP_ARCHITECTURES)
 endif()
 message(
   STATUS "ROCm backend using HIP architectures: ${CMAKE_HIP_ARCHITECTURES}")
+# Each entry becomes an --offload-arch value and part of the
+# MLXCEL_ROCM_ARCHITECTURES string literal below, and comes from the
+# MLX_ROCM_ARCHITECTURES environment variable, so anything but a HIP target ID
+# (gfx1151, gfx11-generic, gfx90a:xnack+) stops the configure step instead of
+# reaching the compiler command line (lablup/mlxcel#2639).
+foreach(arch ${CMAKE_HIP_ARCHITECTURES})
+  if(NOT arch MATCHES "^gfx[0-9a-f]+(-[0-9a-f]+)?(-generic)?(:[a-z0-9]+[+-])*$")
+    message(
+      FATAL_ERROR
+        "Not a HIP target ID in CMAKE_HIP_ARCHITECTURES / MLX_ROCM_ARCHITECTURES: '${arch}' (expected e.g. gfx1151 or gfx90a:xnack+)"
+    )
+  endif()
+endforeach()
 
 # Check if any target architecture provides rocWMMA matrix-core tiles: RDNA 3 /
 # gfx11xx and RDNA 4 / gfx12xx expose native WMMA, while CDNA (gfx908 MI100,
@@ -64,6 +77,33 @@ if(MLX_HAS_ROCM_WMMA)
                       INTERFACE_INCLUDE_DIRECTORIES)
 endif()
 
+# Build include flags - use PROJECT_SOURCE_DIR for correct path
+set(HIP_INCLUDE_FLAGS "-I${PROJECT_SOURCE_DIR}" "-I${HIP_INCLUDE_DIRS}")
+
+# HIP objects on Windows: ROCm's clang targets x86_64-pc-windows-msvc and finds
+# the MSVC STL through the developer environment, so the libstdc++ probing below
+# does not apply. The objects must use the same CRT as MLX and the Rust binary
+# (/MD, release) and carry no -fPIC, which the COFF target rejects.
+if(WIN32)
+  set(HIP_PIC_FLAGS "")
+  # hipcc.exe does not locate the device bitcode of a relocatable (tarball)
+  # SDK on its own; name the root and the bitcode directory explicitly.
+  set(HIP_PLATFORM_FLAGS
+      --rocm-path=${ROCM_PATH}
+      --rocm-device-lib-path=${ROCM_PATH}/lib/llvm/amdgcn/bitcode
+      -fms-runtime-lib=dll
+      -D_DLL
+      -DNOMINMAX
+      -DWIN32_LEAN_AND_MEAN
+      -DMLX_STATIC)
+  set(HIP_OBJ_EXT obj)
+else()
+  set(HIP_PIC_FLAGS -fPIC)
+  set(HIP_PLATFORM_FLAGS "")
+  set(HIP_OBJ_EXT o)
+endif()
+
+if(NOT WIN32)
 # Find GCC installation for C++ standard library headers ROCm's clang needs to
 # know where to find libstdc++ headers
 execute_process(
@@ -78,9 +118,6 @@ execute_process(
   OUTPUT_VARIABLE GCC_VERSION
   OUTPUT_STRIP_TRAILING_WHITESPACE)
 string(REGEX MATCH "^[0-9]+" GCC_MAJOR_VERSION "${GCC_VERSION}")
-
-# Build include flags - use PROJECT_SOURCE_DIR for correct path
-set(HIP_INCLUDE_FLAGS "-I${PROJECT_SOURCE_DIR}" "-I${HIP_INCLUDE_DIRS}")
 
 # Add C++ standard library include paths for HIP compiler
 if(EXISTS "${GCC_CXX_INCLUDE_BASE}/c++/${GCC_MAJOR_VERSION}")
@@ -104,6 +141,7 @@ endif()
 # Add standard system include paths
 list(APPEND HIP_INCLUDE_FLAGS "-I/usr/include/x86_64-linux-gnu")
 list(APPEND HIP_INCLUDE_FLAGS "-I/usr/include")
+endif()
 
 foreach(inc ${HIP_DEVICE_INCLUDES})
   if(inc)
@@ -141,7 +179,6 @@ set(HIP_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/arange.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/arg_reduce.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/binary.hip
-    ${CMAKE_CURRENT_SOURCE_DIR}/binary_two.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/copy.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/copy/copy_contiguous.hip
     ${CMAKE_CURRENT_SOURCE_DIR}/copy/copy_general.hip
@@ -243,9 +280,9 @@ foreach(hip_src ${HIP_SOURCES})
   if(rel_dir)
     set(obj_subdir "${HIP_OBJ_DIR}/${rel_dir}")
     file(MAKE_DIRECTORY ${obj_subdir})
-    set(hip_obj "${obj_subdir}/${hip_name}.o")
+    set(hip_obj "${obj_subdir}/${hip_name}.${HIP_OBJ_EXT}")
   else()
-    set(hip_obj "${HIP_OBJ_DIR}/${hip_name}.o")
+    set(hip_obj "${HIP_OBJ_DIR}/${hip_name}.${HIP_OBJ_EXT}")
   endif()
 
   if(HIP_USE_DEPFILE)
@@ -259,8 +296,9 @@ foreach(hip_src ${HIP_SOURCES})
   add_custom_command(
     OUTPUT ${hip_obj}
     COMMAND
-      ${CMAKE_HIP_COMPILER} -c ${hip_src} -o ${hip_obj} -fPIC -DMLX_USE_ROCM
-      ${HIP_ARCH_FLAGS} ${HIP_INCLUDE_FLAGS} -std=c++17 -parallel-jobs=${NPROC}
+      ${CMAKE_HIP_COMPILER} -c ${hip_src} -o ${hip_obj} ${HIP_PIC_FLAGS}
+      ${HIP_PLATFORM_FLAGS} -DMLX_USE_ROCM ${HIP_ARCH_FLAGS} ${HIP_INCLUDE_FLAGS}
+      -std=c++17 -parallel-jobs=${NPROC}
       ${hip_dep_flags}
     DEPENDS ${hip_src} ${HIP_HEADER_DEPS}
     ${hip_depfile_arg}
@@ -275,13 +313,24 @@ add_custom_target(mlx_hip_objects DEPENDS ${HIP_OBJECTS})
 
 # Create static library from all objects (no device link needed without
 # -fgpu-rdc)
-set(HIP_STATIC_LIB "${CMAKE_CURRENT_BINARY_DIR}/libmlx_rocm_kernels.a")
-add_custom_command(
-  OUTPUT ${HIP_STATIC_LIB}
-  COMMAND ${CMAKE_AR} rcs ${HIP_STATIC_LIB} ${HIP_OBJECTS}
-  DEPENDS ${HIP_OBJECTS}
-  COMMENT "Creating static library from HIP objects"
-  VERBATIM)
+if(WIN32)
+  # MSVC library naming, so cargo's `static=mlx_rocm_kernels` finds it.
+  set(HIP_STATIC_LIB "${CMAKE_CURRENT_BINARY_DIR}/mlx_rocm_kernels.lib")
+  add_custom_command(
+    OUTPUT ${HIP_STATIC_LIB}
+    COMMAND ${CMAKE_AR} /NOLOGO /OUT:${HIP_STATIC_LIB} ${HIP_OBJECTS}
+    DEPENDS ${HIP_OBJECTS}
+    COMMENT "Creating static library from HIP objects"
+    VERBATIM)
+else()
+  set(HIP_STATIC_LIB "${CMAKE_CURRENT_BINARY_DIR}/libmlx_rocm_kernels.a")
+  add_custom_command(
+    OUTPUT ${HIP_STATIC_LIB}
+    COMMAND ${CMAKE_AR} rcs ${HIP_STATIC_LIB} ${HIP_OBJECTS}
+    DEPENDS ${HIP_OBJECTS}
+    COMMENT "Creating static library from HIP objects"
+    VERBATIM)
+endif()
 
 add_custom_target(mlx_rocm_kernels_lib DEPENDS ${HIP_STATIC_LIB})
 
@@ -311,7 +360,24 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/gemms/rocblas_gemm.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/gemms/hipblaslt_gemm.cpp)
 
+# Windows: the delay-load notify hook that loads the ROCm DLLs from the SDK bin
+# directory this build used (lablup/mlxcel#2602). mlxcel's build scripts pass
+# the matching /DELAYLOAD and /INCLUDE:__pfnDliNotifyHook2 link arguments.
+# Forward slashes, because the value becomes a C++ string literal.
+if(WIN32)
+  target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/delayload.cpp)
+  file(TO_CMAKE_PATH "${ROCM_PATH}/bin" _mlxcel_rocm_bin_dir)
+  target_compile_definitions(
+    mlx PRIVATE MLXCEL_ROCM_BIN_DIR="${_mlxcel_rocm_bin_dir}")
+endif()
+
 target_compile_definitions(mlx PRIVATE MLX_USE_ROCM)
+# The compiled HIP target list, printed once next to the bound-device line in
+# device.cpp (lablup/mlxcel#2639). Commas, because a ';' would split the
+# definition into several.
+string(REPLACE ";" "," _mlxcel_rocm_archs "${CMAKE_HIP_ARCHITECTURES}")
+target_compile_definitions(
+  mlx PRIVATE MLXCEL_ROCM_ARCHITECTURES="${_mlxcel_rocm_archs}")
 # Host WARP_SIZE compile-time fallback (device uses __AMDGCN_WAVEFRONT_SIZE__).
 #
 # Policy (hardware): RDNA2/3/3.5/4 (gfx10/11/12, incl. gfx1152 and gfx1200/1201)
@@ -419,6 +485,10 @@ find_library(HIPRTC_LIB hiprtc PATHS ${ROCM_PATH}/lib /opt/rocm/lib
 # Find hipBLASLt library (optimized GEMM for half-precision)
 find_library(HIPBLASLT_LIB hipblaslt PATHS ${ROCM_PATH}/lib /opt/rocm/lib
                                            /opt/rocm-6.0.0/lib)
+# Windows SDKs ship hipBLASLt's COFF import library as libhipblaslt.dll.a.
+if(NOT HIPBLASLT_LIB AND WIN32 AND EXISTS "${ROCM_PATH}/lib/libhipblaslt.dll.a")
+  set(HIPBLASLT_LIB "${ROCM_PATH}/lib/libhipblaslt.dll.a")
+endif()
 
 # Find hipFFT, used by the FFT primitive (lablup/mlxcel#1825)
 find_library(HIPFFT_LIB hipfft PATHS ${ROCM_PATH}/lib /opt/rocm/lib

@@ -23,7 +23,7 @@
 //! - RotatingKVCache for sliding window layers
 
 use crate::models::switch_layers::validate_expert_quantization_params;
-use mlxcel_core::generate::LanguageModel;
+use mlxcel_core::generate::{BatchedDecodeKind, LanguageModel, route_batched_decode};
 use mlxcel_core::layers::{KVCache, RMSNorm, RotatingKVCache, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils;
 use mlxcel_core::weights::WeightMap;
@@ -33,6 +33,7 @@ use std::path::Path;
 
 // Configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(remote = "Self")]
 pub struct ModelArgs {
     pub model_type: String,
     pub vocab_size: usize,
@@ -89,6 +90,8 @@ pub struct ModelArgs {
     pub quantization: Option<Quantization>,
 }
 
+mlxcel_core::impl_rope_lifting_deserialize!(ModelArgs);
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Quantization {
     pub group_size: i32,
@@ -119,13 +122,9 @@ fn default_rope_theta() -> f32 {
 
 impl ModelArgs {
     pub fn get_rope_theta(&self) -> f32 {
-        // Check rope_parameters for rope_theta override
-        if let Some(ref params) = self.rope_parameters
-            && let Some(v) = params.get("rope_theta")
-            && let Some(f) = v.as_f64()
-        {
-            return f as f32;
-        }
+        // The `Deserialize` impl lifts `rope_parameters.rope_theta` into the
+        // flat field when the flat key is absent, so a flat key wins, matching
+        // every other family (#2443).
         self.rope_theta
     }
 
@@ -583,6 +582,41 @@ impl ExaoneMoeDecoderLayer {
         let mlp_out = self.mlp.forward(&normed);
         mlxcel_core::add(&h, &mlp_out)
     }
+
+    pub fn forward_batched(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut KVCache],
+        mask: Option<&MlxArray>,
+        layer_idx: usize,
+    ) -> UniquePtr<MlxArray> {
+        let normed = self.input_layernorm.forward(x);
+        let q = self.self_attn.q_proj.forward(&normed);
+        let k = self.self_attn.k_proj.forward(&normed);
+        let v = self.self_attn.v_proj.forward(&normed);
+        let seq_len = mlxcel_core::array_shape(&q)[1];
+        let metadata = crate::models::batched_decode_cache::uniform_layer_metadata(
+            caches,
+            seq_len,
+            self.self_attn.window_size,
+            "ExaoneMoeModel",
+            layer_idx,
+        );
+        let attn = mlxcel_core::batched_decode::forward_split_attention(
+            &self.self_attn,
+            &q,
+            &k,
+            &v,
+            caches,
+            &metadata,
+            mask,
+        );
+        let attn = self.self_attn.o_proj.forward(&attn);
+        let h = mlxcel_core::add(x, &attn);
+        let normed = self.post_attention_layernorm.forward(&h);
+        let mlp_out = self.mlp.forward(&normed);
+        mlxcel_core::add(&h, &mlp_out)
+    }
 }
 
 // KVCache Trait for Dynamic Dispatch.
@@ -682,7 +716,7 @@ pub struct ExaoneMoeModel {
     pub layers: Vec<ExaoneMoeDecoderLayer>,
     pub norm: RMSNorm,
     pub lm_head: Option<UnifiedLinear>,
-    pub window_size: usize,
+    pub window_size: i32,
 }
 
 impl ExaoneMoeModel {
@@ -728,7 +762,7 @@ impl ExaoneMoeModel {
             // Full-width windowed mask for a fresh single-pass prefill that
             // exceeds the window (RotatingKVCache keeps all prefill keys),
             // clamped mask otherwise. See issue #408.
-            let max_cache = self.window_size as i32;
+            let max_cache = self.window_size;
             let swa_mask = Some(utils::create_sliding_window_prefill_mask(
                 seq_len,
                 swa_live_len,
@@ -766,12 +800,90 @@ impl ExaoneMoeModel {
             .iter()
             .map(|layer| {
                 if layer.is_sliding_window {
-                    AnyKVCache::Rotating(RotatingKVCache::new(self.window_size as i32))
+                    AnyKVCache::Rotating(RotatingKVCache::new(self.window_size))
                 } else {
                     AnyKVCache::Standard(KVCache::new())
                 }
             })
             .collect()
+    }
+
+    /// Run the `LanguageModel` cache type without rebuilding model-owned
+    /// caches on every call. Sliding layers keep the full standard K/V history
+    /// but pass the same window to attention, so outputs match the rotating
+    /// cache path while prompt K/V remains available to the next decode step.
+    fn forward_standard_caches(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let mut h = self.embed_tokens.forward(input_ids);
+        let seq_len = mlxcel_core::array_shape(&h)[1];
+        let (global_mask, sliding_mask) = if seq_len > 1 && mask.is_none() {
+            let ga_live_len = self
+                .layers
+                .iter()
+                .enumerate()
+                .find(|(_, layer)| !layer.is_sliding_window)
+                .map(|(idx, _)| caches[idx].live_len())
+                .unwrap_or(0);
+            let swa_live_len = self
+                .layers
+                .iter()
+                .enumerate()
+                .find(|(_, layer)| layer.is_sliding_window)
+                .map(|(idx, _)| caches[idx].live_len())
+                .unwrap_or(0);
+            (
+                Some(utils::create_causal_mask(seq_len, ga_live_len)),
+                Some(utils::create_sliding_window_prefill_mask(
+                    seq_len,
+                    swa_live_len,
+                    self.window_size,
+                )),
+            )
+        } else {
+            (None, None)
+        };
+
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let generated_mask = if layer.is_sliding_window {
+                sliding_mask.as_deref()
+            } else {
+                global_mask.as_deref()
+            };
+            h = layer.forward(&h, &mut caches[idx], mask.or(generated_mask));
+        }
+        let h = self.norm.forward(&h);
+        if let Some(head) = &self.lm_head {
+            head.forward(&h)
+        } else {
+            self.embed_tokens.as_linear(&h)
+        }
+    }
+
+    pub fn forward_batched_impl(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let mut h = self.embed_tokens.forward(input_ids);
+        for layer_idx in 0..self.layers.len() {
+            let mut caches = crate::models::batched_decode_cache::collect_layer_caches(
+                batch_caches,
+                "ExaoneMoeModel",
+                layer_idx,
+            );
+            h = self.layers[layer_idx].forward_batched(&h, &mut caches, mask, layer_idx);
+        }
+        let h = self.norm.forward(&h);
+        if let Some(head) = &self.lm_head {
+            head.forward(&h)
+        } else {
+            self.embed_tokens.as_linear(&h)
+        }
     }
 
     pub fn load<P: AsRef<Path>>(model_dir: P) -> Result<(Self, ModelArgs), String> {
@@ -796,6 +908,13 @@ impl ExaoneMoeModel {
     pub fn from_weights(weights: &WeightMap, args: &ModelArgs) -> Result<Self, String> {
         let group_size = args.group_size();
         let bits = args.bits();
+        let sliding_window = mlxcel_core::cache::cache_window(
+            "ExaOne MoE",
+            args.sliding_window,
+            args.layer_types
+                .iter()
+                .any(|kind| kind == "sliding_attention"),
+        )?;
 
         // Load embedding
         let embed_tokens =
@@ -804,7 +923,7 @@ impl ExaoneMoeModel {
         // Load layers
         let mut layers = Vec::with_capacity(args.num_hidden_layers);
         for i in 0..args.num_hidden_layers {
-            let layer = load_decoder_layer(weights, args, i)?;
+            let layer = load_decoder_layer(weights, args, i, sliding_window)?;
             layers.push(layer);
         }
 
@@ -826,7 +945,7 @@ impl ExaoneMoeModel {
             layers,
             norm,
             lm_head,
-            window_size: args.sliding_window,
+            window_size: sliding_window,
         })
     }
 }
@@ -836,6 +955,7 @@ fn load_decoder_layer(
     weights: &WeightMap,
     args: &ModelArgs,
     layer_idx: usize,
+    sliding_window: i32,
 ) -> Result<ExaoneMoeDecoderLayer, String> {
     let prefix = format!("model.layers.{}", layer_idx);
     let group_size = args.group_size();
@@ -887,11 +1007,7 @@ fn load_decoder_layer(
         rope_base: args.get_rope_theta(),
         rope_traditional: args.rope_traditional,
         is_sliding_window,
-        window_size: if is_sliding_window {
-            args.sliding_window as i32
-        } else {
-            0
-        },
+        window_size: if is_sliding_window { sliding_window } else { 0 },
     };
 
     // Load MLP (either Dense or MoE)
@@ -1059,34 +1175,95 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
 }
 
 // LanguageModel trait implementation.
+impl mlxcel_core::batched_decode::SplitAttention for ExaoneMoeAttention {
+    fn split_shape(&self) -> mlxcel_core::batched_decode::SplitAttentionShape {
+        mlxcel_core::batched_decode::SplitAttentionShape {
+            num_heads: self.n_heads,
+            num_kv_heads: self.n_kv_heads,
+            head_dim: self.head_dim,
+            scale: self.scale,
+        }
+    }
+
+    fn qk_norm_heads(
+        &self,
+        q: UniquePtr<MlxArray>,
+        k: UniquePtr<MlxArray>,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        (self.q_norm.forward(&q), self.k_norm.forward(&k))
+    }
+
+    fn rope_batched(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        offsets: &[i32],
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        (
+            mlxcel_core::fast_rope_batched(
+                q,
+                self.head_dim,
+                self.rope_traditional,
+                self.rope_base,
+                1.0,
+                offsets,
+            ),
+            mlxcel_core::fast_rope_batched(
+                k,
+                self.head_dim,
+                self.rope_traditional,
+                self.rope_base,
+                1.0,
+                offsets,
+            ),
+        )
+    }
+
+    fn custom_row_attend(&self) -> bool {
+        self.window_size > 0
+    }
+
+    fn attend_row(
+        &self,
+        q: &MlxArray,
+        k: UniquePtr<MlxArray>,
+        v: UniquePtr<MlxArray>,
+        cache: &mut KVCache,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let query_len = mlxcel_core::array_shape(q)[2];
+        let (cache_k, cache_v) = cache.update_and_fetch(k, v);
+        if query_len > 1 && mask.is_none() {
+            mlxcel_core::causal_attention(q, &cache_k, &cache_v, self.scale, 0.0, self.window_size)
+        } else {
+            let mask_ptr = mask.map_or(std::ptr::null(), |m| m as *const MlxArray);
+            unsafe {
+                mlxcel_core::layers::attention_from_ptr(
+                    q,
+                    &cache_k,
+                    &cache_v,
+                    self.scale,
+                    mask_ptr,
+                    0.0,
+                    self.window_size,
+                )
+            }
+        }
+    }
+}
+
 impl LanguageModel for ExaoneMoeModel {
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
         caches: &mut [KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        // Convert KVCache to AnyKVCache
-        let mut any_caches: Vec<AnyKVCache> = caches
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                if self.layers[i].is_sliding_window {
-                    AnyKVCache::Rotating(RotatingKVCache::new(self.window_size as i32))
-                } else {
-                    AnyKVCache::Standard(KVCache::new())
-                }
-            })
-            .collect();
-
-        let result = self.forward(input_ids, &mut any_caches, mask);
-
-        // Copy offsets back to original caches
-        for (i, cache) in caches.iter_mut().enumerate() {
-            cache.offset = any_caches[i].offset();
-        }
-
-        result
+        self.forward_standard_caches(input_ids, caches, mask)
     }
 
     fn make_caches(&self) -> Vec<KVCache> {
@@ -1102,6 +1279,17 @@ impl LanguageModel for ExaoneMoeModel {
     fn eos_token_ids(&self) -> Vec<i32> {
         // ExaOne MoE EOS token
         vec![2] // </s>
+    }
+
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        route_batched_decode(self, input_ids, batch_caches, |batch_caches| {
+            self.forward_batched_impl(input_ids, batch_caches, mask)
+        })
     }
 }
 

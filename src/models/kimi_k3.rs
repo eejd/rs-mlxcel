@@ -42,13 +42,13 @@
 
 use crate::models::conv_decode::{build_conv_decode_weight, short_conv_decode_step};
 use crate::models::gated_delta::{
-    gated_delta_update_with_lower_bound, scaled_fast_rms_norm_no_weight,
+    QK_L2NORM_EPS, gated_delta_update_with_lower_bound, normalize_qk,
 };
 use crate::models::kimi_linear::{MultiLinear, Quantization, ShortConv1d};
 use crate::models::switch_layers::{SwitchGLU, SwitchGluActivation, situ_activation};
-use mlxcel_core::cache::{SequenceId, SequenceStateLayout};
+use mlxcel_core::cache::{CachePool, SequenceId, SequenceStateLayout};
 use mlxcel_core::dtype;
-use mlxcel_core::generate::LanguageModel;
+use mlxcel_core::generate::{BatchedDecodeKind, LanguageModel, route_batched_decode_with_ids};
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, silu, stack_arrays};
 use mlxcel_core::weights::WeightMap;
@@ -65,10 +65,6 @@ mod sanitize;
 /// builds both as `KimiRMSNorm(rank)` with the class default of `1e-6`
 /// rather than `rms_norm_eps` (which is `1e-5` on the published config).
 const MLA_LORA_NORM_EPS: f32 = 1e-6;
-
-/// Epsilon of the FLA in-kernel l2norm applied to the KDA q/k
-/// (`use_qk_l2norm_in_kernel=True`). See [`KimiK3TextConfig::qk_norm_eps`].
-const KDA_L2NORM_EPS: f32 = 1e-6;
 
 // Configuration.
 
@@ -344,22 +340,6 @@ impl KimiK3TextConfig {
     }
     pub fn use_attn_residuals(&self) -> bool {
         self.attn_res_block_size.is_some()
-    }
-
-    /// Epsilon handed to `rms_norm` on the KDA q/k so that the scaled RMS
-    /// norm equals FLA's l2norm.
-    ///
-    /// The reference runs `use_qk_l2norm_in_kernel=True`, which is
-    /// `l2norm(x) = x / sqrt(sum(x^2) + 1e-6)`. With `D = head_dim`,
-    /// `sum(x^2) = D * mean(x^2)`, so
-    /// `l2norm(x) = D^-0.5 * x / sqrt(mean(x^2) + 1e-6 / D)
-    ///            = D^-0.5 * rms_norm(x, eps = 1e-6 / D)`.
-    /// The attention scale is folded in the same way as Kimi Linear does:
-    /// `q = scale^2 * rms_norm(q)` is `scale * l2norm(q)` and
-    /// `k = scale * rms_norm(k)` is `l2norm(k)`, with `scale = D^-0.5`.
-    /// Kimi Linear in this tree uses mlx-lm's plain `1e-6` and is left as is.
-    pub fn qk_norm_eps(&self) -> f32 {
-        KDA_L2NORM_EPS / self.delta_head_dim() as f32
     }
 }
 
@@ -769,7 +749,6 @@ pub(crate) struct KimiK3DeltaAttention {
     projection_dim: i32,
     kernel_size: i32,
     scale: f32,
-    qk_eps: f32,
     gate_lower_bound: Option<f32>,
 }
 
@@ -861,9 +840,10 @@ impl KimiK3DeltaAttention {
         let t = shape[1];
         let x_dtype = mlxcel_core::array_dtype(x);
 
-        // scale * l2norm(q) and l2norm(k), see `KimiK3TextConfig::qk_norm_eps`.
-        let q = scaled_fast_rms_norm_no_weight(q, self.scale * self.scale, self.qk_eps);
-        let k = scaled_fast_rms_norm_no_weight(k, self.scale, self.qk_eps);
+        // scale * l2norm(q) and l2norm(k), the reference's FLA in-kernel
+        // l2norm (`use_qk_l2norm_in_kernel=True`), shared with Kimi Linear,
+        // Qwen3-Next and Qwen 3.5 through `normalize_qk`.
+        let (q, k) = normalize_qk(q, k, self.scale, QK_L2NORM_EPS);
 
         let a = self.f_b_proj.forward(&self.f_a_proj.forward(x));
         let a = mlxcel_core::reshape(&a, &[b, t, self.num_heads, self.head_dim]);
@@ -1060,7 +1040,6 @@ impl KimiK3DeltaAttention {
             projection_dim: projection_dim as i32,
             kernel_size: kernel_size as i32,
             scale: (head_dim as f32).powf(-0.5),
-            qk_eps: config.qk_norm_eps(),
             gate_lower_bound: config.linear_attn_config.gate_lower_bound,
         })
     }
@@ -1102,6 +1081,60 @@ pub(crate) struct KimiK3MLAAttention {
 }
 
 impl KimiK3MLAAttention {
+    fn forward_batched_decode(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut KVCache],
+    ) -> UniquePtr<MlxArray> {
+        let b = mlxcel_core::array_shape(x)[0];
+        let q = match &self.q_proj {
+            QueryProjection::Plain(q_proj) => q_proj.forward(x),
+            QueryProjection::LoRA {
+                q_a_proj,
+                q_a_layernorm,
+                q_b_proj,
+            } => q_b_proj.forward(&q_a_layernorm.forward(&q_a_proj.forward(x))),
+        };
+        let q = mlxcel_core::reshape(&q, &[b, 1, self.num_heads, self.q_head_dim]);
+        let q = mlxcel_core::transpose_axes(&q, &[0, 2, 1, 3]);
+        let q_nope = mlxcel_core::slice(
+            &q,
+            &[0, 0, 0, 0],
+            &[b, self.num_heads, 1, self.qk_nope_head_dim],
+        );
+        let q_pe = mlxcel_core::slice(
+            &q,
+            &[0, 0, 0, self.qk_nope_head_dim],
+            &[b, self.num_heads, 1, self.q_head_dim],
+        );
+        let q_latent = self.embed_q.forward(&q_nope, true);
+
+        let compressed_kv = self.kv_a_proj_with_mqa.forward(x);
+        let compressed = mlxcel_core::slice(&compressed_kv, &[0, 0, 0], &[b, 1, self.kv_lora_rank]);
+        let k_pe = mlxcel_core::slice(
+            &compressed_kv,
+            &[0, 0, self.kv_lora_rank],
+            &[b, 1, self.kv_lora_rank + self.qk_rope_head_dim],
+        );
+        let k_pe = mlxcel_core::reshape(&k_pe, &[b, 1, 1, self.qk_rope_head_dim]);
+        let k_pe = mlxcel_core::transpose_axes(&k_pe, &[0, 2, 1, 3]);
+        let kv_latent = mlxcel_core::expand_dims(&self.kv_a_layernorm.forward(&compressed), 1);
+        let output = super::mla_batched::mla_latent_decode_rows(
+            &q_latent, &q_pe, &kv_latent, &k_pe, caches, self.scale, None,
+        );
+        let output = self.unembed_out.forward(&output, true);
+        let output = mlxcel_core::transpose_axes(&output, &[0, 2, 1, 3]);
+        let output = mlxcel_core::reshape(&output, &[b, 1, -1]);
+        let output = match &self.g_proj {
+            Some(g_proj) => {
+                let gate = mlxcel_core::sigmoid(&g_proj.forward(x));
+                mlxcel_core::multiply(&output, &gate)
+            }
+            None => output,
+        };
+        self.o_proj.forward(&output)
+    }
+
     pub(crate) fn forward(
         &self,
         x: &MlxArray,
@@ -1892,6 +1925,214 @@ impl KimiK3Model {
         make_layer_caches(&self.layers)
     }
 
+    fn delta_rows_uniform(rows: &[&KimiK3DeltaCache]) -> bool {
+        super::recurrent_batch::optional_rows_uniform(
+            &rows
+                .iter()
+                .map(|state| state.conv.as_deref())
+                .collect::<Vec<_>>(),
+        ) && super::recurrent_batch::optional_rows_uniform(
+            &rows
+                .iter()
+                .map(|state| state.ssm.as_deref())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn stack_delta(rows: &[&KimiK3DeltaCache]) -> Option<KimiK3DeltaCache> {
+        if !Self::delta_rows_uniform(rows) {
+            return None;
+        }
+        Some(KimiK3DeltaCache {
+            conv: super::recurrent_batch::stack_optional_rows(
+                &rows
+                    .iter()
+                    .map(|state| state.conv.as_deref())
+                    .collect::<Vec<_>>(),
+            )
+            .into_option(),
+            ssm: super::recurrent_batch::stack_optional_rows(
+                &rows
+                    .iter()
+                    .map(|state| state.ssm.as_deref())
+                    .collect::<Vec<_>>(),
+            )
+            .into_option(),
+            offset: 0,
+        })
+    }
+
+    fn split_delta(state: &KimiK3DeltaCache, offsets: &[i32]) -> Vec<KimiK3DeltaCache> {
+        let batch = offsets.len();
+        let split = |field: &Option<UniquePtr<MlxArray>>| match field {
+            Some(field) => super::recurrent_batch::split_rows(field, batch)
+                .into_iter()
+                .map(Some)
+                .collect::<Vec<_>>(),
+            None => (0..batch).map(|_| None).collect(),
+        };
+        split(&state.conv)
+            .into_iter()
+            .zip(split(&state.ssm))
+            .zip(offsets)
+            .map(|((conv, ssm), offset)| KimiK3DeltaCache {
+                conv,
+                ssm,
+                offset: offset + 1,
+            })
+            .collect()
+    }
+
+    fn validate_batch_cache_layout(&self, rows: &[Vec<KimiK3LayerCache>]) {
+        for (row_idx, row) in rows.iter().enumerate() {
+            assert_eq!(
+                row.len(),
+                self.layers.len(),
+                "KimiK3 batched decode cache count mismatch for row {row_idx}"
+            );
+            for (layer_idx, (cache, layer)) in row.iter().zip(&self.layers).enumerate() {
+                assert!(
+                    matches!(
+                        (cache, layer.is_linear),
+                        (KimiK3LayerCache::Delta(_), true) | (KimiK3LayerCache::Attn(_), false)
+                    ),
+                    "KimiK3 batched decode cache kind mismatch for row {row_idx}, layer {layer_idx}"
+                );
+            }
+        }
+    }
+
+    fn batch_states_uniform(&self, rows: &[Vec<KimiK3LayerCache>]) -> bool {
+        self.layers.iter().enumerate().all(|(layer_idx, layer)| {
+            if layer.is_linear {
+                let states: Vec<_> = rows
+                    .iter()
+                    .map(|row| match &row[layer_idx] {
+                        KimiK3LayerCache::Delta(state) => state,
+                        KimiK3LayerCache::Attn(_) => unreachable!("preflighted cache type"),
+                    })
+                    .collect();
+                Self::delta_rows_uniform(&states)
+            } else {
+                true
+            }
+        })
+    }
+
+    fn forward_rows_with_states(
+        &self,
+        input_ids: &MlxArray,
+        rows: &mut [Vec<KimiK3LayerCache>],
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(input_ids);
+        let outputs: Vec<_> = rows
+            .iter_mut()
+            .enumerate()
+            .map(|(row, state)| {
+                let input =
+                    mlxcel_core::slice(input_ids, &[row as i32, 0], &[row as i32 + 1, shape[1]]);
+                self.forward(&input, state)
+            })
+            .collect();
+        mlxcel_core::concatenate_many(
+            &outputs.iter().map(|output| &**output).collect::<Vec<_>>(),
+            0,
+        )
+    }
+
+    fn forward_batched_attention(
+        &self,
+        layer_idx: usize,
+        x: &MlxArray,
+        rows: &mut [Vec<KimiK3LayerCache>],
+    ) -> UniquePtr<MlxArray> {
+        match &self.layers[layer_idx].self_attn {
+            AttentionVariant::Delta(attn) => {
+                let states: Vec<_> = rows
+                    .iter()
+                    .map(|row| match &row[layer_idx] {
+                        KimiK3LayerCache::Delta(state) => state,
+                        KimiK3LayerCache::Attn(_) => unreachable!("preflighted cache type"),
+                    })
+                    .collect();
+                let offsets: Vec<_> = states.iter().map(|state| state.offset).collect();
+                let mut stacked =
+                    Self::stack_delta(&states).expect("preflighted KimiK3 delta states");
+                let output = attn.forward(x, &mut stacked);
+                for (row, state) in rows.iter_mut().zip(Self::split_delta(&stacked, &offsets)) {
+                    row[layer_idx] = KimiK3LayerCache::Delta(state);
+                }
+                output
+            }
+            AttentionVariant::Mla(attn) => {
+                let mut caches: Vec<_> = rows
+                    .iter_mut()
+                    .map(|row| match &mut row[layer_idx] {
+                        KimiK3LayerCache::Attn(cache) => cache,
+                        KimiK3LayerCache::Delta(_) => unreachable!("preflighted cache type"),
+                    })
+                    .collect();
+                attn.forward_batched_decode(x, &mut caches)
+            }
+        }
+    }
+
+    fn forward_batched_decode_with_caches(
+        &self,
+        input_ids: &MlxArray,
+        rows: &mut [Vec<KimiK3LayerCache>],
+    ) -> UniquePtr<MlxArray> {
+        if !self.batch_states_uniform(rows) {
+            return self.forward_rows_with_states(input_ids, rows);
+        }
+        let mut h = self.embed_tokens.forward(input_ids);
+        let mut blocks = ResidualBlocks::new();
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            if let Some(res) = &layer.attn_res {
+                let mixed = attn_res_mix(&blocks, &h, &res.w_attn, res.eps);
+                let starts_block = layer.layer_idx.is_multiple_of(res.block_size);
+                if starts_block {
+                    blocks.push(&h, res.eps);
+                }
+                let attention = self.forward_batched_attention(
+                    layer_idx,
+                    &layer.input_layernorm.forward(&mixed),
+                    rows,
+                );
+                let partial = if starts_block {
+                    attention
+                } else {
+                    mlxcel_core::add(&h, &attention)
+                };
+                let mixed = attn_res_mix(&blocks, &partial, &res.w_mlp, res.eps);
+                let mlp = layer
+                    .mlp
+                    .forward(&layer.post_attention_layernorm.forward(&mixed));
+                h = mlxcel_core::add(&partial, &mlp);
+            } else {
+                let attention = self.forward_batched_attention(
+                    layer_idx,
+                    &layer.input_layernorm.forward(&h),
+                    rows,
+                );
+                h = mlxcel_core::add(&h, &attention);
+                let mlp = layer
+                    .mlp
+                    .forward(&layer.post_attention_layernorm.forward(&h));
+                h = mlxcel_core::add(&h, &mlp);
+            }
+        }
+        let h = match &self.output_attn_res {
+            Some((weight, eps)) => attn_res_mix(&blocks, &h, weight, *eps),
+            None => h,
+        };
+        let h = self.norm.forward(&h);
+        match &self.lm_head {
+            Some(lm_head) => lm_head.forward(&h),
+            None => self.embed_tokens.as_linear(&h),
+        }
+    }
+
     pub fn load<P: AsRef<Path>>(model_dir: P) -> Result<(Self, KimiK3Config), String> {
         let model_dir = model_dir.as_ref();
 
@@ -2056,12 +2297,28 @@ impl LanguageModel for KimiK3Model {
         self.layers.len()
     }
 
+    /// No mode table: report the real storage so the server does not fall back to the configured
+    /// table (issue #2790). Attention layers keep an FP16 `KVCache`; linear layers none.
+    fn kv_cache_storage_modes(&self) -> Option<Vec<Option<mlxcel_core::cache::KVCacheMode>>> {
+        crate::models::model_owned::table_less_storage_modes(self.layers.len(), |idx| {
+            if self.layers[idx].is_linear {
+                crate::models::model_owned::LayerKv::None
+            } else {
+                crate::models::model_owned::LayerKv::Fp16Only
+            }
+        })
+    }
+
     fn supports_padded_prefill(&self) -> bool {
         false // Padding tokens corrupt the KDA recurrent state.
     }
 
     fn supports_batching(&self) -> bool {
-        false // Mixed model-owned caches (MLA latent + KDA state), like KimiLinear.
+        true
+    }
+
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
     }
 
     /// Prefill runs in one pass for this family.
@@ -2112,6 +2369,24 @@ impl LanguageModel for KimiK3Model {
         SequenceStateLayout::model_owned(self.layers.len())
     }
 
+    fn sync_sequence_storage(
+        &self,
+        seq_id: SequenceId,
+        cache_pool: &mut CachePool,
+    ) -> Result<(), String> {
+        self.sequence_state
+            .with_existing_sequence_state(seq_id, |caches| {
+                let lengths: Vec<_> = caches
+                    .iter()
+                    .map(|cache| match cache {
+                        KimiK3LayerCache::Attn(kv) => kv.live_len().max(0) as usize,
+                        KimiK3LayerCache::Delta(_) => 0,
+                    })
+                    .collect();
+                cache_pool.sync_paged_state_with_lengths(seq_id, &lengths)
+            })?
+    }
+
     fn reset_runtime_state(&self) {
         self.sequence_state
             .replace_internal(self.make_layer_caches());
@@ -2134,6 +2409,54 @@ impl LanguageModel for KimiK3Model {
         _mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         self.forward_for_sequence(input_ids, seq_id)
+    }
+
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_batched_with_ids(input_ids, None, batch_caches, mask)
+    }
+
+    fn forward_batched_with_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(input_ids);
+        assert_eq!(shape.len(), 2, "KimiK3 batched input must be rank 2");
+        assert_eq!(
+            shape[0] as usize,
+            batch_caches.len(),
+            "KimiK3 input/cache row mismatch"
+        );
+        if let Some(ids) = seq_ids {
+            assert_eq!(
+                ids.len(),
+                batch_caches.len(),
+                "KimiK3 requires one sequence id per batch row"
+            );
+        }
+        route_batched_decode_with_ids(self, input_ids, seq_ids, batch_caches, |_| {
+            let ids = seq_ids.expect("KimiK3 model-owned batched decode requires sequence ids");
+            self.sequence_state
+                .validate_sequence_states(ids)
+                .unwrap_or_else(|err| panic!("KimiK3 batched decode: {err}"));
+            self.sequence_state
+                .with_batched_sequence_states(ids, |rows| {
+                    self.validate_batch_cache_layout(rows);
+                    if shape[1] != 1 || mask.is_some() {
+                        self.forward_rows_with_states(input_ids, rows)
+                    } else {
+                        self.forward_batched_decode_with_caches(input_ids, rows)
+                    }
+                })
+                .unwrap_or_else(|err| panic!("KimiK3 batched decode: {err}"))
+        })
     }
 }
 

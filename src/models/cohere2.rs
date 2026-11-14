@@ -22,7 +22,7 @@
 //! - Logit scaling
 
 use mlxcel_core::cache::SequenceId;
-use mlxcel_core::generate::LanguageModel;
+use mlxcel_core::generate::{BatchedDecodeKind, LanguageModel, route_batched_decode};
 use mlxcel_core::layers::{FusedQKVLinear, KVCache, LayerNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, create_sliding_window_prefill_mask_dense};
 use mlxcel_core::weights::WeightMap;
@@ -33,6 +33,7 @@ use std::path::Path;
 // Configuration.
 /// Cohere2 model configuration
 #[derive(Debug, Clone, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Cohere2Config {
     pub model_type: String,
     pub hidden_size: usize,
@@ -74,6 +75,8 @@ pub struct Cohere2Config {
     #[serde(default)]
     pub eos_token_id: Option<EosTokenId>,
 }
+
+mlxcel_core::impl_rope_lifting_deserialize!(Cohere2Config);
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
@@ -256,6 +259,7 @@ impl Cohere2Attention {
         args: &Cohere2Config,
         layer_idx: usize,
         prefix: &str,
+        sliding_cache_window: i32,
     ) -> Result<Self, String> {
         let group_size = args.group_size();
         let bits = args.bits();
@@ -290,11 +294,82 @@ impl Cohere2Attention {
             rope_base: args.rope_theta,
             use_sliding_window,
             window_size: if use_sliding_window {
-                args.sliding_window as i32
+                sliding_cache_window
             } else {
                 0
             },
         })
+    }
+}
+
+impl mlxcel_core::batched_decode::SplitAttention for Cohere2Attention {
+    fn split_shape(&self) -> mlxcel_core::batched_decode::SplitAttentionShape {
+        mlxcel_core::batched_decode::SplitAttentionShape {
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            scale: self.scale,
+        }
+    }
+
+    fn rope_batched(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        offsets: &[i32],
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        if self.use_sliding_window {
+            (
+                mlxcel_core::fast_rope_batched(
+                    q,
+                    self.rope_dims,
+                    true,
+                    self.rope_base,
+                    1.0,
+                    offsets,
+                ),
+                mlxcel_core::fast_rope_batched(
+                    k,
+                    self.rope_dims,
+                    true,
+                    self.rope_base,
+                    1.0,
+                    offsets,
+                ),
+            )
+        } else {
+            (mlxcel_core::copy(q), mlxcel_core::copy(k))
+        }
+    }
+
+    fn custom_row_attend(&self) -> bool {
+        self.window_size > 0
+    }
+
+    fn attend_row(
+        &self,
+        q: &MlxArray,
+        k: UniquePtr<MlxArray>,
+        v: UniquePtr<MlxArray>,
+        cache: &mut KVCache,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let (cache_k, cache_v) = cache.update_and_fetch(k, v);
+        if let Some(mask) = mask {
+            unsafe {
+                mlxcel_core::layers::attention_from_ptr(
+                    q,
+                    &cache_k,
+                    &cache_v,
+                    self.scale,
+                    mask as *const _,
+                    0.0,
+                    self.window_size,
+                )
+            }
+        } else {
+            mlxcel_core::causal_attention(q, &cache_k, &cache_v, self.scale, 0.0, self.window_size)
+        }
     }
 }
 
@@ -372,6 +447,33 @@ impl Cohere2TransformerBlock {
         mlxcel_core::compiled_add3(&attn_h, &ff_h, x)
     }
 
+    pub fn forward_batched(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut KVCache],
+        layer_idx: usize,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let h = self.input_layernorm.forward(x);
+        let (q, k, v) = self.self_attn.qkv_proj.forward(&h);
+        let seq_len = mlxcel_core::array_shape(&q)[1];
+        let metadata = crate::models::batched_decode_cache::uniform_layer_metadata(
+            caches, seq_len, 0, "cohere2", layer_idx,
+        );
+        let attn = mlxcel_core::batched_decode::forward_split_attention(
+            &self.self_attn,
+            &q,
+            &k,
+            &v,
+            caches,
+            &metadata,
+            mask,
+        );
+        let attn = self.self_attn.o_proj.forward(&attn);
+        let mlp = self.mlp.forward(&h);
+        mlxcel_core::compiled_add3(&attn, &mlp, x)
+    }
+
     /// The two parallel branches for an input that is already normalized by
     /// this block's `input_layernorm`. The model's layer loop uses this so the
     /// residual add of block `i` can be fused with the norm of block `i + 1`.
@@ -388,6 +490,7 @@ impl Cohere2TransformerBlock {
         weights: &WeightMap,
         args: &Cohere2Config,
         layer_idx: usize,
+        sliding_cache_window: i32,
     ) -> Result<Self, String> {
         let prefix = format!("model.layers.{}", layer_idx);
 
@@ -396,6 +499,7 @@ impl Cohere2TransformerBlock {
             args,
             layer_idx,
             &format!("{}.self_attn", prefix),
+            sliding_cache_window,
         )?;
         let mlp = Cohere2MLP::from_weights(weights, args, &format!("{}.mlp", prefix))?;
 
@@ -423,12 +527,34 @@ pub struct Cohere2Model {
     pub lm_head: UnifiedLinear,
     pub logit_scale: f32,
     pub config: Cohere2Config,
+    /// The validated sliding window the dense prefill mask uses (issue
+    /// #2798), computed once at load.
+    sliding_cache_window: i32,
     // Indices of first sliding window and first global attention layers
     swa_idx: usize,
     ga_idx: usize,
 }
 
 impl Cohere2Model {
+    pub fn forward_batched_impl(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let mut h = self.embed_tokens.forward(input_ids);
+        for layer_idx in 0..self.layers.len() {
+            let mut layer_caches = crate::models::batched_decode_cache::collect_layer_caches(
+                batch_caches,
+                "Cohere2",
+                layer_idx,
+            );
+            h = self.layers[layer_idx].forward_batched(&h, &mut layer_caches, layer_idx, mask);
+        }
+        let h = self.norm.forward(&h);
+        self.logits_from_hidden(&h)
+    }
+
     /// All transformer layers followed by the final norm, returning the
     /// normalized hidden state for the LM head.
     ///
@@ -507,7 +633,7 @@ impl Cohere2Model {
             let sliding = Some(create_sliding_window_prefill_mask_dense(
                 l as i32,
                 swa_live_len,
-                self.config.sliding_window as i32,
+                self.sliding_cache_window,
             ));
             (full, sliding)
         } else {
@@ -600,6 +726,11 @@ impl Cohere2Model {
     pub fn from_weights(weights: &WeightMap, args: &Cohere2Config) -> Result<Self, String> {
         let group_size = args.group_size();
         let bits = args.bits();
+        let sliding_cache_window = mlxcel_core::cache::cache_window(
+            "Cohere2",
+            args.sliding_window,
+            (0..args.num_hidden_layers).any(|i| args.is_sliding_window_layer(i)),
+        )?;
 
         // Find first indices for each attention type
         let sliding_window_pattern = args.get_sliding_window_pattern();
@@ -617,7 +748,8 @@ impl Cohere2Model {
         // Load layers
         let mut layers = Vec::with_capacity(args.num_hidden_layers);
         for i in 0..args.num_hidden_layers {
-            let layer = Cohere2TransformerBlock::from_weights(weights, args, i)?;
+            let layer =
+                Cohere2TransformerBlock::from_weights(weights, args, i, sliding_cache_window)?;
             layers.push(layer);
         }
 
@@ -640,6 +772,7 @@ impl Cohere2Model {
             lm_head,
             logit_scale: args.logit_scale,
             config: args.clone(),
+            sliding_cache_window,
             swa_idx,
             ga_idx,
         })
@@ -648,6 +781,10 @@ impl Cohere2Model {
 
 // LanguageModel trait implementation.
 impl LanguageModel for Cohere2Model {
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
@@ -718,6 +855,17 @@ impl LanguageModel for Cohere2Model {
             Some(EosTokenId::Multiple(ids)) => ids.clone(),
             None => vec![255001], // Default Cohere2 EOS token
         }
+    }
+
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        route_batched_decode(self, input_ids, batch_caches, |caches| {
+            self.forward_batched_impl(input_ids, caches, mask)
+        })
     }
 }
 

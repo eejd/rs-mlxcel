@@ -53,7 +53,10 @@ fn phi3_vision_config() -> vision::config::VisionConfig {
         num_channels: 3,
         patch_size: 14,
         layer_norm_eps: 1e-5,
-        hidden_act: vision::config::VisionHiddenActivation::ExactGelu,
+        // The Phi-3-V / Phi-3.5-V remote code builds its CLIP ViT-L/14-336 with
+        // `hidden_act="quick_gelu"` (`CLIP_VIT_LARGE_PATCH14_336_CONFIG`); erf
+        // before #2548.
+        hidden_act: vision::config::VisionHiddenActivation::QuickGelu,
     }
 }
 
@@ -66,6 +69,7 @@ const PHI4_FUSED_TEXT_FIELDS: &[&str] = &[
     "hidden_size",
     "num_key_value_heads",
     "rope_theta",
+    "rope_parameters",
     "rope_traditional",
     "partial_rotary_factor",
     "rope_scaling",
@@ -403,8 +407,15 @@ pub(crate) fn load_minicpmo_vlm(model_path: &Path) -> Result<LoadedModel> {
     let mut text_config: models::qwen3::ModelArgs = serde_json::from_value(full_config.clone())
         .map_err(|e| anyhow::anyhow!("Failed to parse MiniCPM-o text config: {}", e))?;
     text_config.set_checkpoint_label(model_path);
-    let vision_config: MiniCPMOVisionConfig =
+    let mut vision_config: MiniCPMOVisionConfig =
         parse_required_vlm_subconfig(&full_config, "vision_config", "MiniCPM-o vision config")?;
+    // `vision_config.hidden_act` decides the encoder MLP GELU (#2548).
+    vision_config.mlp_activation = vision::encoders::minicpmo::mlp_activation_from_vision_config(
+        full_config
+            .get("vision_config")
+            .unwrap_or(&serde_json::Value::Null),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
     let processor_config = minicpmo_processor_config_value(model_path, &full_config)
         .unwrap_or_else(|| full_config.clone());
 
@@ -1428,29 +1439,43 @@ pub(crate) fn load_molmo2_xla_text_embeddings(
     let text = full_config
         .get("text_config")
         .ok_or_else(|| anyhow::anyhow!("Molmo2 config is missing text_config"))?;
-    let hidden_size = text
-        .get("hidden_size")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow::anyhow!("Molmo2 text_config.hidden_size is required"))?
-        as usize;
+    let mut text_config_value = text.clone();
+    inherit_quantization_if_missing(&mut text_config_value, &full_config)?;
+    let text_config: models::molmo2::Molmo2TextConfig =
+        serde_json::from_value(text_config_value)
+            .map_err(|error| anyhow::anyhow!("invalid Molmo2 text config: {error}"))?;
+    let hidden_size = text_config.hidden_size;
     let max_sequence_len = text
         .get("max_position_embeddings")
         .and_then(Value::as_u64)
         .ok_or_else(|| anyhow::anyhow!("Molmo2 text_config.max_position_embeddings is required"))?
         as usize;
     let raw_weights = super::load_vlm_weights_common_filtered_canonical(model_path, |name| {
-        matches!(
-            name,
-            "language_model.model.wte.embedding"
-                | "language_model.model.wte.new_embedding"
-                | "model.transformer.wte.embedding"
-                | "model.transformer.wte.new_embedding"
-        )
+        [
+            "language_model.model.wte.embedding",
+            "language_model.model.wte.new_embedding",
+            "model.transformer.wte.embedding",
+            "model.transformer.wte.new_embedding",
+        ]
+        .iter()
+        .any(|base| {
+            name == *base
+                || name
+                    .strip_prefix(*base)
+                    .is_some_and(|suffix| suffix == ".scales" || suffix == ".biases")
+        })
     })?;
     let weights = remap_molmo2_weights(raw_weights);
-    let embeddings =
-        models::molmo2::Molmo2Embedding::from_weights(&weights, "language_model.model.wte")
-            .map_err(|error| anyhow::anyhow!("invalid Molmo2 text embedding tables: {error}"))?;
+    let embeddings = models::molmo2::Molmo2Embedding::from_weights(
+        &weights,
+        "language_model.model.wte",
+        text_config.vocab_size,
+        text_config.additional_vocab_size,
+        text_config.hidden_size,
+        text_config.group_size(),
+        text_config.bits(),
+    )
+    .map_err(|error| anyhow::anyhow!("invalid Molmo2 text embedding tables: {error}"))?;
     Ok((embeddings, hidden_size, max_sequence_len))
 }
 
@@ -2195,6 +2220,9 @@ fn build_molmo2_vision_model(
         .get("pooling_attention_mask")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let (group_size, bits) = parse_quantization_params(full_config);
+    let group_size = if group_size > 0 { group_size } else { 64 };
+    let bits = if bits > 0 { bits } else { 4 };
 
     Molmo2VisionModel::from_weights(
         weights,
@@ -2217,6 +2245,8 @@ fn build_molmo2_vision_model(
         adapter_float32_attention,
         &vit_layers,
         pooling_attention_mask,
+        group_size,
+        bits,
     )
     .map_err(|e| anyhow::anyhow!("Failed to load vision model: {}", e))
 }
@@ -2640,6 +2670,8 @@ pub(crate) fn load_molmo_point_vlm(model_path: &Path) -> Result<LoadedModel> {
         vit_image_num_pos,
         vit_layer_norm_eps,
         true, // float32_attention
+        text_config.group_size(),
+        text_config.bits(),
     )
     .map_err(|e| anyhow::anyhow!("Failed to load vision model: {e}"))?;
 
@@ -2652,6 +2684,8 @@ pub(crate) fn load_molmo_point_vlm(model_path: &Path) -> Result<LoadedModel> {
         adapter_head_dim,
         positional_embeddings_size,
         pooling_attention_mask,
+        text_config.group_size(),
+        text_config.bits(),
     )
     .map_err(|e| anyhow::anyhow!("Failed to load connector: {e}"))?;
 
@@ -2892,6 +2926,7 @@ pub(crate) fn load_llama4_vlm(model_path: &Path) -> Result<LoadedModel> {
         block_prefix_tokens: Vec::new(),
         block_suffix_tokens: Vec::new(),
         pixtral_layout: None,
+        newline_runs: std::sync::OnceLock::new(),
     };
 
     let vlm = vision::VisionLanguageModel {

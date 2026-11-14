@@ -28,7 +28,7 @@ use crate::distributed::pipeline::LayerFilter;
 use crate::distributed::pipeline::StageExecutionOutput;
 use crate::distributed::pipeline::partial_loading::filter_weight_map;
 use crate::models::kv_snapshot::{self, KvSnapshotNames};
-use crate::models::model_owned::{KvCacheLayerModes, ModelOwnedSequenceState};
+use crate::models::model_owned::{KvCacheLayerModes, LayerKv, ModelOwnedSequenceState};
 use crate::models::rope_utils::{RopeScalingSpec, printable_label};
 use mlxcel_core::cache::{
     CachePool, DECODE_LOOKAHEAD_MAX_SPECULATIVE_APPENDS, KVCacheMode, KvAttention, SequenceId,
@@ -38,14 +38,16 @@ use mlxcel_core::generate::ModelStateSnapshot;
 use mlxcel_core::layers::{
     FusedQKVLinear, GemmaRMSNorm, KVCache, RotatingKVCache, UnifiedEmbedding, UnifiedLinear,
 };
-use mlxcel_core::utils::{create_causal_mask, create_sliding_window_prefill_mask, pipeline_hint};
+use mlxcel_core::utils::{create_sliding_window_prefill_mask, pipeline_hint};
 use mlxcel_core::weights::WeightMap;
+use mlxcel_core::window_sdpa::{self, WindowSdpaExtras, WindowSdpaShape};
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
 // Configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(remote = "Self")]
 #[serde(default)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -70,6 +72,8 @@ pub struct ModelArgs {
 
     pub quantization: Option<Quantization>,
 }
+
+mlxcel_core::impl_rope_lifting_deserialize!(ModelArgs);
 
 impl Default for ModelArgs {
     fn default() -> Self {
@@ -103,6 +107,19 @@ pub struct Quantization {
 }
 
 impl ModelArgs {
+    /// The sliding window as the `i32` the rotating caches take, checked at
+    /// load (issue #2790): a `sliding_window_pattern` of 0 would divide by
+    /// zero in every layer-kind predicate, and a window of 0 (or above
+    /// `i32::MAX`) cannot back a `RotatingKVCache`. A config whose pattern
+    /// leaves no sliding layer keeps any window, unused.
+    pub(crate) fn validated_sliding_window(&self) -> Result<i32, String> {
+        if self.sliding_window_pattern == 0 {
+            return Err("Gemma 3: sliding_window_pattern must be positive".to_string());
+        }
+        let has_sliding_layer = self.sliding_window_pattern > 1 && self.num_hidden_layers > 0;
+        crate::models::model_owned::cache_window("Gemma 3", self.sliding_window, has_sliding_layer)
+    }
+
     pub fn group_size(&self) -> i32 {
         self.quantization
             .as_ref()
@@ -328,7 +345,7 @@ impl Attention {
         self.o_proj.forward(&attn_out)
     }
 
-    fn forward_batched_decode(
+    pub(crate) fn forward_batched_decode(
         &self,
         x: &MlxArray,
         caches: &mut [&mut Cache],
@@ -901,13 +918,150 @@ impl KvAttention for Cache {
     }
 }
 
+/// Whether a sliding-layer prefill of `seq_len` rows after `sliding_live_len`
+/// live keys plans the native window route (issue #2621). When it does, the
+/// forward builds no sliding mask: `RotatingKVCache::attend` carries the
+/// window, and `causal_attention`'s over-window branch applies the band
+/// through MLX's native `window_size` entry, or, should the per-layer
+/// decision decline after all, through the same full-width mask this model
+/// built before, so a disagreement costs a mask build, never semantics.
+///
+/// `attn` is any sliding layer's attention (the head counts and head dim are
+/// shared), `h` the hidden state whose dtype the projections keep, and
+/// `caches` the forward's caches. The plan reads the K/V dtype the sliding
+/// caches return ([`sliding_caches_kv_dtype`]), so a `Turbo4Asym` ring under
+/// bf16 activations plans the legacy route here, with one mask per forward,
+/// instead of planning native and then declining at every sliding layer.
+/// Sliding layers whose caches return different dtypes (Boundary-V keeps the
+/// outer layers at FP16 under a Turbo mode) also plan legacy, since no one
+/// shape describes them all.
+///
+/// Used by: [`text_prefill_sliding_mask`].
+fn sliding_prefill_plans_native(
+    attn: &Attention,
+    h: &MlxArray,
+    caches: &[Cache],
+    seq_len: i32,
+    sliding_live_len: i32,
+    window: i32,
+) -> bool {
+    let activation_dtype = mlxcel_core::array_dtype(h);
+    let Some(kv_dtype) = sliding_caches_kv_dtype(caches, activation_dtype) else {
+        return false;
+    };
+    let shape = WindowSdpaShape::prefill(
+        mlxcel_core::array_shape(h)[0],
+        attn.num_heads,
+        attn.num_kv_heads,
+        seq_len,
+        window_sdpa::rotating_prefill_key_len(seq_len, sliding_live_len, window),
+        attn.head_dim,
+        activation_dtype,
+    )
+    .with_kv_dtype(kv_dtype);
+    window_sdpa::plan(&shape, window, WindowSdpaExtras::default()).is_native()
+}
+
+/// The sliding-layer mask of a text-only prefill of `seq_len` rows after
+/// `sliding_live_len` live keys, or `None` when the attention kernels derive
+/// it themselves. Global layers never take a mask on this path: a plain
+/// bottom-right causal mask goes through MLX's maskless causal SDPA (mlx-lm
+/// passes `"causal"`). The sliding mask is also left `None` while every live
+/// key is inside the window, and past the window when the native window route
+/// is planned ([`sliding_prefill_plans_native`]); otherwise it is the dense
+/// band.
+///
+/// Every Gemma 3 text forward builds its prefill masks here so they all run
+/// the same attention kernels. A pipeline stage that built explicit masks
+/// instead took the masked SDPA path while the single-process model took the
+/// maskless one, and its logits drifted from the dense ones (issue #2654).
+///
+/// `sliding_attn` is any sliding layer's attention and `sliding_live_len` the
+/// live length of a sliding cache.
+///
+/// Used by: `Gemma3Model::forward_with_caches_and_embeddings`,
+/// `Gemma3StageModel::execute_hidden`, `Gemma3Backbone::forward_embeds`.
+pub(crate) fn text_prefill_sliding_mask(
+    sliding_attn: &Attention,
+    h: &MlxArray,
+    caches: &[Cache],
+    seq_len: i32,
+    sliding_live_len: i32,
+    window: i32,
+) -> Option<UniquePtr<MlxArray>> {
+    if sliding_live_len + seq_len <= window
+        || sliding_prefill_plans_native(sliding_attn, h, caches, seq_len, sliding_live_len, window)
+    {
+        None
+    } else {
+        Some(create_sliding_window_prefill_mask(
+            seq_len,
+            sliding_live_len,
+            window,
+        ))
+    }
+}
+
+/// The sliding-layer form of an external (VLM) prefill mask: `external` with
+/// every key `window` or more positions behind its query masked, the band
+/// `create_sliding_window_prefill_mask` applies (`q - k < window`), or `None`
+/// when the key axis fits the window and the band would mask nothing.
+///
+/// transformers composes Gemma 3's image-prompt masks the same way: the
+/// full-attention layers use `causal OR same_image_block`, the sliding layers
+/// `sliding_window AND (causal OR same_image_block)`. Queries are aligned to
+/// the end of the key axis, so a mask over prior keys keeps its positions. A
+/// boolean mask stays boolean; an additive one gets `f32::MIN` outside the
+/// band.
+///
+/// Used by: `Gemma3Model::hidden_with_caches_and_embeddings`.
+pub(crate) fn external_mask_with_window_band(
+    external: &MlxArray,
+    window: i32,
+) -> Option<UniquePtr<MlxArray>> {
+    let shape = mlxcel_core::array_shape(external);
+    let (q_len, k_len) = (shape[shape.len() - 2], shape[shape.len() - 1]);
+    if k_len <= window {
+        return None;
+    }
+    let query_pos = mlxcel_core::reshape(
+        &mlxcel_core::arange_i32(k_len - q_len, k_len, 1),
+        &[q_len, 1],
+    );
+    let key_pos = mlxcel_core::reshape(&mlxcel_core::arange_i32(0, k_len, 1), &[1, k_len]);
+    let window_arr = mlxcel_core::from_slice_i32(&[window], &[1]);
+    let in_band = mlxcel_core::less(&mlxcel_core::subtract(&query_pos, &key_pos), &window_arr);
+    Some(
+        if mlxcel_core::array_dtype(external) == mlxcel_core::dtype::BOOL {
+            mlxcel_core::logical_and(external, &in_band)
+        } else {
+            let masked = mlxcel_core::from_slice_f32(&[f32::MIN], &[1]);
+            mlxcel_core::where_cond(&in_band, external, &masked)
+        },
+    )
+}
+
+/// [`mlxcel_core::window_sdpa::sliding_caches_kv_dtype`] over this model's
+/// sliding (`Rotating`) caches. Used by: `sliding_prefill_plans_native`
+/// (issue #2621).
+pub(crate) fn sliding_caches_kv_dtype(caches: &[Cache], activation_dtype: i32) -> Option<i32> {
+    mlxcel_core::window_sdpa::sliding_caches_kv_dtype(
+        caches.iter().filter_map(|cache| match cache {
+            Cache::Rotating(c) => Some(c),
+            Cache::Standard(_) => None,
+        }),
+        activation_dtype,
+    )
+}
+
 // Gemma3 Model.
 pub struct Gemma3Model {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<TransformerBlock>,
     pub norm: GemmaRMSNorm,
     pub lm_head: UnifiedLinear,
-    pub sliding_window: usize,
+    /// Validated at load ([`ModelArgs::validated_sliding_window`]).
+    pub sliding_window: i32,
     pub sliding_window_pattern: usize,
     pub hidden_size: usize,
 }
@@ -985,15 +1139,27 @@ impl Gemma3Model {
         h = mlxcel_core::multiply_scalar(&h, scale);
 
         let n = self.layers.len();
-        // If external 4D mask is provided (from VLM), use it for all layers.
-        // Python mlx-vlm passes a 0/1 INT32 mask from prepare_inputs_for_multimodal
-        // directly to all layers, bypassing the causal mask creation.
-        // When attention_mask is all-ones (no padding), this creates a bidirectional
-        // mask that lets all tokens attend to all others during prefill.
         if let Some(ext_mask) = external_mask {
-            // VLM provides a 4D attention mask -- apply it to all layers
+            // A VLM prefill hands in its own 4D mask (for Gemma 3 image
+            // prompts: causal plus bidirectional image blocks, built by
+            // `vision::merge`). As in transformers, the global layers take it
+            // as is and the sliding layers take it intersected with their
+            // window band; the band is built once per forward, and only when
+            // the key axis is wider than the window.
+            let sliding_ext_mask = if self.sliding_window_pattern > 1 {
+                external_mask_with_window_band(ext_mask, self.sliding_window)
+            } else {
+                None
+            };
             for (i, layer) in self.layers.iter().enumerate() {
-                h = layer.forward(&h, caches[i].as_interface(), Some(ext_mask));
+                let is_global =
+                    (i % self.sliding_window_pattern) == (self.sliding_window_pattern - 1);
+                let mask = if is_global {
+                    ext_mask
+                } else {
+                    sliding_ext_mask.as_deref().unwrap_or(ext_mask)
+                };
+                h = layer.forward(&h, caches[i].as_interface(), Some(mask));
                 pipeline_hint(&h, i, n);
             }
         } else if seq_len == 1 {
@@ -1030,16 +1196,14 @@ impl Gemma3Model {
 
             let sliding_mask = if self.sliding_window_pattern > 1 {
                 let sliding_live_len = caches[0].as_interface().live_len();
-                let window = self.sliding_window as i32;
-                if sliding_live_len + seq_len <= window {
-                    None
-                } else {
-                    Some(create_sliding_window_prefill_mask(
-                        seq_len,
-                        sliding_live_len,
-                        window,
-                    ))
-                }
+                text_prefill_sliding_mask(
+                    &self.layers[0].self_attn,
+                    &h,
+                    caches,
+                    seq_len,
+                    sliding_live_len,
+                    self.sliding_window,
+                )
             } else {
                 None
             };
@@ -1080,16 +1244,17 @@ impl Gemma3Model {
             .map(|i| {
                 let is_global =
                     (i % self.sliding_window_pattern) == (self.sliding_window_pattern - 1);
-                let mode = modes
-                    .map(|modes| modes.mode_for_layer(i))
-                    .unwrap_or(KVCacheMode::Fp16);
                 if is_global {
+                    let mode = modes
+                        .map(|modes| modes.mode_for_layer(i))
+                        .unwrap_or(KVCacheMode::Fp16);
                     Cache::Standard(KVCache::new_with_mode(mode))
                 } else {
-                    Cache::Rotating(RotatingKVCache::new_with_mode(
-                        self.sliding_window as i32,
-                        mode,
-                    ))
+                    let window = self.sliding_window;
+                    let mode = modes.map_or(KVCacheMode::Fp16, |modes| {
+                        modes.rotating_mode_for_layer(i, window)
+                    });
+                    Cache::Rotating(RotatingKVCache::new_with_mode(window, mode))
                 }
             })
             .collect()
@@ -1140,6 +1305,7 @@ impl Gemma3Model {
 
     /// Create model from loaded weights
     pub fn from_weights(weights: &WeightMap, args: &ModelArgs) -> Result<Self, String> {
+        let sliding_window = args.validated_sliding_window()?;
         let group_size = args.group_size();
         let bits = args.bits();
 
@@ -1166,7 +1332,7 @@ impl Gemma3Model {
             layers,
             norm,
             lm_head,
-            sliding_window: args.sliding_window,
+            sliding_window,
             sliding_window_pattern: args.sliding_window_pattern,
             hidden_size: args.hidden_size,
         })
@@ -1179,7 +1345,7 @@ pub(crate) struct Gemma3StageModel {
     layers: Vec<TransformerBlock>,
     norm: Option<GemmaRMSNorm>,
     lm_head: Option<UnifiedLinear>,
-    sliding_window: usize,
+    sliding_window: i32,
     sliding_window_pattern: usize,
     hidden_size: usize,
 }
@@ -1208,6 +1374,7 @@ impl Gemma3StageModel {
         filter: &LayerFilter,
         stage_index: usize,
     ) -> Result<Self, String> {
+        let sliding_window = args.validated_sliding_window()?;
         let group_size = args.group_size();
         let bits = args.bits();
         let embed_tokens = if filter.has_embedding {
@@ -1248,7 +1415,7 @@ impl Gemma3StageModel {
             layers,
             norm,
             lm_head,
-            sliding_window: args.sliding_window,
+            sliding_window,
             sliding_window_pattern: args.sliding_window_pattern,
             hidden_size: args.hidden_size,
         })
@@ -1267,7 +1434,7 @@ impl Gemma3StageModel {
                 if is_global {
                     Cache::Standard(KVCache::new())
                 } else {
-                    Cache::Rotating(RotatingKVCache::new(self.sliding_window as i32))
+                    Cache::Rotating(RotatingKVCache::new(self.sliding_window))
                 }
             })
             .collect()
@@ -1314,36 +1481,29 @@ impl Gemma3StageModel {
         }
 
         let seq_len = mlxcel_core::array_shape(hidden.as_ref().unwrap())[1];
+        let n = self.layers.len();
         if seq_len > 1 {
-            // Size both prefill masks from the cache's live window
-            // (`live_len()`), not the monotonic `offset`, so the mask key axis
-            // matches the K/V `update_and_fetch` returns after a
-            // `--max-kv-size` trim advances `live_start` while `offset` keeps
-            // growing for RoPE. Byte-identical when untrimmed (`live_len ==
-            // offset`); mirrors `Gemma3Model::forward_with_caches` and
-            // `Gemma4StageModel::execute_hidden`. See issue #430.
-            let global_live_len = self
-                .first_global_cache_index()
-                .map(|idx| caches[idx].as_interface().live_len())
-                .unwrap_or(0);
-            let global_mask = create_causal_mask(seq_len, global_live_len);
-
-            let sliding_mask = if self.first_sliding_cache_index().is_some() {
-                let sliding_live_len = caches[self.first_sliding_cache_index().unwrap()]
-                    .as_interface()
-                    .live_len();
-                Some(create_sliding_window_prefill_mask(
+            // The same masks the single-process forward builds, from the
+            // stage's own first sliding layer and cache: global layers take
+            // the maskless causal SDPA, and sliding layers a dense band only
+            // past the window when the native route is not planned. Building
+            // explicit masks here instead ran different attention kernels
+            // than the dense model and broke remote parity (issue #2654).
+            let sliding_mask = self.first_sliding_cache_index().and_then(|sliding_idx| {
+                let sliding_live_len = caches[sliding_idx].as_interface().live_len();
+                text_prefill_sliding_mask(
+                    &self.layers[sliding_idx].self_attn,
+                    hidden.as_ref().unwrap(),
+                    caches,
                     seq_len,
                     sliding_live_len,
-                    self.sliding_window as i32,
-                ))
-            } else {
-                None
-            };
+                    self.sliding_window,
+                )
+            });
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let mask = if self.is_global_layer(layer_idx) {
-                    Some(global_mask.as_ref().unwrap() as &MlxArray)
+                    None
                 } else {
                     sliding_mask.as_deref()
                 };
@@ -1352,6 +1512,7 @@ impl Gemma3StageModel {
                     caches[layer_idx].as_interface(),
                     mask,
                 );
+                pipeline_hint(&hidden, layer_idx, n);
             }
         } else {
             for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -1360,6 +1521,7 @@ impl Gemma3StageModel {
                     caches[layer_idx].as_interface(),
                     None,
                 );
+                pipeline_hint(&hidden, layer_idx, n);
             }
         }
 
@@ -1379,10 +1541,6 @@ impl Gemma3StageModel {
     fn is_global_layer(&self, local_idx: usize) -> bool {
         let global_idx = self.global_layer_index(local_idx);
         (global_idx % self.sliding_window_pattern) == (self.sliding_window_pattern - 1)
-    }
-
-    fn first_global_cache_index(&self) -> Option<usize> {
-        (0..self.layers.len()).find(|&idx| self.is_global_layer(idx))
     }
 
     fn first_sliding_cache_index(&self) -> Option<usize> {
@@ -1414,6 +1572,22 @@ impl Gemma3Wrapper {
             sequence_state: ModelOwnedSequenceState::new(caches),
             kv_cache_layer_modes: KvCacheLayerModes::new(),
         }
+    }
+
+    /// The KV cache mode each of sequence `id`'s layer caches was built with.
+    #[cfg(test)]
+    pub(crate) fn sequence_kv_modes(&self, id: SequenceId) -> Vec<KVCacheMode> {
+        self.sequence_state
+            .with_sequence_state_ref(id, |caches| {
+                caches
+                    .iter()
+                    .map(|cache| match cache {
+                        Cache::Standard(c) => c.mode,
+                        Cache::Rotating(c) => c.mode,
+                    })
+                    .collect()
+            })
+            .expect("test sequence exists")
     }
 
     /// Caches for one scheduler sequence. When the decode lookahead can be
@@ -1492,6 +1666,10 @@ impl Gemma3Wrapper {
 }
 
 impl mlxcel_core::generate::LanguageModel for Gemma3Wrapper {
+    fn batched_decode_kind(&self) -> mlxcel_core::generate::BatchedDecodeKind {
+        mlxcel_core::generate::BatchedDecodeKind::Native
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
@@ -1537,6 +1715,17 @@ impl mlxcel_core::generate::LanguageModel for Gemma3Wrapper {
 
     fn kv_cache_layer_modes(&self) -> Option<Vec<KVCacheMode>> {
         self.kv_cache_layer_modes.clone_modes()
+    }
+
+    /// Sliding layers hold a `RotatingKVCache`, which stores FP16 for every
+    /// mode but an aligned `Turbo4Asym` (issue #2783).
+    fn kv_cache_storage_modes(&self) -> Option<Vec<Option<KVCacheMode>>> {
+        let window = self.model.sliding_window;
+        self.kv_cache_layer_modes.storage_modes(|layer_idx| {
+            self.is_sliding_layer(layer_idx)
+                .then_some(window)
+                .map_or(LayerKv::Full, LayerKv::Sliding)
+        })
     }
 
     fn num_layers(&self) -> usize {
@@ -1916,6 +2105,7 @@ mod gemma3_mask_tests {
     // so it relies on both the full over-window mask (fresh prefill) and the
     // window-clamped shape (rolled-over cache) the helper produces.
     use super::*;
+    use mlxcel_core::utils::create_causal_mask;
 
     fn mask_at(mask: &MlxArray, q: i32, k: i32) -> f32 {
         let scalar = mlxcel_core::slice(mask, &[q, k], &[q + 1, k + 1]);
@@ -2062,4 +2252,8 @@ mod gemma3_mask_tests {
 
 #[cfg(test)]
 #[path = "gemma3_tests.rs"]
-mod gemma3_tests;
+pub(super) mod gemma3_tests;
+
+#[cfg(test)]
+#[path = "gemma3_stage_tests.rs"]
+mod gemma3_stage_tests;

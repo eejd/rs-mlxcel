@@ -18,12 +18,16 @@
 //! - layer_types: Vec<String> with "sliding_attention" or "full_attention"
 //! - Llama 4 attention scaling per position: scale = 1 + beta * ln(1 + floor(pos / max_pos))
 //! - RotatingKVCache for sliding_attention layers
+//! - YaRN rotary frequencies when `rope_parameters` declares `rope_type: yarn`
+//!   (every released Ministral 3 checkpoint does), as mlx-lm's `YarnRoPE`
 
 use mlxcel_core::layers::{KVCache, RMSNorm, RotatingKVCache, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, create_sliding_window_prefill_mask};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
+
+use crate::models::gpt_oss_common::{YarnRopeParams, yarn_rope_freqs};
 use std::path::Path;
 
 // Configuration.
@@ -62,11 +66,62 @@ pub struct ModelArgs {
     pub quantization: Option<Quantization>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct RopeParameters {
     pub rope_theta: f32,
     pub llama_4_scaling_beta: f32,
     pub original_max_position_embeddings: usize,
+    /// `rope_type`; checkpoints also carry the legacy `type` spelling.
+    #[serde(default)]
+    pub rope_type: Option<String>,
+    #[serde(default, rename = "type")]
+    pub legacy_type: Option<String>,
+    /// YaRN `factor`.
+    #[serde(default)]
+    pub factor: Option<f32>,
+    #[serde(default)]
+    pub beta_fast: Option<f32>,
+    #[serde(default)]
+    pub beta_slow: Option<f32>,
+    #[serde(default)]
+    pub mscale: Option<f32>,
+    #[serde(default)]
+    pub mscale_all_dim: Option<f32>,
+    #[serde(default)]
+    pub truncate: Option<bool>,
+}
+
+impl RopeParameters {
+    /// YaRN frequencies (`dims / 2` values for `fast_rope_with_freqs`) and the
+    /// q/k attention factor, or `None` when the rope is not YaRN.
+    ///
+    /// Mirrors mlx-lm `initialize_rope` -> `YarnRoPE`: `type` wins over
+    /// `rope_type`, and the defaults are mlx-lm's (`beta_fast` 32, `beta_slow`
+    /// 1, `mscale` 1, `mscale_all_dim` 0, `truncate` true).
+    ///
+    /// Used by: Ministral3 `Attention::from_weights`
+    #[must_use]
+    pub fn yarn_freqs(&self, head_dim: usize) -> Option<(Vec<f32>, f32)> {
+        let kind = self
+            .legacy_type
+            .as_deref()
+            .or(self.rope_type.as_deref())
+            .unwrap_or("default");
+        if kind != "yarn" {
+            return None;
+        }
+        Some(yarn_rope_freqs(&YarnRopeParams {
+            dims: head_dim,
+            base: self.rope_theta,
+            factor: self.factor.unwrap_or(1.0),
+            original_max_position_embeddings: self.original_max_position_embeddings as f32,
+            beta_fast: self.beta_fast.unwrap_or(32.0),
+            beta_slow: self.beta_slow.unwrap_or(1.0),
+            mscale: self.mscale.unwrap_or(1.0),
+            mscale_all_dim: self.mscale_all_dim.unwrap_or(0.0),
+            truncate: self.truncate.unwrap_or(true),
+        }))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -111,7 +166,8 @@ impl ModelArgs {
 /// Compute Llama 4 attention scale per position
 /// scale = 1 + beta * ln(1 + floor(pos / max_pos))
 ///
-/// Used by: Ministral 3 generation (`Ministral3Model::forward_with_caches`) and
+/// Used by: Ministral 3 generation and the ERNIE-Image text conditioner and
+/// prompt enhancer (`Ministral3Model::forward_hidden_states`), and
 /// Nemotron-3-Embed (`crate::models::ministral3_embedding`), which needs the
 /// same schedule at offset 0 for its single bidirectional prefill.
 pub(crate) fn get_llama4_attn_scale(
@@ -140,6 +196,10 @@ pub struct Attention {
     pub head_dim: i32,
     pub scale: f32,
     pub rope_base: f32,
+    /// YaRN frequencies; `None` rotates with `rope_base`.
+    pub rope_freqs: Option<UniquePtr<MlxArray>>,
+    /// YaRN attention factor applied to q and k before rotation.
+    pub rope_mscale: f32,
     pub window_size: i32,
 }
 
@@ -172,9 +232,26 @@ impl Attention {
 
         let offset = cache.offset();
 
-        // Apply RoPE
-        let q = mlxcel_core::fast_rope(&q, self.head_dim, false, self.rope_base, 1.0, offset);
-        let k = mlxcel_core::fast_rope(&k, self.head_dim, false, self.rope_base, 1.0, offset);
+        // Apply RoPE (YaRN: scale by mscale, then rotate with its frequencies)
+        let (q, k) = if let Some(freqs) = self.rope_freqs.as_ref() {
+            let (q, k) = if (self.rope_mscale - 1.0).abs() > 1e-6 {
+                (
+                    mlxcel_core::multiply_scalar(&q, self.rope_mscale),
+                    mlxcel_core::multiply_scalar(&k, self.rope_mscale),
+                )
+            } else {
+                (q, k)
+            };
+            (
+                mlxcel_core::fast_rope_with_freqs(&q, self.head_dim, false, 1.0, offset, freqs),
+                mlxcel_core::fast_rope_with_freqs(&k, self.head_dim, false, 1.0, offset, freqs),
+            )
+        } else {
+            (
+                mlxcel_core::fast_rope(&q, self.head_dim, false, self.rope_base, 1.0, offset),
+                mlxcel_core::fast_rope(&k, self.head_dim, false, self.rope_base, 1.0, offset),
+            )
+        };
 
         // Apply Llama 4 attention scaling.
         //
@@ -221,6 +298,112 @@ impl Attention {
         self.o_proj.forward(&attn_out)
     }
 
+    pub fn forward_batched_decode(
+        &self,
+        x: &MlxArray,
+        attn_scale: &[f32],
+        caches: &mut [&mut Cache],
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(x);
+        let b = shape[0];
+        let l = shape[1];
+
+        // Project Q, K, V
+        let q = self.q_proj.forward(x);
+        let k = self.k_proj.forward(x);
+        let v = self.v_proj.forward(x);
+
+        // Reshape to [batch, seq_len, n_heads, head_dim]
+        let q = mlxcel_core::reshape(&q, &[b, l, self.num_heads, self.head_dim]);
+        let k = mlxcel_core::reshape(&k, &[b, l, self.num_kv_heads, self.head_dim]);
+        let v = mlxcel_core::reshape(&v, &[b, l, self.num_kv_heads, self.head_dim]);
+
+        // Transpose to [batch, n_heads, seq_len, head_dim]
+        let q = mlxcel_core::transpose_axes(&q, &[0, 2, 1, 3]);
+        let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
+        let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+
+        let offsets: Vec<i32> = caches
+            .iter_mut()
+            .map(|c| c.as_interface().offset())
+            .collect();
+
+        // Apply RoPE per row (YaRN as in `forward`)
+        let (q, k) = if let Some(freqs) = self.rope_freqs.as_ref() {
+            let (q, k) = if (self.rope_mscale - 1.0).abs() > 1e-6 {
+                (
+                    mlxcel_core::multiply_scalar(&q, self.rope_mscale),
+                    mlxcel_core::multiply_scalar(&k, self.rope_mscale),
+                )
+            } else {
+                (q, k)
+            };
+            (
+                mlxcel_core::fast_rope_batched_with_freqs(
+                    &q,
+                    self.head_dim,
+                    false,
+                    1.0,
+                    &offsets,
+                    freqs,
+                ),
+                mlxcel_core::fast_rope_batched_with_freqs(
+                    &k,
+                    self.head_dim,
+                    false,
+                    1.0,
+                    &offsets,
+                    freqs,
+                ),
+            )
+        } else {
+            (
+                mlxcel_core::fast_rope_batched(
+                    &q,
+                    self.head_dim,
+                    false,
+                    self.rope_base,
+                    1.0,
+                    &offsets,
+                ),
+                mlxcel_core::fast_rope_batched(
+                    &k,
+                    self.head_dim,
+                    false,
+                    self.rope_base,
+                    1.0,
+                    &offsets,
+                ),
+            )
+        };
+
+        // Per-row position scaling stays in the query dtype.
+        let scale_shape = vec![b, 1, 1, 1];
+        let scale_arr = mlxcel_core::from_slice_f32(attn_scale, &[b]);
+        let scale_arr = mlxcel_core::reshape(&scale_arr, &scale_shape);
+        let scale_arr = mlxcel_core::astype(&scale_arr, mlxcel_core::array_dtype(&q));
+        let q = mlxcel_core::multiply(&q, &scale_arr);
+
+        // Update KV cache and get sliced views
+        // Preserve the single-row window hint, including full-cache layers.
+        let mut adapters: Vec<_> = caches
+            .iter_mut()
+            .map(|cache| DecodeAttentionCache {
+                cache,
+                window: self.window_size,
+            })
+            .collect();
+        let mut rows: Vec<_> = adapters.iter_mut().collect();
+        let attn_out = attend_batched_rows(&q, &k, &v, &mut rows, self.scale, None);
+
+        // Transpose back and reshape
+        let attn_out = mlxcel_core::transpose_axes(&attn_out, &[0, 2, 1, 3]);
+        let attn_out = mlxcel_core::reshape(&attn_out, &[b, l, self.num_heads * self.head_dim]);
+
+        // Output projection
+        self.o_proj.forward(&attn_out)
+    }
+
     pub fn from_weights(
         weights: &WeightMap,
         args: &ModelArgs,
@@ -246,6 +429,17 @@ impl Attention {
             .as_ref()
             .map(|r| r.rope_theta)
             .unwrap_or(10000.0);
+        let (rope_freqs, rope_mscale) = match args
+            .rope_parameters
+            .as_ref()
+            .and_then(|r| r.yarn_freqs(head_dim as usize))
+        {
+            Some((freqs, mscale)) => (
+                Some(mlxcel_core::from_slice_f32(&freqs, &[freqs.len() as i32])),
+                mscale,
+            ),
+            None => (None, 1.0),
+        };
 
         Ok(Self {
             q_proj,
@@ -257,6 +451,8 @@ impl Attention {
             head_dim,
             scale,
             rope_base,
+            rope_freqs,
+            rope_mscale,
             window_size: args.sliding_window.map(|w| w as i32).unwrap_or(0),
         })
     }
@@ -336,6 +532,25 @@ impl TransformerBlock {
         // Pre-norm attention
         let normed = self.input_layernorm.forward(x);
         let attn_out = self.self_attn.forward(&normed, attn_scale, cache, mask);
+        let h = mlxcel_core::add(x, &attn_out);
+
+        // Pre-norm FFN
+        let normed = self.post_attention_layernorm.forward(&h);
+        let ff_out = self.mlp.forward(&normed);
+        mlxcel_core::add(&h, &ff_out)
+    }
+
+    pub fn forward_batched_decode(
+        &self,
+        x: &MlxArray,
+        attn_scale: &[f32],
+        caches: &mut [&mut Cache],
+    ) -> UniquePtr<MlxArray> {
+        // Pre-norm attention
+        let normed = self.input_layernorm.forward(x);
+        let attn_out = self
+            .self_attn
+            .forward_batched_decode(&normed, attn_scale, caches);
         let h = mlxcel_core::add(x, &attn_out);
 
         // Pre-norm FFN
@@ -429,12 +644,20 @@ pub enum Cache {
 }
 
 impl Cache {
-    /// Used by: `Ministral3Model::forward_with_caches` and the Nemotron-3-Embed
-    /// bidirectional prefill in `crate::models::ministral3_embedding`.
+    /// Used by: `Ministral3Model::forward_hidden_states` (Ministral 3
+    /// generation, ErnieImage) and the Nemotron-3-Embed bidirectional prefill
+    /// in `crate::models::ministral3_embedding`.
     pub(crate) fn as_interface(&mut self) -> &mut dyn CacheInterface {
         match self {
             Cache::Standard(c) => c,
             Cache::Rotating(c) => c,
+        }
+    }
+
+    fn visible_len(&self) -> usize {
+        match self {
+            Cache::Standard(c) => c.live_len().max(0) as usize,
+            Cache::Rotating(c) => c.visible_len().max(0) as usize,
         }
     }
 }
@@ -447,14 +670,113 @@ pub struct Ministral3Model {
     pub lm_head: Option<UnifiedLinear>,
     pub sliding_window: Option<usize>,
     pub rope_params: Option<RopeParameters>,
+    /// The window the sliding layers' `RotatingKVCache`s are built with
+    /// (`sliding_window`, default 512), validated at load (issue #2790).
+    /// The embedding path reads it for its bidirectional band (issue #2798).
+    pub(crate) sliding_cache_window: i32,
 }
 
 impl Ministral3Model {
+    fn forward_batched_decode_with_caches(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [Vec<Cache>],
+    ) -> UniquePtr<MlxArray> {
+        let offsets: Vec<i32> = caches
+            .iter_mut()
+            .map(|row| row[0].as_interface().offset())
+            .collect();
+        let attn_scale: Vec<f32> = offsets
+            .iter()
+            .map(|&offset| {
+                self.rope_params.as_ref().map_or(1.0, |params| {
+                    get_llama4_attn_scale(
+                        1,
+                        offset,
+                        params.llama_4_scaling_beta,
+                        params.original_max_position_embeddings,
+                    )[0]
+                })
+            })
+            .collect();
+        let mut h = self.embed_tokens.forward(input_ids);
+        for (index, layer) in self.layers.iter().enumerate() {
+            let mut rows: Vec<&mut Cache> = caches.iter_mut().map(|row| &mut row[index]).collect();
+            h = layer.forward_batched_decode(&h, &attn_scale, &mut rows);
+        }
+        let h = self.norm.forward(&h);
+        match &self.lm_head {
+            Some(head) => head.forward(&h),
+            None => self.embed_tokens.as_linear(&h),
+        }
+    }
+
     /// Forward pass through the entire model
+    ///
+    /// Used by: `Ministral3Wrapper` (Ministral 3 generation).
     pub fn forward_with_caches(
         &self,
         input_ids: &MlxArray,
         caches: &mut [Cache],
+    ) -> UniquePtr<MlxArray> {
+        let h = self.hidden_states_unchecked(input_ids, caches, self.layers.len(), true);
+
+        // LM head
+        if let Some(head) = &self.lm_head {
+            head.forward(&h)
+        } else {
+            self.embed_tokens.as_linear(&h)
+        }
+    }
+
+    /// Hidden states after the embedding and the first `num_layers` decoder
+    /// layers (`None` runs them all), with the final norm applied when
+    /// `final_norm` is set: `[B, L, hidden_size]`, no LM head.
+    ///
+    /// `caches` must hold at least `num_layers` entries; only those are
+    /// advanced. Masks, offsets and the Llama 4 attention scale are built
+    /// exactly as [`Self::forward_with_caches`] builds them, which is this
+    /// function with every layer and the final norm followed by the head.
+    ///
+    /// The full-attention mask index is searched over all layers, not just the
+    /// first `num_layers`: a truncation that drops the only full-attention
+    /// layer (or the only sliding one) still builds the mask for it, so such a
+    /// checkpoint must not be truncated this way.
+    ///
+    /// Used by: [`Self::forward_with_caches`], the ERNIE-Image text conditioner
+    /// (`num_layers = layers - 1`, no final norm) and prompt enhancer
+    /// (`crate::imagegen::ernie_image`).
+    pub fn forward_hidden_states(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [Cache],
+        num_layers: Option<usize>,
+        final_norm: bool,
+    ) -> Result<UniquePtr<MlxArray>, String> {
+        let num_layers = num_layers.unwrap_or(self.layers.len());
+        if num_layers > self.layers.len() {
+            return Err(format!(
+                "Ministral 3 has {} layers, cannot run {num_layers}",
+                self.layers.len()
+            ));
+        }
+        if caches.len() < num_layers {
+            return Err(format!(
+                "Ministral 3 needs {num_layers} caches, got {}",
+                caches.len()
+            ));
+        }
+        Ok(self.hidden_states_unchecked(input_ids, caches, num_layers, final_norm))
+    }
+
+    /// The body of [`Self::forward_hidden_states`]; the caller has checked
+    /// `num_layers <= layers.len()` and `caches.len() >= num_layers`.
+    fn hidden_states_unchecked(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [Cache],
+        num_layers: usize,
+        final_norm: bool,
     ) -> UniquePtr<MlxArray> {
         // Find indices for mask creation
         let fa_idx = self.layers.iter().position(|l| !l.use_sliding).unwrap_or(0);
@@ -497,7 +819,7 @@ impl Ministral3Model {
         };
 
         // Pass through transformer layers
-        for (i, layer) in self.layers.iter().enumerate() {
+        for (i, layer) in self.layers.iter().take(num_layers).enumerate() {
             let mask = if layer.use_sliding {
                 swa_mask.as_ref().map(|m| m.as_ref().unwrap())
             } else {
@@ -507,27 +829,31 @@ impl Ministral3Model {
         }
 
         // Final norm
-        let h = self.norm.forward(&h);
-
-        // LM head
-        if let Some(head) = &self.lm_head {
-            head.forward(&h)
-        } else {
-            self.embed_tokens.as_linear(&h)
-        }
+        if final_norm { self.norm.forward(&h) } else { h }
     }
 
     /// Create KV caches for all layers
     pub fn make_caches(&self) -> Vec<Cache> {
+        self.make_caches_with_modes(None)
+    }
+
+    /// [`Self::make_caches`] with every layer stored in its resolved KV cache
+    /// mode; `None` keeps all layers FP16.
+    pub(crate) fn make_caches_with_modes(&self, modes: Option<&KvCacheLayerModes>) -> Vec<Cache> {
         self.layers
             .iter()
-            .map(|layer| {
+            .enumerate()
+            .map(|(layer_idx, layer)| {
                 if layer.use_sliding {
-                    Cache::Rotating(RotatingKVCache::new(
-                        self.sliding_window.unwrap_or(512) as i32
-                    ))
+                    let window = self.sliding_cache_window;
+                    let mode = modes.map_or(KVCacheMode::Fp16, |modes| {
+                        modes.rotating_mode_for_layer(layer_idx, window)
+                    });
+                    Cache::Rotating(RotatingKVCache::new_with_mode(window, mode))
                 } else {
-                    Cache::Standard(KVCache::new())
+                    let mode =
+                        modes.map_or(KVCacheMode::Fp16, |modes| modes.mode_for_layer(layer_idx));
+                    Cache::Standard(KVCache::new_with_mode(mode))
                 }
             })
             .collect()
@@ -615,6 +941,12 @@ impl Ministral3Model {
             layers.push(layer);
         }
 
+        let sliding_cache_window = crate::models::model_owned::cache_window(
+            "Ministral 3",
+            args.sliding_window.unwrap_or(512),
+            layers.iter().any(|layer| layer.use_sliding),
+        )?;
+
         // Load final norm
         let norm_weight = get_weight_copy(weights, &format!("{}model.norm.weight", prefix))?;
         let norm = RMSNorm::new(norm_weight, args.rms_norm_eps);
@@ -638,6 +970,7 @@ impl Ministral3Model {
             lm_head,
             sliding_window: args.sliding_window,
             rope_params: args.rope_parameters.clone(),
+            sliding_cache_window,
         })
     }
 }
@@ -651,27 +984,68 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
 }
 
 // LanguageModel trait implementation.
-use std::cell::RefCell;
+use crate::models::model_owned::{KvCacheLayerModes, LayerKv, ModelOwnedSequenceState};
+use mlxcel_core::cache::{
+    KVCacheMode, KvAttention, SequenceId, SequenceStateLayout, attend_batched_rows,
+};
+use mlxcel_core::generate::{BatchedDecodeKind, route_batched_decode_with_ids};
 
 /// Wrapper for Ministral3Model that implements LanguageModel trait
 /// Uses internal cache management for sliding window attention
 pub struct Ministral3Wrapper {
     model: Ministral3Model,
-    caches: RefCell<Vec<Cache>>,
+    sequence_state: ModelOwnedSequenceState<Cache>,
+    kv_cache_layer_modes: KvCacheLayerModes,
 }
 
 impl Ministral3Wrapper {
+    #[cfg(test)]
+    pub(crate) fn sequence_offsets(&self, id: SequenceId) -> Vec<i32> {
+        self.sequence_state
+            .with_sequence_state_ref(id, |caches| {
+                caches
+                    .iter()
+                    .map(|cache| match cache {
+                        Cache::Standard(c) => c.offset,
+                        Cache::Rotating(c) => c.offset,
+                    })
+                    .collect()
+            })
+            .expect("test sequence exists")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sequence_kv_modes(&self, id: SequenceId) -> Vec<KVCacheMode> {
+        self.sequence_state
+            .with_sequence_state_ref(id, |caches| {
+                caches
+                    .iter()
+                    .map(|cache| match cache {
+                        Cache::Standard(c) => c.mode,
+                        Cache::Rotating(c) => c.mode,
+                    })
+                    .collect()
+            })
+            .expect("test sequence exists")
+    }
+
     pub fn new(model: Ministral3Model) -> Self {
         let caches = model.make_caches();
         Self {
             model,
-            caches: RefCell::new(caches),
+            sequence_state: ModelOwnedSequenceState::new(caches),
+            kv_cache_layer_modes: KvCacheLayerModes::new(),
         }
     }
 
+    /// Fresh caches in the KV cache modes the server or CLI injected.
+    fn fresh_caches(&self) -> Vec<Cache> {
+        self.model
+            .make_caches_with_modes(Some(&self.kv_cache_layer_modes))
+    }
+
     pub fn reset_caches(&self) {
-        let caches = self.model.make_caches();
-        *self.caches.borrow_mut() = caches;
+        self.sequence_state.replace_internal(self.fresh_caches());
     }
 }
 
@@ -682,8 +1056,9 @@ impl mlxcel_core::generate::LanguageModel for Ministral3Wrapper {
         _caches: &mut [mlxcel_core::layers::KVCache],
         _mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let mut caches = self.caches.borrow_mut();
-        self.model.forward_with_caches(input_ids, &mut caches)
+        self.sequence_state.with_sequence_state(None, |caches| {
+            self.model.forward_with_caches(input_ids, caches)
+        })
     }
 
     fn make_caches(&self) -> Vec<mlxcel_core::layers::KVCache> {
@@ -699,11 +1074,173 @@ impl mlxcel_core::generate::LanguageModel for Ministral3Wrapper {
         self.model.layers.len()
     }
 
+    fn set_kv_cache_layer_modes(&self, modes: Vec<KVCacheMode>) {
+        self.kv_cache_layer_modes.set(modes);
+        self.reset_caches();
+    }
+
+    fn kv_cache_layer_modes(&self) -> Option<Vec<KVCacheMode>> {
+        self.kv_cache_layer_modes.clone_modes()
+    }
+
+    /// Sliding layers hold a `RotatingKVCache`, which stores FP16 for every
+    /// mode but an aligned `Turbo4Asym` (issue #2783).
+    fn kv_cache_storage_modes(&self) -> Option<Vec<Option<KVCacheMode>>> {
+        let window = self.model.sliding_cache_window;
+        self.kv_cache_layer_modes.storage_modes(|layer_idx| {
+            self.model
+                .layers
+                .get(layer_idx)
+                .is_some_and(|layer| layer.use_sliding)
+                .then_some(window)
+                .map_or(LayerKv::Full, LayerKv::Sliding)
+        })
+    }
+
     fn supports_batching(&self) -> bool {
-        false // Ministral3 uses internal RefCell mixed caches, not compatible with per-sequence KV isolation
+        true
+    }
+    fn supports_padded_prefill(&self) -> bool {
+        false
+    }
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
+    }
+    fn sequence_state_layout(&self) -> SequenceStateLayout {
+        SequenceStateLayout::model_owned(self.model.layers.len())
+    }
+    fn prepare_sequence_state(&self, seq_id: SequenceId) {
+        self.sequence_state
+            .prepare_sequence_state(seq_id, self.fresh_caches());
+    }
+    fn release_sequence_state_by_id(&self, seq_id: SequenceId) {
+        self.sequence_state.release_sequence_state(seq_id);
+    }
+    fn forward_with_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        seq_id: Option<SequenceId>,
+        _caches: &mut [KVCache],
+        _mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.sequence_state.with_or_create_sequence_state(
+            seq_id,
+            || self.fresh_caches(),
+            |caches| self.model.forward_with_caches(input_ids, caches),
+        )
+    }
+    fn sync_sequence_storage(
+        &self,
+        seq_id: SequenceId,
+        cache_pool: &mut mlxcel_core::cache::CachePool,
+    ) -> Result<(), String> {
+        self.sequence_state
+            .with_existing_sequence_state(seq_id, |caches| {
+                let visible_lens: Vec<_> = caches.iter().map(Cache::visible_len).collect();
+                cache_pool.sync_paged_state_with_lengths(seq_id, &visible_lens)
+            })?
+    }
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_batched_with_ids(input_ids, None, caches, mask)
+    }
+
+    fn forward_batched_with_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(input_ids);
+        assert_eq!(
+            shape.len(),
+            2,
+            "ministral3 batched decode expects rank-2 input ids"
+        );
+        assert_eq!(
+            shape[0] as usize,
+            batch_caches.len(),
+            "ministral3 input batch must match cache rows"
+        );
+        if let Some(ids) = seq_ids {
+            assert_eq!(
+                ids.len(),
+                batch_caches.len(),
+                "ministral3 requires one sequence id per row"
+            );
+        }
+        route_batched_decode_with_ids(self, input_ids, seq_ids, batch_caches, |batch_caches| {
+            let ids = seq_ids.expect("ministral3 model-owned batched decode requires sequence ids");
+            if shape[1] != 1 || mask.is_some() {
+                self.sequence_state
+                    .validate_sequence_states(ids)
+                    .unwrap_or_else(|err| panic!("ministral3 batched decode: {err}"));
+                let mut outputs = batch_caches.iter_mut().enumerate().map(|(row, caches)| {
+                    let input = mlxcel_core::slice(
+                        input_ids,
+                        &[row as i32, 0],
+                        &[row as i32 + 1, shape[1]],
+                    );
+                    self.forward_with_sequence_id(&input, Some(ids[row]), caches, mask)
+                });
+                let first = outputs.next().expect("nonempty batch");
+                return outputs.fold(first, |out, next| mlxcel_core::concatenate(&out, &next, 0));
+            }
+            self.sequence_state
+                .with_batched_sequence_states(ids, |caches| {
+                    self.model
+                        .forward_batched_decode_with_caches(input_ids, caches)
+                })
+                .unwrap_or_else(|err| panic!("ministral3 batched decode: {err}"))
+        })
     }
 
     fn eos_token_ids(&self) -> Vec<i32> {
         vec![2] // Mistral/Ministral EOS token
     }
 }
+
+impl KvAttention for Cache {
+    fn attend(
+        &mut self,
+        q: &MlxArray,
+        k: UniquePtr<MlxArray>,
+        v: UniquePtr<MlxArray>,
+        scale: f32,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        match self {
+            Self::Standard(c) => c.attend(q, k, v, scale, mask),
+            Self::Rotating(c) => c.attend(q, k, v, scale, mask),
+        }
+    }
+}
+
+// The legacy Ministral attention passes its window hint on full layers too.
+// Keep that graph's visible KV span while sharing projections across rows.
+struct DecodeAttentionCache<'a> {
+    cache: &'a mut Cache,
+    window: i32,
+}
+impl KvAttention for DecodeAttentionCache<'_> {
+    fn attend(
+        &mut self,
+        q: &MlxArray,
+        k: UniquePtr<MlxArray>,
+        v: UniquePtr<MlxArray>,
+        scale: f32,
+        _mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let (k, v) = self.cache.as_interface().update_and_fetch(k, v);
+        mlxcel_core::causal_attention(q, &k, &v, scale, 0.0, self.window)
+    }
+}
+
+#[cfg(test)]
+#[path = "ministral3_tests.rs"]
+mod tests;

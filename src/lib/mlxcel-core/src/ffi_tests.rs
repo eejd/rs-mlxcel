@@ -1424,6 +1424,32 @@ fn from_bytes_round_trips_16bit_floats_bit_exactly() {
     }
 }
 
+/// INT16 and UINT16 used to fall through to the 1-byte `uint8_t*` branch,
+/// which read the first half of the buffer one element per byte.
+#[test]
+fn from_bytes_round_trips_16bit_integers_bit_exactly() {
+    let vals = [-32768i32, -1, 0, 1, 255, 256, 32767, 7];
+    let shape = [2i32, 4];
+    for &dt in &[dtype::INT16, dtype::UINT16] {
+        let orig = astype(&from_slice_i32(&vals, &shape), dt);
+        eval(&orig);
+        let bytes = array_to_raw_bytes(&orig);
+        let recon = from_bytes(&bytes, &array_shape(&orig), array_dtype(&orig));
+        eval(&recon);
+        assert_eq!(array_dtype(&recon), dt, "dtype {dt} must be preserved");
+        assert_eq!(
+            array_shape(&recon),
+            array_shape(&orig),
+            "shape must be preserved (dtype {dt})"
+        );
+        assert_eq!(
+            array_to_raw_bytes(&recon),
+            bytes,
+            "from_bytes must reproduce the exact bytes for dtype {dt}; 16-bit integers must be reinterpreted, not read one value per byte"
+        );
+    }
+}
+
 #[test]
 fn test_rms_norm() {
     let x = ones(&[1, 4], dtype::FLOAT32);
@@ -1628,6 +1654,31 @@ fn test_new_ops() {
     let total = sum_all(&y);
     eval(&total);
     assert_eq!(item_f32(&total), 4.0);
+}
+
+#[test]
+fn moge3_searchsorted_preserves_integer_boundaries_and_side_semantics() {
+    // Include duplicates and values beyond f32's exact integer range. This
+    // guards the int64 path used by MoGe3 sparse voxel keys.
+    let sorted = from_slice_i64(&[16_777_217, 16_777_219, 16_777_219, 16_777_225], &[4]);
+    let values = from_slice_i64(
+        &[16_777_216, 16_777_217, 16_777_218, 16_777_219, 16_777_226],
+        &[5],
+    );
+    let left = searchsorted(&sorted, &values, false);
+    let right = searchsorted(&sorted, &values, true);
+    let expected_left = from_slice_u32(&[0, 0, 1, 1, 4], &[5]);
+    let expected_right = from_slice_u32(&[0, 1, 1, 3, 4], &[5]);
+    assert!(item_bool(&array_equal(&left, &expected_left, false)));
+    assert!(item_bool(&array_equal(&right, &expected_right, false)));
+
+    let empty = from_slice_i64(&[], &[0]);
+    let empty_result = searchsorted(&empty, &values, false);
+    assert!(item_bool(&array_equal(
+        &empty_result,
+        &from_slice_u32(&[0, 0, 0, 0, 0], &[5]),
+        false,
+    )));
 }
 
 #[test]
@@ -1902,22 +1953,6 @@ fn test_clip_residual_f16_widens_and_returns_f16() {
 }
 
 #[test]
-fn test_compiled_gelu() {
-    let x = from_slice_f32(&[0.0, 1.0, -1.0, 2.0], &[1, 4]);
-
-    let out = compiled_gelu(&x);
-    eval(&out);
-
-    assert_eq!(array_shape(&out), vec![1, 4]);
-
-    // gelu(0) = 0, gelu(x) > 0 for x > 0, gelu(x) < 0 for x < 0 (slightly)
-    let total = sum_all(&out);
-    eval(&total);
-    // sum of gelu([0, 1, -1, 2]) should be positive (1 and 2 dominate)
-    assert!(item_f32(&total) > 0.0);
-}
-
-#[test]
 fn test_compiled_gelu_approx() {
     let x = from_slice_f32(&[0.0, 1.0, -1.0, 2.0], &[1, 4]);
 
@@ -1930,18 +1965,6 @@ fn test_compiled_gelu_approx() {
     let total = sum_all(&out);
     eval(&total);
     assert!(item_f32(&total) > 0.0);
-}
-
-#[test]
-fn test_compiled_gelu_preserves_bf16_and_f16_dtype() {
-    for dtype in [dtype::BFLOAT16, dtype::FLOAT16] {
-        let x = astype(&from_slice_f32(&[0.0, 1.0, -1.0, 2.0], &[1, 4]), dtype);
-        let out = compiled_gelu(&x);
-        eval(&out);
-
-        assert_eq!(array_shape(&out), vec![1, 4]);
-        assert_eq!(array_dtype(&out), dtype);
-    }
 }
 
 #[test]
@@ -1968,6 +1991,101 @@ fn test_compiled_gelu_topk_preserves_bf16_and_f16_dtype() {
     }
 }
 
+/// Max absolute difference between two arrays, both read back as f32.
+fn max_abs_diff_2548(a: &MlxArray, b: &MlxArray) -> f32 {
+    let a = crate::utils::array_to_vec_f32(&astype(a, dtype::FLOAT32));
+    let b = crate::utils::array_to_vec_f32(&astype(b, dtype::FLOAT32));
+    assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(&b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
+}
+
+/// The cutoff-shifted input `max(x - (mean + std * multiplier), 0)` the
+/// `gelu_topk` kernel activates, computed eagerly in f32.
+fn gelu_topk_shifted_f32_2548(x: &MlxArray, std_multiplier: f32) -> UniquePtr<MlxArray> {
+    let x = astype(x, dtype::FLOAT32);
+    let mean = mean_axis(&x, -1, true);
+    let var = mean_axis(&square(&subtract(&x, &mean)), -1, true);
+    let mult = full_f32(&[1], std_multiplier, dtype::FLOAT32);
+    let cutoff = add(&mean, &multiply(&sqrt(&var), &mult));
+    maximum(&subtract(&x, &cutoff), &full_f32(&[1], 0.0, dtype::FLOAT32))
+}
+
+#[test]
+fn test_compiled_gelu_topk_is_the_tanh_gelu_of_the_shifted_input() {
+    // #2548: mlx-lm `gelu_topk` and Hugging Face Gemma3n (`gelu_pytorch_tanh`)
+    // apply the tanh GELU after the cutoff; the kernel used erf before.
+    let values: Vec<f32> = (0..64).map(|i| (i as f32 - 20.0) * 0.173).collect();
+    let x = from_slice_f32(&values, &[2, 32]);
+    let multiplier = -0.5;
+    let out = compiled_gelu_topk(&x, multiplier);
+    eval(&out);
+
+    let shifted = gelu_topk_shifted_f32_2548(&x, multiplier);
+    let tanh_ref = gelu_tanh(&shifted);
+    let erf_ref = gelu(&shifted);
+    eval(&tanh_ref);
+    eval(&erf_ref);
+
+    let to_tanh = max_abs_diff_2548(&out, &tanh_ref);
+    let to_erf = max_abs_diff_2548(&out, &erf_ref);
+    assert!(to_tanh <= 2e-6, "f32 topk vs tanh GELU: {to_tanh}");
+    assert!(
+        to_erf > 1e-4,
+        "f32 topk must not be the erf GELU (max diff to erf {to_erf})"
+    );
+
+    // The bf16 carrier is pinned bit for bit against mlx-lm's graph in
+    // `ffi_gelu_topk_tests` (#2795); a tolerance here could not tell the f32
+    // and bf16 carriers apart.
+}
+
+#[test]
+fn test_compiled_gelu_mlp_forward_fp16_uses_the_tanh_geglu() {
+    // #2548: the dense Gemma MLP kernel is the tanh GeGLU, like the quantized
+    // `compiled_gelu_approx_mlp_forward`; it used erf before.
+    let x_vals: Vec<f32> = (0..8).map(|i| (i as f32 - 3.5) * 0.4).collect();
+    let w_vals: Vec<f32> = (0..48)
+        .map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.25)
+        .collect();
+    let x = from_slice_f32(&x_vals, &[1, 8]);
+    let gate_w = from_slice_f32(&w_vals[..48], &[6, 8]);
+    let up_w = from_slice_f32(&w_vals.iter().rev().copied().collect::<Vec<_>>(), &[6, 8]);
+    let down_vals: Vec<f32> = (0..48).map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.1).collect();
+    let down_w = from_slice_f32(&down_vals, &[8, 6]);
+
+    let out = unsafe {
+        compiled_gelu_mlp_forward_fp16(
+            &x,
+            &gate_w,
+            &up_w,
+            &down_w,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    eval(&out);
+
+    let gate = matmul(&x, &transpose(&gate_w));
+    let up = matmul(&x, &transpose(&up_w));
+    let down_t = transpose(&down_w);
+    let tanh_ref = matmul(&multiply(&gelu_tanh(&gate), &up), &down_t);
+    let erf_ref = matmul(&multiply(&gelu(&gate), &up), &down_t);
+    eval(&tanh_ref);
+    eval(&erf_ref);
+
+    let to_tanh = max_abs_diff_2548(&out, &tanh_ref);
+    let to_erf = max_abs_diff_2548(&out, &erf_ref);
+    assert!(to_tanh <= 1e-5, "dense GeGLU vs tanh reference: {to_tanh}");
+    assert!(
+        to_erf > 1e-4,
+        "dense GeGLU must not be the erf GeGLU (max diff to erf {to_erf})"
+    );
+}
+
 #[test]
 fn test_gelu_approx_bf16_negative_values() {
     // Verify gelu_approx does not produce NaN for negative bf16 inputs.
@@ -1990,29 +2108,6 @@ fn test_gelu_approx_bf16_negative_values() {
     );
 }
 
-#[test]
-fn test_compiled_gelu_matches_gelu() {
-    // Verify compiled_gelu gives same result as non-compiled gelu
-    let x = from_slice_f32(&[0.5, -0.5, 1.5, -1.5], &[1, 4]);
-
-    let compiled_out = compiled_gelu(&x);
-    let regular_out = gelu(&x);
-
-    eval(&compiled_out);
-    eval(&regular_out);
-
-    let compiled_sum = sum_all(&compiled_out);
-    let regular_sum = sum_all(&regular_out);
-    eval(&compiled_sum);
-    eval(&regular_sum);
-
-    let diff = (item_f32(&compiled_sum) - item_f32(&regular_sum)).abs();
-    assert!(
-        diff < 1e-4,
-        "compiled_gelu and gelu should give same result, diff={diff}"
-    );
-}
-
 // --- compiled_gelu_approx_mlp_forward: 8-bit decode gate + 4-bit legacy
 // path coverage (issue #680) -------------------------------------------
 //
@@ -2021,7 +2116,7 @@ fn test_compiled_gelu_matches_gelu() {
 // checkpoints. The reference below reproduces the function's own
 // op-at-a-time fallback (`quantized_matmul` for gate/up/down plus
 // `gelu_tanh_approx`) using only primitive FFI ops, since none of the
-// exposed `gelu`/`gelu_approx`/`compiled_gelu*` helpers implement the
+// exposed `gelu`/`gelu_approx`/`compiled_gelu_approx` helpers implement the
 // tanh approximation (they are all erf-based; see the comments on
 // `gelu_approx` and `compiled_gelu_approx` in mlx_cxx_bridge.cpp).
 
@@ -2339,10 +2434,10 @@ fn random_block_float_weight(
 /// Whether the running backend has native NVFP4 kernels, per the capability
 /// table (issue #1806). The native-NVFP4 tests below run group-16 `nvfp4`
 /// through FFI calls that return no `Result`, so on a backend without the
-/// kernel (ROCm) MLX's dispatch throw would terminate the whole test binary and
-/// hide every later test. They skip there with the reason printed instead; the
-/// load path converts NVFP4 to affine on that backend, so native NVFP4 is never
-/// reached in production either.
+/// kernel (ROCm until lablup/mlxcel#2617) MLX's dispatch throw would terminate
+/// the whole test binary and hide every later test. They skip there with the
+/// reason printed instead; the load path converts NVFP4 to affine on such a
+/// backend, so native NVFP4 is never reached in production either.
 fn backend_runs_native_nvfp4(test: &str) -> bool {
     use crate::hardware::{QuantMode, QuantModeSupport, gpu_backend_kind};
     let backend = gpu_backend_kind();
@@ -2553,8 +2648,8 @@ fn shapeless_compile_audit_harness() {
             eval(&compiled_relu_squared(&x));
             eval(&compiled_silu(&x));
             eval(&compiled_gpt_oss_swiglu_activation(&gpt_linear, &gpt_glu));
-            eval(&compiled_gelu(&x));
             eval(&compiled_gelu_approx(&x));
+            eval(&compiled_gelu_tanh_f32(&x));
             eval(&compiled_geglu_activation(&gate, &x));
             eval(&compiled_geglu_approx_activation(&gate, &x));
             eval(&compiled_gelu_topk(&x, 0.75));
@@ -2759,8 +2854,8 @@ fn shapeless_compile_audit_harness() {
         "compiled_relu_squared",
         "compiled_silu",
         "compiled_gpt_oss_swiglu_activation",
-        "compiled_gelu",
         "compiled_gelu_approx",
+        "compiled_gelu_tanh_f32",
         "compiled_geglu_activation",
         "compiled_geglu_approx_activation",
         "compiled_gelu_topk",
@@ -4770,6 +4865,129 @@ fn qmv_matches_qmm_across_bits_and_group_sizes() {
     }
 }
 
+/// Metal few-row dense products keep each row's single-row result.
+///
+/// On GPU generations 13 and 14 the matmul overlay runs up to
+/// `kDenseGemvDefaultRows` rows through the GEMV kernel as a batch. The grid
+/// depth, the row stride and the fixed matrix stride all have to be right for
+/// a row to land where it belongs, so every row is compared with the same row
+/// computed alone: contiguous activations, a strided slice of a wider
+/// activation (row stride larger than K), and a weight that is not transposed.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_few_row_dense_matmul_matches_single_rows() {
+    random_seed(2587);
+    for dt in [dtype::FLOAT32, dtype::FLOAT16, dtype::BFLOAT16] {
+        for rows in 2..=8 {
+            for (n, k) in [(64, 32), (6144, 2048), (2048, 8192)] {
+                let w = unsafe { random_normal(&[n, k], dt, std::ptr::null()) };
+                let wt = transpose(&w);
+                let plain = unsafe { random_normal(&[k, n], dt, std::ptr::null()) };
+                let wide = unsafe { random_normal(&[rows, k + 8], dt, std::ptr::null()) };
+                let strided = slice(&wide, &[0, 4], &[rows, k + 4]);
+                let packed = unsafe { random_normal(&[rows, k], dt, std::ptr::null()) };
+                for (x, weight) in [(&packed, &wt), (&strided, &wt), (&packed, &plain)] {
+                    let together = matmul(x, weight);
+                    let singles: Vec<_> = (0..rows)
+                        .map(|row| matmul(&slice(x, &[row, 0], &[row + 1, k]), weight))
+                        .collect();
+                    let refs: Vec<&MlxArray> = singles.iter().map(|o| &**o).collect();
+                    let alone = concatenate_many(&refs, 0);
+                    // Rows the overlay keeps on GEMV run the same kernel alone
+                    // and together, so they match bit for bit.
+                    let narrow_gpu = matches!(
+                        crate::hardware::get_hardware().silicon_gen,
+                        crate::hardware::AppleSiliconGen::M1 | crate::hardware::AppleSiliconGen::M2
+                    );
+                    if narrow_gpu && rows <= 6 {
+                        let equal = array_equal(&together, &alone, false);
+                        eval(&equal);
+                        assert!(item_bool(&equal), "rows={rows} n={n} k={k}");
+                    }
+                    let tolerance = if dt == dtype::FLOAT32 { 1e-2 } else { 2.0 };
+                    let diff = max_all(&abs(&subtract(
+                        &astype(&together, dtype::FLOAT32),
+                        &astype(&alone, dtype::FLOAT32),
+                    )));
+                    eval(&diff);
+                    assert!(
+                        item_f32(&diff) <= tolerance,
+                        "rows={rows} n={n} k={k}: {}",
+                        item_f32(&diff)
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Metal few-row affine products against an f32 reference, at every row
+/// count a decode batch can have.
+///
+/// On GPU generations 13 and 14 the overlay sends 5- to 8-row affine 4- and
+/// 8-bit products to `mlxcel_affine_qmm_t_rows` (an 8-row steel MMA tile)
+/// instead of one `qmv` per row; 1 to 4 rows keep `qmv`. Every row of each
+/// product must stay within output-rounding distance of the same product in
+/// f32 with the dequantized weight. The cases cover both BK tiles (group 32
+/// takes BK = 32, groups 64 and 128 take BK = 64), all three activation types,
+/// a K long enough for many K tiles, and an N that is not a multiple of the
+/// 32-column tile, which must fall back to the upstream route. On other
+/// hardware the same products run upstream kernels and the bound still holds.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_few_row_qmm_matches_dequantized_reference() {
+    random_seed(2738);
+    // (n, k, group_size, bits, dtype)
+    let cases = [
+        (256, 1024, 64, 4, dtype::BFLOAT16),
+        (256, 4096, 64, 4, dtype::BFLOAT16),
+        (256, 1024, 128, 4, dtype::FLOAT16),
+        (256, 512, 32, 4, dtype::FLOAT32),
+        (256, 1024, 64, 8, dtype::BFLOAT16),
+        (264, 1024, 64, 4, dtype::BFLOAT16),
+    ];
+    for &(n, k, group_size, bits, dt) in &cases {
+        let (w, s32, b32) = random_quantized_weight(n, k, group_size, bits);
+        // Scales and biases in the activation type, as a checkpoint has them.
+        let s = astype(&s32, dt);
+        let b = astype(&b32, dt);
+        eval(&s);
+        eval(&b);
+        let dense =
+            unsafe { dequantize(&w, &s, &*b as *const MlxArray, group_size, bits, "affine") };
+        let dense_t = transpose_axes(&astype(&dense, dtype::FLOAT32), &[1, 0]);
+        for rows in 1..=8i32 {
+            let x_f32 = unsafe { random_normal(&[rows, k], dtype::FLOAT32, std::ptr::null()) };
+            let x = astype(&x_f32, dt);
+            eval(&x);
+            let out = unsafe {
+                quantized_matmul(
+                    &x,
+                    &w,
+                    &s,
+                    &*b as *const MlxArray,
+                    true,
+                    group_size,
+                    bits,
+                    "affine",
+                )
+            };
+            eval(&out);
+            assert_eq!(array_shape(&out), vec![rows, n]);
+            let reference = matmul(&astype(&x, dtype::FLOAT32), &dense_t);
+            // Outputs have a standard deviation near sqrt(k); atol covers
+            // cancellation, rtol a few 16-bit output ulps.
+            let close = allclose(&astype(&out, dtype::FLOAT32), &reference, 2e-2, 5e-1);
+            eval(&close);
+            assert!(
+                item_bool(&close),
+                "{rows}-row [{rows}x{k}] -> {n} {bits}-bit gs{group_size} product \
+                 disagreed with the dequantized f32 reference"
+            );
+        }
+    }
+}
+
 /// [#1541] `qmm_naive` output must not depend on the CTA tile width.
 ///
 /// A tile width is a blocking decision: it changes which output columns a CTA
@@ -4971,10 +5189,17 @@ fn activation_helpers_return_the_input_dtype() {
         (crate::dtype::FLOAT32, "f32"),
     ] {
         let x = full_f32(&[4, 8], 0.75, dtype);
-        let cases: [(&str, UniquePtr<MlxArray>); 5] = [
+        let cases: [(&str, UniquePtr<MlxArray>); 12] = [
+            ("qwen4_activate", qwen4_hyper_activate(&x, 4)),
+            ("qwen4_gate", qwen4_hyper_gate(&x, 4)),
+            ("qwen4_mix", qwen4_hyper_mix(&x, &x)),
+            ("qwen4_inject", qwen4_hyper_inject(&x, &x, &x)),
             ("silu", silu(&x)),
             ("gelu", gelu(&x)),
             ("gelu_approx", gelu_approx(&x)),
+            ("gelu_tanh", gelu_tanh(&x)),
+            ("gelu_tanh_f32", gelu_tanh_f32(&x)),
+            ("compiled_gelu_tanh_f32", compiled_gelu_tanh_f32(&x)),
             ("relu", relu(&x)),
             ("leaky_relu", leaky_relu(&x, 0.01)),
         ];

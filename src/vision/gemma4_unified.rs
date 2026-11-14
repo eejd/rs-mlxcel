@@ -32,6 +32,7 @@ use super::gemma4_per_layer_inputs_state::Gemma4PerLayerInputsState;
 use super::processors::gemma4_unified::{Gemma4UnifiedImageInput, Gemma4UnifiedProcessor};
 use super::{encoders, merge};
 use crate::LanguageModel;
+use crate::multimodal::batched_dispatch::forward_batched_with_seq_ids_dispatch;
 use mlxcel_core::cache::{KVCacheMode, SequenceId, SequenceStateLayout};
 use mlxcel_core::layers::KVCache;
 use mlxcel_core::{MlxArray, UniquePtr};
@@ -377,6 +378,12 @@ impl Gemma4UnifiedModel {
             .bind_fallback_to_sequence(seq_id);
     }
 
+    /// Drop the fallback slot without binding it (admission abort after
+    /// media preparation, issue #2625).
+    pub fn clear_per_layer_inputs_fallback(&self) {
+        self.per_layer_inputs_state.clear_fallback();
+    }
+
     pub fn take_per_layer_inputs_for_sequence(
         &self,
         seq_id: SequenceId,
@@ -552,6 +559,10 @@ impl Gemma4UnifiedModel {
 }
 
 impl LanguageModel for Gemma4UnifiedModel {
+    fn batched_decode_kind(&self) -> mlxcel_core::generate::BatchedDecodeKind {
+        mlxcel_core::generate::BatchedDecodeKind::Native
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
@@ -711,6 +722,10 @@ impl LanguageModel for Gemma4UnifiedModel {
         self.text_model.kv_cache_layer_modes()
     }
 
+    fn kv_cache_storage_modes(&self) -> Option<Vec<Option<KVCacheMode>>> {
+        self.text_model.kv_cache_storage_modes()
+    }
+
     fn sequence_state_layout(&self) -> SequenceStateLayout {
         self.text_model.sequence_state_layout()
     }
@@ -814,8 +829,47 @@ impl LanguageModel for Gemma4UnifiedModel {
     }
 
     fn supports_batching(&self) -> bool {
-        // Vision prefill needs single-chunk, single-row handling for the
-        // bidirectional block mask; keep batched decode off for correctness.
-        false
+        true
+    }
+
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.text_model
+            .forward_batched(input_ids, batch_caches, mask)
+    }
+
+    fn forward_batched_with_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(input_ids);
+        let text_only_decode = shape.len() == 2
+            && shape[1] == 1
+            && mask.is_none()
+            && seq_ids.is_some_and(|ids| {
+                ids.len() == batch_caches.len()
+                    && !ids
+                        .iter()
+                        .any(|&id| self.per_layer_inputs_state.has_pending_for_sequence(id))
+            });
+        if text_only_decode {
+            return self.text_model.forward_batched_with_ids(
+                input_ids,
+                seq_ids,
+                batch_caches,
+                None,
+            );
+        }
+        // Vision/audio prefill keeps the wrapper's single-row embedding and
+        // bidirectional-block handling. Only the later token-only decode is
+        // delegated to the native Gemma 4 text path above.
+        forward_batched_with_seq_ids_dispatch(self, input_ids, seq_ids, batch_caches, mask)
     }
 }

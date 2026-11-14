@@ -15,17 +15,23 @@
 use std::path::PathBuf;
 
 use super::{
-    MIN_PARALLEL_CONTEXT_SIZE, ServerStartupConfig, build_server_config,
-    detect_model_media_support, effective_parallel_context_slots, resolve_chat_template,
-    resolve_decode_storage_backend, resolve_default_max_tokens, resolve_dry_penalty_last_n,
-    resolve_generation_sampling_defaults, resolve_loop_detection_env,
-    resolve_parallel_context_size, resolve_remote_pipeline_topology,
-    resolve_tensor_parallel_runtime_support, validate_parallel_context_startup,
-    validate_pipeline_parallel_startup, validate_settings_endpoint_exposure,
-    validate_tensor_parallel_startup,
+    MIN_PARALLEL_CONTEXT_SIZE, ServerStartupConfig, build_cluster_init_request,
+    build_server_config, detect_model_media_support, effective_parallel_context_slots,
+    ensure_peers_can_reach_control_addr, ensure_pp_peer_not_dry_run, resolve_chat_template,
+    resolve_decode_storage_backend, resolve_default_max_tokens, resolve_disaggregated_cluster_auth,
+    resolve_dry_penalty_last_n, resolve_generation_sampling_defaults, resolve_loop_detection_env,
+    resolve_parallel_context_size, resolve_pipeline_cluster_auth, resolve_pp_auto_cluster_auth,
+    resolve_pp_peer_listen_addr, resolve_remote_pipeline_topology,
+    resolve_tensor_parallel_runtime_support, run_zero_config_bring_up, server_distributed_request,
+    validate_parallel_context_startup, validate_pipeline_parallel_startup,
+    validate_settings_endpoint_exposure, validate_tensor_parallel_startup,
 };
-use crate::distributed::{ClusterConfig, TransportBackend};
+use crate::distributed::{
+    ClusterAuth, ClusterConfig, ClusterDiscoveryMode, ClusterSecret, ClusterSecretSources,
+    TransportBackend,
+};
 use crate::server::chat_template::ChatMessage;
+#[cfg(unix)]
 use crate::server::media::scan_insecure_allowlist_dirs;
 use crate::server::state::ModelMediaSupport;
 use crate::server::{DecodeStorageBackend, PipelineParallelRuntimeConfig};
@@ -38,6 +44,379 @@ fn temp_path(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("mlxcel-{}-{}", name, uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&path).unwrap();
     path
+}
+
+fn test_cluster_auth() -> std::sync::Arc<ClusterAuth> {
+    std::sync::Arc::new(ClusterAuth::new(&ClusterSecret::random()))
+}
+
+const TWO_STAGE_CLUSTER_TOML: &str = r#"
+[cluster]
+name = "remote-pp"
+pipeline_parallel_size = 2
+transport_backend = "tcp"
+
+[[nodes]]
+id = "coordinator"
+address = "127.0.0.1:19000"
+role = "hybrid"
+
+[[nodes]]
+id = "stage-0"
+address = "127.0.0.1:19001"
+role = "pipeline_stage"
+stage = 0
+
+[[nodes]]
+id = "stage-1"
+address = "127.0.0.1:19002"
+role = "pipeline_stage"
+stage = 1
+"#;
+
+#[test]
+fn pipeline_cluster_auth_fails_closed_without_a_secret() {
+    let cluster = ClusterConfig::from_toml(TWO_STAGE_CLUSTER_TOML).unwrap();
+    let err = resolve_pipeline_cluster_auth(&ClusterSecretSources::default(), &cluster)
+        .expect_err("pipeline role without a secret must refuse to start")
+        .to_string();
+    for needle in [
+        "--cluster-secret-file",
+        "MLXCEL_CLUSTER_SECRET_FILE",
+        "MLXCEL_CLUSTER_SECRET",
+        "secret_file",
+    ] {
+        assert!(err.contains(needle), "error must name {needle}: {err}");
+    }
+
+    let sources = ClusterSecretSources {
+        env_value: Some("startup-test-secret-0123456789".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        resolve_pipeline_cluster_auth(&sources, &cluster)
+            .unwrap()
+            .is_some()
+    );
+
+    // A topology without a pipeline needs no secret (single-node default
+    // and non-PP clusters are unchanged).
+    let single = ClusterConfig::from_toml(
+        r#"
+[cluster]
+name = "single"
+
+[[nodes]]
+id = "node-0"
+address = "127.0.0.1:19000"
+role = "hybrid"
+"#,
+    )
+    .unwrap();
+    assert!(
+        resolve_pipeline_cluster_auth(&ClusterSecretSources::default(), &single)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Every disaggregated role refuses to start without a cluster secret and
+/// names the role and every source; `Hybrid` needs none (#2655).
+#[test]
+fn disaggregated_roles_fail_closed_without_a_secret() {
+    use crate::distributed::disaggregated::ServingMode;
+    for (mode, role_flag) in [
+        (ServingMode::PrefillOnly, "--node-role prefill"),
+        (ServingMode::DecodeOnly, "--node-role decode"),
+        (ServingMode::Router, "--node-role router"),
+    ] {
+        let err = resolve_disaggregated_cluster_auth(&ClusterSecretSources::default(), mode)
+            .expect_err("disaggregated role without a secret must refuse to start")
+            .to_string();
+        assert!(err.contains(role_flag), "error must name the role: {err}");
+        for needle in [
+            "--cluster-secret-file",
+            "MLXCEL_CLUSTER_SECRET_FILE",
+            "MLXCEL_CLUSTER_SECRET",
+            "secret_file",
+        ] {
+            assert!(err.contains(needle), "error must name {needle}: {err}");
+        }
+
+        let sources = ClusterSecretSources {
+            env_value: Some("startup-test-secret-0123456789".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            resolve_disaggregated_cluster_auth(&sources, mode)
+                .unwrap()
+                .is_some(),
+            "{mode} with a secret must resolve"
+        );
+    }
+
+    // The single-node default reads no source and needs no secret.
+    assert!(
+        resolve_disaggregated_cluster_auth(&ClusterSecretSources::default(), ServingMode::Hybrid)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A `--pp-auto` coordinator config with two static peers, so the bring-up
+/// path needs no network for discovery.
+fn pp_auto_static_startup(cluster_config_out: PathBuf) -> ServerStartupConfig {
+    ServerStartupConfig {
+        pp_auto: Some(2),
+        cluster_discovery: "static".to_string(),
+        cluster_peers: vec![
+            "127.0.0.1:19371".parse().unwrap(),
+            "127.0.0.1:19372".parse().unwrap(),
+        ],
+        cluster_config_out: Some(cluster_config_out),
+        ..ServerStartupConfig::default()
+    }
+}
+
+#[test]
+fn pp_auto_records_secret_file_as_absolute_path_peers_resolve() {
+    // `ClusterConfig::from_file` resolves a relative `secret_file` against
+    // the TOML's directory (default `./.mlxcel/`), while the operator typed
+    // the flag relative to the CWD. The coordinator must record the path it
+    // actually read, absolute, so every reader of the TOML finds the file.
+    let out_dir = temp_path("pp-auto-secret-path");
+    let toml_path = out_dir.join(".mlxcel").join("cluster.toml");
+    let relative = PathBuf::from("pp-auto-secrets").join("cluster.secret");
+    let expected = std::env::current_dir().unwrap().join(&relative);
+    let startup = ServerStartupConfig {
+        cluster_secret_file: Some(relative.clone()),
+        ..pp_auto_static_startup(toml_path.clone())
+    };
+
+    let request = build_cluster_init_request(&startup).unwrap();
+    assert_eq!(request.secret_file.as_deref(), Some(expected.as_path()));
+
+    let mut planned = request;
+    planned.static_peers = startup.cluster_peers.clone();
+    let plan = crate::distributed::plan_cluster(&planned).unwrap();
+    crate::distributed::write_plan_toml(&plan, &toml_path).unwrap();
+    let reloaded = ClusterConfig::from_file(&toml_path).unwrap();
+    assert_eq!(
+        reloaded.cluster.secret_file.as_deref(),
+        Some(expected.as_path()),
+        "a peer loading the emitted TOML must resolve the same secret file"
+    );
+    std::fs::remove_dir_all(out_dir).unwrap();
+}
+
+#[test]
+fn pp_auto_secret_resolution_fails_closed_naming_every_source() {
+    let err = resolve_pp_auto_cluster_auth(&ClusterSecretSources::default())
+        .expect_err("--pp-auto without a secret must refuse to start")
+        .to_string();
+    for needle in [
+        "--pp-auto",
+        "--cluster-secret-file",
+        "MLXCEL_CLUSTER_SECRET_FILE",
+        "MLXCEL_CLUSTER_SECRET",
+    ] {
+        assert!(err.contains(needle), "error must name {needle}: {err}");
+    }
+    let sources = ClusterSecretSources {
+        env_value: Some("pp-auto-test-secret-0123456789".to_string()),
+        ..Default::default()
+    };
+    assert!(resolve_pp_auto_cluster_auth(&sources).is_ok());
+}
+
+#[test]
+fn pp_auto_bring_up_fails_closed_before_discovery_or_toml_write() {
+    // Drive the real bring-up entry point. With static discovery the
+    // pre-fix path resolved peers and wrote the cluster TOML without ever
+    // asking for a secret; now it must stop first, leaving no TOML behind.
+    let out_dir = temp_path("pp-auto-fail-closed");
+    let toml_path = out_dir.join("cluster.toml");
+    let mut startup = pp_auto_static_startup(toml_path.clone());
+
+    let result = {
+        let _env_guard = env_lock();
+        let keys = ["MLXCEL_CLUSTER_SECRET", "MLXCEL_CLUSTER_SECRET_FILE"];
+        let previous: Vec<_> = keys.iter().map(std::env::var_os).collect();
+        for key in keys {
+            // SAFETY: serialized via the crate-wide ENV_LOCK acquired above.
+            unsafe { std::env::remove_var(key) };
+        }
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run_zero_config_bring_up(&mut startup));
+        for (key, value) in keys.iter().zip(previous) {
+            // SAFETY: serialized via the crate-wide ENV_LOCK acquired above.
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+        result
+    };
+
+    let err = result
+        .expect_err("--pp-auto bring-up without a secret must fail")
+        .to_string();
+    assert!(err.contains("--pp-auto requires a cluster secret"), "{err}");
+    assert!(err.contains("--cluster-secret-file"), "{err}");
+    assert!(
+        !toml_path.exists(),
+        "no cluster TOML may be written before the secret check"
+    );
+    assert!(startup.distributed_config.is_none());
+    std::fs::remove_dir_all(out_dir).unwrap();
+}
+
+#[test]
+fn pp_peer_refuses_dry_run_before_binding() {
+    let startup = ServerStartupConfig {
+        pp_peer: true,
+        dry_run: true,
+        ..ServerStartupConfig::default()
+    };
+    let err = ensure_pp_peer_not_dry_run(&startup)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("--dry-run") && err.contains("--pp-peer"),
+        "unexpected error: {err}"
+    );
+    let ok = ServerStartupConfig {
+        pp_peer: true,
+        ..ServerStartupConfig::default()
+    };
+    ensure_pp_peer_not_dry_run(&ok).unwrap();
+}
+
+#[test]
+fn pp_peer_static_requires_listen_addr_not_distributed_config() {
+    // Before #2658 the peer branch demanded `--distributed-config` and
+    // `--node-id`. Now a static peer needs only its own listen address, and
+    // the error says so before any secret or socket is touched.
+    let mut startup = ServerStartupConfig {
+        pp_peer: true,
+        cluster_discovery: "static".to_string(),
+        ..ServerStartupConfig::default()
+    };
+    let err = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(run_zero_config_bring_up(&mut startup))
+        .expect_err("a static peer without a listen address must fail")
+        .to_string();
+    assert!(err.contains("--cluster-control-addr"), "{err}");
+    assert!(err.contains("--cluster-peers"), "{err}");
+    assert!(!err.contains("--distributed-config"), "{err}");
+
+    // A port of 0 is not a concrete port in static mode.
+    startup.cluster_control_addr = Some("192.168.1.11:0".parse().unwrap());
+    let err = resolve_pp_peer_listen_addr(&startup, ClusterDiscoveryMode::Static)
+        .expect_err("port 0 is not a static listen address")
+        .to_string();
+    assert!(err.contains("concrete port"), "{err}");
+
+    // mdns defaults to the unspecified address with an OS-assigned port.
+    startup.cluster_control_addr = None;
+    assert_eq!(
+        resolve_pp_peer_listen_addr(&startup, ClusterDiscoveryMode::Mdns).unwrap(),
+        "0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap()
+    );
+    startup.cluster_control_addr = Some("192.168.1.11:19001".parse().unwrap());
+    assert_eq!(
+        resolve_pp_peer_listen_addr(&startup, ClusterDiscoveryMode::Static)
+            .unwrap()
+            .to_string(),
+        "192.168.1.11:19001"
+    );
+
+    // The manual override keeps its own requirement.
+    startup.distributed_config = Some(PathBuf::from("cluster.toml"));
+    startup.node_id = None;
+    let err = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(run_zero_config_bring_up(&mut startup))
+        .expect_err("manual override needs --node-id")
+        .to_string();
+    assert!(err.contains("--node-id"), "{err}");
+}
+
+#[test]
+fn pp_auto_rejects_loopback_control_with_remote_peers() {
+    let loopback_control: std::net::SocketAddr = "127.0.0.1:19000".parse().unwrap();
+    let remote_peers: Vec<std::net::SocketAddr> = vec![
+        "10.0.0.5:19001".parse().unwrap(),
+        "127.0.0.1:19002".parse().unwrap(),
+    ];
+    let err = ensure_peers_can_reach_control_addr(loopback_control, &remote_peers)
+        .expect_err("stages on another host cannot reply to a loopback control address")
+        .to_string();
+    assert!(err.contains("--cluster-control-addr"), "{err}");
+    assert!(err.contains("--host"), "{err}");
+    assert!(err.contains("10.0.0.5:19001"), "{err}");
+    assert!(!err.contains("127.0.0.1:19002"), "{err}");
+
+    let loopback_peers: Vec<std::net::SocketAddr> = vec!["127.0.0.1:19001".parse().unwrap()];
+    ensure_peers_can_reach_control_addr(loopback_control, &loopback_peers)
+        .expect("loopback peers may use a loopback control address");
+    let lan_control: std::net::SocketAddr = "192.168.1.10:19000".parse().unwrap();
+    ensure_peers_can_reach_control_addr(lan_control, &remote_peers)
+        .expect("a LAN control address is reachable by remote peers");
+}
+
+#[test]
+fn remote_pipeline_topology_without_auth_is_an_internal_error() {
+    let dir = temp_path("pp-remote-no-auth");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{"model_type": "llama", "num_hidden_layers": 16}"#,
+    )
+    .unwrap();
+    let startup = ServerStartupConfig {
+        model_path: dir.clone(),
+        host: "127.0.0.1".to_string(),
+        port: 8080,
+        node_id: Some("coordinator".to_string()),
+        ..ServerStartupConfig::default()
+    };
+    let cluster = ClusterConfig::from_toml(TWO_STAGE_CLUSTER_TOML).unwrap();
+    let err = resolve_remote_pipeline_topology(&startup, &cluster, "coordinator", None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--cluster-secret-file"), "{err}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn remote_stage_service_config_names_the_coordinator_peer() {
+    let dir = temp_path("pp-remote-stage-coordinator");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{"model_type": "llama", "num_hidden_layers": 16}"#,
+    )
+    .unwrap();
+    let startup = ServerStartupConfig {
+        model_path: dir.clone(),
+        node_id: Some("stage-0".to_string()),
+        ..ServerStartupConfig::default()
+    };
+    let cluster = ClusterConfig::from_toml(TWO_STAGE_CLUSTER_TOML).unwrap();
+    let (_, stage) =
+        resolve_remote_pipeline_topology(&startup, &cluster, "stage-0", Some(&test_cluster_auth()))
+            .unwrap();
+    let stage = stage.expect("stage service config");
+    assert_eq!(stage.coordinator_peer, "127.0.0.1:19000");
+    assert_eq!(stage.downstream_peer.as_deref(), Some("127.0.0.1:19002"));
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -511,8 +890,13 @@ stage = 1
     )
     .unwrap();
 
-    let (runtime, stage) =
-        resolve_remote_pipeline_topology(&startup, &cluster, "coordinator").unwrap();
+    let (runtime, stage) = resolve_remote_pipeline_topology(
+        &startup,
+        &cluster,
+        "coordinator",
+        Some(&test_cluster_auth()),
+    )
+    .unwrap();
     assert!(stage.is_none());
     match runtime {
         Some(PipelineParallelRuntimeConfig::RemoteCoordinator(config)) => {
@@ -573,7 +957,9 @@ stage = 1
     )
     .unwrap();
 
-    let (runtime, stage) = resolve_remote_pipeline_topology(&startup, &cluster, "stage-1").unwrap();
+    let (runtime, stage) =
+        resolve_remote_pipeline_topology(&startup, &cluster, "stage-1", Some(&test_cluster_auth()))
+            .unwrap();
     assert!(runtime.is_none());
     let stage = stage.expect("stage service config");
     assert_eq!(stage.bind_address, "127.0.0.1:19002");
@@ -631,8 +1017,13 @@ stage = 1
     )
     .unwrap();
 
-    let (runtime, stage) =
-        resolve_remote_pipeline_topology(&startup, &cluster, "coordinator").unwrap();
+    let (runtime, stage) = resolve_remote_pipeline_topology(
+        &startup,
+        &cluster,
+        "coordinator",
+        Some(&test_cluster_auth()),
+    )
+    .unwrap();
     assert!(stage.is_none());
     match runtime {
         Some(PipelineParallelRuntimeConfig::RemoteCoordinator(config)) => {
@@ -691,7 +1082,13 @@ stage = 1
     )
     .unwrap();
 
-    let err = resolve_remote_pipeline_topology(&startup, &cluster, "coordinator").unwrap_err();
+    let err = resolve_remote_pipeline_topology(
+        &startup,
+        &cluster,
+        "coordinator",
+        Some(&test_cluster_auth()),
+    )
+    .unwrap_err();
     assert!(
         err.to_string()
             .contains("conflicts with HTTP listen address")
@@ -1739,18 +2136,36 @@ fn a_mode_flag_with_no_matching_worker_fails_startup() {
         &mode_config(EmbeddingServingMode::EmbeddingOnly),
         false,
         true,
+        false,
     )
     .expect_err("--embeddings with no embedder must fail");
     let message = err.to_string();
     assert!(message.contains("--embeddings"), "{message}");
     assert!(message.contains("--embedding-model"), "{message}");
 
-    let err =
-        super::check_serving_mode(&mode_config(EmbeddingServingMode::RerankOnly), true, false)
-            .expect_err("--reranking with no reranker must fail");
+    let err = super::check_serving_mode(
+        &mode_config(EmbeddingServingMode::RerankOnly),
+        true,
+        false,
+        false,
+    )
+    .expect_err("--reranking with no reranker must fail");
     let message = err.to_string();
     assert!(message.contains("--reranking"), "{message}");
     assert!(message.contains("--reranker-model"), "{message}");
+
+    // #2825: the image-only mode has the same gate, naming the flag that
+    // selected it.
+    let err = super::check_serving_mode(
+        &mode_config(EmbeddingServingMode::ImageOnly),
+        false,
+        false,
+        false,
+    )
+    .expect_err("--image-model with no image worker must fail");
+    let message = err.to_string();
+    assert!(message.contains("--image-model without -m"), "{message}");
+    assert!(message.contains("--image-model <path>"), "{message}");
 }
 
 #[test]
@@ -1761,19 +2176,44 @@ fn a_mode_flag_with_its_worker_starts() {
         &mode_config(EmbeddingServingMode::EmbeddingOnly),
         true,
         false,
+        false,
     )
     .expect("--embeddings with an embedder starts");
-    super::check_serving_mode(&mode_config(EmbeddingServingMode::RerankOnly), false, true)
-        .expect("--reranking with a reranker starts");
+    super::check_serving_mode(
+        &mode_config(EmbeddingServingMode::RerankOnly),
+        false,
+        true,
+        false,
+    )
+    .expect("--reranking with a reranker starts");
+    // #2825: the image-only mode starts once its worker resolved.
+    super::check_serving_mode(
+        &mode_config(EmbeddingServingMode::ImageOnly),
+        false,
+        false,
+        true,
+    )
+    .expect("--image-model with an image worker starts");
 }
 
 #[test]
 fn an_unrestricted_server_never_fails_the_mode_gate() {
     use crate::server::config::EmbeddingServingMode;
 
-    for (embedding, rerank) in [(false, false), (true, false), (false, true), (true, true)] {
-        super::check_serving_mode(&mode_config(EmbeddingServingMode::Any), embedding, rerank)
-            .expect("no mode flag, nothing to check");
+    for (embedding, rerank, image) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (true, true, false),
+        (false, false, true),
+    ] {
+        super::check_serving_mode(
+            &mode_config(EmbeddingServingMode::Any),
+            embedding,
+            rerank,
+            image,
+        )
+        .expect("no mode flag, nothing to check");
     }
 }
 
@@ -1893,5 +2333,367 @@ fn startup_warmup_skips_only_the_families_without_a_text_chat_worker() {
         startup_warmup_skip_reason(None),
         None,
         "an undetected model type still warms"
+    );
+}
+
+#[test]
+fn server_distributed_request_names_each_distributed_flag() {
+    assert_eq!(
+        server_distributed_request(&ServerStartupConfig::default()),
+        None,
+        "a default startup is single-node"
+    );
+    let cases: Vec<(ServerStartupConfig, &str)> = vec![
+        (
+            ServerStartupConfig {
+                pp_auto: Some(2),
+                ..ServerStartupConfig::default()
+            },
+            "--pp-auto",
+        ),
+        (
+            ServerStartupConfig {
+                pp_peer: true,
+                ..ServerStartupConfig::default()
+            },
+            "--pp-peer",
+        ),
+        (
+            ServerStartupConfig {
+                distributed_config: Some(PathBuf::from("cluster.toml")),
+                ..ServerStartupConfig::default()
+            },
+            "--distributed-config",
+        ),
+        (
+            ServerStartupConfig {
+                node_role: Some("prefill".to_string()),
+                ..ServerStartupConfig::default()
+            },
+            "--node-role",
+        ),
+        (
+            ServerStartupConfig {
+                peers: vec!["127.0.0.1:9000".parse().unwrap()],
+                ..ServerStartupConfig::default()
+            },
+            "--peers",
+        ),
+        (
+            ServerStartupConfig {
+                prefill_peers: vec!["127.0.0.1:9001".parse().unwrap()],
+                ..ServerStartupConfig::default()
+            },
+            "--prefill-peers",
+        ),
+        (
+            ServerStartupConfig {
+                decode_peers: vec!["127.0.0.1:9002".parse().unwrap()],
+                ..ServerStartupConfig::default()
+            },
+            "--decode-peers",
+        ),
+        (
+            ServerStartupConfig {
+                serving_bind: Some("127.0.0.1:9003".parse().unwrap()),
+                ..ServerStartupConfig::default()
+            },
+            "--serving-bind",
+        ),
+        (
+            ServerStartupConfig {
+                pp_layers: Some("0-15,16-31".to_string()),
+                ..ServerStartupConfig::default()
+            },
+            "--pp-layers",
+        ),
+        (
+            ServerStartupConfig {
+                tp_size: 2,
+                ..ServerStartupConfig::default()
+            },
+            "--tp-size",
+        ),
+    ];
+    for (startup, flag) in cases {
+        assert_eq!(server_distributed_request(&startup), Some(flag));
+    }
+}
+
+/// #2664, #2697, #2722: lines raised before `initialize_server_logging`
+/// installs a subscriber (a CORS origin variable that a command-line flag
+/// overrode, or the INFO line an `env_fallback_*` helper raises when a flag
+/// takes precedence over its variable) are carried in the config and logged
+/// by `start_server` afterwards. This drives every precedence helper with
+/// both the flag and a differing variable set, outside any subscriber, and
+/// pins that the post-subscriber step writes each precedence line exactly
+/// once at INFO while a warning stays at WARN and an error at ERROR.
+#[test]
+fn startup_notices_are_logged_once_a_subscriber_exists() {
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use crate::server::StartupNotice;
+
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+        type Writer = BufWriter;
+        fn make_writer(&'a self) -> BufWriter {
+            BufWriter(Arc::clone(&self.0))
+        }
+    }
+
+    // Every variable differs from the value the "command line" set below.
+    const VARS: [(&str, &str); 21] = [
+        ("LLAMA_ARG_KV_BITS", "8"),
+        ("LLAMA_ARG_KV_GROUP_SIZE", "128"),
+        ("LLAMA_ARG_KV_SKIP_LAST_LAYER", "true"),
+        ("LLAMA_ARG_KV_QUANT_SCHEME", "turboquant"),
+        ("APC_HASH", "xxhash"),
+        ("LLAMA_ARG_MODEL_DRAFT", "models/env-draft"),
+        ("LLAMA_LOG_FILE", "/tmp/env.log"),
+        ("MLXCEL_EMBEDDING_MODEL", "env-embedder"),
+        ("MLXCEL_RERANKER_MODEL", "env-reranker"),
+        ("LLAMA_ARG_LANG_BIAS", "ko"),
+        ("LLAMA_ARG_LANG_BIAS_INCLUDE_BYTE_FRAGMENTS", "false"),
+        ("MLXCEL_PROMPT_CACHE_ENABLED", "false"),
+        ("MLXCEL_PROMPT_CACHE_TTL", "60"),
+        ("MLXCEL_PROMPT_CACHE_SNAPSHOT_TTL", "60"),
+        ("APC_ENABLED", "true"),
+        ("APC_BLOCK_SIZE", "32"),
+        ("LLAMA_ARG_CACHE_TYPE_K", "int8"),
+        ("MLXCEL_DRAFT_KIND", "dflash"),
+        ("MLXCEL_DRAFT_BLOCK_SIZE", "8"),
+        ("LLAMA_ARG_THINK_BUDGET", "100"),
+        (
+            "LLAMA_ARG_CHAT_TEMPLATE_KWARGS",
+            "{\"enable_thinking\":true}",
+        ),
+    ];
+
+    let mut notices = Vec::new();
+    {
+        let _env_guard = env_lock();
+        // The legacy reasoning-budget alias would add a second line.
+        const UNSET: [&str; 1] = ["LLAMA_ARG_REASONING_BUDGET"];
+        let previous: Vec<_> = VARS
+            .iter()
+            .map(|(key, _)| *key)
+            .chain(UNSET)
+            .map(|key| (key, std::env::var_os(key)))
+            .collect();
+        for (key, value) in VARS {
+            // SAFETY: serialized via the crate-wide ENV_LOCK acquired above.
+            unsafe { std::env::set_var(key, value) };
+        }
+        for key in UNSET {
+            // SAFETY: serialized via the crate-wide ENV_LOCK acquired above.
+            unsafe { std::env::remove_var(key) };
+        }
+
+        let mut kv_bits = 4;
+        crate::server::env_fallback_kv_bits(&mut kv_bits, &mut notices);
+        let mut kv_group_size = 32;
+        crate::server::env_fallback_kv_group_size(&mut kv_group_size, &mut notices);
+        let mut kv_skip_last_layer = false;
+        crate::server::env_fallback_kv_skip_last_layer(&mut kv_skip_last_layer, &mut notices);
+        let mut kv_quant_scheme = Some("uniform".to_string());
+        crate::server::env_fallback_kv_quant_scheme(&mut kv_quant_scheme, &mut notices);
+        let mut apc_hash = Some("sha256".to_string());
+        crate::server::env_fallback_apc_hash(&mut apc_hash, &mut notices);
+        let mut draft_model = Some(PathBuf::from("models/cli-draft"));
+        crate::server::env_fallback_draft_model(&mut draft_model, &mut notices);
+        let mut log_file = Some(PathBuf::from("/tmp/cli.log"));
+        crate::server::env_fallback_log_file(&mut log_file, &mut notices);
+        let mut embedding_model = Some("cli-embedder".to_string());
+        crate::server::env_fallback_embedding_model(&mut embedding_model, &mut notices);
+        let mut reranker_model = Some("cli-reranker".to_string());
+        crate::server::env_fallback_reranker_model(&mut reranker_model, &mut notices);
+        let mut lang_bias = crate::lang_bias::LangBiasCliArgs {
+            lang_bias: Some("en".to_string()),
+            include_byte_fragments: true,
+            ..Default::default()
+        };
+        crate::server::env_fallback_lang_bias(&mut lang_bias, &mut notices);
+        crate::server::env_fallback_lang_bias_include_byte_fragments(&mut lang_bias, &mut notices);
+        let mut prompt_cache_enabled = true;
+        crate::server::env_fallback_prompt_cache_enabled(
+            &mut prompt_cache_enabled,
+            true,
+            &mut notices,
+        );
+        let mut prompt_cache_ttl = Some(5);
+        crate::server::env_fallback_prompt_cache_ttl(&mut prompt_cache_ttl, &mut notices);
+        let mut snapshot_ttl = Some(5);
+        crate::server::env_fallback_prompt_cache_snapshot_ttl(&mut snapshot_ttl, &mut notices);
+        let mut apc_enabled = false;
+        crate::server::env_fallback_apc_enabled(&mut apc_enabled, true, &mut notices);
+        let mut apc_block_size = Some(16);
+        crate::server::env_fallback_apc_block_size(&mut apc_block_size, &mut notices);
+        let mut cache_type_k = Some("fp16".to_string());
+        crate::server::env_fallback_cache_type_k(&mut cache_type_k, &mut notices);
+        let mut draft_kind = Some("eagle".to_string());
+        crate::cli::speculative_args::env_fallback_draft_kind(&mut draft_kind, &mut notices);
+        let mut draft_block_size = Some(4);
+        crate::cli::speculative_args::env_fallback_draft_block_size(
+            &mut draft_block_size,
+            &mut notices,
+        );
+        let mut reasoning_budget = 0;
+        crate::server::env_fallback_reasoning_budget(&mut reasoning_budget, true, &mut notices);
+        let mut chat_template_kwargs = Some("{}".to_string());
+        crate::server::env_fallback_chat_template_kwargs(&mut chat_template_kwargs, &mut notices);
+
+        for (key, value) in previous {
+            // SAFETY: serialized via the crate-wide ENV_LOCK acquired above.
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+    notices.push(StartupNotice::warn(
+        "MLXCEL_ALLOWED_ORIGINS is ignored because --cors-origins was given",
+    ));
+    notices.push(StartupNotice::error(
+        "--grammar: failed to parse grammar: unexpected end of input",
+    ));
+
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(SharedBuf(Arc::clone(&buf)))
+        .with_ansi(false)
+        .finish();
+    let startup = ServerStartupConfig {
+        startup_notices: notices,
+        ..ServerStartupConfig::default()
+    };
+    tracing::subscriber::with_default(subscriber, || {
+        super::log_startup_notices(&startup);
+    });
+
+    let output = String::from_utf8(buf.lock().expect("log buffer").clone()).expect("UTF-8 log");
+    let lines: Vec<&str> = output.lines().collect();
+    let precedence = [
+        "LLAMA_ARG_KV_BITS env var is set but --kv-bits CLI flag takes precedence",
+        "LLAMA_ARG_KV_GROUP_SIZE env var is set but --kv-group-size CLI flag takes precedence",
+        "LLAMA_ARG_KV_SKIP_LAST_LAYER env var is set but --kv-skip-last-layer CLI flag",
+        "LLAMA_ARG_KV_QUANT_SCHEME env var is set but --kv-quant-scheme CLI flag",
+        "APC_HASH env var is set but --apc-hash CLI flag takes precedence",
+        "LLAMA_ARG_MODEL_DRAFT env var is set but --draft-model CLI flag takes precedence",
+        "LLAMA_LOG_FILE env var is set but --log-file CLI flag takes precedence",
+        "MLXCEL_EMBEDDING_MODEL env var is set but --embedding-model",
+        "MLXCEL_RERANKER_MODEL env var is set but --reranker-model",
+        "LLAMA_ARG_LANG_BIAS env var is set but --lang-bias CLI flag takes precedence",
+        "LLAMA_ARG_LANG_BIAS_INCLUDE_BYTE_FRAGMENTS env var is set but \
+         --lang-bias-include-byte-fragments",
+        "MLXCEL_PROMPT_CACHE_ENABLED is set but --prompt-cache-enabled takes precedence",
+        "MLXCEL_PROMPT_CACHE_TTL env var is set but --prompt-cache-ttl CLI flag",
+        "MLXCEL_PROMPT_CACHE_SNAPSHOT_TTL env var is set but --prompt-cache-snapshot-ttl",
+        "APC_ENABLED env var is set but --apc-enabled CLI flag takes precedence",
+        "APC_BLOCK_SIZE env var is set but --apc-block-size CLI flag takes precedence",
+        "LLAMA_ARG_CACHE_TYPE_K env var is set but --cache-type-k CLI flag takes precedence",
+        "MLXCEL_DRAFT_KIND=\"dflash\" differs from --draft-kind=\"eagle\"; keeping CLI value",
+        "MLXCEL_DRAFT_BLOCK_SIZE=8 is set but the CLI --draft-block-size flag",
+        "LLAMA_ARG_THINK_BUDGET env var is set but --reasoning-budget CLI flag",
+        "LLAMA_ARG_CHAT_TEMPLATE_KWARGS env var is set but --chat-template-kwargs",
+    ];
+    for message in precedence {
+        let matching: Vec<&&str> = lines.iter().filter(|line| line.contains(message)).collect();
+        assert!(
+            matching.len() == 1 && matching[0].contains("INFO"),
+            "the precedence line {message:?} must be logged exactly once at INFO:\n{output}"
+        );
+    }
+    let info_lines = lines.iter().filter(|line| line.contains("INFO")).count();
+    assert_eq!(
+        info_lines,
+        precedence.len(),
+        "one INFO line per precedence case:\n{output}"
+    );
+    let warn_lines: Vec<&&str> = lines.iter().filter(|line| line.contains("WARN")).collect();
+    assert!(
+        warn_lines.len() == 1
+            && warn_lines[0].contains("MLXCEL_ALLOWED_ORIGINS is ignored because --cors-origins"),
+        "the warning must stay a single WARN line: {output:?}"
+    );
+    let error_lines: Vec<&&str> = lines.iter().filter(|line| line.contains("ERROR")).collect();
+    assert!(
+        error_lines.len() == 1 && error_lines[0].contains("--grammar: failed to parse grammar"),
+        "the grammar error must be a single ERROR line: {output:?}"
+    );
+}
+
+#[tokio::test]
+async fn join_model_worker_before_exit_reports_a_worker_still_loading() {
+    // Model load has no cancellation point, so a worker inside its load window
+    // cannot be joined by the deadline. The returned error must say the worker
+    // is still running and warn about the CPU abort mode (#2745).
+    let provider = std::sync::Arc::new(super::ModelProvider::slow_to_start_worker_for_tests(
+        std::time::Duration::from_secs(2),
+    ));
+    let err = super::join_model_worker_before_exit(
+        provider,
+        Ok(()),
+        std::time::Duration::from_millis(100),
+    )
+    .await
+    .expect_err("a worker that has not read its channel cannot be joined");
+    let message = format!("{err:#}");
+    assert!(message.contains("still running"), "{message}");
+    assert!(message.contains("may abort"), "{message}");
+    assert!(message.contains("pure virtual method called"), "{message}");
+}
+
+#[tokio::test]
+async fn stage_shutdown_runs_when_the_signal_handler_fails() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct FakeStage {
+        shutdown_called: Arc<AtomicBool>,
+    }
+
+    impl super::StageServiceHandle for FakeStage {
+        fn local_addr(&self) -> &str {
+            "127.0.0.1:0"
+        }
+
+        fn exited(
+            &mut self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            // The real stage thread has not exited; only the signal resolves.
+            Box::pin(std::future::pending())
+        }
+
+        fn shutdown(self) -> anyhow::Result<()> {
+            self.shutdown_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let shutdown_called = Arc::new(AtomicBool::new(false));
+    let handle = FakeStage {
+        shutdown_called: shutdown_called.clone(),
+    };
+    let err = super::wait_for_stage_shutdown(handle, async {
+        Err(std::io::Error::other("ctrl_c unavailable"))
+    })
+    .await
+    .expect_err("the signal error wins over a clean shutdown");
+    assert!(format!("{err:#}").contains("ctrl_c unavailable"), "{err:#}");
+    assert!(
+        shutdown_called.load(Ordering::SeqCst),
+        "the stage shutdown must run even when the signal handler failed"
     );
 }

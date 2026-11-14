@@ -811,7 +811,7 @@ fn fd_stream_timeout_keeps_partial_private_and_unpublished() {
 
     let root = tempfile::tempdir().expect("download root");
     let root_dir = std::fs::File::open(root.path()).expect("open root fd");
-    let client = reqwest::Client::builder()
+    let client = crate::http_tls::client_builder()
         .read_timeout(std::time::Duration::from_millis(50))
         .build()
         .expect("client");
@@ -898,7 +898,7 @@ fn fd_stream_enospc_writer_cleans_partial_without_publishing() {
 
     let root = tempfile::tempdir().expect("download root");
     let root_dir = std::fs::File::open(root.path()).expect("open root fd");
-    let client = reqwest::Client::builder().build().expect("client");
+    let client = crate::http_tls::client_builder().build().expect("client");
     let url = format!("http://{addr}/model.safetensors");
     let err = tokio::runtime::Runtime::new()
         .expect("runtime")
@@ -1227,7 +1227,7 @@ async fn stream_file_cleans_up_tempfile_on_error() {
         }
     });
 
-    let client = reqwest::Client::new();
+    let client = crate::http_tls::client();
     let url = format!("http://{addr}/x");
     let mp = indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
     let file_pb = mp.add(indicatif::ProgressBar::hidden());
@@ -1290,7 +1290,7 @@ xy",
             .expect("response");
     });
 
-    let client = reqwest::Client::new();
+    let client = crate::http_tls::client();
     let url = format!("http://{addr}/x");
     let mp = indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
     let file_pb = mp.add(indicatif::ProgressBar::hidden());
@@ -1439,6 +1439,36 @@ fn file_url_encodes_repo_id_and_revision() {
         url.contains("%20"),
         "expected space to be percent-encoded as %20, got: {url}"
     );
+}
+
+/// Manifest and file requests must share the normalized `HF_ENDPOINT`.
+#[test]
+fn hub_requests_use_normalized_hf_endpoint() {
+    let _env_guard = env_lock();
+    let prev_endpoint = std::env::var("HF_ENDPOINT").ok();
+    for (value, expected) in [
+        ("", "https://huggingface.co"),
+        (" / ", "https://huggingface.co"),
+        ("https://mirror.example/", "https://mirror.example"),
+        ("  https://mirror.example//  ", "https://mirror.example"),
+    ] {
+        // SAFETY: serialized via the crate-wide ENV_LOCK acquired above.
+        unsafe { std::env::set_var("HF_ENDPOINT", value) };
+        let endpoint = hf_endpoint();
+        let api = build_api(Some("hf_test".to_string()));
+        restore_env("HF_ENDPOINT", prev_endpoint.clone());
+
+        assert_eq!(endpoint, expected, "HF_ENDPOINT={value:?}");
+        let request = api
+            .expect("build hf-hub api")
+            .model("owner/repo".to_string())
+            .info_request();
+        assert_eq!(
+            request.uri_ref().expect("manifest URI").to_string(),
+            format!("{expected}/api/models/owner/repo/revision/main"),
+            "HF_ENDPOINT={value:?}"
+        );
+    }
 }
 
 /// L3 — Tokens containing non-ASCII or control characters must produce a

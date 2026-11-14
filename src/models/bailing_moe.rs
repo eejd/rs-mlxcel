@@ -93,7 +93,7 @@
 //! a Rust error, so a check that happens at the first forward pass is not a
 //! check.
 
-use mlxcel_core::generate::LanguageModel;
+use mlxcel_core::generate::{BatchedDecodeKind, LanguageModel, route_batched_decode};
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::slice_axis;
 use mlxcel_core::weights::WeightMap;
@@ -120,6 +120,7 @@ use crate::models::switch_layers::{
 /// `use_qk_norm`, `partial_rotary_factor` and `rotary_dim` are all absent from
 /// that file. Declaring any of them required would fail the whole parse.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(remote = "Self")]
 pub struct ModelArgs {
     #[serde(default = "default_model_type")]
     pub model_type: String,
@@ -242,6 +243,8 @@ pub struct ModelArgs {
     #[serde(default)]
     pub quantization: Option<Quantization>,
 }
+
+mlxcel_core::impl_rope_lifting_deserialize!(ModelArgs);
 
 /// A `config.json` token-id field, which may be a single int or a list of ints.
 ///
@@ -1119,17 +1122,30 @@ fn validate_experts(weights: &WeightMap, args: &ModelArgs, mlp_prefix: &str) -> 
 /// Returns the prefix without the `.weight` suffix, ready for
 /// `UnifiedLinear::from_weights`.
 pub fn router_prefix(weights: &WeightMap, mlp_prefix: &str) -> Result<String, String> {
-    let converted = format!("{mlp_prefix}.gate.gate_proj");
+    router_prefix_named(weights, mlp_prefix, "gate")
+}
+
+/// [`router_prefix`] for the router module `router` of `mlp_prefix`
+/// (`"gate"`, or Ming-Image's second router `"image_gate"`).
+///
+/// Used by: [`router_prefix`] (BailingMoe, BailingMoeLinear through
+/// [`BailingMoeGate::from_weights`]), [`image_router`] (MingImage).
+pub fn router_prefix_named(
+    weights: &WeightMap,
+    mlp_prefix: &str,
+    router: &str,
+) -> Result<String, String> {
+    let converted = format!("{mlp_prefix}.{router}.gate_proj");
     if weights.contains_key(&format!("{converted}.weight")) {
         return Ok(converted);
     }
-    let raw = format!("{mlp_prefix}.gate");
+    let raw = format!("{mlp_prefix}.{router}");
     if weights.contains_key(&format!("{raw}.weight")) {
         return Ok(raw);
     }
     Err(format!(
-        "Bailing MoE router weight not found: expected {mlp_prefix}.gate.weight (raw checkpoint) \
-         or {mlp_prefix}.gate.gate_proj.weight (mlx-lm conversion, which renames the router into \
+        "Bailing MoE router weight not found: expected {mlp_prefix}.{router}.weight (raw checkpoint) \
+         or {mlp_prefix}.{router}.gate_proj.weight (mlx-lm conversion, which renames the router into \
          the gate_proj spelling the routed experts also use)"
     ))
 }
@@ -1464,7 +1480,22 @@ impl BailingMoeGate {
         args: &ModelArgs,
         mlp_prefix: &str,
     ) -> Result<Self, String> {
-        let prefix = router_prefix(weights, mlp_prefix)?;
+        Self::from_weights_named(weights, args, mlp_prefix, "gate")
+    }
+
+    /// [`Self::from_weights`] for the router module `router` of `mlp_prefix`
+    /// (`"gate"`, or Ming-Image's `"image_gate"`, which has the same shape and
+    /// routing rule and its own weight and correction bias).
+    ///
+    /// Used by: [`Self::from_weights`] (BailingMoe, BailingMoeLinear),
+    /// [`image_router`] (MingImage).
+    pub fn from_weights_named(
+        weights: &WeightMap,
+        args: &ModelArgs,
+        mlp_prefix: &str,
+        router: &str,
+    ) -> Result<Self, String> {
+        let prefix = router_prefix_named(weights, mlp_prefix, router)?;
         let gate_proj =
             UnifiedLinear::from_weights(weights, &prefix, args.group_size(), args.bits())?;
 
@@ -1473,7 +1504,7 @@ impl BailingMoeGate {
         // than failing to load. The key is unaffected by `sanitize`'s router
         // rename, which touches only `.weight` and `.bias`.
         let expert_bias = if args.moe_router_enable_expert_bias {
-            let key = format!("{mlp_prefix}.gate.expert_bias");
+            let key = format!("{mlp_prefix}.{router}.expert_bias");
             Some(match weights.get(&key) {
                 Some(bias) => mlxcel_core::astype(bias, mlxcel_core::dtype::FLOAT32),
                 None => mlxcel_core::full_f32(
@@ -1821,6 +1852,44 @@ impl DecoderLayer {
         mlxcel_core::add(&h, &mlp_out)
     }
 
+    pub fn forward_batched(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut KVCache],
+        mask: Option<&MlxArray>,
+        layer_idx: usize,
+    ) -> UniquePtr<MlxArray> {
+        let normed = self.input_layernorm.forward(x);
+        let qkv = self.attention.query_key_value.forward(&normed);
+        let q_size = self.attention.num_heads * self.attention.head_dim;
+        let kv_size = self.attention.num_kv_heads * self.attention.head_dim;
+        let q = mlxcel_core::slice_last_dim(&qkv, 0, q_size);
+        let k = mlxcel_core::slice_last_dim(&qkv, q_size, q_size + kv_size);
+        let v = mlxcel_core::slice_last_dim(&qkv, q_size + kv_size, q_size + 2 * kv_size);
+        let seq_len = mlxcel_core::array_shape(&q)[1];
+        let metadata = crate::models::batched_decode_cache::uniform_layer_metadata(
+            caches,
+            seq_len,
+            0,
+            "BailingMoeModel",
+            layer_idx,
+        );
+        let attn = mlxcel_core::batched_decode::forward_split_attention(
+            &self.attention,
+            &q,
+            &k,
+            &v,
+            caches,
+            &metadata,
+            mask,
+        );
+        let attn = self.attention.dense.forward(&attn);
+        let h = mlxcel_core::add(x, &attn);
+        let normed = self.post_attention_layernorm.forward(&h);
+        let mlp_out = self.mlp.forward(&normed);
+        mlxcel_core::add(&h, &mlp_out)
+    }
+
     pub fn from_weights(
         weights: &WeightMap,
         args: &ModelArgs,
@@ -1897,6 +1966,28 @@ impl BailingMoeModel {
         (0..self.layers.len()).map(|_| KVCache::new()).collect()
     }
 
+    pub fn forward_batched_impl(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let mut h = self.word_embeddings.forward(input_ids);
+        for layer_idx in 0..self.layers.len() {
+            let mut caches = crate::models::batched_decode_cache::collect_layer_caches(
+                batch_caches,
+                "BailingMoeModel",
+                layer_idx,
+            );
+            h = self.layers[layer_idx].forward_batched(&h, &mut caches, mask, layer_idx);
+        }
+        let h = self.norm.forward(&h);
+        match &self.lm_head {
+            Some(head) => head.forward(&h),
+            None => self.word_embeddings.as_linear(&h),
+        }
+    }
+
     pub fn load<P: AsRef<Path>>(model_dir: P) -> Result<(Self, ModelArgs), String> {
         let model_dir = model_dir.as_ref();
 
@@ -1966,7 +2057,50 @@ impl BailingMoeModel {
 
 // LanguageModel trait implementation.
 
+impl mlxcel_core::batched_decode::SplitAttention for Attention {
+    fn split_shape(&self) -> mlxcel_core::batched_decode::SplitAttentionShape {
+        mlxcel_core::batched_decode::SplitAttentionShape {
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            scale: self.scale,
+        }
+    }
+
+    fn qk_norm_heads(
+        &self,
+        q: UniquePtr<MlxArray>,
+        k: UniquePtr<MlxArray>,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        let q = match &self.query_layernorm {
+            Some(norm) => norm.forward(&q),
+            None => q,
+        };
+        let k = match &self.key_layernorm {
+            Some(norm) => norm.forward(&k),
+            None => k,
+        };
+        (q, k)
+    }
+
+    fn rope_batched(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        offsets: &[i32],
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        (
+            mlxcel_core::fast_rope_batched(q, self.rope_dims, false, self.rope_base, 1.0, offsets),
+            mlxcel_core::fast_rope_batched(k, self.rope_dims, false, self.rope_base, 1.0, offsets),
+        )
+    }
+}
+
 impl LanguageModel for BailingMoeModel {
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
@@ -1987,7 +2121,21 @@ impl LanguageModel for BailingMoeModel {
     fn eos_token_ids(&self) -> Vec<i32> {
         self.eos_token_ids.clone()
     }
+
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        route_batched_decode(self, input_ids, batch_caches, |batch_caches| {
+            self.forward_batched_impl(input_ids, batch_caches, mask)
+        })
+    }
 }
+
+#[path = "bailing_moe_image_router.rs"]
+pub mod image_router;
 
 #[cfg(test)]
 #[path = "bailing_moe_tests.rs"]

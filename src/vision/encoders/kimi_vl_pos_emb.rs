@@ -19,23 +19,34 @@
 //!
 //! The module holds a learned `[init_h, init_w, dim]` grid. For a native
 //! resolution whose patch grid equals the learned grid it flattens the grid
-//! directly (the upstream fast path); otherwise it bicubically resamples the
-//! grid to the target `[h, w]` before flattening and adding it to the patch
-//! embeddings.
+//! directly (the upstream fast path); otherwise it resamples the grid to the
+//! target `[h, w]` before flattening and adding it to the patch embeddings.
 //!
-//! `mlxcel_core` exposes no `bicubic_interpolate` op (upstream calls a custom
-//! Metal kernel), so we implement the resample as a separable
-//! interpolation-matrix contraction: `out = W_h · grid · W_wᵀ`, where `W_h`
-//! and `W_w` are precomputed cubic-convolution weight matrices. This matches
-//! PyTorch's non-antialiased bicubic (`align_corners=False`, cubic `a = -0.75`,
-//! edge-replicated boundaries) — the exact mode upstream's
-//! `bicubic_interpolate(..., size=shape)` uses by default. The weights sum to
-//! one per output position, so a constant grid resamples to the same constant,
-//! and a same-size resample is the identity.
+//! Two resample modes exist ([`PosEmbResample`]):
+//!
+//! - `Bicubic` (MoonViT, the default). Upstream calls a custom Metal
+//!   `bicubic_interpolate` kernel; here the resample is a separable
+//!   interpolation-matrix contraction, `out = W_h · grid · W_wᵀ`, where `W_h`
+//!   and `W_w` are precomputed cubic-convolution weight matrices. This matches
+//!   PyTorch's non-antialiased bicubic (`align_corners=False`, cubic
+//!   `a = -0.75`, edge-replicated boundaries), the mode upstream's
+//!   `bicubic_interpolate(..., size=shape)` uses by default.
+//! - `BilinearAntialias` (LFM2-VL, whose tower is SigLIP2). SigLIP2 resizes its
+//!   grid with `F.interpolate(mode="bilinear", antialias=True,
+//!   align_corners=False)`, which mlx-vlm mirrors since Blaizzy/mlx-vlm#2266;
+//!   the matrices come from the shared
+//!   [`resample_matrix::interp_matrix`](super::super::resample_matrix::interp_matrix)
+//!   with the triangle kernel, and the contraction runs in float32 before
+//!   casting back to the table dtype.
+//!
+//! The weights sum to one per output position in both modes, so a constant grid
+//! resamples to the same constant, and a same-size resample is the identity.
 
+use mlxcel_core::layers::{QuantizedTensorShapes, UnifiedEmbedding, validate_quantized_packing};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 
+use super::super::resample_matrix::{self, ResampleKernel};
 use super::KimiMediaGrid;
 
 /// Build the temporal position-embedding table for `t` frames, shape
@@ -77,14 +88,28 @@ pub(crate) fn temporal_sinusoid(t: i32, dim: i32) -> UniquePtr<MlxArray> {
     }
 }
 
-/// Learned per-patch position grid with on-the-fly bicubic resampling.
+/// How [`Learnable2DInterpPosEmb`] resizes its learned grid to an image's
+/// patch grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PosEmbResample {
+    /// PyTorch non-antialiased bicubic with edge replication (MoonViT).
+    #[default]
+    Bicubic,
+    /// PyTorch bilinear with `antialias=True`, computed in float32 (SigLIP2,
+    /// used by LFM2-VL).
+    BilinearAntialias,
+}
+
+/// Learned per-patch position grid with on-the-fly resampling.
 pub(crate) struct Learnable2DInterpPosEmb {
     weight: UniquePtr<MlxArray>,
     init_h: i32,
     init_w: i32,
     dim: i32,
+    resample: PosEmbResample,
 }
 
+// Used by: encoders::lfm2_vl, encoders::kimi_vl
 impl Learnable2DInterpPosEmb {
     pub(crate) fn from_weights(
         weights: &WeightMap,
@@ -92,18 +117,90 @@ impl Learnable2DInterpPosEmb {
         init_h: i32,
         init_w: i32,
         dim: i32,
+        group_size: i32,
+        bits: i32,
     ) -> Result<Self, String> {
         let key = format!("{prefix}.weight");
-        let weight = weights
+        let stored = weights
             .get(&key)
-            .map(|w| mlxcel_core::copy(w))
             .ok_or_else(|| format!("Weight not found: {key}"))?;
+        let stored_shape = mlxcel_core::array_shape(stored);
+        let flat_rows = init_h
+            .checked_mul(init_w)
+            .ok_or_else(|| format!("{key} grid dimensions [{init_h}, {init_w}] overflow i32"))?;
+        let leading_matches = match stored_shape.as_slice() {
+            [rows, _] => *rows == flat_rows,
+            [height, width, _] => *height == init_h && *width == init_w,
+            _ => false,
+        };
+        if init_h <= 0 || init_w <= 0 || dim <= 0 || !leading_matches {
+            return Err(format!(
+                "{key} shape mismatch: expected [{flat_rows}, {dim}] or [{init_h}, {init_w}, {dim}], got {stored_shape:?}"
+            ));
+        }
+        let logical_shape = if stored_shape.len() == 2 {
+            vec![flat_rows, dim]
+        } else {
+            vec![init_h, init_w, dim]
+        };
+        let (effective_group_size, effective_bits) =
+            crate::vision::weights::resolve_param_quantization(
+                weights,
+                &key,
+                &logical_shape,
+                Some((group_size, bits)),
+            )?
+            .unwrap_or((group_size, bits));
+        let table =
+            UnifiedEmbedding::from_weights(weights, prefix, effective_group_size, effective_bits)?;
+        if let Some(quantized) = table.quantized() {
+            if mlxcel_core::array_dtype(&quantized.weight) != mlxcel_core::dtype::UINT32 {
+                return Err(format!("{key} must have uint32 packed weights"));
+            }
+            let scales_shape = mlxcel_core::array_shape(&quantized.scales);
+            let biases_shape = quantized
+                .biases
+                .as_ref()
+                .map(|biases| mlxcel_core::array_shape(biases));
+            validate_quantized_packing(
+                &key,
+                &QuantizedTensorShapes {
+                    weight: &stored_shape,
+                    scales: &scales_shape,
+                    biases: biases_shape.as_deref(),
+                },
+                dim as usize,
+                quantized.group_size,
+                quantized.bits,
+                &quantized.mode,
+            )?;
+        } else if stored_shape[stored_shape.len() - 1] != dim {
+            return Err(format!(
+                "{key} shape mismatch: expected last dimension {dim}, got {stored_shape:?}"
+            ));
+        }
+        let weight = table.dequantized_weight();
+        let dense_shape = mlxcel_core::array_shape(&weight);
+        if dense_shape != logical_shape {
+            return Err(format!(
+                "{key} dequantized to shape {dense_shape:?}, expected {logical_shape:?}"
+            ));
+        }
+        let weight = mlxcel_core::reshape(&weight, &[init_h, init_w, dim]);
         Ok(Self {
             weight,
             init_h,
             init_w,
             dim,
+            resample: PosEmbResample::Bicubic,
         })
+    }
+
+    /// Select the resample mode (the default is [`PosEmbResample::Bicubic`]).
+    #[must_use]
+    pub(crate) fn with_resample(mut self, resample: PosEmbResample) -> Self {
+        self.resample = resample;
+        self
     }
 
     /// Construct directly from an in-memory grid (used by unit tests).
@@ -119,6 +216,7 @@ impl Learnable2DInterpPosEmb {
             init_h,
             init_w,
             dim,
+            resample: PosEmbResample::Bicubic,
         }
     }
 
@@ -128,7 +226,30 @@ impl Learnable2DInterpPosEmb {
         if h == self.init_h && w == self.init_w {
             return mlxcel_core::reshape(&self.weight, &[h * w, self.dim]);
         }
-        let resampled = bicubic_resample(&self.weight, self.init_h, self.init_w, self.dim, h, w);
+        let resampled = match self.resample {
+            PosEmbResample::Bicubic => {
+                bicubic_resample(&self.weight, self.init_h, self.init_w, self.dim, h, w)
+            }
+            PosEmbResample::BilinearAntialias => {
+                let table_dtype = mlxcel_core::array_dtype(&self.weight);
+                let grid = mlxcel_core::astype(&self.weight, mlxcel_core::dtype::FLOAT32);
+                let w_h =
+                    resample_matrix::interp_matrix(self.init_h, h, ResampleKernel::Triangle, true);
+                let w_w =
+                    resample_matrix::interp_matrix(self.init_w, w, ResampleKernel::Triangle, true);
+                let out = resample_matrix::separable_resample(
+                    &grid,
+                    self.init_h,
+                    self.init_w,
+                    self.dim,
+                    h,
+                    w,
+                    &w_h,
+                    &w_w,
+                );
+                mlxcel_core::astype(&out, table_dtype)
+            }
+        };
         mlxcel_core::reshape(&resampled, &[h * w, self.dim])
     }
 
@@ -192,22 +313,12 @@ impl Learnable2DInterpPosEmb {
     }
 }
 
-/// Keys' cubic-convolution kernel, PyTorch ATen upsample coefficient `a = -0.75`.
-fn cubic(x: f32) -> f32 {
-    const A: f32 = -0.75;
-    let x = x.abs();
-    if x <= 1.0 {
-        (A + 2.0) * x * x * x - (A + 3.0) * x * x + 1.0
-    } else if x < 2.0 {
-        A * x * x * x - 5.0 * A * x * x + 8.0 * A * x - 4.0 * A
-    } else {
-        0.0
-    }
-}
-
 /// Build the `[out_size, in_size]` cubic interpolation matrix for one axis
-/// (PyTorch `align_corners=False`, edge-replicated boundaries).
-fn interp_matrix(in_size: i32, out_size: i32) -> Vec<f32> {
+/// (PyTorch `align_corners=False`, edge-replicated boundaries, taps not
+/// renormalized). This differs from the shared
+/// [`resample_matrix::interp_matrix`] at the borders, where that one drops and
+/// renormalizes out-of-range taps, so MoonViT keeps its own.
+pub(crate) fn bicubic_interp_matrix(in_size: i32, out_size: i32) -> Vec<f32> {
     let scale = in_size as f32 / out_size as f32;
     let mut m = vec![0.0f32; (out_size * in_size) as usize];
     for o in 0..out_size {
@@ -217,7 +328,7 @@ fn interp_matrix(in_size: i32, out_size: i32) -> Vec<f32> {
         let base = base as i32;
         // Four taps at base-1, base, base+1, base+2 with cubic weights.
         for k in -1i32..=2 {
-            let w = cubic(t - k as f32);
+            let w = resample_matrix::cubic(t - k as f32);
             let mut idx = base + k;
             // Edge replicate (clamp) — matches ATen's boundary handling.
             if idx < 0 {
@@ -240,18 +351,11 @@ fn bicubic_resample(
     out_h: i32,
     out_w: i32,
 ) -> UniquePtr<MlxArray> {
-    let w_h = mlxcel_core::from_slice_f32(&interp_matrix(in_h, out_h), &[out_h, in_h]);
-    let w_w = mlxcel_core::from_slice_f32(&interp_matrix(in_w, out_w), &[out_w, in_w]);
-
-    // Height contraction: [out_h, in_h] @ [in_h, in_w*dim] -> [out_h, in_w, dim].
-    let grid2 = mlxcel_core::reshape(grid, &[in_h, in_w * dim]);
-    let tmp = mlxcel_core::matmul(&w_h, &grid2);
-    let tmp = mlxcel_core::reshape(&tmp, &[out_h, in_w, dim]);
-
-    // Width contraction: move in_w to the front, contract, move back.
-    let tmp = mlxcel_core::transpose_axes(&tmp, &[1, 0, 2]); // [in_w, out_h, dim]
-    let tmp = mlxcel_core::reshape(&tmp, &[in_w, out_h * dim]);
-    let out = mlxcel_core::matmul(&w_w, &tmp); // [out_w, out_h*dim]
-    let out = mlxcel_core::reshape(&out, &[out_w, out_h, dim]);
-    mlxcel_core::transpose_axes(&out, &[1, 0, 2]) // [out_h, out_w, dim]
+    let w_h = bicubic_interp_matrix(in_h, out_h);
+    let w_w = bicubic_interp_matrix(in_w, out_w);
+    resample_matrix::separable_resample(grid, in_h, in_w, dim, out_h, out_w, &w_h, &w_w)
 }
+
+#[cfg(test)]
+#[path = "kimi_vl_pos_emb_quant_tests.rs"]
+mod quantized_layout_tests;

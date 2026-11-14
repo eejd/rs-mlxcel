@@ -18,6 +18,36 @@ use crate::server::batch::generation_bounds::GenerationBounds;
 impl BatchScheduler {
     pub(super) fn release_sequence_caches(&mut self, seq_id: SequenceId) {
         self.engine.close(seq_id);
+        self.release_model_owned_slot_if_held_by(seq_id);
+    }
+
+    /// Record that `seq_id`'s prefill just reset the single model-owned slot
+    /// of a family that cannot batch.
+    pub(super) fn reset_model_owned_slot_for(&mut self, seq_id: SequenceId) {
+        if self.engine.model().supports_batching() {
+            return;
+        }
+        let _ = self.engine.model().make_caches();
+        self.model_owned_slot_holder = Some(seq_id);
+    }
+
+    /// Free the single model-owned slot when `seq_id` is the sequence whose
+    /// prefill filled it, so an idle server does not keep the last request's
+    /// KV resident. Any other id leaves the slot untouched: it may hold an
+    /// in-flight sequence's state (#2748 review).
+    fn release_model_owned_slot_if_held_by(&mut self, seq_id: SequenceId) {
+        if self.model_owned_slot_holder != Some(seq_id) || self.engine.model().supports_batching() {
+            return;
+        }
+        self.engine.model().reset_runtime_state();
+        self.model_owned_slot_holder = None;
+        mlxcel_core::clear_memory_cache();
+    }
+
+    /// The sequence that holds the single model-owned slot, if any (tests).
+    #[cfg(test)]
+    pub(crate) fn model_owned_slot_holder(&self) -> Option<SequenceId> {
+        self.model_owned_slot_holder
     }
 
     /// #822: note a successful MLX eval at the decode/prefill boundary, clearing
@@ -206,7 +236,18 @@ impl BatchScheduler {
     /// loop (#708). The whole node serves one model, so this is a node-level fact
     /// the serving-role loop checks once and applies to every request.
     pub(crate) fn handoff_supported(&self) -> bool {
+        // The handoff frame carries only the pool caches, so a dense family
+        // whose per-token state is not all in its KV cache (Baichuan-M1's K/V
+        // convolution state, #2567) cannot be handed off either.
         self.engine.model().sequence_state_layout().backend == SequenceStateBackend::DenseKvCache
+            && self.engine.model().kv_cache_captures_sequence_state()
+    }
+
+    /// Whether this scheduler has a prompt-cache store, the predicate under
+    /// which single node reports `usage.prompt_tokens_details`. A prefill node
+    /// sends it to the router on its first-token frame (#2715).
+    pub(crate) fn has_prompt_cache_store(&self) -> bool {
+        self.prompt_cache.is_some()
     }
 
     /// Prefill role (#126 B2b): run a full prefill for `seq`, then extract its
@@ -392,7 +433,7 @@ impl BatchScheduler {
             created_at: Instant::now(),
             prefill_start: None,
             first_token_time: None,
-            prompt_lookup: None,
+            token_only: None,
             token_history: Vec::new(),
             sampler,
             merged_eos: Vec::new(),
@@ -459,6 +500,14 @@ impl BatchScheduler {
                 DEFAULT_PAGED_BLOCK_SIZE,
             )?;
 
+        // Merge the model's configured stop tokens (`config.json` EOS) into the
+        // request sampling exactly as single-node intake and the prefill
+        // handoff do. The wire sampling carries only the request's own stop
+        // ids (the router sends none), and a model whose built-in
+        // `eos_token_ids()` cannot see the checkpoint's EOS (MiniCPM-2B in
+        // llama format loads as `Llama3Model`) would otherwise decode past
+        // `</s>` until the token budget runs out (#2695).
+        let sampling = merge_config_stop_tokens(sampling, &self.config_eos);
         let needs_history = sampling.needs_token_history();
         // Rebuild the penalty history exactly as a single-node run would have it
         // after prefill: prompt prefix (when penalties need it) plus whatever the
@@ -517,7 +566,7 @@ impl BatchScheduler {
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             created_at: Instant::now(),
             prefill_start: None,
-            prompt_lookup: None,
+            token_only: None,
             first_token_time: Some(Instant::now()),
             token_history,
             sampler,

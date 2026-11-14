@@ -438,7 +438,13 @@ pub fn fuse_lora_weights_into(
             );
         }
 
-        // Fuse: W_fused = W_base + delta
+        // Fuse: W_fused = W_base + delta, kept in the base weight's dtype.
+        // The delta is f32 (see `compute_lora_delta`), and MLX promotes
+        // bf16 + f32 to f32, so an uncast add would double the fused weight's
+        // bytes and turn every activation downstream of it into f32. mlx-lm's
+        // `LoRALinear.fuse` and the embedding fusion (`embedding.rs`) cast the
+        // delta the same way.
+        let delta = mlxcel_core::astype(&delta, mlxcel_core::array_dtype(base_weight));
         let fused = mlxcel_core::add(base_weight, &delta);
 
         base_weights.insert(base_weight_name.clone(), fused);

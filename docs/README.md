@@ -14,7 +14,7 @@ MkDocs pages are added later.
 
 Current GitHub-facing docs:
 
-1. `installation.md` - platform prerequisites and build flags for macOS, Linux with CUDA, and Linux with AMD ROCm (experimental).
+1. `installation.md` - platform prerequisites and build flags for macOS, Linux with CUDA, Linux with AMD ROCm (experimental), and Windows with NVIDIA CUDA (experimental).
 2. `environment-variables.md` - `MLXCEL_*` runtime, build, downloader, cache, and diagnostic knobs.
 3. `benchmarks.md` - benchmark methodology and the requirements for future raw result tables.
 4. `supported-models.md` - maintained architecture/checkpoint support matrix.
@@ -29,15 +29,19 @@ Current GitHub-facing docs:
 13. `block-diffusion.md` - DiffusionGemma block-diffusion generation: canvas denoising vs autoregressive, CLI flags, throughput, and phase 1 limitations.
 14. `python-client.md` - the `mlxcel` Python client over the OpenAI-compatible server, covering managed and connect modes, streaming, chat, structured output, the `openai_client` escape hatch, async usage, and troubleshooting.
 15. `audio-preprocessing.md` - shared WAV/MP3/FLAC model-input normalization, loaded family policy, resource limits, cancellation, metrics, and current XLA capability boundary.
-16. `speculative-acceptance.md` - speculative-decoding acceptance rules, which rule each code path runs, the distribution-preservation guarantee and its RNG dependency, the kill switch, and how to read the active rule off a log.
+16. `speculative-acceptance.md` - speculative-decoding acceptance rules, which rule each code path runs, the distribution-preservation guarantee, offline `--draft-model` routing, and per-request acceptance reporting.
 17. `mla-absorbed-decode.md` - DeepSeek-family matrix-absorbed MLA decode over a compressed-latent KV cache: the identity, the cache layout, the flags, and what is and is not verified.
 18. `cascade-attention.md` - shared-prompt-prefix (cascade) decode: computing a prefix shared by several concurrent sequences once per step instead of once per sequence, the two-level decomposition, the flags, and how to tell which path a launch took.
 19. `sparse-paged-decode.md` - sparse attention reduced to page indirection over the fused v2 decode kernel: the addressing argument, the MiniMax-M3 routing, why DeepSeek Sparse Attention is not routed, where the dispatch floor sits, the kill switch, and the benchmark harness.
 20. `mtp-policy-api.md` - the supported read interface for the adaptive B=1 MTP verdict (`GET /v1/internal/mtp-policy`): the response body, the four states, the unavailable reasons, and the schema versioning and compatibility policy.
 21. `code-guidelines.md` - the file-size and module-split thresholds, including when to extract a `<name>_helpers.rs` and when inline tests move to a sibling `_tests.rs`, the `// Used by:` annotation convention for shared functions, the JIT kernel rule that every varying input dtype must appear in `template_args` because CUDA keys the compiled-module cache on it, and the `HashMap` iteration-order rule covering what counts as an order-sensitive consumer, why a stable sort on a non-total key does not pin the result, the fresh-map-per-iteration testing requirement, and why no static check enforces it.
 22. `embeddings.md` - the `/v1/embeddings` and `/v1/rerank` endpoints plus `mlxcel embed` and `mlxcel rerank`: embedding and reranker detection, pooling and scoring, multimodal and late-interaction inputs, request/response schemas, server flags, error codes, and family-registration guidance.
-23. `llama-server-compat.md` - the verified llama-server b10621 compatibility boundary: how to read the machine-readable manifest under `compat/llama-server/b10621/`, the compatibility-policy states, the area sharding used by epic #1431, the CI gates, and the deterministic regeneration procedure.
-24. `webui/README.md` - the bundled browser WebUI (`--webui`): the English and Korean user guide (quickstarts, keys, remote access, models, settings and privacy, troubleshooting), the contributor workflow, and the API, state-machine, UX, and design-system contracts behind it. `webui-integration-matrix.md` is its release evidence record.
+23. `token-classification.md` - `mlxcel tag` and `mlxcel extract`: BIO / BIOES token classification with windowed scoring, span decoding and redaction, the span-extraction request and output shapes, detection, load-time errors, and how to add a family.
+24. `llama-server-compat.md` - the verified llama-server b10621 compatibility boundary: how to read the machine-readable manifest under `compat/llama-server/b10621/`, the compatibility-policy states, the area sharding used by epic #1431, the CI gates, and the deterministic regeneration procedure.
+25. `webui/README.md` - the bundled browser WebUI (`--webui`): the English and Korean user guide (quickstarts, keys, remote access, models, settings and privacy, troubleshooting), the contributor workflow, and the API, state-machine, UX, and design-system contracts behind it. `webui-integration-matrix.md` is its release evidence record.
+26. `model-triage.md` - dispositions for reported model-coverage gaps, each with the evidence it rests on, and what a port of the remaining candidates would add.
+27. `vision-model-scope.md` - the scope record for detection, segmentation, 3D body, grounding, and image or video generation families: which are supported, which moved to the image-generation and dense-prediction epics with their port issues, which remain out of scope, and the criteria for re-scoping one.
+28. `dense-prediction.md` - the `mlxcel predict` image/video CLI, tensor and preview file contract, shared interpolation/preprocessing APIs, and family-registration guide.
 
 ## mlxcelverse maintenance
 

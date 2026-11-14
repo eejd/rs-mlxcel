@@ -16,8 +16,13 @@ set(MLX_BUILD_BENCHMARKS OFF)
 set(MLX_BUILD_PYTHON_BINDINGS OFF)
 
 function(mlx_apply_source_overlays mlx_source_dir)
-  # Metal patches: JIT type promotion fix + kernel utils (SIMD group matrix).
+  # Metal patches: command-buffer budget, kernel utils (SIMD group matrix)
+  # and the qmv-wide off-switch.
   #
+  # The compiled.cpp overlay (an input cast for mixed-dtype fused kernels) was
+  # retired in #2333: at this pin MLX ops promote their own inputs, so
+  # upstream emission is correct, and the cast broke comparisons (#1792) and
+  # `Imag` of complex64.
   # The SDPA / steel-attention overlays (scaled_dot_product_attention.cpp,
   # scaled_dot_product_attention.metal, steel_attention.metal,
   # steel_attention_nax.metal) were dropped when the MLX pin moved to
@@ -41,11 +46,63 @@ function(mlx_apply_source_overlays mlx_source_dir)
   # decode steps and leaves at the device default for prefill. Upstream latches
   # the budget once from MLX_MAX_MB_PER_BUFFER and has no setter. Same refresh
   # rule: take the new upstream file and re-apply the three marked hunks.
+  # kernels/quantized.metal adds `mlxcel_affine_qmm_t_rows` (an 8-row steel
+  # MMA quantized matmul) after upstream's instantiations; quantized.cpp
+  # dispatches it for 5- to 8-row affine products on GPU generations 13 and
+  # 14. Refresh: take the new upstream file and re-append the marked block.
+  # matmul.cpp keeps few-row dense products on GEMV on GPU generations 13 and
+  # 14 (#2587). Refresh: take the new upstream file and re-apply the marked
+  # helper and the branch before the steel GEMM route.
   set(_metal_patch_files
-      "mlx/backend/metal/compiled.cpp"
       "mlx/backend/metal/device.cpp"
+      "mlx/backend/metal/kernels/quantized.metal"
       "mlx/backend/metal/kernels/utils.h"
+      "mlx/backend/metal/matmul.cpp"
       "mlx/backend/metal/quantized.cpp")
+  # A cached _deps/mlx-src is reused while the pin is unchanged (build.rs
+  # only compares the pin), so a file this list no longer carries would keep
+  # its old overlaid copy. Restore every modified Metal file the list does
+  # not name to the pinned upstream version before copying the overlays.
+  find_package(Git QUIET)
+  if(GIT_FOUND AND EXISTS "${mlx_source_dir}/.git")
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" -C "${mlx_source_dir}"
+              diff --name-only -- mlx/backend/metal
+      RESULT_VARIABLE _metal_diff_result
+      OUTPUT_VARIABLE _metal_modified_files
+      ERROR_VARIABLE _metal_diff_error
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT _metal_diff_result EQUAL 0)
+      message(WARNING
+        "Cannot list modified Metal files in ${mlx_source_dir} "
+        "(${_metal_diff_error}); a retired Metal overlay may still be in "
+        "place. Delete _deps/mlx-src to refetch.")
+    else()
+      string(REPLACE "\n" ";" _metal_modified_files "${_metal_modified_files}")
+      foreach(_modified_file ${_metal_modified_files})
+        if(NOT _modified_file IN_LIST _metal_patch_files)
+          execute_process(
+            COMMAND "${GIT_EXECUTABLE}" -C "${mlx_source_dir}"
+                    checkout -- "${_modified_file}"
+            RESULT_VARIABLE _metal_restore_result
+            ERROR_VARIABLE _metal_restore_error)
+          if(_metal_restore_result EQUAL 0)
+            message(STATUS
+              "Restored upstream ${_modified_file} (no longer overlaid)")
+          else()
+            message(FATAL_ERROR
+              "Cannot restore upstream ${_modified_file} in "
+              "${mlx_source_dir}: ${_metal_restore_error}")
+          endif()
+        endif()
+      endforeach()
+    endif()
+  else()
+    message(WARNING
+      "${mlx_source_dir} is not a git checkout or git is unavailable, so a "
+      "retired Metal overlay cannot be restored to upstream. Delete "
+      "_deps/mlx-src to refetch if a Metal overlay was removed.")
+  endif()
   foreach(_patch_file ${_metal_patch_files})
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/overlays/metal/${_patch_file}")
       configure_file(
@@ -81,7 +138,9 @@ function(mlx_apply_source_overlays mlx_source_dir)
     message(STATUS "Applied CPU backend patches (${_cpu_patch_files})")
   endif()
 
-  # CUDA patches: custom grouped GEMM, quantized kernels, reduce ops, binary ops.
+  # CUDA patches: custom grouped GEMM, quantized kernels, reduce ops, binary ops,
+  # and device.cpp (captured child graphs as barriers inside a CUDA graph,
+  # issue #2462).
   # These are in overlays/cuda/mlx/backend/cuda/ and only compiled for CUDA targets,
   # so they are safe to apply unconditionally (harmless on Metal-only builds).
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/overlays/cuda/mlx/backend/cuda")
@@ -203,7 +262,7 @@ else()
     #     `)` as ending the declaration, so one there would hide the tag
     #     instead of being read past.
     # Both parsers fail loudly rather than guess when the shape does not hold.
-    GIT_TAG 243bdf09c0cccbb85ca6a686dab3cc0102cf1f7e)
+    GIT_TAG 7ca40033132dae444d45f7fc3daae57e24c13f6c)
 
   # Use FetchContent_Populate + add_subdirectory so we can apply source
   # overlays before the MLX build system processes the files.
@@ -267,6 +326,38 @@ if(MLX_BUILD_CUDA)
   if(EXISTS "${_cutlass_include}")
     target_compile_definitions(mlx
                                PRIVATE MLX_CUTLASS_DIR="${_cutlass_include}")
+  endif()
+
+  # Test-only hooks of the PTX disk cache in our jit_module.cpp overlay
+  # (MLXCEL_PTX_CACHE_TEST_TMP_SUFFIX, lablup/mlxcel#2765). mlxcel-core's
+  # build script turns this on for the `debug` and `test-fast` Cargo profiles
+  # and off for every other one, `release` included, so a shipped binary
+  # ignores the variable. Set on that one source rather than on the target,
+  # so switching it recompiles nothing else.
+  option(MLXCEL_PTX_CACHE_TEST_HOOKS
+         "Compile the PTX disk cache's test-only hooks into jit_module.cpp" OFF)
+  if(MLXCEL_PTX_CACHE_TEST_HOOKS)
+    set_property(
+      SOURCE "${mlx_SOURCE_DIR}/mlx/backend/cuda/jit_module.cpp"
+      TARGET_DIRECTORY mlx
+      APPEND
+      PROPERTY COMPILE_DEFINITIONS MLXCEL_PTX_CACHE_TEST_HOOKS)
+  endif()
+
+  # CUDA runtime headers for the same NVRTC JIT on Windows (#58), consumed by
+  # the jit_module.cpp overlay after CUDA_HOME / CUDA_PATH. Upstream otherwise
+  # only scans the installer's Program Files location, which a redistributable
+  # toolkit unpacked elsewhere (the only kind NVIDIA ships for Windows on Arm)
+  # is not in. Derived from the cached nvcc path because FindCUDAToolkit's
+  # variables stay inside MLX's own directory scope.
+  if(WIN32 AND CMAKE_CUDA_COMPILER)
+    get_filename_component(_cuda_bin "${CMAKE_CUDA_COMPILER}" DIRECTORY)
+    get_filename_component(_cuda_root "${_cuda_bin}" DIRECTORY)
+    file(TO_CMAKE_PATH "${_cuda_root}/include" _cuda_include)
+    if(EXISTS "${_cuda_include}/cuda.h")
+      target_compile_definitions(
+        mlx PRIVATE MLXCEL_CUDA_INCLUDE_DIR="${_cuda_include}")
+    endif()
   endif()
 
   # ------------------- Hardware block-float converter ----------------------
@@ -346,5 +437,19 @@ if(MLX_BUILD_CUDA)
       STATUS
         "Hardware block-float converter: fp_quantize.cu also compiled for "
         "${_fp_quantize_arch_flags}")
+  endif()
+endif()
+
+# ----------------------------- ROCm (Windows) --------------------------------
+# ROCm headers for the hiprtc JIT on Windows (lablup/mlxcel#2602), the ROCm
+# counterpart of MLXCEL_CUDA_INCLUDE_DIR above. Consumed by the ROCm overlay's
+# jit_module.cpp after ROCM_HOME / ROCM_PATH / HIP_PATH, so a binary started
+# without those variables still JIT-compiles against the SDK it was built with.
+# Linux keeps its /opt/rocm fallback and gets no define.
+if(WIN32 AND MLX_BUILD_ROCM AND ROCM_PATH)
+  file(TO_CMAKE_PATH "${ROCM_PATH}/include" _rocm_include)
+  if(EXISTS "${_rocm_include}/hip/hip_runtime.h")
+    target_compile_definitions(
+      mlx PRIVATE MLXCEL_ROCM_INCLUDE_DIR="${_rocm_include}")
   endif()
 endif()

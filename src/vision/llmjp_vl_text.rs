@@ -71,6 +71,10 @@ impl LlmJpTextModel {
 }
 
 impl LanguageModel for LlmJpTextModel {
+    fn batched_decode_kind(&self) -> mlxcel_core::generate::BatchedDecodeKind {
+        on_text_model!(self, inner => LanguageModel::batched_decode_kind(inner))
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
@@ -110,6 +114,10 @@ impl LanguageModel for LlmJpTextModel {
 
     fn kv_cache_layer_modes(&self) -> Option<Vec<KVCacheMode>> {
         on_text_model!(self, inner => LanguageModel::kv_cache_layer_modes(inner))
+    }
+
+    fn kv_cache_storage_modes(&self) -> Option<Vec<Option<KVCacheMode>>> {
+        on_text_model!(self, inner => LanguageModel::kv_cache_storage_modes(inner))
     }
 
     fn num_layers(&self) -> usize {

@@ -104,7 +104,7 @@ fn parse_with_default_model<T: serde::de::DeserializeOwned>(
 /// on the three routes that only inspect (issue #1349 moved the video+audio
 /// arm of that check here too, so the combination is covered by the same
 /// call).
-async fn render_chat_prompt(
+pub(crate) async fn render_chat_prompt(
     state: &AppState,
     live: &LiveSettings,
     request: ChatCompletionRequest,
@@ -184,7 +184,7 @@ pub(crate) enum PromptCountError {
 
 impl PromptCountError {
     /// The OpenAI-envelope response for this failure.
-    fn into_error_response(self) -> ErrorResponse {
+    pub(crate) fn into_error_response(self) -> ErrorResponse {
         match self {
             Self::Tokenization(message) => ErrorResponse::new(
                 format!("Tokenization error: {message}"),
@@ -292,6 +292,11 @@ pub async fn apply_template(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    // Image-only serving has no chat template or tokenizer (#2825); every
+    // other mode keeps this route.
+    if let Some(response) = super::chat_not_available_image_only(&state) {
+        return response.into_response();
+    }
     let live = state.live();
     let request: ChatCompletionRequest = match parse_with_default_model(&state, body) {
         Ok(request) => request,

@@ -116,6 +116,24 @@ async fn a_second_bind_without_reuse_port_fails() {
     );
 }
 
+#[tokio::test]
+async fn a_second_socket_with_so_reuseaddr_cannot_take_a_live_port() {
+    let first = bind_tcp("127.0.0.1", 0, false).expect("binds");
+    let addr = first.local_addr().expect("local addr");
+    let intruder = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .expect("socket");
+    intruder.set_reuse_address(true).expect("SO_REUSEADDR");
+    let taken = intruder.bind(&addr.into()).is_ok() && intruder.listen(16).is_ok();
+    assert!(
+        !taken,
+        "a foreign SO_REUSEADDR socket must not share the server's live port {addr}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn reuse_port_lets_two_listeners_share_one_port() {
@@ -214,6 +232,23 @@ async fn tls_is_refused_on_a_unix_domain_socket() {
     assert!(format!("{err:#}").contains("--ssl-cert-file"), "{err:#}");
 }
 
+#[cfg(not(unix))]
+#[tokio::test]
+async fn a_unix_socket_target_is_refused_off_unix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let target = ListenTarget::Unix(dir.path().join("mlxcel.sock"));
+    let err = serve(&target, test_router(), options(30), |_| {
+        panic!("nothing may be announced for a refused socket")
+    })
+    .await
+    .expect_err("a Unix socket target must be refused off Unix");
+    assert!(
+        format!("{err:#}").contains("listen on TCP instead"),
+        "{err:#}"
+    );
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn a_unix_socket_listener_answers_requests() {
     let dir = tempfile::tempdir().expect("tempdir");

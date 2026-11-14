@@ -21,6 +21,8 @@
 //! - `DELETE /v1/responses/:id`  — delete a stored response
 //! - `POST /v1/responses/:id/cancel` — best-effort cancellation
 //!
+//! `POST /v1/responses/compact` lives in [`super::responses_compact`].
+//!
 //! The handlers are intentionally thin: every meaningful decision lives
 //! in [`crate::server::responses_translator`] (request flattening +
 //! outbound assembly) and in the existing chat-completions building
@@ -54,9 +56,8 @@ use crate::server::tool_calls::stream_filter::StreamFilter;
 use crate::server::types::ErrorResponse;
 use crate::server::types::responses_request::CreateResponseRequest;
 use crate::server::types::responses_response::{
-    ResponseFunctionCallOutput, ResponseItemStatus, ResponseObject, ResponseOutputContent,
-    ResponseOutputItem, ResponseOutputMessage, ResponseReasoningOutput, ResponseReasoningPart,
-    ResponseStatus,
+    ResponseItemStatus, ResponseObject, ResponseOutputContent, ResponseOutputItem,
+    ResponseOutputMessage, ResponseReasoningOutput, ResponseReasoningPart, ResponseStatus,
 };
 use crate::server::types::responses_stream::ResponseStreamEvent;
 use crate::server::{AppState, LiveSettings};
@@ -64,6 +65,12 @@ use crate::server::{AppState, LiveSettings};
 fn generation_error_to_response(err: anyhow::Error) -> ErrorResponse {
     super::generation_error_to_response(err)
 }
+
+use super::responses_auto_compact::{
+    AutoCompaction, apply_auto_compaction, cap_output_tokens, clamp_reasoning_budget, final_status,
+    mark_incomplete_output, parse_context_management, prepend_compaction_item,
+    send_compaction_events, stopped_at_limit,
+};
 
 use super::chat::{
     build_generate_options_with_live, build_prompt_cache_request_context,
@@ -84,6 +91,11 @@ pub async fn create_response(
     if let Some(response) = super::chat_not_available(&state) {
         return response.into_response();
     }
+    // `context_management` (issue #2397) is validated before any work.
+    let compact_threshold = match parse_context_management(request.context_management.as_ref()) {
+        Ok(threshold) => threshold,
+        Err(err) => return err.into_response(),
+    };
 
     // -- Translate Responses request → ChatCompletionRequest ---------------
     let mut translated = match responses_request_to_chat(
@@ -156,6 +168,28 @@ pub async fn create_response(
         return ErrorResponse::new(message, "invalid_request_error").into_response();
     }
 
+    // Automatic compaction (issue #2397): count, and compact at the
+    // threshold, once the request is known to be valid. A rebuilt request
+    // repeats the video substitution its original went through above.
+    let auto = match compact_threshold {
+        None => None,
+        Some(threshold) => {
+            match apply_auto_compaction(&state, &live, &request, &mut translated, threshold).await {
+                Ok(auto) => Some(auto),
+                Err(err) => return err.into_response(),
+            }
+        }
+    };
+    if auto.as_ref().is_some_and(AutoCompaction::compacted)
+        && let Err(err) = crate::server::chat_request::expand_request_video_parts(
+            &state,
+            &mut translated.chat_request,
+        )
+        .await
+    {
+        return err.into_error_response().into_response();
+    }
+
     // Build the structured-output constraint up front: the `text.format`
     // json_schema, otherwise the forced tool-call grammar (#1319).
     let structured =
@@ -206,6 +240,7 @@ pub async fn create_response(
             budget_override,
             structured,
             resumable,
+            auto,
         )
         .await
     } else {
@@ -219,6 +254,7 @@ pub async fn create_response(
             priority,
             budget_override,
             structured,
+            auto,
         )
         .await
     }
@@ -237,6 +273,7 @@ async fn non_stream_create_response(
     structured: Option<
         std::sync::Arc<std::sync::Mutex<crate::server::structured::StructuredOutputConstraint>>,
     >,
+    auto: Option<AutoCompaction>,
 ) -> Response {
     if !state.can_accept_request() {
         return ErrorResponse::service_unavailable("All slots are busy. Please try again later.")
@@ -286,6 +323,13 @@ async fn non_stream_create_response(
         &live,
         amplified,
     );
+    // Output cap at the remaining context, for `context_management`
+    // requests only (issue #2397, mlx-vlm#2458).
+    if let Some(auto) = auto.as_ref()
+        && let Err(err) = cap_output_tokens(&state, auto, &prepared, &mut options.max_tokens)
+    {
+        return err.into_response();
+    }
     options.priority = priority;
     // per-request Gemma 4 image soft-token budget, resolved and validated from
     // the translated `image_url` content parts. `None` when unset.
@@ -297,6 +341,11 @@ async fn non_stream_create_response(
     // native renderer closes. `None` for every template-rendered request.
     options.pre_rendered_prompt_tokens = prepared.prompt_token_ids.take();
     options.reasoning_budget = budget_override;
+    // The budget was validated against the uncapped limit; keep it below the
+    // capped one (issue #2397).
+    if auto.is_some() {
+        clamp_reasoning_budget(&mut options.reasoning_budget, options.max_tokens);
+    }
     // The prompt may already leave generation inside an open thinking block
     // (a template that primes `<think>\n`, #2123): the scheduler's
     // `ThinkingState` then counts reasoning from the first token, as on
@@ -365,7 +414,17 @@ async fn non_stream_create_response(
     } else {
         None
     };
-    let (visible_text, _reasoning_text) = split_reasoning(&result.text, parsed_tools.as_ref());
+    let (visible_text, reasoning_text) =
+        split_reasoning(&result.text, parsed_tools.as_ref(), primed_open_thinking);
+    let reasoning_tokens =
+        count_reasoning_tokens_off_executor(&state.tokenizer, reasoning_text.as_deref()).await;
+    // #2394: GLM-4.1V-Thinking's `<answer>` wrapper, only for a tokenizer
+    // that defines it, as the streaming filter does.
+    let visible_text = if tool_calls::answer_wrapper_enabled(&state.tokenizer) {
+        tool_calls::strip_answer_wrapper(&visible_text)
+    } else {
+        visible_text
+    };
     // Remember the `reasoning` item this reply carries for a follow-up that
     // echoes only the message item (#2118). A tool-calling turn is echoed back
     // with its function calls, which the store never fills.
@@ -375,30 +434,33 @@ async fn non_stream_create_response(
             echo_scope.as_ref(),
             &translated.chat_request.messages,
             &visible_text,
-            _reasoning_text.as_deref(),
+            reasoning_text.as_deref(),
         );
     }
 
     let completed_at = chrono::Utc::now().timestamp() as f64;
-    let response = build_response_object(OutboundContext {
+    let (status, incomplete_reason) = final_status(auto.as_ref(), &result.finish_reason);
+    let mut response = build_response_object(OutboundContext {
         response_id: response_id.clone(),
         model_id: model_id.clone(),
         created_at,
         completed_at,
-        status: ResponseStatus::Completed,
+        status,
         prompt_tokens: result.prompt_tokens,
         completion_tokens: result.completion_tokens,
         cached_tokens: result.cached_tokens,
-        reasoning_tokens: 0,
+        reasoning_tokens,
         text: visible_text,
-        reasoning_text: _reasoning_text,
+        reasoning_text,
         parsed_tool_calls: parsed_tools.as_ref(),
         max_tool_calls: request.max_tool_calls,
         request: &request,
         error: None,
-        incomplete_reason: None,
+        incomplete_reason,
         finish_reason: result.finish_reason.clone(),
     });
+    prepend_compaction_item(auto.as_ref(), &mut response);
+    mark_incomplete_output(&mut response);
 
     persist_response(&state, &request, &translated, &response);
 
@@ -419,6 +481,7 @@ async fn stream_create_response(
         std::sync::Arc<std::sync::Mutex<crate::server::structured::StructuredOutputConstraint>>,
     >,
     resumable: super::chat::ResumableStreamContext,
+    auto: Option<AutoCompaction>,
 ) -> Response {
     if !state.can_accept_request() {
         return ErrorResponse::service_unavailable("All slots are busy. Please try again later.")
@@ -468,6 +531,13 @@ async fn stream_create_response(
         &live,
         amplified,
     );
+    // Output cap at the remaining context, for `context_management`
+    // requests only (issue #2397, mlx-vlm#2458).
+    if let Some(auto) = auto.as_ref()
+        && let Err(err) = cap_output_tokens(&state, auto, &prepared, &mut options.max_tokens)
+    {
+        return err.into_response();
+    }
     options.priority = priority;
     // per-request Gemma 4 image soft-token budget, resolved and validated from
     // the translated `image_url` content parts. `None` when unset.
@@ -479,6 +549,11 @@ async fn stream_create_response(
     // native renderer closes. `None` for every template-rendered request.
     options.pre_rendered_prompt_tokens = prepared.prompt_token_ids.take();
     options.reasoning_budget = budget_override;
+    // The budget was validated against the uncapped limit; keep it below the
+    // capped one (issue #2397).
+    if auto.is_some() {
+        clamp_reasoning_budget(&mut options.reasoning_budget, options.max_tokens);
+    }
     // The prompt may already leave generation inside an open thinking block
     // (a template that primes `<think>\n`, #2123): the scheduler's
     // `ThinkingState` then counts reasoning from the first token, as on
@@ -578,6 +653,9 @@ async fn stream_create_response(
             sequence_number: emitter.next_seq(),
             response: initial_response,
         });
+        // Automatic compaction ran before the stream opened (issue #2397):
+        // report it and emit its item at output_index 0.
+        send_compaction_events(&sender, &mut emitter, &response_id_for_task, auto.as_ref());
 
         // Lazy envelope state: we don't open the message or reasoning
         // item until the first matching chunk arrives, so we can emit
@@ -600,9 +678,28 @@ async fn stream_create_response(
             } else {
                 StreamFilter::new()
             }
+            // #2394: GLM-4.1V-Thinking's `<answer>` wrapper, as non-streamed.
+            .with_answer_wrapper(tool_calls::answer_wrapper_enabled(&state.tokenizer))
             .with_minicpm5_calls(parse_tools),
         ));
         let filter_for_callback = stream_filter.clone();
+        // Incremental tool-call argument streaming (#2396), when tool calls
+        // are parsed for this request. The end-of-stream parse stays
+        // authoritative.
+        let tool_stream = tools_for_parser.as_deref().map(|tools| {
+            std::sync::Arc::new(std::sync::Mutex::new(
+                super::tool_call_stream::ResponsesToolCallStream::new(
+                    tools,
+                    translated_for_task
+                        .chat_request
+                        .tool_choice
+                        .as_ref()
+                        .and_then(|choice| choice.specific_function()),
+                    primed_open_thinking,
+                ),
+            ))
+        });
+        let tool_stream_for_callback = tool_stream.clone();
         let sender_clone = sender.clone();
         let emitter_arc = std::sync::Arc::new(std::sync::Mutex::new(emitter));
         let emitter_for_callback = emitter_arc.clone();
@@ -737,6 +834,16 @@ async fn stream_create_response(
                             delta: text,
                         });
                     }
+
+                    // Tool-call items and argument fragments (#2396).
+                    if let Some(tool_stream) = tool_stream_for_callback.as_ref()
+                        && let Ok(mut tool_stream) = tool_stream.lock()
+                        && let Ok(mut em) = emitter_for_callback.lock()
+                    {
+                        for event in tool_stream.feed(&token, &mut em) {
+                            let _ = sender_clone.send_event(&event);
+                        }
+                    }
                 },
                 |stats| {
                     slot.on_prefill_progress(
@@ -869,7 +976,7 @@ async fn stream_create_response(
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
-        let parsed_tools = if parse_tools {
+        let mut parsed_tools = if parse_tools {
             Some(tool_calls::parse_tool_calls(
                 &full_raw,
                 tools_for_parser.as_deref(),
@@ -928,10 +1035,16 @@ async fn stream_create_response(
                 content_index: 0,
                 part: ResponseOutputContent::output_text(message_text.clone()),
             });
-            let msg_item = ResponseOutputItem::Message(ResponseOutputMessage::new_assistant(
+            let mut message = ResponseOutputMessage::new_assistant(
                 closed_msg_id.clone(),
                 vec![ResponseOutputContent::output_text(message_text.clone())],
-            ));
+            );
+            // A `context_management` reply cut off at its output limit
+            // (issue #2397).
+            if stopped_at_limit(auto.as_ref(), &result.finish_reason) {
+                message.status = ResponseItemStatus::Incomplete;
+            }
+            let msg_item = ResponseOutputItem::Message(message);
             let seq = em.next_seq();
             let _ = sender.send_event(&ResponseStreamEvent::OutputItemDone {
                 sequence_number: seq,
@@ -942,6 +1055,12 @@ async fn stream_create_response(
         }
 
         let reasoning_text_for_response = em.completed_reasoning_text();
+        // A message item a streamed tool call closed early (#2396) still
+        // belongs to the response text.
+        let message_text = match tool_stream.as_ref().and_then(|t| t.lock().ok()) {
+            Some(tool_stream) => tool_stream.message_text(&message_text),
+            None => message_text,
+        };
 
         // Remember the streamed `reasoning` item for a follow-up that echoes
         // only the message item (#2118), from exactly the text the stream
@@ -956,45 +1075,15 @@ async fn stream_create_response(
             );
         }
 
-        if let Some(parsed) = parsed_tools.as_ref() {
-            for call in &parsed.tool_calls {
-                let fc_id = format!("fc_{}", short_uuid());
-                let call_id = format!("call_{}", short_uuid());
-                let fc = ResponseFunctionCallOutput {
-                    id: fc_id.clone(),
-                    call_id: call_id.clone(),
-                    name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                    status: ResponseItemStatus::Completed,
-                };
-                let item = ResponseOutputItem::FunctionCall(fc);
-                let seq = em.next_seq();
-                let _ = sender.send_event(&ResponseStreamEvent::OutputItemAdded {
-                    sequence_number: seq,
-                    output_index: em.output_index(),
-                    item: item.clone(),
-                });
-                let seq = em.next_seq();
-                let _ = sender.send_event(&ResponseStreamEvent::FunctionCallArgumentsDelta {
-                    sequence_number: seq,
-                    item_id: fc_id.clone(),
-                    output_index: em.output_index(),
-                    delta: call.arguments.clone(),
-                });
-                let seq = em.next_seq();
-                let _ = sender.send_event(&ResponseStreamEvent::FunctionCallArgumentsDone {
-                    sequence_number: seq,
-                    item_id: fc_id.clone(),
-                    output_index: em.output_index(),
-                    arguments: call.arguments.clone(),
-                });
-                let seq = em.next_seq();
-                let _ = sender.send_event(&ResponseStreamEvent::OutputItemDone {
-                    sequence_number: seq,
-                    output_index: em.output_index(),
-                    item,
-                });
-                em.advance_output_index();
+        // #2396: streamed calls end with their parsed arguments under the
+        // ids they streamed with; every other parsed call is emitted in one
+        // shot. The ids are written back so the final object agrees.
+        if let (Some(parsed), Some(tool_stream)) = (parsed_tools.as_mut(), tool_stream.as_ref())
+            && let Ok(tool_stream) = tool_stream.lock()
+        {
+            for event in tool_stream.finish(&mut parsed.tool_calls, &mut em, &response_id_for_task)
+            {
+                let _ = sender.send_event(&event);
             }
         }
 
@@ -1002,30 +1091,57 @@ async fn stream_create_response(
         // outbound assembly fills the canonical output[] for the
         // "completed" event payload.
         let completed_at_now = chrono::Utc::now().timestamp() as f64;
-        let final_response = build_response_object(OutboundContext {
+        let (status, incomplete_reason) = final_status(auto.as_ref(), &result.finish_reason);
+        let mut final_response = build_response_object(OutboundContext {
             response_id: response_id_for_task.clone(),
             model_id: model_id_for_task,
             created_at,
             completed_at: completed_at_now,
-            status: ResponseStatus::Completed,
+            status,
             prompt_tokens: result.prompt_tokens,
             completion_tokens: result.completion_tokens,
             cached_tokens: result.cached_tokens,
-            reasoning_tokens: 0,
+            reasoning_tokens: count_reasoning_tokens(
+                &state_for_task.tokenizer,
+                reasoning_text_for_response.as_deref(),
+            ),
             text: message_text,
             reasoning_text: reasoning_text_for_response,
             parsed_tool_calls: parsed_tools.as_ref(),
             max_tool_calls: request_for_task.max_tool_calls,
             request: &request_for_task,
             error: None,
-            incomplete_reason: None,
+            incomplete_reason,
             finish_reason: result.finish_reason.clone(),
         });
 
+        // #2396: with tool-call streaming a call can split the message into
+        // segments and its item is added mid-stream, so the completed object
+        // (and the stored copy `previous_response_id` reads) lists exactly
+        // the items the stream delivered: same ids, order, `output_index`
+        // and content, with the parsed arguments the `.done` events carried.
+        if tool_stream.is_some() {
+            let streamed = sender.streamed_output();
+            if !streamed.is_empty() {
+                final_response.output_text = streamed_output_text(&streamed);
+                final_response.output = streamed;
+            }
+        }
+
+        prepend_compaction_item(auto.as_ref(), &mut final_response);
+        mark_incomplete_output(&mut final_response);
+
         let seq = em.next_seq();
-        let _ = sender.send_event(&ResponseStreamEvent::Completed {
-            sequence_number: seq,
-            response: final_response.clone(),
+        let _ = sender.send_event(&if status == ResponseStatus::Incomplete {
+            ResponseStreamEvent::Incomplete {
+                sequence_number: seq,
+                response: final_response.clone(),
+            }
+        } else {
+            ResponseStreamEvent::Completed {
+                sequence_number: seq,
+                response: final_response.clone(),
+            }
         });
 
         persist_response(
@@ -1048,6 +1164,23 @@ async fn stream_create_response(
     }
 
     sse_response(stream, keepalive)
+}
+
+/// The `output_text` aggregate of `items`: every message's `output_text`
+/// parts, in order.
+fn streamed_output_text(items: &[ResponseOutputItem]) -> String {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            ResponseOutputItem::Message(message) => Some(&message.content),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|part| match part {
+            ResponseOutputContent::OutputText { text, .. } => Some(text.as_str()),
+            ResponseOutputContent::Refusal { .. } => None,
+        })
+        .collect()
 }
 
 /// GET /v1/responses/:id
@@ -1100,24 +1233,17 @@ pub async fn cancel_response(State(state): State<AppState>, Path(id): Path<Strin
         .into_response();
     };
 
-    // Review H2: first check the in-flight registry — if the response
-    // is still streaming, flip its cancellation token so the scheduler
-    // aborts the underlying sequence and the streaming task emits
-    // `response.failed` / `response.error` on its way out.
-    let in_flight_aborted = store.cancel_in_flight(&id);
-
-    if let Some(mut stored) = store.get(&id) {
-        // Already-persisted response: just mark cancelled.
-        stored.response.status = ResponseStatus::Cancelled;
-        let stored_for_insert = StoredResponse {
-            response: stored.response.clone(),
-            input_items: stored.input_items.clone(),
-        };
-        store.insert(id.clone(), stored_for_insert);
-        return Json(stored.response).into_response();
+    // Responses are persisted only after generation finishes. Check before
+    // signalling a stream whose in-flight token may not yet be unregistered.
+    if store.get(&id).is_some() {
+        return ErrorResponse::new(
+            format!("response '{id}' has already finished and cannot be cancelled"),
+            "invalid_request_error",
+        )
+        .into_response();
     }
 
-    if in_flight_aborted {
+    if store.cancel_in_flight(&id) {
         // The streaming task is still mid-flight; return a minimal
         // "cancelled" envelope so the client knows the cancel call was
         // honoured. The persisted entry (when `store=true`) will be
@@ -1166,21 +1292,36 @@ fn translate_error_to_response(err: ResponsesTranslateError) -> ErrorResponse {
 ///   injected `<think>\n` into the prompt, so the model's first emitted
 ///   tokens are reasoning, followed by `</think>` and the visible
 ///   reply.
-/// - **No `<think>` at all**: visible text is the cleaned raw output;
-///   no reasoning is emitted.
+/// - **No `<think>` at all**: visible text is the cleaned raw output.
+///   Reasoning then comes from the same sources the chat route reads
+///   (#2470): replay the streaming filter first so multiple analysis segments
+///   have identical text and token counts in both response modes. The parser
+///   and close-only extraction remain fallbacks for unsupported marker forms.
+///
+/// Used by: non-streamed Responses requests and response parity tests.
 pub(crate) fn split_reasoning(
     raw: &str,
     parsed: Option<&crate::server::tool_calls::types::ToolCallParseResult>,
+    primed_open_thinking: bool,
 ) -> (String, Option<String>) {
     // Recover the reasoning chunk from the *raw* output before any
     // thinking-block stripping. `clean_structural_tokens` (and the tool
     // parser's internal `strip_thinking`) erase `<think>...</think>`
     // entirely, which would otherwise mask reasoning from this helper.
-    let reasoning = extract_reasoning_from_raw(raw);
+    let reasoning = super::chat::extract_reasoning_content(raw, primed_open_thinking)
+        .or_else(|| parsed.and_then(|p| p.reasoning_content.clone()))
+        .or_else(|| extract_reasoning_from_raw(raw))
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty());
     let visible_source = match parsed {
         Some(p) => p.content.clone(),
         None => tool_calls::clean_structural_tokens(raw),
     };
+    // A primed thinking block that never closed is reasoning only: the
+    // StreamFilter fallback above already returns all of it, so the visible
+    // text must be empty, as in the chat route and the streamed reply.
+    let visible_source =
+        super::chat::strip_unclosed_primed_thinking(visible_source, raw, primed_open_thinking);
     // If the visible source still carries a `</think>` close tag (the
     // open-primed-close-only case — `clean_structural_tokens` does not
     // strip a bare close marker), keep only the chunk after it. Any
@@ -1225,6 +1366,50 @@ fn extract_reasoning_from_raw(raw: &str) -> Option<String> {
     None
 }
 
+/// `output_tokens_details.reasoning_tokens`: the reasoning item's text
+/// encoded with the model tokenizer (#2470). Both the streamed and the
+/// non-streamed reply count their own reasoning item this way, so the two
+/// agree whenever their reasoning text does. Surrounding whitespace is not
+/// counted, since the two arms trim it differently.
+/// [`count_reasoning_tokens`] on the blocking pool, for the async non-stream
+/// arm. Tiktoken BPE is quadratic per piece, so a long reasoning item must not
+/// stall a tokio worker; the stream arm already counts inside its
+/// `spawn_blocking` task. Same counting, so the two arms stay equal.
+async fn count_reasoning_tokens_off_executor(
+    tokenizer: &std::sync::Arc<crate::tokenizer::MlxcelTokenizer>,
+    reasoning: Option<&str>,
+) -> usize {
+    let Some(text) = reasoning.map(str::trim).filter(|t| !t.is_empty()) else {
+        return 0;
+    };
+    let tokenizer = std::sync::Arc::clone(tokenizer);
+    let text = text.to_owned();
+    match tokio::task::spawn_blocking(move || count_reasoning_tokens(&tokenizer, Some(&text))).await
+    {
+        Ok(count) => count,
+        Err(err) => {
+            tracing::warn!(error = %err, "reasoning token count task failed; reporting 0");
+            0
+        }
+    }
+}
+
+fn count_reasoning_tokens(
+    tokenizer: &crate::tokenizer::MlxcelTokenizer,
+    reasoning: Option<&str>,
+) -> usize {
+    let Some(text) = reasoning.map(str::trim).filter(|t| !t.is_empty()) else {
+        return 0;
+    };
+    match tokenizer.encode(text, false) {
+        Ok(ids) => ids.len(),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to count reasoning tokens; reporting 0");
+            0
+        }
+    }
+}
+
 fn persist_response(
     state: &AppState,
     request: &CreateResponseRequest,
@@ -1246,10 +1431,13 @@ fn persist_response(
     if let Some(conv_id) = translated.conversation_id.as_ref()
         && let Some(conv_store) = state.conversation_store.as_ref()
     {
-        let mut items: Vec<ConversationItem> = translated
-            .canonical_input_items
-            .iter()
-            .cloned()
+        // The response snapshot may include compacted prior history, but
+        // an append-only conversation must receive only this turn.
+        let mut items: Vec<ConversationItem> = request
+            .input
+            .clone()
+            .into_items()
+            .into_iter()
             .map(ConversationItem::Input)
             .collect();
         items.extend(
@@ -1261,7 +1449,6 @@ fn persist_response(
         );
         conv_store.append(conv_id, items);
     }
-    let _ = request; // silence unused on minimal-feature builds
 }
 
 #[cfg(test)]
@@ -1282,7 +1469,8 @@ mod tests {
 
     #[test]
     fn split_reasoning_inline_block_separates_content() {
-        let (visible, reasoning) = split_reasoning("<think>some thoughts</think>hi there", None);
+        let (visible, reasoning) =
+            split_reasoning("<think>some thoughts</think>hi there", None, false);
         assert_eq!(visible, "hi there");
         assert_eq!(reasoning.as_deref(), Some("some thoughts"));
     }
@@ -1292,23 +1480,214 @@ mod tests {
         // Qwen3 primed-open scenario: prompt injected `<think>\n`, the
         // model's emitted text begins with the reasoning trace followed
         // by `</think>` and the real reply.
-        let (visible, reasoning) = split_reasoning("reasoning text</think>\n\nHello!", None);
+        let (visible, reasoning) = split_reasoning("reasoning text</think>\n\nHello!", None, false);
         assert_eq!(visible, "Hello!");
         assert_eq!(reasoning.as_deref(), Some("reasoning text"));
     }
 
     #[test]
     fn split_reasoning_close_only_empty_reasoning_yields_none() {
-        let (visible, reasoning) = split_reasoning("</think>\n\nGreetings.", None);
+        let (visible, reasoning) = split_reasoning("</think>\n\nGreetings.", None, false);
         assert_eq!(visible, "Greetings.");
         assert!(reasoning.is_none());
     }
 
     #[test]
     fn split_reasoning_no_think_block_returns_raw() {
-        let (visible, reasoning) = split_reasoning("just text", None);
+        let (visible, reasoning) = split_reasoning("just text", None, false);
         assert_eq!(visible, "just text");
         assert!(reasoning.is_none());
+    }
+
+    // -- Harmony reasoning and reasoning_tokens (#2470) --
+
+    /// gpt-oss reply shape from the GB10 smoke test ("What is 12 + 30?").
+    const HARMONY_RAW: &str = concat!(
+        "<|channel|>analysis<|message|>The user asks 12 + 30. That is 42.<|end|>",
+        "<|start|>assistant<|channel|>final<|message|>42"
+    );
+    const HARMONY_ANALYSIS: &str = "The user asks 12 + 30. That is 42.";
+
+    fn weather_tool() -> crate::server::types::request::Tool {
+        crate::server::types::request::Tool {
+            tool_type: "function".to_string(),
+            function: crate::server::types::request::FunctionDefinition {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: None,
+            },
+        }
+    }
+
+    /// One token per word or punctuation run, so counts are easy to read.
+    fn word_tokenizer() -> crate::tokenizer::MlxcelTokenizer {
+        let json = r#"{
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": [], "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null, "decoder": null,
+            "model": {"type": "WordLevel", "vocab": {"[UNK]": 0}, "unk_token": "[UNK]"}
+        }"#;
+        crate::tokenizer::MlxcelTokenizer::HuggingFace(
+            tokenizers::Tokenizer::from_bytes(json.as_bytes()).expect("stub tokenizer builds"),
+        )
+    }
+
+    /// The reasoning item text the streaming arm accumulates: the route's
+    /// `StreamFilter` fed one character per token, then flushed.
+    fn streamed_reasoning(raw: &str, primed: bool) -> Option<String> {
+        let mut filter = if primed {
+            StreamFilter::new_primed_open_thinking()
+        } else {
+            StreamFilter::new()
+        };
+        let mut reasoning = String::new();
+        let mut buf = [0u8; 4];
+        for ch in raw.chars() {
+            let out = filter.feed(ch.encode_utf8(&mut buf));
+            reasoning.push_str(out.reasoning.as_deref().unwrap_or(""));
+        }
+        reasoning.push_str(filter.flush().reasoning.as_deref().unwrap_or(""));
+        Some(reasoning).filter(|r| !r.is_empty())
+    }
+
+    #[test]
+    fn split_reasoning_surfaces_harmony_analysis_without_tools() {
+        let (visible, reasoning) = split_reasoning(HARMONY_RAW, None, false);
+        assert_eq!(visible, "42");
+        assert_eq!(reasoning.as_deref(), Some(HARMONY_ANALYSIS));
+    }
+
+    #[test]
+    fn split_reasoning_surfaces_harmony_analysis_with_parsed_tools() {
+        let tools = [weather_tool()];
+        let parsed = tool_calls::parse_tool_calls(HARMONY_RAW, Some(&tools));
+        let (visible, reasoning) = split_reasoning(HARMONY_RAW, Some(&parsed), false);
+        assert_eq!(visible, "42");
+        assert_eq!(reasoning.as_deref(), Some(HARMONY_ANALYSIS));
+    }
+
+    #[test]
+    fn harmony_reply_carries_a_reasoning_output_item() {
+        let request: CreateResponseRequest =
+            serde_json::from_str(r#"{"model":"m","input":"What is 12 + 30?"}"#).unwrap();
+        let (text, reasoning_text) = split_reasoning(HARMONY_RAW, None, false);
+        let tokenizer = word_tokenizer();
+        let reasoning_tokens = count_reasoning_tokens(&tokenizer, reasoning_text.as_deref());
+        let response = build_response_object(OutboundContext {
+            response_id: "resp_1".to_string(),
+            model_id: "m".to_string(),
+            created_at: 0.0,
+            completed_at: 0.0,
+            status: ResponseStatus::Completed,
+            prompt_tokens: 10,
+            completion_tokens: 54,
+            cached_tokens: 0,
+            reasoning_tokens,
+            text,
+            reasoning_text,
+            parsed_tool_calls: None,
+            max_tool_calls: None,
+            request: &request,
+            error: None,
+            incomplete_reason: None,
+            finish_reason: "stop".to_string(),
+        });
+        let ResponseOutputItem::Reasoning(item) = &response.output[0] else {
+            panic!("first output item is not reasoning: {:?}", response.output);
+        };
+        let ResponseReasoningPart::ReasoningText { text } = &item.content[0];
+        assert_eq!(text, HARMONY_ANALYSIS);
+        let details = response.usage.output_tokens_details;
+        assert_eq!(details.map(|d| d.reasoning_tokens), Some(reasoning_tokens));
+        assert!(reasoning_tokens > 0);
+    }
+
+    #[test]
+    fn reasoning_tokens_match_between_streamed_and_non_streamed() {
+        let tokenizer = word_tokenizer();
+        let tools = [weather_tool()];
+        let parsed = tool_calls::parse_tool_calls(HARMONY_RAW, Some(&tools));
+        // (raw, primed prompt, parsed tools)
+        let cases: [(&str, bool, Option<&tool_calls::types::ToolCallParseResult>); 4] = [
+            ("<think>\nAdd them: 12 + 30.\n</think>\n\n42", false, None),
+            ("Add them: 12 + 30.\n</think>\n\n42", true, None),
+            (HARMONY_RAW, false, None),
+            (HARMONY_RAW, false, Some(&parsed)),
+        ];
+        for (raw, primed, parsed) in cases {
+            let (_, non_streamed) = split_reasoning(raw, parsed, primed);
+            let streamed = streamed_reasoning(raw, primed);
+            let non_streamed_count = count_reasoning_tokens(&tokenizer, non_streamed.as_deref());
+            let streamed_count = count_reasoning_tokens(&tokenizer, streamed.as_deref());
+            assert!(non_streamed_count > 0, "no reasoning tokens for {raw:?}");
+            assert_eq!(
+                streamed_count, non_streamed_count,
+                "counts differ for {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_reasoning_segments_match_streamed_text_and_tokens() {
+        let tokenizer = word_tokenizer();
+        let tools = [weather_tool()];
+        let samples = [
+            concat!(
+                "<|channel|>analysis<|message|>first<|end|>",
+                "<|start|>assistant<|channel|>analysis<|message|>second<|end|>",
+                "<|start|>assistant<|channel|>final<|message|>42<|return|>"
+            ),
+            "<think>first</think><think>second</think>42",
+        ];
+        for raw in samples {
+            let parsed = tool_calls::parse_tool_calls(raw, Some(&tools));
+            for parsed in [None, Some(&parsed)] {
+                let (_, reasoning) = split_reasoning(raw, parsed, false);
+                let streamed = streamed_reasoning(raw, false);
+                assert_eq!(reasoning, streamed, "{raw:?}");
+                assert_eq!(
+                    count_reasoning_tokens(&tokenizer, reasoning.as_deref()),
+                    count_reasoning_tokens(&tokenizer, streamed.as_deref()),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_reasoning_unclosed_primed_thinking_is_reasoning_only() {
+        // max_tokens hit inside a primed `<think>`: the whole output is
+        // reasoning and must not also surface as the message text.
+        let raw = "still thinking about 12 + 30";
+        let (visible, reasoning) = split_reasoning(raw, None, true);
+        assert_eq!(visible, "");
+        assert_eq!(reasoning.as_deref(), Some(raw));
+        assert_eq!(streamed_reasoning(raw, true).as_deref(), Some(raw));
+        let tools = [weather_tool()];
+        let parsed = tool_calls::parse_tool_calls(raw, Some(&tools));
+        let (visible, reasoning) = split_reasoning(raw, Some(&parsed), true);
+        assert_eq!(visible, "");
+        assert_eq!(reasoning.as_deref(), Some(raw));
+    }
+
+    #[tokio::test]
+    async fn off_executor_count_matches_the_blocking_count() {
+        let tokenizer = std::sync::Arc::new(word_tokenizer());
+        for text in [None, Some(" \n "), Some(HARMONY_ANALYSIS)] {
+            assert_eq!(
+                count_reasoning_tokens_off_executor(&tokenizer, text).await,
+                count_reasoning_tokens(&tokenizer, text),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_tokens_are_zero_without_reasoning() {
+        let tokenizer = word_tokenizer();
+        assert_eq!(count_reasoning_tokens(&tokenizer, None), 0);
+        assert_eq!(count_reasoning_tokens(&tokenizer, Some(" \n ")), 0);
+        assert_eq!(count_reasoning_tokens(&tokenizer, Some("one two.")), 3);
     }
 
     // -- no-effective-input rejection (issue #773), exercised on the
@@ -1469,3 +1848,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "responses_cancel_route_tests.rs"]
+mod responses_cancel_route_tests;

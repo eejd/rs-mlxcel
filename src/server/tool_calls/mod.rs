@@ -23,6 +23,8 @@
 mod atem;
 mod formats;
 mod minicpm5;
+pub mod incremental;
+mod json_scan;
 pub mod parser;
 pub mod stream_filter;
 pub mod types;
@@ -30,7 +32,7 @@ pub mod types;
 pub use atem::render_muse_channels_for_display;
 pub use parser::{
     clean_structural_tokens, content_with_thinking_block, generate_tool_call_id, parse_tool_calls,
-    thinking_marker_pair, thinking_marker_pair_for_close,
+    strip_answer_wrapper, thinking_marker_pair, thinking_marker_pair_for_close,
 };
 pub use types::{ParsedToolCall, ToolCallFormat, ToolCallParseResult};
 
@@ -358,6 +360,19 @@ pub fn special_token_id(tokenizer: &crate::tokenizer::MlxcelTokenizer, text: &st
     (token.special || (text.starts_with('<') && text.ends_with('>'))).then_some(id)
 }
 
+/// Whether the loaded model wraps its answer in GLM-4.1V-Thinking's
+/// `<answer>` / `</answer>` (#2394): true when the tokenizer defines both as
+/// added tokens, as the GLM-4.1V checkpoints do. Gates
+/// [`stream_filter::StreamFilter::with_answer_wrapper`] and
+/// [`strip_answer_wrapper`], so a model whose tags are ordinary text keeps
+/// them on both the streamed and the non-streamed path.
+// Used by: routes/chat, routes/responses, routes/anthropic, router_front, in_process
+pub fn answer_wrapper_enabled(tokenizer: &crate::tokenizer::MlxcelTokenizer) -> bool {
+    stream_filter::ANSWER_WRAPPER
+        .iter()
+        .all(|marker| special_token_id(tokenizer, marker).is_some())
+}
+
 /// JSON schema for one forced call: `{"name": <const>, <arguments_key>: <parameters>}`
 /// with both keys required and nothing else allowed, in that order (the order
 /// llguidance enforces is the schema's own, which matches how the templates
@@ -484,7 +499,7 @@ pub fn build_tool_call_responses(
             }
         })
         .map(|c| ToolCallResponse {
-            id: generate_tool_call_id(),
+            id: c.id.clone().unwrap_or_else(generate_tool_call_id),
             call_type: "function".to_string(),
             function: ToolCallFunctionResponse {
                 name: c.name.clone(),
@@ -803,6 +818,73 @@ mod tool_choice_grammar_tests {
             tool_choice_grammar(ToolCallFormat::Hermes, &two_tools(), &named("get_stock"))
                 .is_none(),
             "an undeclared name forces nothing; validation rejects it upstream"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_call_id_tests {
+    use super::*;
+
+    #[test]
+    fn build_tool_call_responses_prefers_model_id() {
+        let parsed = parse_tool_calls(
+            r#"[TOOL_CALLS] [{"name":"f","arguments":"{\"a\":1}","id":"abc123def"}]"#,
+            None,
+        );
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("chat request");
+        let calls = build_tool_call_responses(&parsed, &request);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(serde_json::to_value(&calls[0]).unwrap()["id"], "abc123def");
+    }
+
+    #[test]
+    fn build_tool_call_responses_mints_id_when_absent() {
+        let parsed = parse_tool_calls(r#"[TOOL_CALLS]a[ARGS]{"x":1}"#, None);
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("chat request");
+        let calls = build_tool_call_responses(&parsed, &request);
+        assert!(calls[0].id.starts_with("call_"));
+    }
+    /// The #2392 inputs dispatch to the rewritten parsers through the full
+    /// parser chain (Hermes / functionary v3.1 run first and must decline).
+    #[test]
+    fn issue_2392_inputs_dispatch_through_parse_tool_calls() {
+        let names = |text: &str| -> (Option<ToolCallFormat>, Vec<String>) {
+            let r = parse_tool_calls(text, None);
+            (r.format, r.tool_calls.into_iter().map(|c| c.name).collect())
+        };
+        assert_eq!(
+            names(
+                "<tool_call>\n<function=get_time\n<parameter=tz>\nUTC\n</parameter>\n</function>\n</tool_call>"
+            ),
+            (
+                Some(ToolCallFormat::Qwen3Coder),
+                vec!["get_time".to_string()]
+            )
+        );
+        assert_eq!(
+            names(r#"[TOOL_CALLS]get-weather[ARGS]{"city":"Paris"}get_time[ARGS]{"tz":"UTC"}"#),
+            (
+                Some(ToolCallFormat::Mistral),
+                vec!["get-weather".to_string(), "get_time".to_string()]
+            )
+        );
+        assert_eq!(
+            names(
+                r#"<|tool_call_start|>[get_weather(city="Paris"), get_time(tz="UTC")]<|tool_call_end|>"#
+            ),
+            (
+                Some(ToolCallFormat::Pythonic),
+                vec!["get_weather".to_string(), "get_time".to_string()]
+            )
         );
     }
 }

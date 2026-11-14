@@ -630,6 +630,7 @@ pub(crate) fn video_dir_allowlist_from_env() -> Vec<PathBuf> {
 /// directly keeps the helper unit-testable: tests can construct a
 /// world-writable temp directory and assert the helper detects it.
 #[must_use]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn scan_insecure_allowlist_dirs(allowlist: &[PathBuf]) -> Vec<PathBuf> {
     #[cfg(unix)]
     {
@@ -898,8 +899,9 @@ async fn decode_video_data_uri(url: &str) -> Option<(PathBuf, PrivateTempDir)> {
 /// bounded by `MAX_VIDEO_PAYLOAD_SIZE` regardless of what the remote server
 /// does with the wire protocol.
 ///
-/// Connect timeout, total request timeout, and redirect cap are configured
-/// on the shared client (see [`http_image_client`]).
+/// Connect and total timeouts are configured on the shared client (see
+/// [`media_client_builder`]); redirects are followed hop by hop through
+/// [`media_net::send_following_redirects`], which re-checks each target.
 async fn fetch_remote_video(url: &str) -> Option<(PathBuf, PrivateTempDir)> {
     let client = match http_image_client().await {
         Ok(client) => client,
@@ -912,21 +914,48 @@ async fn fetch_remote_video(url: &str) -> Option<(PathBuf, PrivateTempDir)> {
     let parsed = match media_net::ensure_media_url_allowed(url).await {
         Ok(parsed) => parsed,
         Err(err) => {
+            err.log_detail(url);
             tracing::warn!("Video URL rejected {}: {}", url, err);
             return None;
         }
     };
-    let host = parsed.host_str().unwrap_or_default().to_owned();
-    let response = match client.get(parsed).send().await {
+    let response = match media_net::send_following_redirects(client, parsed).await {
         Ok(r) => r,
-        Err(err) => {
+        Err(media_net::MediaSendError::Refused(refusal)) => {
+            refusal.log_detail(url);
+            tracing::warn!("Video URL rejected {}: {}", url, refusal);
+            return None;
+        }
+        Err(media_net::MediaSendError::Transport(err)) => {
             tracing::warn!("Failed to fetch video URL {}: {}", url, err);
             return None;
         }
+        Err(media_net::MediaSendError::BadRedirect { status }) => {
+            tracing::warn!(
+                "Video URL returned redirect {} without a usable Location header: {}",
+                status,
+                url
+            );
+            return None;
+        }
+        Err(media_net::MediaSendError::DeadlineExceeded { host }) => {
+            log_redirect_deadline(&host, url);
+            tracing::warn!(
+                "Video URL timed out {}: {}",
+                url,
+                REDIRECT_DEADLINE_EXCEEDED
+            );
+            return None;
+        }
     };
+    // The final response's host: after a redirect it differs from the request's.
     if let Some(peer) = response.remote_addr()
-        && let Err(err) = media_net::ensure_socket_addr_allowed(&host, peer)
+        && let Err(err) = media_net::ensure_socket_addr_allowed(
+            response.url().host_str().unwrap_or_default(),
+            peer,
+        )
     {
+        err.log_detail(url);
         tracing::warn!("Video URL rejected {}: {}", url, err);
         return None;
     }
@@ -1370,6 +1399,35 @@ pub(crate) async fn read_image_url(url: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// Fetch and decode one image URL, prefixing every failure with `label`.
+///
+/// Shared by the embeddings, rerank and image-generation routes so the 400
+/// `invalid_request_error` texts stay identical: `{label}: unsupported image
+/// URL scheme`, `{label}: failed to read image: {err}`, `{label}: {err}` for a
+/// decode failure and `{label}: image decoded to nothing`.
+pub(crate) async fn fetch_labeled_image(
+    url: &str,
+    label: &str,
+    limits: ImageInputLimits,
+) -> std::result::Result<image::DynamicImage, super::types::ErrorResponse> {
+    use super::model_provider::model_worker::decode_request_images_with_limits;
+    use super::types::ErrorResponse;
+
+    let invalid = |message: String| ErrorResponse::new(message, "invalid_request_error");
+    let bytes = match try_read_image_url_with_limits(url, limits).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Err(invalid(format!("{label}: unsupported image URL scheme"))),
+        Err(err) => {
+            return Err(invalid(format!("{label}: failed to read image: {err:#}")));
+        }
+    };
+    let mut decoded = decode_request_images_with_limits(&[bytes], limits)
+        .map_err(|err| invalid(format!("{label}: {err:#}")))?;
+    decoded
+        .pop()
+        .ok_or_else(|| invalid(format!("{label}: image decoded to nothing")))
+}
+
 pub(crate) async fn try_read_image_url_with_limits(
     url: &str,
     limits: ImageInputLimits,
@@ -1450,25 +1508,38 @@ async fn fetch_remote_bytes_with_limit_cancel(
     check_media_cancel(cancelled, 0)?;
     // Address policy before the socket opens: scheme, credentials, IP literal,
     // and every address the host name resolves to (issue #1451).
+    //
+    // Every refusal below reaches the client as `{kind} URL rejected:` plus the
+    // policy's generic text; the refused host and its address are logged at
+    // debug only (issue #2644).
+    let rejected = |err: &media_net::MediaUrlError| media_url_rejected(kind, url, err);
     let parsed = media_net::ensure_media_url_allowed(url)
         .await
-        .map_err(|err| anyhow!("{kind} URL rejected: {err}"))?;
-    let host = parsed.host_str().unwrap_or_default().to_owned();
-    let response = match http_image_client().await?.get(parsed).send().await {
-        Ok(response) => response,
-        Err(err) => bail!("Failed to fetch {kind} URL {url}: {err}"),
-    };
-    // Post-connect re-check: the peer the request actually reached. This is
-    // what closes the DNS-rebinding window the pre-flight resolution leaves,
-    // and it runs before any body byte is read.
+        .map_err(|err| rejected(&err))?;
+    // Every redirect hop goes through the same policy before it is requested,
+    // proxied or not (issue #2693).
+    let response = media_net::send_following_redirects(http_image_client().await?, parsed)
+        .await
+        .map_err(|err| media_send_failure(kind, url, err))?;
+    // Post-connect re-check: the peer the request actually reached, before any
+    // body byte is read. The client's policy resolver already refuses private
+    // addresses at connect time, so this is defence in depth (and the check
+    // that sees a proxy's own address when one is configured).
     if let Some(peer) = response.remote_addr() {
-        media_net::ensure_socket_addr_allowed(&host, peer)
-            .map_err(|err| anyhow!("{kind} URL rejected: {err}"))?;
+        // The final response's host, which differs from the request's after a redirect.
+        let final_host = response.url().host_str().unwrap_or_default();
+        media_net::ensure_socket_addr_allowed(final_host, peer).map_err(|err| rejected(&err))?;
     }
 
+    // reqwest's error text carries the URL it failed on, which after a
+    // redirect is a hop the origin chose; only the client's own `url` is
+    // rendered (issue #2728).
     let response = match response.error_for_status() {
         Ok(response) => response,
-        Err(err) => bail!("{kind} URL returned error status {url}: {err}"),
+        Err(err) => bail!(
+            "{kind} URL returned error status {url}: {}",
+            err.without_url()
+        ),
     };
 
     if let Some(content_length) = response.content_length()
@@ -1485,7 +1556,9 @@ async fn fetch_remote_bytes_with_limit_cancel(
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         check_media_cancel(cancelled, bytes.len())?;
-        let chunk = chunk.with_context(|| format!("Failed to read {kind} response body {url}"))?;
+        let chunk = chunk
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("Failed to read {kind} response body {url}"))?;
         if bytes.len().saturating_add(chunk.len()) > max_size {
             bail!(
                 "{kind} payload too large: response body exceeded {} bytes",
@@ -1587,6 +1660,52 @@ fn check_media_cancel(
     Ok(())
 }
 
+/// The client-facing error for a media URL the address policy refused.
+///
+/// The one place `{kind} URL rejected:` is rendered: the pre-flight check, a
+/// redirect hop and the post-connect peer check all come through here, so they
+/// read identically. The refused host and address go to the log at `debug`
+/// (issue #2644).
+fn media_url_rejected(kind: &str, url: &str, err: &media_net::MediaUrlError) -> anyhow::Error {
+    err.log_detail(url);
+    anyhow!("{kind} URL rejected: {err}")
+}
+
+/// Client-facing text for a chain deadline that ran out while a redirect
+/// target was being resolved. It names no host (issue #2644).
+const REDIRECT_DEADLINE_EXCEEDED: &str =
+    "the fetch deadline ran out while resolving a redirect target";
+
+/// Log a redirect hop whose lookup outlived the chain deadline, at `debug`.
+fn log_redirect_deadline(host: &str, url: &str) {
+    tracing::debug!(
+        host = %host,
+        url,
+        "media redirect hop lookup ran past the fetch deadline"
+    );
+}
+
+/// The client-facing error for a media fetch that produced no response.
+///
+/// A policy refusal on any hop renders exactly like the pre-flight refusal
+/// through [`media_url_rejected`]. A chain deadline that ran out while a hop
+/// was being resolved is reported as a timeout, without the hop's host.
+fn media_send_failure(kind: &str, url: &str, err: media_net::MediaSendError) -> anyhow::Error {
+    match err {
+        media_net::MediaSendError::Refused(refusal) => media_url_rejected(kind, url, &refusal),
+        media_net::MediaSendError::DeadlineExceeded { host } => {
+            log_redirect_deadline(&host, url);
+            anyhow!("Failed to fetch {kind} URL {url}: {REDIRECT_DEADLINE_EXCEEDED}")
+        }
+        media_net::MediaSendError::Transport(err) => {
+            anyhow!("Failed to fetch {kind} URL {url}: {err}")
+        }
+        media_net::MediaSendError::BadRedirect { status } => {
+            anyhow!("{kind} URL returned redirect {status} without a usable Location header")
+        }
+    }
+}
+
 fn validate_payload_size(bytes: Vec<u8>, kind: &str, max_size: usize) -> Result<Vec<u8>> {
     if bytes.len() > max_size {
         bail!(
@@ -1596,6 +1715,27 @@ fn validate_payload_size(bytes: Vec<u8>, kind: &str, max_size: usize) -> Result<
         );
     }
     Ok(bytes)
+}
+
+/// The media client's configuration, without the extra CA certificates.
+///
+/// Split out of [`http_image_client`] so tests build the same client with a
+/// proxy of their own.
+pub(super) fn media_client_builder() -> reqwest::ClientBuilder {
+    crate::http_tls::client_builder()
+        // Total deadline for any single request; the redirect helper narrows
+        // it per hop to what is left of the chain's shared deadline.
+        .timeout(media_net::MEDIA_FETCH_TIMEOUT)
+        // Cap the time spent dialling a hostile or unreachable origin so the
+        // request as a whole cannot stall longer than necessary.
+        .connect_timeout(Duration::from_secs(5))
+        // Redirects are followed by `media_net::send_following_redirects`,
+        // which runs the full address policy on every hop before requesting
+        // it, proxied or not, and bounds the chain (issues #1451, #2693).
+        .redirect(reqwest::redirect::Policy::none())
+        // Resolve every name the client dials through the address policy
+        // (issue #2644).
+        .dns_resolver(std::sync::Arc::new(media_net::PolicyResolver))
 }
 
 /// Returns the shared image/media-fetch client, or an error if
@@ -1625,18 +1765,7 @@ async fn http_image_client() -> Result<&'static reqwest::Client> {
     static CLIENT: tokio::sync::OnceCell<reqwest::Client> = tokio::sync::OnceCell::const_new();
     CLIENT
         .get_or_try_init(|| async {
-            let mut builder = reqwest::Client::builder()
-                // Total deadline for any single fetch.
-                .timeout(Duration::from_secs(10))
-                // Cap the time spent dialling a hostile or unreachable
-                // origin so the request as a whole cannot stall longer
-                // than necessary.
-                .connect_timeout(Duration::from_secs(5))
-                // Bound redirect chains so a malicious origin cannot
-                // bounce the client through unbounded hops, and refuse a hop
-                // whose target leaves the public address space or the
-                // http(s) schemes (issue #1451).
-                .redirect(media_net::media_redirect_policy());
+            let mut builder = media_client_builder();
             // See `downloader::load_extra_ca_certificates` — this client
             // fetches remote media URLs over the same rustls-tls backend,
             // so it needs the same MLXCEL_EXTRA_CA_CERTS trust anchors to

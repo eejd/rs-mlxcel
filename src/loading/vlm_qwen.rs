@@ -40,6 +40,7 @@ use crate::vision;
 
 #[cfg(feature = "xla-iree")]
 use super::load_vlm_weights_common_filtered_canonical;
+use super::qwen3_vision::load_qwen3_vl_vision_encoder;
 use super::{
     Qwen35VlmVariant, QwenVisionTokenIds, inherit_qwen_text_quantization,
     inherit_qwen_vision_quantization, load_vlm_weights_common, load_vlm_weights_common_filtered,
@@ -753,7 +754,7 @@ pub(crate) fn load_qwen2_5_vl(model_path: &Path) -> Result<LoadedModel> {
 
 /// Load a Qwen3-VL model (ViT + interleaved MRoPE + DeepStack)
 pub(crate) fn load_qwen3_vl(model_path: &Path) -> Result<LoadedModel> {
-    use vision::encoders::qwen3_vl::{Qwen3VLVisionConfig, Qwen3VLVisionEncoder};
+    use vision::encoders::qwen3_vl::Qwen3VLVisionConfig;
 
     let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
     let has_vision = models::vlm_has_vision(&full_config, model_path);
@@ -773,7 +774,7 @@ pub(crate) fn load_qwen3_vl(model_path: &Path) -> Result<LoadedModel> {
         .map_err(|e| anyhow::anyhow!("Failed to load Qwen3VL text model: {}", e))?;
 
     let vision_encoder = load_qwen_vision_encoder(has_vision, || {
-        Qwen3VLVisionEncoder::from_weights(&weights, &vision_config, "vision_tower")
+        load_qwen3_vl_vision_encoder(&mut weights, &vision_config, "vision_tower")
             .map_err(|e| anyhow::anyhow!("Failed to load Qwen3VL vision encoder: {}", e))
     })?;
 
@@ -803,7 +804,7 @@ pub(crate) fn load_qwen3_vl(model_path: &Path) -> Result<LoadedModel> {
 }
 
 pub(crate) fn load_qwen3_vl_moe(model_path: &Path) -> Result<LoadedModel> {
-    use vision::encoders::qwen3_vl::{Qwen3VLVisionConfig, Qwen3VLVisionEncoder};
+    use vision::encoders::qwen3_vl::Qwen3VLVisionConfig;
 
     let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
     let has_vision = models::vlm_has_vision(&full_config, model_path);
@@ -823,7 +824,7 @@ pub(crate) fn load_qwen3_vl_moe(model_path: &Path) -> Result<LoadedModel> {
         .map_err(|e| anyhow::anyhow!("Failed to load Qwen3VLMoe text model: {}", e))?;
 
     let vision_encoder = load_qwen_vision_encoder(has_vision, || {
-        Qwen3VLVisionEncoder::from_weights(&weights, &vision_config, "vision_tower")
+        load_qwen3_vl_vision_encoder(&mut weights, &vision_config, "vision_tower")
             .map_err(|e| anyhow::anyhow!("Failed to load Qwen3VLMoe vision encoder: {}", e))
     })?;
 
@@ -866,7 +867,7 @@ fn load_qwen3_5_vlm_with_variant(
     model_path: &Path,
     variant: Qwen35VlmVariant,
 ) -> Result<LoadedModel> {
-    use vision::encoders::qwen3_vl::{Qwen3VLVisionConfig, Qwen3VLVisionEncoder};
+    use vision::encoders::qwen3_vl::Qwen3VLVisionConfig;
 
     let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
     models::qwen3_5::validate_qwen35_wrapper_config(&full_config)?;
@@ -961,7 +962,7 @@ fn load_qwen3_5_vlm_with_variant(
     text_model.set_mrope(mrope_section, rope_theta, rope_dims);
 
     let vision_encoder =
-        Qwen3VLVisionEncoder::from_weights(&vision_weights, &vision_config, "vision_tower")
+        load_qwen3_vl_vision_encoder(&mut vision_weights, &vision_config, "vision_tower")
             .map_err(|e| anyhow::anyhow!("Failed to load Qwen3.5 vision encoder: {}", e))?;
 
     let processor =
@@ -1075,12 +1076,13 @@ fn drop_extra_text_layers(weights: &mut mlxcel_core::weights::WeightMap, num_hid
     }
 }
 
-/// Lift GLM-OCR's `rope_parameters` block into the fields `Glm4vTextConfig`
-/// deserializes: `mrope_section` under `rope_scaling`, plus top-level
-/// `partial_rotary_factor` and `rope_theta`. GLM-OCR nests all three under
-/// `rope_parameters` (not `rope_scaling`) and omits the top-level scalars, so
-/// feeding the config through unchanged silently yields half-width rotary with
-/// the wrong sections.
+/// Lift GLM-OCR's `rope_parameters.mrope_section` into `rope_scaling`, the
+/// field `Glm4vTextConfig` deserializes it from, also when a `rope_scaling`
+/// object already exists. GLM-OCR nests it under `rope_parameters` (not
+/// `rope_scaling`), so feeding the config through unchanged silently yields the
+/// wrong sections. The top-level `partial_rotary_factor` and `rope_theta` come
+/// from the shared transformers 5 lift in `Glm4vTextConfig`'s `Deserialize`
+/// (#2443).
 fn normalize_glm_ocr_rope(text_config: &mut serde_json::Value) -> Result<()> {
     let obj = super::require_object_mut(text_config, "GLM-OCR text_config")?;
     let Some(rp) = obj.get("rope_parameters").cloned() else {
@@ -1093,21 +1095,6 @@ fn normalize_glm_ocr_rope(text_config: &mut serde_json::Value) -> Result<()> {
         if let Some(rs_obj) = rs.as_object_mut() {
             rs_obj.insert("mrope_section".to_string(), section);
         }
-    }
-    if obj
-        .get("partial_rotary_factor")
-        .and_then(|v| v.as_f64())
-        .is_none()
-        && let Some(prf) = rp.get("partial_rotary_factor").cloned()
-    {
-        obj.insert("partial_rotary_factor".to_string(), prf);
-    }
-    if obj.get("rope_theta").and_then(|v| v.as_f64()).is_none() {
-        let theta = rp
-            .get("rope_theta")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(10000.0);
-        obj.insert("rope_theta".to_string(), serde_json::json!(theta));
     }
     Ok(())
 }
@@ -1233,21 +1220,19 @@ pub(crate) fn load_glm4v_moe(model_path: &Path) -> Result<LoadedModel> {
 
     let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
 
-    // Text config: normalize `rope_theta` (it may live under `rope_parameters`)
-    // and inherit top-level quantization, then reuse the shared GLM-4 MoE args.
+    // Text config: lift `rope_parameters` through the shared transformers 5
+    // lift (#2443), default a still-missing `rope_theta` (required by the
+    // GLM-4 MoE args) to 10000, and inherit top-level quantization, then reuse
+    // the shared GLM-4 MoE args.
     let mut text_config_val = full_config
         .get("text_config")
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("Missing text_config in config.json"))?;
+    models::rope_utils::lift_rope_parameters(&mut text_config_val);
     {
         let obj = super::require_object_mut(&mut text_config_val, "GLM-4V MoE text_config")?;
         if obj.get("rope_theta").and_then(|v| v.as_f64()).is_none() {
-            let theta = obj
-                .get("rope_parameters")
-                .and_then(|rp| rp.get("rope_theta"))
-                .and_then(|v| v.as_f64())
-                .unwrap_or(10000.0);
-            obj.insert("rope_theta".to_string(), serde_json::json!(theta));
+            obj.insert("rope_theta".to_string(), serde_json::json!(10000.0));
         }
         if obj.get("quantization_config").is_none()
             && obj.get("group_size").is_none()
@@ -1314,7 +1299,7 @@ pub(crate) fn load_glm4v_moe(model_path: &Path) -> Result<LoadedModel> {
 /// [`load_qwen3_omni_speech`], so this default path stays zero-cost.
 /// Sub-configs live under `thinker_config`, as do the multimodal token ids.
 pub(crate) fn load_qwen3_omni_moe(model_path: &Path) -> Result<LoadedModel> {
-    use vision::encoders::qwen3_vl::{Qwen3VLVisionConfig, Qwen3VLVisionEncoder};
+    use vision::encoders::qwen3_vl::Qwen3VLVisionConfig;
 
     let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
     let thinker = full_config
@@ -1394,9 +1379,8 @@ pub(crate) fn load_qwen3_omni_moe(model_path: &Path) -> Result<LoadedModel> {
     let text_model = models::Qwen3VLMoeModel::from_weights(&weights, &text_config)
         .map_err(|e| anyhow::anyhow!("Failed to load Qwen3-Omni text model: {}", e))?;
 
-    let vision_encoder =
-        Qwen3VLVisionEncoder::from_weights(&weights, &vision_config, "vision_tower")
-            .map_err(|e| anyhow::anyhow!("Failed to load Qwen3-Omni vision encoder: {}", e))?;
+    let vision_encoder = load_qwen3_vl_vision_encoder(&mut weights, &vision_config, "vision_tower")
+        .map_err(|e| anyhow::anyhow!("Failed to load Qwen3-Omni vision encoder: {}", e))?;
 
     let audio_encoder = crate::audio::qwen3_omni_moe::Qwen3OmniAudioEncoder::from_weights(
         &weights,

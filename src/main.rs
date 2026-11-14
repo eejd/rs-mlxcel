@@ -14,6 +14,7 @@
 
 use clap::{Args, Parser, Subcommand};
 use mlxcel::tokenizer::MlxcelTokenizer;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
 mod commands;
@@ -197,19 +198,52 @@ enum Commands {
     #[command(verbatim_doc_comment)]
     Download(DownloadArgs),
 
-    /// Detect objects in an image with an RT-DETRv2 model.
+    /// Detect objects or document regions in an image.
     ///
-    /// Loads an RT-DETRv2 object-detection checkpoint and prints bounding
+    /// Loads an RT-DETRv2, PP-DocLayoutV3, or RF-DETR checkpoint and prints bounding
     /// boxes (`l, t, r, b`), class labels, and confidences in original-image
-    /// pixel coordinates. Detection models output boxes rather than a token
-    /// stream, so this is a separate surface from `generate`.
+    /// pixel coordinates. PP-DocLayoutV3 detections also carry the model's
+    /// global reading order. RF-DETR Seg Small can also write one instance-mask
+    /// PNG per detection with `--masks-dir`. Detection models output boxes and
+    /// masks rather than a token stream, so this is separate from `generate`.
     ///
     /// Examples:
     ///
-    ///     mlxcel detect -m models/docling-layout-heron-mlx-bf16 -i page.png
+    ///     mlxcel detect -m models/PP-DocLayoutV3 -i page.png --format json
     ///     mlxcel detect -m models/rt-detr-v2 -i img.jpg --threshold 0.5 --format json
+    ///     mlxcel detect -m models/rf-detr-seg-small -i img.jpg --masks-dir masks --format json
     #[command(verbatim_doc_comment)]
     Detect(DetectArgs),
+
+    /// Predict dense maps or keypoints from an image or video.
+    ///
+    /// Writes f32 tensors to `result.safetensors`, run metadata to
+    /// `meta.json`, optional `keypoints.json`, and PNG map previews.
+    ///
+    /// Examples:
+    ///
+    ///     mlxcel predict -m models/video-depth --video clip.mp4 -o depth
+    ///     mlxcel predict -m models/sapiens2-pose --image person.jpg -o pose
+    #[command(verbatim_doc_comment)]
+    Predict(PredictArgs),
+
+    /// Generate or edit an image with a Diffusers-style checkpoint.
+    ///
+    /// Runs text-to-image generation (`--task generate`, the default) or
+    /// reference-image editing (`--task edit`, one or more `--image`) and
+    /// writes PNG files. Image models produce pixels rather than tokens, so
+    /// this is a separate surface from `generate`. The seed is printed so a
+    /// run can be reproduced; with `-n` greater than one, image `i` uses seed
+    /// `seed + i` and is written as `<output>-01.png`, `<output>-02.png`, and
+    /// so on. Serve the same models over HTTP with `mlxcel-server --image-model`.
+    ///
+    /// Examples:
+    ///
+    ///     mlxcel generate-image -m models/flux2-klein -p "a watercolor fox"
+    ///     mlxcel generate-image -m models/flux2-klein -p "a fox" --size 768x512 --seed 7 -n 2 -o fox.png
+    ///     mlxcel generate-image -m models/flux2-klein --task edit --image fox.png -p "make it night"
+    #[command(verbatim_doc_comment)]
+    GenerateImage(GenerateImageArgs),
 
     /// Embed texts (or images) with an embedding checkpoint and print the vectors.
     ///
@@ -242,6 +276,38 @@ enum Commands {
     ///     mlxcel rerank -m Qwen/Qwen3-VL-Reranker-2B -q "a chart of quarterly revenue" --image chart.png --image cat.jpg
     #[command(verbatim_doc_comment)]
     Rerank(commands::RerankArgs),
+
+    /// Tag and redact entities with a token-classification checkpoint.
+    ///
+    /// Runs a fixed-label BIO / BIOES token classifier (BERT / XLM-RoBERTa
+    /// `ForTokenClassification`, e.g. Rampart, or OpenAI Privacy Filter) over
+    /// the text in context-sized windows and prints the detected spans with
+    /// character offsets plus a redacted copy, as `python -m
+    /// mlx_vlm.token_classification` and `mlx_vlm.privacy_filter` do.
+    ///
+    /// Examples:
+    ///
+    ///     mlxcel tag -m nativ-community/rampart-mlx-fp16 --keep CITY,STATE,ZIP_CODE "I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net"
+    ///     mlxcel tag -m nativ-community/rampart-mlx-4bit --replacement "[REDACTED]" "Call Maria Garcia on 617-555-0142."
+    ///     mlxcel tag -m mlx-community/openai-privacy-filter-bf16 "Alice Smith can be reached at alice@example.com."
+    ///     mlxcel tag -m mlx-community/openai-privacy-filter-8bit --argmax --keep private_email "Alice Smith can be reached at alice@example.com."
+    #[command(verbatim_doc_comment)]
+    Tag(commands::TagArgs),
+
+    /// Extract spans for labels chosen per request, or classify the text.
+    ///
+    /// For span-extraction checkpoints (GLiNER2.5, e.g.
+    /// `fastino/gliner2.5-small-v1`) that take their labels with every
+    /// request, as `mlx_vlm.models.gliner2_5` does. A token-classification
+    /// checkpoint is refused with a pointer to `mlxcel tag`.
+    ///
+    /// Examples:
+    ///
+    ///     mlxcel extract -m fastino/gliner2.5-small-v1 --labels company,person,location --include-confidence --include-spans "Apple hired Sam in New York."
+    ///     mlxcel extract -m fastino/gliner2.5-small-v1 --labels-json '{"person": "a human name"}' "Ada Lovelace worked with Charles Babbage."
+    ///     mlxcel extract -m fastino/gliner2.5-small-v1 --classify '{"sentiment": ["positive", "neutral", "negative"]}' "The launch was excellent."
+    #[command(verbatim_doc_comment)]
+    Extract(commands::ExtractArgs),
 
     /// Remove a downloaded model from the global store.
     ///
@@ -501,8 +567,8 @@ pub(crate) struct GenerateArgs {
     pub(crate) lang_bias: LangBiasCliArgs,
 
     /// Speculative-decoding flag group (`--draft-kind`, `--draft-block-size`).
-    /// The `--draft-model` and `--num-draft-tokens` flags stay on
-    /// [`ModelOptions`] above to keep their existing scope and to preserve
+    /// The `--draft-model` flag stays on [`ModelOptions`] above to keep its
+    /// existing scope and to preserve
     /// the llama-server-compat naming on `mlxcel-server`. See
     /// [`SpeculativeArgs`] for the rationale.
     #[command(flatten)]
@@ -574,13 +640,15 @@ pub(crate) struct ModelOptions {
     #[arg(long, value_name = "PATH")]
     pub(crate) adapter: Option<PathBuf>,
 
-    /// Path to draft model for classic offline speculative decoding (optional)
+    /// Speculative drafter checkpoint (optional), a path or an `owner/name`
+    /// repo id resolved like `-m`. Takes an MTP or DFlash drafter
+    /// (`--draft-kind mtp`, `--draft-kind dflash`, or auto-detected), or an
+    /// ordinary smaller checkpoint that shares the target's tokenizer
+    /// (`--draft-kind full-model`, auto-detected for any other model directory),
+    /// which drafts from its own KV caches on the engine's token-only loop.
+    /// `--prompt-lookup` needs no checkpoint.
     #[arg(long, value_name = "PATH")]
     pub(crate) draft_model: Option<PathBuf>,
-
-    /// Number of draft tokens per speculation step (default: 3)
-    #[arg(long, default_value_t = 3, value_name = "N")]
-    pub(crate) num_draft_tokens: usize,
 }
 
 /// Text generation options
@@ -620,9 +688,8 @@ pub(crate) struct GenerationOptions {
     /// skipped. `-p/--prompt` is not used on this path: every region's prompt
     /// comes from its class.
     ///
-    /// mlxcel ships no document-layout DETECTOR, so the detections must come
-    /// from elsewhere. The accepted shape is the one `mlxcel detect --format
-    /// json` prints:
+    /// PP-DocLayoutV3 detections can be produced by `mlxcel detect --format
+    /// json`. The accepted shape is:
     ///
     ///     {"detections": [{"label": "title", "confidence": 0.95,
     ///                      "box": {"l": 60, "t": 55, "r": 940, "b": 140}}]}
@@ -888,7 +955,7 @@ pub(crate) struct InspectArgs {
 /// Arguments for the `mlxcel detect` subcommand.
 #[derive(Args, Debug)]
 pub(crate) struct DetectArgs {
-    /// Path to the RT-DETRv2 model directory (config.json + safetensors).
+    /// Path to an RT-DETRv2, PP-DocLayoutV3, or RF-DETR model directory.
     #[arg(short, long, value_name = "PATH")]
     pub(crate) model: std::path::PathBuf,
 
@@ -896,13 +963,141 @@ pub(crate) struct DetectArgs {
     #[arg(short, long, value_name = "PATH")]
     pub(crate) image: std::path::PathBuf,
 
-    /// Confidence threshold in [0, 1]; detections below it are dropped.
-    #[arg(short, long, default_value_t = 0.3, value_name = "FLOAT")]
-    pub(crate) threshold: f32,
+    /// Confidence threshold in [0, 1]. Defaults to 0.5 for RF-DETR and 0.3
+    /// for RT-DETRv2 and PP-DocLayoutV3.
+    #[arg(short, long, value_name = "FLOAT")]
+    pub(crate) threshold: Option<f32>,
+
+    /// Save one binary instance-mask PNG per detection (RF-DETR segmentation
+    /// checkpoints only). JSON output includes each saved mask path.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) masks_dir: Option<std::path::PathBuf>,
 
     /// Output format.
     #[arg(long, value_enum, default_value_t = commands::detect::OutputFormat::Text)]
     pub(crate) format: commands::detect::OutputFormat,
+}
+
+/// Arguments for the `mlxcel predict` subcommand.
+#[derive(Args, Debug)]
+pub(crate) struct PredictArgs {
+    /// Object mask image (SAM 3D Objects only); RGBA alpha is used when omitted.
+    #[arg(long, value_name = "PATH", conflicts_with = "video")]
+    pub(crate) mask: Option<std::path::PathBuf>,
+    /// Safetensors file with an HWC XYZ `points` tensor (SAM 3D Objects only).
+    #[arg(long, value_name = "PATH", conflicts_with = "video")]
+    pub(crate) pointmap: Option<std::path::PathBuf>,
+    /// Path to a dense-prediction model directory.
+    #[arg(short, long, value_name = "PATH")]
+    pub(crate) model: std::path::PathBuf,
+
+    /// Input image. Conflicts with `--video`.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "video",
+        required_unless_present = "video"
+    )]
+    pub(crate) image: Option<std::path::PathBuf>,
+
+    /// Input video. Conflicts with `--image`.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "image",
+        required_unless_present = "image"
+    )]
+    pub(crate) video: Option<std::path::PathBuf>,
+
+    /// Output directory, created when absent.
+    #[arg(short, long, value_name = "DIR")]
+    pub(crate) output: std::path::PathBuf,
+
+    /// Model task. Required when the family supports more than one task.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) task: Option<String>,
+
+    /// Text prompt. Repeat to run several prompts against the same input.
+    #[arg(long, value_name = "TEXT")]
+    pub(crate) prompt: Vec<String>,
+
+    /// Pixel-coordinate xyxy boxes. Repeat the flag or separate boxes with `;`.
+    #[arg(long, value_name = "X1,Y1,X2,Y2[;...]")]
+    pub(crate) boxes: Vec<String>,
+
+    /// Maximum sampled video frames (default: 32).
+    #[arg(long, value_name = "N")]
+    pub(crate) max_frames: Option<usize>,
+
+    /// Target video sampling rate.
+    #[arg(long, value_name = "FPS")]
+    pub(crate) target_fps: Option<f64>,
+
+    /// Model-specific options as a JSON object.
+    #[arg(long, value_name = "JSON")]
+    pub(crate) opts: Option<String>,
+}
+
+/// Arguments for the `mlxcel generate-image` subcommand.
+#[derive(Args, Debug)]
+pub(crate) struct GenerateImageArgs {
+    /// Path to the image model directory (Diffusers layout: model_index.json
+    /// plus component folders).
+    #[arg(short, long, value_name = "PATH")]
+    pub(crate) model: std::path::PathBuf,
+
+    /// Text prompt (for `--task edit`, the edit instruction).
+    #[arg(short, long, value_name = "TEXT")]
+    pub(crate) prompt: String,
+
+    /// Negative prompt; the model default applies when omitted.
+    #[arg(long, value_name = "TEXT")]
+    pub(crate) negative_prompt: Option<String>,
+
+    /// Task to run.
+    #[arg(long, value_enum, default_value_t = commands::generate_image::TaskArg::Generate)]
+    pub(crate) task: commands::generate_image::TaskArg,
+
+    /// Reference image for `--task edit`. Repeat for several references.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) image: Vec<std::path::PathBuf>,
+
+    /// Output size as WIDTHxHEIGHT. Defaults to 512x512 for generation and to
+    /// the first reference image's size for editing. Both sides must be
+    /// multiples of the model's grid (16 for most families).
+    #[arg(long, value_name = "WxH")]
+    pub(crate) size: Option<String>,
+
+    /// Denoising steps; the model default applies when omitted.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub(crate) steps: Option<u32>,
+
+    /// Classifier-free guidance scale; the model default applies when omitted.
+    #[arg(long, value_name = "FLOAT")]
+    pub(crate) guidance: Option<f32>,
+
+    /// Seed for reproducible output. A random 32-bit seed is used, and printed,
+    /// when omitted.
+    #[arg(long, value_name = "N")]
+    pub(crate) seed: Option<u64>,
+
+    /// Number of images to generate (1 to 10). Image `i` uses seed `seed + i`.
+    #[arg(
+        short = 'n',
+        value_name = "N",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..=10)
+    )]
+    pub(crate) n: u32,
+
+    /// Output PNG path. Defaults to outputs/image-<seed>.png. With `-n` greater
+    /// than one, `-01`, `-02`, ... is added before the extension.
+    #[arg(short, long, value_name = "PATH")]
+    pub(crate) output: Option<std::path::PathBuf>,
+
+    /// Model-specific options as a JSON object, passed to the model untouched.
+    #[arg(long, value_name = "JSON")]
+    pub(crate) gen_kwargs: Option<String>,
 }
 
 /// Sampling strategy options
@@ -1393,9 +1588,13 @@ pub(crate) struct ServeArgs {
     models_max: usize,
 
     /// For router server, whether to automatically load models
+    ///
+    /// Also reads `LLAMA_ARG_MODELS_AUTOLOAD` when neither this flag nor
+    /// `--no-models-autoload` is on the command line
+    /// (`env_fallback_models_autoload`); clap's own `env` binding would turn
+    /// that variable into a hard conflict with `--no-models-autoload`.
     #[arg(
         long = "models-autoload",
-        env = "LLAMA_ARG_MODELS_AUTOLOAD",
         default_value_t = true,
         overrides_with = "_no_models_autoload"
     )]
@@ -1561,8 +1760,9 @@ pub(crate) struct ServeArgs {
     )]
     draft_max: usize,
 
-    /// Largest active decode batch at which a prompt-lookup sequence runs
-    /// its own verify round (`--draft-kind prompt-lookup`). Each proposing
+    /// Largest active decode batch at which a prompt-lookup or full-model
+    /// sequence runs its own verify round (`--draft-kind prompt-lookup`, or a
+    /// full-model `--draft-model`). Each proposing
     /// row costs one verify forward on top of the batched step, so on ticks
     /// with more concurrent rows every row takes the plain batched step and
     /// the drafter keeps observing the emitted tokens until the batch
@@ -1616,6 +1816,19 @@ pub(crate) struct ServeArgs {
         value_name = "PATH_OR_REPO_ID"
     )]
     embedding_model: Option<String>,
+
+    /// Image-generation checkpoint to serve on /v1/images next to the chat model
+    ///
+    /// A local directory or a HuggingFace `owner/name` repo-id (resolved like
+    /// `-m`). Loads on its own worker thread and serves
+    /// POST /v1/images/generations and POST /v1/images/edits (JSON bodies, base64
+    /// PNG responses); `-m` keeps serving chat. Without `-m`, the server starts
+    /// image-only: this checkpoint is the served model, and chat, completion and
+    /// tokenizer routes answer 501. Requests run one at a time. Startup fails
+    /// when the checkpoint is not a supported image-generation family. Also
+    /// reads `MLXCEL_IMAGE_MODEL`. See docs/image-generation.md.
+    #[arg(long, env = "MLXCEL_IMAGE_MODEL", value_name = "PATH_OR_REPO_ID")]
+    image_model: Option<String>,
 
     /// Texts per embedding forward pass (default: 16)
     ///
@@ -1735,14 +1948,23 @@ pub(crate) struct ServeArgs {
     /// instead of the default permissive policy that reflects any origin.
     /// Unset (default) keeps the permissive behavior. Only affects the
     /// browser-reachable TCP HTTP listener. Also reads
-    /// `MLXCEL_ALLOWED_ORIGINS`.
+    /// `MLXCEL_ALLOWED_ORIGINS` after parsing (#2664): `--cors-origins` on the
+    /// command line makes it ignored, and setting it together with
+    /// `LLAMA_ARG_CORS_ORIGINS` is a startup error.
     #[arg(
         long = "allowed-origins",
-        env = "MLXCEL_ALLOWED_ORIGINS",
         value_delimiter = ',',
         value_name = "ORIGINS"
     )]
     allowed_origins: Vec<String>,
+
+    /// Lines from the `env_fallback_*` helpers (a warning about an invalid
+    /// or ignored environment variable, or the INFO line saying a flag took
+    /// precedence over one), collected by `run_serve` before logging exists
+    /// and logged at their own level by `start_server` (#2664, #2697, #2722).
+    /// Not a command-line argument.
+    #[arg(skip)]
+    startup_notices: Vec<mlxcel::server::StartupNotice>,
 
     /// Preemption policy: "longest-first" (default) or "lowest-priority"
     ///
@@ -2014,10 +2236,12 @@ pub(crate) struct ServeArgs {
     /// `localhost` (which echoes the `Origin` only when its host is
     /// `localhost`, `127.0.0.1` or `::1`). For per-origin matching against a
     /// list, use the mlxcel-native `--allowed-origins` instead; the two are
-    /// mutually exclusive. Also reads `LLAMA_ARG_CORS_ORIGINS`.
+    /// mutually exclusive on the command line. Also reads
+    /// `LLAMA_ARG_CORS_ORIGINS` after parsing (#2664): `--allowed-origins` on
+    /// the command line makes it ignored, and setting it together with
+    /// `MLXCEL_ALLOWED_ORIGINS` is a startup error.
     #[arg(
         long = "cors-origins",
-        env = "LLAMA_ARG_CORS_ORIGINS",
         default_value = "*",
         value_name = "ORIGINS",
         conflicts_with = "allowed_origins"
@@ -2339,7 +2563,13 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "PATH")]
     distributed_config: Option<std::path::PathBuf>,
 
-    /// Role this node plays in the cluster (prefill, decode, pipeline_stage, tensor_parallel_rank, pipeline_tensor_parallel, hybrid)
+    /// Role this node plays in the cluster (prefill, decode, router, pipeline_stage, tensor_parallel_rank, pipeline_tensor_parallel, hybrid).
+    ///
+    /// `prefill`, `decode` and `router` are the disaggregated serving roles;
+    /// each requires `--serving-bind` and a cluster secret
+    /// (`--cluster-secret-file` or its alternatives) and refuses to start
+    /// without one. `hybrid` (the default) is single-node serving and needs
+    /// neither.
     #[arg(long, value_name = "ROLE")]
     node_role: Option<String>,
 
@@ -2387,19 +2617,33 @@ pub(crate) struct ServeArgs {
     #[arg(long = "pp-micro-batch-size", default_value_t = 1, value_name = "N")]
     pp_micro_batch_size: usize,
 
-    /// Zero-config pipeline bring-up: coordinator declares N stages.
+    /// Zero-config pipeline bring-up: run as the coordinator of N stages.
     ///
-    /// See the "Pipeline parallelism" section of `docs/distributed.md` for the
-    /// full operator workflow. Mutually exclusive with
-    /// `--distributed-config`.
+    /// Resolves N `--pp-peer` processes (from `--cluster-peers` or their
+    /// beacons with `--cluster-discovery=mdns`), pushes a stage assignment to
+    /// each over the authenticated cluster handshake, and starts serving once
+    /// all N committed. The coordinator runs no stage itself. See the
+    /// "Zero-config bring-up" section of `docs/distributed.md`. Mutually
+    /// exclusive with `--distributed-config`.
     #[arg(long = "pp-auto", value_name = "N")]
     pp_auto: Option<u32>,
 
-    /// Zero-config pipeline bring-up: run as a peer that joins a coordinator.
+    /// Zero-config pipeline bring-up: run as a stage that receives its
+    /// assignment from a `--pp-auto` coordinator.
+    ///
+    /// Listens on `--cluster-control-addr` (announcing it by signed UDP
+    /// beacon with `--cluster-discovery=mdns`), verifies the coordinator's
+    /// secret, cluster name, model, and mlxcel version, then serves the
+    /// assigned stage. `--distributed-config` and `--node-id` are optional;
+    /// given together they skip the wait.
     #[arg(long = "pp-peer")]
     pp_peer: bool,
 
-    /// Cluster discovery mechanism: "static" (default) or "mdns" for UDP broadcast.
+    /// Cluster discovery mechanism: "static" (default) or "mdns".
+    ///
+    /// "static" uses `--cluster-peers` on the coordinator; "mdns" has each
+    /// peer send HMAC-signed UDP beacons to `--cluster-discovery-target` on
+    /// `--cluster-discovery-port` (plain UDP, not DNS-SD).
     #[arg(
         long = "cluster-discovery",
         default_value = "static",
@@ -2407,25 +2651,53 @@ pub(crate) struct ServeArgs {
     )]
     cluster_discovery: String,
 
-    /// Human-readable cluster name for discovery and TOML header.
+    /// Human-readable cluster name for discovery and TOML header (default: `mlxcel-cluster`).
     #[arg(long = "cluster-name", value_name = "NAME")]
     cluster_name: Option<String>,
 
     /// Static peer addresses for zero-config bring-up (host:port, comma-separated).
+    ///
+    /// Each entry is the `--cluster-control-addr` of one `--pp-peer` process.
     #[arg(long = "cluster-peers", value_delimiter = ',', value_name = "ADDR")]
     cluster_peers: Vec<std::net::SocketAddr>,
 
-    /// UDP port for the discovery beacon when `--cluster-discovery=mdns`.
+    /// UDP port for the discovery beacon when `--cluster-discovery=mdns` (default: 49555).
     #[arg(long = "cluster-discovery-port", value_name = "PORT")]
     cluster_discovery_port: Option<u16>,
 
-    /// Coordinator control-plane bind address for zero-config bring-up (host:port).
+    /// Where a `--pp-peer` sends its beacons with `--cluster-discovery=mdns`.
+    ///
+    /// The limited broadcast (default) leaves only through the default-route
+    /// interface; name a directed subnet broadcast (`192.168.1.255`) or the
+    /// coordinator's IP (`127.0.0.1` for a loopback test). Peer side only.
+    #[arg(
+        long = "cluster-discovery-target",
+        default_value = "255.255.255.255",
+        value_name = "IP"
+    )]
+    cluster_discovery_target: std::net::IpAddr,
+
+    /// Cluster control address (host:port): the coordinator's control bind
+    /// address on `--pp-auto` (default: the `--host` IP on port 19000), the
+    /// stage listen address on `--pp-peer` (required with a concrete port for
+    /// static discovery, `0.0.0.0:0` by default for mdns).
     #[arg(long = "cluster-control-addr", value_name = "ADDR")]
     cluster_control_addr: Option<std::net::SocketAddr>,
 
-    /// Output path for the emitted cluster TOML (default: `.mlxcel/cluster.toml`).
+    /// Output path for the cluster TOML this process writes (coordinator
+    /// default `.mlxcel/cluster.toml`, peer default `.mlxcel/cluster-<node-id>.toml`).
     #[arg(long = "cluster-config-out", value_name = "PATH")]
     cluster_config_out: Option<PathBuf>,
+
+    /// File holding the pre-shared cluster secret (at least 16 bytes).
+    ///
+    /// Required by every distributed role: the pipeline roles and the
+    /// disaggregated `--node-role prefill`, `decode` and `router` roles.
+    /// Precedence: this flag, then `MLXCEL_CLUSTER_SECRET_FILE`, then
+    /// `MLXCEL_CLUSTER_SECRET`, then `[cluster] secret_file` in the cluster
+    /// TOML. See `docs/distributed.md`.
+    #[arg(long = "cluster-secret-file", value_name = "PATH")]
+    cluster_secret_file: Option<PathBuf>,
 
     /// Plan the cluster topology and emit the TOML without starting workers.
     #[arg(long = "dry-run", default_value_t = false)]
@@ -3013,36 +3285,56 @@ impl Default for DiffusionServeOptions {
     }
 }
 
-/// Install a `tracing` subscriber for the offline CLI commands when `RUST_LOG`
-/// is set.
+/// Install a `tracing` subscriber for the offline CLI commands.
 ///
 /// The CLI shipped without any global subscriber, so every `tracing::*` call
 /// reached by `mlxcel generate`, `inspect`, `tune` and friends was silently
 /// discarded no matter what `RUST_LOG` said. That is exactly backwards: the
 /// instrumentation is unreachable precisely when someone has set `RUST_LOG`
 /// because they are trying to diagnose something. Notably it hid the drafter
-/// auto-detection line, which is the difference between a benchmark that ran
-/// the classic `SpeculativeGenerator` and one that ran a kind-specific round
-/// loop.
+/// auto-detection line, which is what a benchmark needs to state which
+/// round loop it ran.
+///
+/// By default the subscriber filters at `warn`, so the warnings and errors an
+/// offline command raises (environment fallbacks, deprecated flags) reach
+/// stderr without any setup. `RUST_LOG` still overrides the filter and keeps
+/// its usual `tracing` directive syntax, which is how `info!` lines such as
+/// `autotune: applied ...` stay opt-in.
 ///
 /// Two deliberate constraints:
 ///
-/// * **Opt-in.** Nothing is installed unless `RUST_LOG` is set, so default
-///   command output is unchanged byte for byte.
-/// * **stderr.** Diagnostics must not contaminate the generated text on stdout,
-///   which callers pipe.
+/// * **stdout is untouched.** Every line the subscriber writes goes to stderr,
+///   so piped output stays byte-for-byte unchanged whether or not `RUST_LOG`
+///   is set.
+/// * **stderr carries a bounded default.** Only `WARN` and above are emitted
+///   when `RUST_LOG` is unset.
 ///
 /// `Serve` is skipped because `server::startup` installs its own subscriber and
 /// would panic on the double `init()`. `try_init` is used anyway so a future
 /// second initializer degrades to a no-op rather than aborting the process.
 fn init_cli_tracing(command: &Commands) {
-    if matches!(command, Commands::Serve(_)) || std::env::var_os("RUST_LOG").is_none() {
+    if matches!(command, Commands::Serve(_)) {
         return;
     }
+    let rust_log = std::env::var_os("RUST_LOG");
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(cli_tracing_filter(rust_log.as_deref()))
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+/// The filter an offline command's subscriber runs with.
+///
+/// Unset `RUST_LOG` means `warn`, so lost diagnostics are recovered without
+/// changing stdout. A set value is used verbatim, matching
+/// `EnvFilter::from_default_env()` at the call site. Kept pure and separate
+/// from installation so the selection is testable without touching the
+/// process environment or the global subscriber.
+fn cli_tracing_filter(rust_log: Option<&OsStr>) -> tracing_subscriber::EnvFilter {
+    match rust_log {
+        Some(value) => tracing_subscriber::EnvFilter::new(value.to_string_lossy()),
+        None => tracing_subscriber::EnvFilter::new("warn"),
+    }
 }
 
 /// The checkpoint a command was given, for the GB10 graph budget default
@@ -3057,9 +3349,13 @@ fn cli_model_dir(command: &Commands) -> Option<&std::path::Path> {
         Commands::Serve(args) => args.model.as_deref(),
         Commands::Embed(args) => Some(args.model.as_path()),
         Commands::Rerank(args) => Some(args.model.as_path()),
+        Commands::Tag(args) => Some(args.model.as_path()),
+        Commands::Extract(args) => Some(args.model.as_path()),
         Commands::Tune(args) => args.model.as_deref(),
         Commands::Inspect(args) => Some(args.model.as_path()),
         Commands::Detect(args) => Some(args.model.as_path()),
+        Commands::Predict(args) => Some(args.model.as_path()),
+        Commands::GenerateImage(args) => Some(args.model.as_path()),
         Commands::List(_) | Commands::Arch(_) | Commands::Download(_) | Commands::Rm(_) => None,
         // Gated exactly like the variant itself and its dispatch arm below;
         // without the gate this arm does not compile in feature sets that
@@ -3070,6 +3366,9 @@ fn cli_model_dir(command: &Commands) -> Option<&std::path::Path> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // reqwest is built without a bundled rustls provider; install ring before
+    // any client exists (the client builders also do this, so it is belt only).
+    mlxcel::http_tls::install_default_crypto_provider();
     // Hidden machine interface for the llama-server b10621 compatibility
     // manifest (issue #1443): `mlxcel serve --dump-flag-surface` prints the
     // complete clap surface of the `serve` subcommand, hidden compatibility
@@ -3176,10 +3475,24 @@ fn main() -> anyhow::Result<()> {
     // window) into the environment the patched MLX kernels read (#906). Inert
     // unless MLXCEL_AUTOTUNE is set and a tuned entry exists, never overwrites
     // an operator-set variable, and must run before any MLX op.
+    // `serve` installs its subscriber inside `start_server`, so its lines go
+    // through the startup notices; every other command has one by now (#2722).
+    let mut cli = cli;
     for (var, value) in mlxcel_core::autotune::ops::apply_tuned_cuda_kernel_env(
         mlxcel_core::autotune::ops::cuda_kernel_knobs::TILE_M_CAP_BLACKWELL,
     ) {
-        tracing::info!("autotune: applied {var}={value} from the tactic cache");
+        let line = format!("autotune: applied {var}={value} from the tactic cache");
+        match &mut cli.command {
+            Commands::Serve(args) => args
+                .startup_notices
+                .push(mlxcel::server::StartupNotice::info(line)),
+            _ => tracing::info!("{line}"),
+        }
+    }
+
+    // `serve` reports these from `start_server`, where its subscriber exists.
+    if !matches!(cli.command, Commands::Serve(_)) {
+        mlxcel_core::native_env::log_effective_native_env();
     }
 
     match cli.command {
@@ -3191,15 +3504,19 @@ fn main() -> anyhow::Result<()> {
             if args.json {
                 write_supported_models_json(std::io::stdout())?;
             } else {
-                print_supported_models();
+                print_supported_models()?;
             }
             Ok(())
         }
         Commands::Inspect(args) => commands::run_inspect(args),
         Commands::Download(args) => commands::run_download(args),
         Commands::Detect(args) => commands::run_detect(args),
+        Commands::Predict(args) => commands::run_predict(args),
+        Commands::GenerateImage(args) => commands::run_generate_image(args),
         Commands::Embed(args) => commands::run_embed(args),
         Commands::Rerank(args) => commands::run_rerank(args),
+        Commands::Tag(args) => commands::run_tag(args),
+        Commands::Extract(args) => commands::run_extract(args),
         Commands::Rm(args) => commands::run_remove(
             &args.repo_id,
             args.yes,
@@ -3273,12 +3590,30 @@ const FAMILY_ORDER: &[&str] = &[
     "Other VLM",
 ];
 
-fn print_supported_models() {
+fn print_supported_models() -> std::io::Result<()> {
+    use std::io::Write;
     let mut out = String::new();
     // Writing to a `String` cannot fail, `fmt::Write` for `String` is
     // infallible, so `expect` is appropriate here.
     write_supported_models(&mut out).expect("writing to a String cannot fail");
-    print!("{out}");
+    // `print!` panics on a write error, so write through the locked handle and
+    // keep the error instead.
+    let mut stdout = std::io::stdout().lock();
+    ignore_broken_pipe(
+        stdout
+            .write_all(out.as_bytes())
+            .and_then(|()| stdout.flush()),
+    )
+}
+
+/// Treat a reader that closed early (`mlxcel arch | head`) as the normal end
+/// of output. Rust ignores SIGPIPE, so the write returns `BrokenPipe` instead
+/// of ending the process the way a C tool would; any other error is kept.
+fn ignore_broken_pipe(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => other,
+    }
 }
 
 /// Render the human-readable `mlxcel arch` output into `out`.
@@ -3287,11 +3622,12 @@ fn print_supported_models() {
 /// exact bytes that the CLI would print without spawning a subprocess.
 fn write_supported_models<W: std::fmt::Write>(out: &mut W) -> std::fmt::Result {
     use mlxcel::models::ALL_MODEL_TYPES;
+    use mlxcel::vision::dense::FAMILIES as DENSE_FAMILIES;
 
     writeln!(
         out,
         "Supported Model Architectures ({}):",
-        ALL_MODEL_TYPES.len()
+        ALL_MODEL_TYPES.len() + DENSE_FAMILIES.len()
     )?;
     writeln!(out)?;
 
@@ -3327,6 +3663,14 @@ fn write_supported_models<W: std::fmt::Write>(out: &mut W) -> std::fmt::Result {
         writeln!(out, "{family}:")?;
         for name in members {
             writeln!(out, "  - {name}")?;
+        }
+        writeln!(out)?;
+    }
+
+    if !DENSE_FAMILIES.is_empty() {
+        writeln!(out, "Dense Prediction:")?;
+        for family in DENSE_FAMILIES {
+            writeln!(out, "  - {}", family.model_type)?;
         }
         writeln!(out)?;
     }
@@ -3370,7 +3714,7 @@ fn write_supported_models_json<W: std::io::Write>(mut out: W) -> anyhow::Result<
     let mut payload = Vec::new();
     serde_json::to_writer_pretty(&mut payload, &registry)?;
     payload.push(b'\n');
-    out.write_all(&payload)?;
+    ignore_broken_pipe(out.write_all(&payload).and_then(|()| out.flush()))?;
     Ok(())
 }
 

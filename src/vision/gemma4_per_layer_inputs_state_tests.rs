@@ -215,3 +215,42 @@ fn take_for_sequence_returns_none_for_unknown_id() {
     let unknown = SequenceId::from_raw(401);
     assert!(state.take_for_sequence(unknown).is_none());
 }
+
+#[test]
+#[ignore = "requires serial MLX execution"]
+fn pending_check_tracks_fallback_and_bound_per_layer_input() {
+    let state = Gemma4PerLayerInputsState::new();
+    let seq = SequenceId::from_raw(402);
+
+    assert!(!state.has_pending_for_sequence(seq));
+    state.set_fallback(Some(make_pli(5.0)));
+    assert!(
+        state.has_pending_for_sequence(seq),
+        "unbound multimodal input must gate native token batching"
+    );
+    state.bind_fallback_to_sequence(seq);
+    assert!(
+        state.has_pending_for_sequence(seq),
+        "bound multimodal input must gate native token batching"
+    );
+
+    let _ = state.take_for_sequence(seq).expect("pending input");
+    assert!(!state.has_pending_for_sequence(seq));
+}
+
+/// Issue #2625: admission that aborts between media preparation and the bind
+/// clears the fallback, so the next request's bind adopts nothing.
+#[test]
+fn clear_fallback_leaves_the_next_bind_empty() {
+    let _guard = crate::models::embedding_test_support::mlx_test_guard();
+    let state = Gemma4PerLayerInputsState::new();
+    state.set_fallback(Some(make_pli(5.0)));
+    state.clear_fallback();
+    let next = SequenceId::from_raw(262_501);
+    state.bind_fallback_to_sequence(next);
+    assert!(
+        state.take_for_sequence(next).is_none(),
+        "the next sequence must not inherit the aborted request's tensor"
+    );
+    assert!(state.take_fallback().is_none());
+}

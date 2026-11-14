@@ -25,7 +25,6 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -36,7 +35,8 @@ use tokio::sync::mpsc;
 use crate::distributed::request_tracker::RequestId;
 use crate::distributed::tensor_protocol::{TensorDtype, TensorKind};
 use crate::distributed::tensor_serialize::{
-    DeserializedTensor, SerializeOptions, deserialize_tensor, serialize_tensor,
+    DeserializedTensor, SerializeOptions, TensorDecodeLimits, deserialize_tensor_with_limits,
+    serialize_tensor,
 };
 use crate::distributed::{Transport, TransportMessage};
 
@@ -53,11 +53,15 @@ pub struct ActivationMessage {
     pub stage_index: u32,
     /// Total number of stages in the pipeline.
     pub num_stages: u32,
-    /// Serialized hidden-state tensor (wire-format bytes from tensor_serialize).
+    /// Serialized hidden-state tensor (wire-format bytes from tensor_serialize),
+    /// base64 in JSON (#2656).
+    #[serde(with = "super::wire_bytes::base64_bytes")]
     pub tensor_data: Vec<u8>,
     /// Serialized attention mask tensor (wire-format bytes), if present.
+    #[serde(with = "super::wire_bytes::base64_bytes_opt")]
     pub attention_mask: Option<Vec<u8>>,
     /// Serialized position IDs tensor (wire-format bytes), if present.
+    #[serde(with = "super::wire_bytes::base64_bytes_opt")]
     pub position_ids: Option<Vec<u8>>,
     /// True when this message travels the reverse path (last stage -> first).
     pub is_reverse_path: bool,
@@ -65,6 +69,14 @@ pub struct ActivationMessage {
     pub seq_len: u32,
     /// Monotonic timestamp (nanos since an arbitrary epoch) for latency tracking.
     pub timestamp_ns: u64,
+    /// The coordinator's exchange nonce of the `RunEntry` this forward
+    /// activation descends from (#2694). The entry stage sets it, middle
+    /// stages copy it, and the final stage echoes it in the `RunResult` it
+    /// sends straight to the coordinator, so the logits need no reverse
+    /// relay through the stages. `None` on messages from a sender that did
+    /// not set it (the in-process worker, an older peer, the reverse path).
+    #[serde(default)]
+    pub reply_nonce: Option<u64>,
 }
 
 impl ActivationMessage {
@@ -90,7 +102,15 @@ impl ActivationMessage {
             is_reverse_path: false,
             seq_len,
             timestamp_ns: timestamp_nanos(),
+            reply_nonce: None,
         }
+    }
+
+    /// Carry (or clear) the coordinator's `RunEntry` nonce; see
+    /// [`Self::reply_nonce`].
+    pub fn with_reply_nonce(mut self, nonce: Option<u64>) -> Self {
+        self.reply_nonce = nonce;
+        self
     }
 
     /// Create a reverse-path message (logits/tokens from last stage).
@@ -113,6 +133,7 @@ impl ActivationMessage {
             is_reverse_path: true,
             seq_len,
             timestamp_ns: timestamp_nanos(),
+            reply_nonce: None,
         }
     }
 
@@ -134,8 +155,33 @@ impl ActivationMessage {
     }
 
     /// Deserialize the `tensor_data` field back into a tensor.
+    ///
+    /// Refuses COMPRESSED and QUANTIZED frames, which
+    /// [`Self::serialize_activation`] never emits; see
+    /// [`Self::deserialize_activation_with_limits`].
     pub fn deserialize_activation(wire_bytes: &[u8]) -> Result<DeserializedTensor> {
-        let (tensor, _consumed) = deserialize_tensor(wire_bytes)?;
+        Self::deserialize_activation_with_limits(wire_bytes, &TensorDecodeLimits::unrestricted())
+    }
+
+    /// Deserialize an activation whose header must also satisfy `limits`.
+    ///
+    /// COMPRESSED and QUANTIZED are refused whatever `limits` allows: an
+    /// honest sender never sets them, and honoring them would let a peer make
+    /// a small frame decode to up to 256 times its size.
+    pub fn deserialize_activation_with_limits(
+        wire_bytes: &[u8],
+        limits: &TensorDecodeLimits,
+    ) -> Result<DeserializedTensor> {
+        let limits = if limits.allow_compressed || limits.allow_quantized {
+            std::borrow::Cow::Owned(TensorDecodeLimits {
+                allow_compressed: false,
+                allow_quantized: false,
+                ..limits.clone()
+            })
+        } else {
+            std::borrow::Cow::Borrowed(limits)
+        };
+        let (tensor, _consumed) = deserialize_tensor_with_limits(wire_bytes, &limits)?;
         Ok(tensor)
     }
 }
@@ -235,87 +281,6 @@ pub struct StageLifecycleSnapshot {
     pub last_barrier_id: Option<u64>,
 }
 
-/// Lifecycle RPC request for remote pipeline stages.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum StageLifecycleRequest {
-    ProbeHealth,
-    BeginDrain,
-    Barrier { barrier_id: u64 },
-    CancelRequest { request_id: String },
-    Shutdown,
-}
-
-/// Lifecycle RPC response for remote pipeline stages.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum StageLifecycleResponse {
-    State(StageLifecycleSnapshot),
-    BarrierAck {
-        barrier_id: u64,
-        state: StageLifecycleSnapshot,
-    },
-    CancelAck {
-        request_id: String,
-        state: StageLifecycleSnapshot,
-    },
-}
-
-/// Install an RPC control plane for a pipeline stage.
-pub async fn install_stage_control_service(
-    transport: Arc<dyn Transport>,
-    state: Arc<Mutex<StageLifecycleState>>,
-) -> Result<()> {
-    transport
-        .serve_rpc(Box::new(move |request| {
-            let decoded: Result<StageLifecycleRequest> =
-                serde_json::from_slice(request).map_err(Into::into);
-            let response = match decoded {
-                Ok(StageLifecycleRequest::ProbeHealth) => {
-                    let state = state.lock().expect("stage lifecycle state poisoned");
-                    StageLifecycleResponse::State(state.snapshot())
-                }
-                Ok(StageLifecycleRequest::BeginDrain) => {
-                    let mut state = state.lock().expect("stage lifecycle state poisoned");
-                    state.draining = true;
-                    StageLifecycleResponse::State(state.snapshot())
-                }
-                Ok(StageLifecycleRequest::Barrier { barrier_id }) => {
-                    let mut state = state.lock().expect("stage lifecycle state poisoned");
-                    state.last_barrier_id = Some(barrier_id);
-                    StageLifecycleResponse::BarrierAck {
-                        barrier_id,
-                        state: state.snapshot(),
-                    }
-                }
-                Ok(StageLifecycleRequest::CancelRequest { request_id }) => {
-                    let mut state = state.lock().expect("stage lifecycle state poisoned");
-                    state.mark_request_finished();
-                    StageLifecycleResponse::CancelAck {
-                        request_id,
-                        state: state.snapshot(),
-                    }
-                }
-                Ok(StageLifecycleRequest::Shutdown) => {
-                    let mut state = state.lock().expect("stage lifecycle state poisoned");
-                    state.draining = true;
-                    state.shutdown = true;
-                    state.health = StageHealth::Failed;
-                    state.in_flight_requests = 0;
-                    StageLifecycleResponse::State(state.snapshot())
-                }
-                Err(err) => StageLifecycleResponse::State(StageLifecycleSnapshot {
-                    health: StageHealth::Failed,
-                    draining: true,
-                    shutdown: true,
-                    in_flight_requests: 0,
-                    last_barrier_id: Some(hash_error(&err.to_string())),
-                }),
-            };
-            serde_json::to_vec(&response)
-                .unwrap_or_else(|err| panic!("failed to serialize lifecycle response: {err}"))
-        }))
-        .await
-}
-
 /// One side of a transport-backed pipeline link.
 #[derive(Clone)]
 pub struct TransportStageEndpoint {
@@ -365,81 +330,12 @@ impl TransportStageEndpoint {
         }
     }
 
-    pub async fn probe_health(&self) -> Result<StageLifecycleSnapshot> {
-        match self
-            .rpc_lifecycle(StageLifecycleRequest::ProbeHealth)
-            .await?
-        {
-            StageLifecycleResponse::State(state) => Ok(state),
-            other => bail!("unexpected probe_health response: {other:?}"),
-        }
-    }
-
-    pub async fn begin_drain(&self) -> Result<StageLifecycleSnapshot> {
-        match self
-            .rpc_lifecycle(StageLifecycleRequest::BeginDrain)
-            .await?
-        {
-            StageLifecycleResponse::State(state) => Ok(state),
-            other => bail!("unexpected begin_drain response: {other:?}"),
-        }
-    }
-
-    pub async fn barrier(&self, barrier_id: u64) -> Result<StageLifecycleSnapshot> {
-        match self
-            .rpc_lifecycle(StageLifecycleRequest::Barrier { barrier_id })
-            .await?
-        {
-            StageLifecycleResponse::BarrierAck {
-                barrier_id: ack_id,
-                state,
-            } => {
-                if ack_id != barrier_id {
-                    bail!("barrier ack mismatch: expected {barrier_id}, got {ack_id}");
-                }
-                Ok(state)
-            }
-            other => bail!("unexpected barrier response: {other:?}"),
-        }
-    }
-
-    pub async fn cancel_request(&self, request_id: &RequestId) -> Result<StageLifecycleSnapshot> {
-        match self
-            .rpc_lifecycle(StageLifecycleRequest::CancelRequest {
-                request_id: request_id.as_str().to_string(),
-            })
-            .await?
-        {
-            StageLifecycleResponse::CancelAck { state, .. } => Ok(state),
-            other => bail!("unexpected cancel_request response: {other:?}"),
-        }
-    }
-
-    pub async fn shutdown_peer(&self) -> Result<StageLifecycleSnapshot> {
-        match self.rpc_lifecycle(StageLifecycleRequest::Shutdown).await? {
-            StageLifecycleResponse::State(state) => Ok(state),
-            other => bail!("unexpected shutdown response: {other:?}"),
-        }
-    }
-
     pub fn peer_addr(&self) -> &str {
         &self.peer_addr
     }
 
     pub fn label(&self) -> &str {
         &self.label
-    }
-
-    async fn rpc_lifecycle(
-        &self,
-        request: StageLifecycleRequest,
-    ) -> Result<StageLifecycleResponse> {
-        let request_bytes = serde_json::to_vec(&request)?;
-        let response_bytes = self
-            .transport
-            .rpc_call(&self.peer_addr, &request_bytes)
-            .await?;
-        serde_json::from_slice(&response_bytes).map_err(Into::into)
     }
 }
 
@@ -753,15 +649,6 @@ fn timestamp_nanos() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let start = START.get_or_init(Instant::now);
     start.elapsed().as_nanos() as u64
-}
-
-fn hash_error(message: &str) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    message.hash(&mut hasher);
-    hasher.finish()
 }
 
 /// Compute one-way latency from the message timestamp to now.

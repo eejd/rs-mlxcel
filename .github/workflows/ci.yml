@@ -11,23 +11,27 @@
 #
 # The `clippy` job below is deliberately not a return to that arrangement. It
 # runs `cargo clippy -p mlxcel --lib --tests -- -D warnings` at default
-# features on the self-hosted GB10 runner with its own persistent target
+# features on the self-hosted Linux x64 runner with its own persistent target
 # directory, so it neither touches the Apple Silicon runner nor pays a cold
-# build after its first run. It exists because #916 merged an `err_expect`
-# that reddened `make verify` for every contributor on every platform and sat
-# on `main` until the nightly backstop caught it a day later (#1283): the
-# per-crate lint that catches it is cheap, and only its absence at PR time was
-# expensive.
+# build after its first run. Default features select no accelerator, so it
+# builds MLX with no GPU backend and takes no place on the GB10 runner that
+# CUDA work and the aarch64 release build need. It exists because #916 merged
+# an `err_expect` that reddened `make verify` for every contributor on every
+# platform and sat on `main` until the nightly backstop caught it a day later
+# (#1283): the per-crate lint that catches it is cheap, and only its absence at
+# PR time was expensive.
 #
 # They are not absent from every workflow, though, so do not read the above as
 # "nothing anywhere runs them":
 #
-#   - pipeline-parallel-ci.yml runs `cargo clippy -p mlxcel --lib --tests
-#     -- -D warnings`, and reaches `cargo test` through scripts/ci/run-pp-*.sh
-#     with `distributed::`-prefixed selectors. It is debug profile on
-#     ubuntu-latest and path-filtered to src/distributed/pipeline/** and its
-#     siblings, so it never runs on a model-port PR and never selects a model
-#     or CLI test module.
+#   - pipeline-parallel-ci.yml reaches `cargo test` through
+#     scripts/ci/run-pp-*.sh with `distributed::`-prefixed selectors. It is
+#     debug profile on ubuntu-latest and path-filtered to
+#     src/distributed/pipeline/** and its siblings, so it never runs on a
+#     model-port PR and never selects a model or CLI test module. It used to
+#     run the same clippy command as the `clippy` job below as well; that step
+#     was removed once `clippy` covered every Rust PR, because on those paths
+#     it was the same lint pass twice.
 #   - nightly-verify.yml runs the full `make verify` (fmt + clippy + test) once
 #     a day on the self-hosted Apple Silicon runner and files an issue when it
 #     fails. It is a backstop against a red `main`, not a PR gate; see #939 for
@@ -41,17 +45,18 @@
 #                       # per-crate cache may be hiding a regression
 #
 # Note on CUDA gating: running the CUDA test suite stays exclusive to
-# release.yml because it requires a Linux self-hosted runner (currently only the
-# GB10 node used for release builds). Adding a PR-level CUDA *test* gate would
-# double runner cost for limited additional safety on PRs that don't touch
-# CUDA-specific code paths. Compiling CUDA is a different question and four
-# jobs below do it: `xla-compile` and `xla-link` at the shipped sm_121,
-# `cuda-blockfloat` at the same list, and `cuda-sm70-compile` at sm_70, each on a
-# narrow path filter. `cuda-blockfloat` is the single exception to the sentence
-# above, and a narrow one: it runs the block-float quantization tests and only
-# those, because until issue #1934 no build anywhere compiled MLX's hardware
-# NVFP4/MXFP4 converter, so those tests had never once exercised the path they
-# are named for.
+# release.yml because it requires a Linux self-hosted GPU runner (the GB10 and
+# x86_64 CUDA nodes the release builds use). Adding a PR-level CUDA *test* gate
+# would double runner cost for limited additional safety on PRs that don't
+# touch CUDA-specific code paths. Compiling CUDA is a different question and
+# three jobs below do it: `xla-compile` and `xla-link` at the shipped sm_121,
+# and `cuda-blockfloat` at the same list, each on a narrow path filter.
+# A fourth, `cuda-sm70-compile`, is disabled: Volta needs a CUDA 12.x toolkit
+# and no runner in the fleet carries one (see its section below).
+# `cuda-blockfloat` is the single exception to the sentence above, and a narrow
+# one: it runs the block-float quantization tests and only those, because until
+# issue #1934 no build anywhere compiled MLX's hardware NVFP4/MXFP4 converter,
+# so those tests had never once exercised the path they are named for.
 
 name: CI
 
@@ -62,12 +67,13 @@ on:
     branches: [main]
 
 concurrency:
-  # One CI run per branch, because seven jobs below land on GB10, the single
-  # self-hosted Linux runner that also serves the release build: `clippy`,
-  # `cpu-link`, `webui-installed-artifact`, `xla-compile`, `xla-link`,
-  # `cuda-sm70-compile`, and `cuda-blockfloat`. Without a group, a run
-  # for a commit nobody is waiting on any more does not merely sit idle, it
-  # holds a place in line ahead of the runs that matter. Measured over
+  # One CI run per branch, because four jobs below land on GB10, the single
+  # self-hosted Linux GPU runner that also serves the aarch64 release build:
+  # `webui-installed-artifact`, `xla-compile`, `xla-link`, and
+  # `cuda-blockfloat`. `clippy` and `cpu-link` run on the self-hosted Linux x64
+  # runner, which no release build shares. Without a
+  # group, a run for a commit nobody is waiting on any more does not merely sit
+  # idle, it holds a place in line ahead of the runs that matter. Measured over
   # 2026-09-10 KST: 113 runs created, 14 open at once, 11 of those stacked on
   # four branches, and six cancelled by hand purely to free the runner (#1774).
   #
@@ -88,10 +94,10 @@ concurrency:
   # the same reason (its group is unconditional, having no PR half to key on).
   #
   # `github.event.pull_request.number || github.ref` is the shape already used
-  # by pipeline-parallel-ci.yml and by the two per-job groups below, and it
-  # keeps a PR run and a `main` push run in distinct groups. The per-job groups
-  # in `xla-link` and `cuda-sm70-compile` stay as they are: workflow-level and
-  # job-level groups compose, and those two are keyed differently on purpose.
+  # by pipeline-parallel-ci.yml and by the per-job group below, and it keeps a
+  # PR run and a `main` push run in distinct groups. The per-job group in
+  # `xla-link` stays as it is: workflow-level and job-level groups compose, and
+  # that one is keyed differently on purpose.
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
@@ -107,13 +113,19 @@ jobs:
       pull-requests: read
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      deps: ${{ steps.filter.outputs.deps }}
       mlx_pin: ${{ steps.filter.outputs.mlx_pin }}
       xla_link: ${{ steps.filter.outputs.xla_link }}
       cuda_arch: ${{ steps.filter.outputs.cuda_arch }}
       rocm: ${{ steps.filter.outputs.rocm }}
+      windows_build: ${{ steps.filter.outputs.windows_build }}
+      windows_cache_trust: ${{ steps.filter.outputs.windows_cache_trust }}
       cpu_link: ${{ steps.filter.outputs.cpu_link }}
+      overlay_host: ${{ steps.filter.outputs.overlay_host }}
+      webui_contract: ${{ steps.filter.outputs.webui_contract }}
       workflows: ${{ steps.filter.outputs.workflows }}
       webui_bundle: ${{ steps.filter.outputs.webui_bundle }}
+      webui_installed: ${{ steps.filter.outputs.webui_installed }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -132,16 +144,29 @@ jobs:
           # reduces to `some` (lablup/mlxcel#1992).
           predicate-quantifier: 'some-with-excludes'
           filters: |
+            # Every path whose change can move a Rust build, a lint or a
+            # formatting result. `rust-toolchain.toml` belongs here because a
+            # pin bump changes rustc, rustfmt and clippy together: without it a
+            # toolchain PR skipped `fmt` and `clippy` and could land a tree that
+            # neither accepts.
             rust:
               - '**/*.rs'
               - '**/Cargo.toml'
               - 'Cargo.lock'
-              - 'deny.toml'
               - 'build.rs'
               - 'scripts/iree/**'
+              - 'rust-toolchain.toml'
+            # The dependency graph alone: the manifests, the lockfile and the
+            # policy file. `cargo-deny` reads nothing else, so a source-only PR
+            # cannot change its verdict and does not need the job.
+            deps:
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'deny.toml'
             mlx_pin:
               - 'src/lib/mlxcelverse/CMakeLists.txt'
               - 'src/lib/mlxcel-core/build_support/mlx_pin.rs'
+              - 'src/lib/mlxcel-core/build_support/ptx_cache_test_hooks*.rs'
               - 'src/lib/mlxcel-mlx-pin/**'
               - 'scripts/ci/mlx_pinned_commit.sh'
               - 'scripts/ci/mlx_pinned_commit_test.sh'
@@ -163,14 +188,14 @@ jobs:
             # MLX overlays and mlxcel kernels, the pinned MLX commit, and the
             # build scripts that hand CMake the architecture list. Rust sources
             # outside these paths cannot break an arch-conditional compile, so
-            # the sm_70 gate below does not run on every Rust PR. See the
-            # `cuda-sm70-compile` job comment for why sm_70 specifically.
+            # `cuda-blockfloat` does not run on every Rust PR. See that job's
+            # comment for what it checks.
             cuda_arch:
               - 'src/lib/mlxcelverse/**'
               # Two subtrees under that glob cannot change what nvcc compiles,
-              # and these are the heaviest jobs on the shared GB10 runner. Most
-              # of epic #1801's pull requests touch only `overlays/rocm/`, so
-              # before this exclusion every one of them woke both CUDA jobs
+              # and this is the heaviest job on the shared GB10 runner. Most of
+              # epic #1801's pull requests touch only `overlays/rocm/`, so before
+              # this exclusion every one of them woke the CUDA job
               # (lablup/mlxcel#1992). `overlays/cpu/` is not excluded because
               # every build compiles it (#2248).
               - '!src/lib/mlxcelverse/overlays/rocm/**'
@@ -196,6 +221,45 @@ jobs:
               - 'build.rs'
               - '**/Cargo.toml'
               - 'Cargo.lock'
+            # The Windows build glue and its tests: the build scripts and
+            # build_support modules that lay out the Windows CUDA and ROCm
+            # builds, the overlay sources that choose the runtime and include
+            # directories at run time, the runtime bundle packagers, and the
+            # host tests and suites that cover them, and the MLX pin, whose bump
+            # changes the MLX and HIP sources the Windows build compiles. Gates
+            # `windows-build` (lablup/mlxcel#2642).
+            windows_build:
+              - 'build.rs'
+              - 'src/lib/mlxcelverse/CMakeLists.txt'
+              - 'src/lib/mlxcel-core/build.rs'
+              - 'src/lib/mlxcel-core/build_support/**'
+              - 'src/lib/mlxcel-mlx-pin/**'
+              - 'src/lib/mlxcelverse/overlays/rocm/mlx/backend/rocm/delayload.cpp'
+              - 'src/lib/mlxcelverse/overlays/rocm/mlx/backend/rocm/runtime_dir.h'
+              - 'src/lib/mlxcelverse/overlays/rocm/mlx/backend/rocm/hsaco_cache_dir.h'
+              - 'src/lib/mlxcelverse/overlays/rocm/mlx/backend/rocm/hsaco_cache_dir_win.h'
+              - 'src/lib/mlxcelverse/overlays/rocm/mlx/backend/rocm/jit_module.cpp'
+              - 'src/lib/mlxcelverse/overlays/cuda/mlx/backend/cuda/delayload.cpp'
+              - 'src/lib/mlxcelverse/overlays/cuda/mlx/backend/cuda/runtime_dir.h'
+              - 'src/lib/mlxcelverse/overlays/cuda/mlx/backend/cuda/jit_module.cpp'
+              - 'src/lib/mlxcelverse/overlays/cuda/mlx/backend/cuda/ptx_cache_dir.h'
+              - 'src/lib/mlxcelverse/overlays/cuda/mlx/backend/cuda/ptx_cache_dir_win.h'
+              - 'src/lib/mlxcelverse/overlays/cuda/mlx/backend/cuda/ptx_cache_acl_win.h'
+              - 'scripts/package_windows_*.py'
+              - 'scripts/mlxcelverse/rocm_runtime_dir_test.*'
+              - 'scripts/mlxcelverse/rocm_hsaco_cache_test*'
+              - 'scripts/mlxcelverse/cuda_runtime_dir_test.*'
+              - 'tests/test_package_windows_*.py'
+              - 'tests/test_rocm_arch_validation.py'
+            # The Windows trust checks of the JIT kernel caches and their host
+            # tests. Gates `overlay-host-tests-windows`.
+            windows_cache_trust:
+              - 'src/lib/mlxcelverse/overlays/cuda/mlx/backend/cuda/ptx_cache_*.h'
+              - 'src/lib/mlxcelverse/overlays/cuda/mlx/backend/cuda/jit_module.cpp'
+              - 'src/lib/mlxcelverse/overlays/rocm/mlx/backend/rocm/hsaco_cache_dir*.h'
+              - 'src/lib/mlxcelverse/overlays/rocm/mlx/backend/rocm/jit_module.cpp'
+              - 'scripts/mlxcelverse/cuda_ptx_cache_win_test*'
+              - 'scripts/mlxcelverse/rocm_hsaco_cache_test*'
             # What can break the CPU-only link of `mlxcel-core`: the Rust
             # sources and manifests, plus the bridge C++ that `rust` above does
             # not match. The bug that motivated the `cpu-link` job lived in
@@ -214,6 +278,26 @@ jobs:
               - 'src/lib/mlxcelverse/**'
               - 'src/lib/mlxcel-core/cpp/**'
               - 'src/lib/mlxcel-core/build_support/**'
+            # The inputs the overlay host tests read: the overlay sources, the
+            # scripts that inspect them, the pin-extraction script the record
+            # check resolves the MLX commit from, and the two build scripts
+            # whose CUDA and ROCm library and runtime-directory choices the
+            # tests compile against. A model or documentation change cannot
+            # move them.
+            overlay_host:
+              - 'src/lib/mlxcelverse/**'
+              - 'scripts/mlxcelverse/**'
+              - 'scripts/ci/mlx_pinned_commit.sh'
+              - 'build.rs'
+              - 'src/lib/mlxcel-core/build.rs'
+            # The OpenAPI contract, its generated DTO, the requirement map and
+            # the fixtures. The checker reads docs/webui/** and
+            # tests/fixtures/webui/** and nothing else, so a frontend component
+            # change cannot make it stale.
+            webui_contract:
+              - 'docs/webui/**'
+              - 'tests/fixtures/webui/**'
+              - 'scripts/ci/*webui*'
             # The workflow files themselves. Deliberately NOT folded into the
             # filters above: those gate what gets compiled, and a workflow edit
             # compiles nothing. What a workflow edit needs is the lint job and
@@ -221,16 +305,31 @@ jobs:
             workflows:
               - '.github/workflows/**'
               - '.github/actionlint.yaml'
+            # The frontend bundle's own inputs. `build_bundle.py` embeds the
+            # generated OpenAPI DTO, so `docs/webui/**` belongs here as well as
+            # under `webui_contract`. It reads no Cargo manifest and no server
+            # source, so neither is on this list: the pnpm job below cannot be
+            # moved by them.
             webui_bundle:
               - 'webui/**'
               - 'src/webui/assets/**'
+              - 'docs/webui/**'
+              - 'tests/fixtures/webui/**'
+              - 'scripts/webui/**'
+              - 'scripts/ci/*webui*'
+            # The installed artifact: the checked-in bundle the binary embeds,
+            # the verifier scripts that drive it, and what the binary is built
+            # from. Frontend sources are not here: a `webui/**` change must
+            # rebuild `src/webui/assets/**` (webui-bundle fails otherwise), and
+            # the rebuilt assets are what this job serves. `docs/webui/**` is
+            # likewise reached only through the rebuilt assets.
+            webui_installed:
+              - 'src/webui/assets/**'
+              - 'scripts/webui/**'
               - 'src/server/**'
               - 'src/cli/**'
               - 'src/bin/mlx_server.rs'
               - 'src/main.rs'
-              - 'tests/fixtures/webui/**'
-              - 'scripts/webui/**'
-              - 'scripts/ci/*webui*'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'Makefile'
@@ -238,7 +337,7 @@ jobs:
   deny:
     name: cargo-deny
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.deps == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -273,19 +372,43 @@ jobs:
   clippy:
     name: cargo-clippy
     needs: changes
-    # On the repository guard, because it is easy to read more into it than it
-    # does. It keeps this job from queueing forever in a *fork of* this
-    # repository, which has no GB10 runner of its own. It does not stop a pull
-    # request opened *from* a fork against lablup/mlxcel: on that event
-    # `github.repository` is the base repository, so the guard is true and the
-    # job runs here, executing the PR's `build.rs` and `scripts/iree/**` as the
-    # runner's own user. What actually gates that case is the repository's
-    # Actions fork-PR approval policy, currently `first_time_contributors`.
-    # The same reading applies to `xla-compile` and `xla-link` below.
+    # Two guards, and they do different jobs. The repository guard keeps this
+    # job from queueing forever in a *fork of* this repository, which has no
+    # self-hosted runner of its own. On a pull request opened *from* a fork it
+    # is true, because `github.repository` is the base repository. The head-repo
+    # guard is what skips those, so the code of a fork PR that leaves this
+    # file alone (`build.rs`, `scripts/iree/**`, `scripts/webui/**`,
+    # `pnpm install`) does not run on the shared runner. `push`, `schedule`
+    # and `workflow_dispatch` have a null `github.event.pull_request`, hence
+    # `event_name != 'pull_request' ||`. The `ci:full` label is ANDed after
+    # the guards, so it cannot opt a fork PR in.
+    #
+    # These guards do not stop a hostile fork PR. A `pull_request` run takes
+    # its workflow files from the PR's merge commit, so a fork PR that deletes
+    # this `if:`, or adds a job of its own with a self-hosted `runs-on`, is
+    # held back only by the repository's Actions fork-PR approval policy. That
+    # policy is `first_time_contributors`, which stops holding a contributor's
+    # fork PRs once one of their contributions has merged;
+    # `all_external_contributors` holds every fork PR. Read a fork PR's
+    # `.github/workflows/**` diff before
+    # approving its run.
+    #
+    # Remaining exposure: a same-repository PR (its author has write access)
+    # still runs as the runner's own uid. Only convention, not an OS boundary,
+    # keeps it away from release build inputs: the per-job
+    # `$HOME/.cargo-target/mlxcel-*-ci` directories merely have different
+    # names from the release build's `mlxcel-cuda-*` ones, and rustup and
+    # `~/.cargo/bin` are shared outright.
+    #
+    # The same reading applies to every other self-hosted job below
+    # (`cpu-link`, `webui-installed-artifact`, `xla-compile`, `xla-link`,
+    # `cuda-blockfloat`, `rocm-build`).
     if: >-
       github.repository == 'lablup/mlxcel'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
       && (needs.changes.outputs.rust == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
-    runs-on: GB10
+    runs-on: self-hosted-linux-26.04-x64
     permissions:
       contents: read
     timeout-minutes: 60
@@ -298,7 +421,7 @@ jobs:
         run: |
           # Clippy emits different artifacts than a build, so it gets its own
           # directory rather than sharing (and repeatedly invalidating) the
-          # xla-compile or release caches. Cold on first run, warm after.
+          # CPU-only link cache below. Cold on first run, warm after.
           CARGO_TARGET="$HOME/.cargo-target/mlxcel-clippy-ci"
           mkdir -p "$CARGO_TARGET"
           echo "CARGO_TARGET_DIR=$CARGO_TARGET" >> $GITHUB_ENV
@@ -315,16 +438,22 @@ jobs:
       # not decide whether the C++ builds. A GitHub-hosted runner would pay that
       # cold on every run, since the one `ubuntu-latest` job this repository
       # already has (`pipeline-parallel-ci.yml`) caches the cargo registry and
-      # not `target/`, and it takes about 28 minutes. Here the same command is
-      # 2m44s cold and 27 to 40 seconds warm off the persistent target directory.
+      # not `target/`, and it takes about 28 minutes. The same command measured
+      # 2m44s cold and 27 to 40 seconds warm off a persistent target directory
+      # on GB10, which builds the same CPU-only MLX tree.
       #
-      # The cost of staying on GB10 is that this runner also serves
-      # `xla-compile` and the release build, so a release in flight queues this
-      # job behind it and delays a merge. That happened once on 2026-08-22
-      # (#1301). It is a delay and not a failure: a queued job consumes nothing,
-      # and the release was not slowed by it. Trading a rare queue wait for
-      # roughly 20 minutes on every PR would re-create the cost objection that
-      # removed clippy from PR-time CI in the first place (#21, #23).
+      # It is not on the Apple Silicon runner. The header records that PR-time
+      # clippy there consumed ~30 minutes per run and blocked PRs and releases
+      # (#21, #23), and `nightly-verify.yml` already runs clippy on macOS every
+      # day with `metal,accelerate`.
+      #
+      # It is not on GB10 either. Default features select no accelerator, so the
+      # job compiles MLX with no GPU backend and never touches a device, while
+      # the GB10 runner also serves `xla-compile`, the CUDA gates and the
+      # aarch64 release build; a release in flight used to queue this job behind
+      # it and delay a merge (2026-08-22, #1301). The Linux x64 runner is not
+      # shared with any release build, so lateness there is bounded by other PRs
+      # and by the workflow-level concurrency group above.
       - name: Clippy
         run: |
           cargo clippy \
@@ -339,13 +468,17 @@ jobs:
     # Links the `mlxcel-core` test binary with no GPU feature. A Linux build
     # without one compiles MLX with no GPU backend, so bridge C++ that calls a
     # GPU-only MLX helper without the `MLXCEL_BRIDGE_GPU_BACKEND` guard fails
-    # only here, at link time: `cargo check` does not link, and every other
-    # GB10 job passes `--features cuda` (#2108). `--no-run` links without
-    # running the tests. The repository guard reads as on `clippy` above.
+    # only here, at link time: `cargo check` does not link, and every other CUDA
+    # job passes `--features cuda` (#2108). `--no-run` links without running the
+    # tests, so nothing here needs a device and it runs on the self-hosted Linux
+    # x64 runner instead of holding the GB10 GPU runner. Both guards read as on
+    # `clippy` above.
     if: >-
       github.repository == 'lablup/mlxcel'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
       && (needs.changes.outputs.cpu_link == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
-    runs-on: GB10
+    runs-on: self-hosted-linux-26.04-x64
     permissions:
       contents: read
     timeout-minutes: 30
@@ -356,16 +489,23 @@ jobs:
 
       - name: Use a persistent target directory
         run: |
-          # Its own directory: a CPU-only MLX tree would otherwise evict the
-          # CUDA build in any directory it shared. Measured on GB10 for #2108,
-          # about 2.5 minutes cold (including the CPU-only MLX tree) and about
-          # 6 seconds to relink after a one-file change.
+          # Its own directory: a CPU-only MLX tree would otherwise evict any
+          # other build in a directory it shared. About 2.5 minutes cold
+          # (including the CPU-only MLX tree) and about 6 seconds to relink
+          # after a one-file change, measured on GB10 for #2108.
           CARGO_TARGET="$HOME/.cargo-target/mlxcel-cpu-link-ci"
           mkdir -p "$CARGO_TARGET"
           echo "CARGO_TARGET_DIR=$CARGO_TARGET" >> "$GITHUB_ENV"
 
       - name: Link the CPU-only mlxcel-core test binary
         run: cargo test -p mlxcel-core --profile test-fast --lib --no-run
+
+      # The binary is linked above and these need neither CUDA nor a GPU. The
+      # GPU jobs elsewhere do not run the unix tests of ptx_cache_dirs.rs.
+      - name: Run the PTX cache directory, cache-root and native env tests
+        run: >-
+          cargo test -p mlxcel-core --profile test-fast --lib --
+          ptx_cache_dirs empty_mlxcel_cache_dir native_env
 
   crate-versions:
     name: crate versions
@@ -417,6 +557,33 @@ jobs:
       - name: Check the dtype-key checker rejects a shrunk or moved scope
         run: bash scripts/ci/check_kernel_dtype_keys_test.sh
 
+  env-var-docs:
+    name: env var docs
+    # Deliberately not behind the `changes` filter, like `crate-versions` and
+    # `kernel-dtype-keys`: it needs no toolchain and runs in seconds, and it has
+    # to fire on both halves of a break. A new `MLXCEL_*` read under `src/`
+    # breaks it, and so does a docs-only change that deletes the row for a name
+    # still read; a `rust`-filtered job would miss the second. Every `MLXCEL_*`
+    # string literal in `src/**/*.rs` must be on docs/environment-variables.md
+    # or carry a reasoned entry in the script's ALLOWLIST (issue #1140). The
+    # second step is the checker's own negative coverage on synthetic trees.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check every MLXCEL_* name in src is documented or allowlisted
+        run: python3 scripts/ci/check_env_var_docs.py
+      - name: Check the env-var docs checker rejects an undocumented name
+        run: python3 -m unittest tests/test_check_env_var_docs.py -v
+      # A direct std::env write is inert for native code on Windows (#2803).
+      - name: Check production environment writes go through native_env
+        run: python3 scripts/ci/check_native_env_writes.py
+      - name: Check the native env guard rejects a direct write
+        run: python3 -m unittest tests/test_check_native_env_writes.py -v
+
   kernel-port-dispatch:
     name: kernel port dispatch
     # Not behind the `changes` filter, for the same reasons as the job above: no
@@ -467,6 +634,32 @@ jobs:
         run: python3 scripts/ci/check_binary_assets.py
       - name: Check the guard still fails on undeclared and oversize binaries
         run: bash scripts/ci/check_binary_assets_test.sh
+      - name: Check benchmark data has no uncited raw logs
+        run: python3 scripts/ci/check_benchmark_raw_logs.py
+      - name: Check the guard still fails on raw logs and stale entries
+        run: bash scripts/ci/check_benchmark_raw_logs_test.sh
+
+  windows-reserved-paths:
+    name: Windows reserved paths
+    # Deliberately not behind the `changes` filter, like `binary-assets`: it
+    # needs no toolchain, runs in seconds, and the defect it guards against is
+    # silent on every platform CI uses. A tracked path whose name is a Windows
+    # device name (CON, PRN, AUX, NUL, COM0-9, LPT0-9, COM/LPT plus a superscript
+    # digit, with any extension) makes
+    # Git for Windows abort the checkout, so the repository cannot be cloned
+    # there. `src/lib/mlxcel-xla/src/aux.rs` did exactly that, and macOS and
+    # Linux accepted it without a word.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check no tracked path uses a Windows reserved device name
+        run: python3 scripts/ci/check_windows_reserved_paths.py
+      - name: Check the guard still fails on reserved names and passes on look-alikes
+        run: bash scripts/ci/check_windows_reserved_paths_test.sh
 
   cuda-arch-lists:
     name: CUDA architecture lists
@@ -611,7 +804,7 @@ jobs:
         with:
           node-version: '26.5.1'
       - name: Install pnpm
-        run: npm install --global pnpm@11.18.0
+        run: npm install --global pnpm@12.16.1
       - name: Install WebUI dependencies
         run: pnpm --dir webui install --frozen-lockfile
       - name: Typecheck WebUI
@@ -623,6 +816,15 @@ jobs:
       # gate evaluates every theme selector against the ids theme.ts ships.
       - name: Check WebUI theme selectors
         run: pnpm --dir webui run check:theme-selectors
+      # The product themes are pre-built Astryx themes (webui/src/design-system/
+      # themes/built/); the CSP forbids the runtime injection an unbuilt theme
+      # needs. `astryx theme build --check` fails when they drift from the source.
+      - name: Check WebUI built themes
+        run: pnpm --dir webui run check:themes
+      # webui/AGENTS.md carries the `ui-common agents` block; a ui-common or
+      # ui-common-cli bump fails here until the block is regenerated.
+      - name: Check WebUI agent guidance
+        run: pnpm --dir webui run check:agents
       - name: Test WebUI scaffold
         run: pnpm --dir webui run unit
       - name: Install browser runtime
@@ -675,10 +877,14 @@ jobs:
 
   webui-contract:
     name: WebUI contract
+    needs: changes
     # Contract-first gate for the bundled WebUI epic. It needs no Rust
     # toolchain and intentionally runs as its own drift check: schema changes
     # must update generated TypeScript DTOs and representative fixtures in the
-    # same PR before backend or frontend owners consume the contract.
+    # same PR before backend or frontend owners consume the contract. It is
+    # path-filtered to the contract's own inputs, so a backend or model change
+    # does not pay for it.
+    if: needs.changes.outputs.webui_contract == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -694,10 +900,22 @@ jobs:
   webui-installed-artifact:
     name: WebUI installed artifact
     needs: changes
+    # The installed-artifact inputs only, not every Rust change. This job's
+    # checks are all about the installed artifact serving the bundled WebUI:
+    # routing, TLS, assets, the feature-off build, the real-router browser
+    # harness, and the Activity performance gate. A Rust change elsewhere
+    # cannot move any of them, and compilation under the `cuda` + default
+    # (`webui`) feature set is already covered on every Rust PR by
+    # `xla-compile`, which runs `cargo check --features cuda,xla-iree` and
+    # therefore builds the same crate with both features on. Running the
+    # 75-minute Activity gate on every Rust PR bought nothing at the price of
+    # the one GB10 runner that CUDA and release work also need. `ci:full`
+    # still forces this job.
     if: >-
       github.repository == 'lablup/mlxcel'
-      && (needs.changes.outputs.webui_bundle == 'true'
-          || needs.changes.outputs.rust == 'true'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
+      && (needs.changes.outputs.webui_installed == 'true'
           || contains(github.event.pull_request.labels.*.name, 'ci:full'))
     runs-on: GB10
     permissions:
@@ -746,7 +964,7 @@ jobs:
         with:
           node-version: '26.5.1'
       - name: Install pnpm for real-router browser harness
-        run: npm install --global pnpm@11.18.0
+        run: npm install --global pnpm@12.16.1
       - name: Install WebUI dependencies for real-router browser harness
         run: pnpm --dir webui install --frozen-lockfile
       - name: Install Chromium runtime for real-router browser harness
@@ -788,6 +1006,7 @@ jobs:
           python3 scripts/webui/verify_generated_key_helper_tests.py
           python3 scripts/webui/verify_reverse_proxy_tests.py
           python3 scripts/webui/verify_single_model_tests.py
+          python3 scripts/webui/activity_performance_verdict_tests.py
           python3 scripts/webui/verify_activity_performance_tests.py
           python3 scripts/webui/summarize_activity_evidence_tests.py
           python3 scripts/webui/activity_gate_host_tests.py
@@ -1138,6 +1357,8 @@ jobs:
     needs: changes
     if: >-
       github.repository == 'lablup/mlxcel'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
       && (needs.changes.outputs.rust == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
     runs-on: GB10
     permissions:
@@ -1311,6 +1532,8 @@ jobs:
     needs: changes
     if: >-
       github.repository == 'lablup/mlxcel'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
       && (needs.changes.outputs.xla_link == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
     runs-on: GB10
     permissions:
@@ -1365,10 +1588,10 @@ jobs:
           bash scripts/iree/setup-cuda.sh --env | sed 's/^export //' >> "$GITHUB_ENV"
 
       - name: Link the OpenXLA integration test
-        run: cargo test --release --features cuda,xla-iree --test xla_prepared_prefill --no-run
+        run: cargo test --release --features cuda,xla-iree,test-utils --test xla_prepared_prefill --no-run
 
   # ============================================================================
-  # CUDA sm_70 compile (self-hosted GB10)
+  # CUDA sm_70 compile (DISABLED)
   # ============================================================================
   # Every other CUDA job in this repository compiles for sm_121, and
   # release.yml ships `80;86;89;90a;100;120` on x86_64 and `90a;100;121` on
@@ -1392,6 +1615,16 @@ jobs:
   # an architecture mismatch into a named startup error instead of an opaque
   # CUDA load failure.
   #
+  # DISABLED: the gate never ran. Volta support needs nvcc from a CUDA 12.x
+  # toolkit; the GPU runners carry 13.x, which rejects `compute_70` outright,
+  # and the self-hosted Linux x64 runner carries no CUDA toolkit at all. The
+  # job probed for that and skipped, so it held a queue slot and verified
+  # nothing. The definition below is commented out rather than deleted so the
+  # gate is not lost: restore it by uncommenting the block and pointing
+  # `runs-on` at a runner that carries a CUDA 12.x toolkit. A missing nvcc is a
+  # hard failure there, not a skip, because the job only exists on such a
+  # runner.
+  #
   # Path-filtered on `cuda_arch`, which is narrower than `rust`: a cold MLX
   # build for a new architecture is measured in tens of minutes, and only the
   # MLX overlays, the pinned commit and the build scripts can move what nvcc
@@ -1399,127 +1632,129 @@ jobs:
   # list is part of the build-script fingerprint and sharing a directory with
   # an sm_121 job would make the two rebuild MLX against each other on every
   # run.
-  cuda-sm70-compile:
-    name: CUDA sm_70 compile
-    needs: changes
-    if: >-
-      github.repository == 'lablup/mlxcel'
-      && (needs.changes.outputs.cuda_arch == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
-    runs-on: GB10
-    permissions:
-      contents: read
-    # Same reasoning as `xla-link`: minutes warm, tens of minutes cold, on the
-    # one runner that also serves clippy for every Rust PR and the release
-    # build. Keyed per PR, so PRs never cancel each other.
-    #
-    # `main` is exempt, as in `xla-link` and at the workflow level: pushes to
-    # `main` carry no pull request number, so they share the `refs/heads/main`
-    # key, and an unconditional flag would let one merge cancel the previous
-    # merge's compile before it proves the shipped architecture still builds.
-    concurrency:
-      group: cuda-sm70-${{ github.event.pull_request.number || github.ref }}
-      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
-    timeout-minutes: 120
-    env:
-      # Volta. Plain `70`, not `70a`: architecture-specific suffixes only exist
-      # from sm_90 on, and build.rs forwards this string to CMake verbatim.
-      MLX_CUDA_ARCHITECTURES: "70"
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
+# cuda-sm70-compile:
+#   name: CUDA sm_70 compile
+#   needs: changes
+#   if: >-
+#     github.repository == 'lablup/mlxcel'
+#     && (github.event_name != 'pull_request'
+#         || github.event.pull_request.head.repo.full_name == github.repository)
+#     && (needs.changes.outputs.cuda_arch == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
+#   runs-on: self-hosted-linux-26.04-x64
+#     permissions:
+#       contents: read
+#     # Same reasoning as `xla-link`: minutes warm, tens of minutes cold, on a
+#     # runner that also serves `clippy` for every Rust PR. Keyed per PR, so PRs
+#     # never cancel each other.
+#     #
+#     # `main` is exempt, as in `xla-link` and at the workflow level: pushes to
+#     # `main` carry no pull request number, so they share the `refs/heads/main`
+#     # key, and an unconditional flag would let one merge cancel the previous
+#     # merge's compile before it proves the shipped architecture still builds.
+#     concurrency:
+#       group: cuda-sm70-${{ github.event.pull_request.number || github.ref }}
+#       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+#     timeout-minutes: 120
+#     env:
+#       # Volta. Plain `70`, not `70a`: architecture-specific suffixes only exist
+#       # from sm_90 on, and build.rs forwards this string to CMake verbatim.
+#       MLX_CUDA_ARCHITECTURES: "70"
+#     steps:
+#       - uses: actions/checkout@v7
+#         with:
+#           persist-credentials: false
 
-      - name: Use a persistent target directory
-        run: |
-          # Not shared with any sm_121 job: the architecture list reaches CMake
-          # through the build script, so two jobs at different architectures
-          # sharing one directory would invalidate each other's MLX build every
-          # run and pay a cold nvcc pass each time.
-          CARGO_TARGET="$HOME/.cargo-target/mlxcel-cuda-sm70-ci"
-          mkdir -p "$CARGO_TARGET"
-          echo "CARGO_TARGET_DIR=$CARGO_TARGET" >> $GITHUB_ENV
+#       - name: Use a persistent target directory
+#         run: |
+#           # Not shared with any sm_121 job: the architecture list reaches CMake
+#           # through the build script, so two jobs at different architectures
+#           # sharing one directory would invalidate each other's MLX build every
+#           # run and pay a cold nvcc pass each time.
+#           CARGO_TARGET="$HOME/.cargo-target/mlxcel-cuda-sm70-ci"
+#           mkdir -p "$CARGO_TARGET"
+#           echo "CARGO_TARGET_DIR=$CARGO_TARGET" >> $GITHUB_ENV
 
-      - name: Check whether the toolkit can target sm_70
-        id: toolkit
-        run: |
-          # CUDA 13 removed Volta: nvcc there fails with
-          # `nvcc fatal : Unsupported gpu architecture 'compute_70'` before it
-          # compiles anything. The CUDA runners currently carry 13.x, so this
-          # gate cannot run on them, and a job that simply failed would red-light
-          # every PR touching these paths for a toolkit limitation rather than a
-          # code defect. Probe instead, and skip loudly. The moment a CUDA 12.x
-          # runner joins the fleet this job starts gating for real with no edit.
-          set -euo pipefail
-          # Same resolution order as the cuobjdump lookup below and as
-          # build.rs: CUDA_HOME, then the conventional location, then PATH.
-          # nvcc is not on PATH on this runner either.
-          NVCC="${CUDA_HOME:-/usr/local/cuda}/bin/nvcc"
-          if [ ! -x "$NVCC" ]; then
-            NVCC=$(command -v nvcc || true)
-          fi
-          if [ ! -x "${NVCC:-}" ]; then
-            echo "nvcc not found at ${CUDA_HOME:-/usr/local/cuda}/bin/nvcc or on PATH" >&2
-            exit 1
-          fi
-          VERSION=$("$NVCC" --version | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1)
-          if "$NVCC" --list-gpu-arch 2>/dev/null | grep -qx compute_70; then
-            echo "supported=true" >> "$GITHUB_OUTPUT"
-            echo "CUDA $VERSION targets sm_70; gating for real."
-          else
-            echo "supported=false" >> "$GITHUB_OUTPUT"
-            echo "CUDA $VERSION cannot target sm_70; skipping the sm_70 build." | tee -a "$GITHUB_STEP_SUMMARY"
-            {
-              echo ""
-              echo "**sm_70 gate skipped.** This runner's CUDA toolkit is $VERSION, and CUDA 13 removed Volta (sm_70) support, so nvcc rejects \`compute_70\` outright. Nothing was compiled for Volta and nothing was verified. This is a toolkit limitation, not a passing gate. Building mlxcel for Volta requires a CUDA 12.x toolchain; see the CUDA architecture selection section of docs/installation.md."
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+#       - name: Check whether the toolkit can target sm_70
+#         id: toolkit
+#         run: |
+#           # CUDA 13 removed Volta: nvcc there fails with
+#           # `nvcc fatal : Unsupported gpu architecture 'compute_70'` before it
+#           # compiles anything. A runner carrying 13.x cannot run this gate, and
+#           # a job that simply failed would red-light every PR touching these
+#           # paths for a toolkit limitation rather than a code defect. Probe
+#           # instead, and skip loudly. A runner with a CUDA 12.x toolkit starts
+#           # gating for real with no edit.
+#           set -euo pipefail
+#           # Same resolution order as the cuobjdump lookup below and as
+#           # build.rs: CUDA_HOME, then the conventional location, then PATH.
+#           # nvcc is not on PATH on the GPU runners either.
+#           NVCC="${CUDA_HOME:-/usr/local/cuda}/bin/nvcc"
+#           if [ ! -x "$NVCC" ]; then
+#             NVCC=$(command -v nvcc || true)
+#           fi
+#           if [ ! -x "${NVCC:-}" ]; then
+#             echo "nvcc not found at ${CUDA_HOME:-/usr/local/cuda}/bin/nvcc or on PATH" >&2
+#             exit 1
+#           fi
+#           VERSION=$("$NVCC" --version | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1)
+#           if "$NVCC" --list-gpu-arch 2>/dev/null | grep -qx compute_70; then
+#             echo "supported=true" >> "$GITHUB_OUTPUT"
+#             echo "CUDA $VERSION targets sm_70; gating for real."
+#           else
+#             echo "supported=false" >> "$GITHUB_OUTPUT"
+#             echo "CUDA $VERSION cannot target sm_70; skipping the sm_70 build." | tee -a "$GITHUB_STEP_SUMMARY"
+#             {
+#               echo ""
+#               echo "**sm_70 gate skipped.** This runner's CUDA toolkit is $VERSION, and CUDA 13 removed Volta (sm_70) support, so nvcc rejects \`compute_70\` outright. Nothing was compiled for Volta and nothing was verified. This is a toolkit limitation, not a passing gate. Building mlxcel for Volta requires a CUDA 12.x toolchain; see the CUDA architecture selection section of docs/installation.md."
+#             } >> "$GITHUB_STEP_SUMMARY"
+#           fi
 
-      - name: Compile the CUDA feature set for sm_70
-        if: steps.toolkit.outputs.supported == 'true'
-        run: cargo check --features cuda --all-targets
+#       - name: Compile the CUDA feature set for sm_70
+#         if: steps.toolkit.outputs.supported == 'true'
+#         run: cargo check --features cuda --all-targets
 
-      - name: Verify the emitted cubins are sm_70
-        if: steps.toolkit.outputs.supported == 'true'
-        run: |
-          # `cargo check` still runs the build script, so MLX is compiled and
-          # archived even though nothing links. Asserting on the archive turns
-          # "the environment variable was set" into "nvcc actually emitted
-          # pre-Ampere code", which is what the job claims to gate. It also
-          # catches the silent trap described in #1538: build.rs auto-detects
-          # the host and falls back to `90a` when it cannot, so a job whose
-          # architecture list failed to reach CMake would otherwise pass here
-          # having compiled nothing for Volta.
-          set -euo pipefail
-          # cuobjdump ships with the CUDA toolkit, next to nvcc, and neither is
-          # on PATH on the GB10 runner: a PATH-first lookup is what failed on
-          # the first run of the block-float job. Resolve the toolkit the way
-          # `src/lib/mlxcel-core/build.rs` resolves nvcc, CUDA_HOME first and
-          # then the conventional location, with PATH as a last resort rather
-          # than as the primary, so this reads the same toolkit that compiled
-          # the archive. Not found stays a hard failure: a skip here would make
-          # the gate pass while checking nothing.
-          CUDA_BIN="${CUDA_HOME:-/usr/local/cuda}/bin"
-          CUOBJDUMP="$CUDA_BIN/cuobjdump"
-          if [ ! -x "$CUOBJDUMP" ]; then
-            CUOBJDUMP=$(command -v cuobjdump || true)
-          fi
-          if [ ! -x "${CUOBJDUMP:-}" ]; then
-            echo "cuobjdump not found at $CUDA_BIN/cuobjdump or on PATH; it ships with the CUDA toolkit next to nvcc" >&2
-            exit 1
-          fi
-          echo "cuobjdump: $CUOBJDUMP"
-          LIB=$(find "$CARGO_TARGET_DIR/debug/build" -path '*/out/build/lib/libmlx.a' | head -1)
-          if [ -z "$LIB" ]; then
-            echo "libmlx.a not found under $CARGO_TARGET_DIR/debug/build" >&2
-            exit 1
-          fi
-          echo "archive: $LIB"
-          ARCHES=$("$CUOBJDUMP" --list-elf "$LIB" | grep -oE 'sm_[0-9]+a?' | sort -u)
-          echo "architectures present: $(echo "$ARCHES" | tr '\n' ' ')"
-          if [ "$ARCHES" != "sm_70" ]; then
-            echo "expected sm_70 only, found: $ARCHES" >&2
-            exit 1
-          fi
+#       - name: Verify the emitted cubins are sm_70
+#         if: steps.toolkit.outputs.supported == 'true'
+#         run: |
+#           # `cargo check` still runs the build script, so MLX is compiled and
+#           # archived even though nothing links. Asserting on the archive turns
+#           # "the environment variable was set" into "nvcc actually emitted
+#           # pre-Ampere code", which is what the job claims to gate. It also
+#           # catches the silent trap described in #1538: build.rs auto-detects
+#           # the host and falls back to `90a` when it cannot, so a job whose
+#           # architecture list failed to reach CMake would otherwise pass here
+#           # having compiled nothing for Volta.
+#           set -euo pipefail
+#           # cuobjdump ships with the CUDA toolkit, next to nvcc, and neither is
+#           # on PATH on the GPU runners: a PATH-first lookup is what failed on
+#           # the first run of the block-float job. Resolve the toolkit the way
+#           # `src/lib/mlxcel-core/build.rs` resolves nvcc, CUDA_HOME first and
+#           # then the conventional location, with PATH as a last resort rather
+#           # than as the primary, so this reads the same toolkit that compiled
+#           # the archive. Not found stays a hard failure: a skip here would make
+#           # the gate pass while checking nothing.
+#           CUDA_BIN="${CUDA_HOME:-/usr/local/cuda}/bin"
+#           CUOBJDUMP="$CUDA_BIN/cuobjdump"
+#           if [ ! -x "$CUOBJDUMP" ]; then
+#             CUOBJDUMP=$(command -v cuobjdump || true)
+#           fi
+#           if [ ! -x "${CUOBJDUMP:-}" ]; then
+#             echo "cuobjdump not found at $CUDA_BIN/cuobjdump or on PATH; it ships with the CUDA toolkit next to nvcc" >&2
+#             exit 1
+#           fi
+#           echo "cuobjdump: $CUOBJDUMP"
+#           LIB=$(find "$CARGO_TARGET_DIR/debug/build" -path '*/out/build/lib/libmlx.a' | head -1)
+#           if [ -z "$LIB" ]; then
+#             echo "libmlx.a not found under $CARGO_TARGET_DIR/debug/build" >&2
+#             exit 1
+#           fi
+#           echo "archive: $LIB"
+#           ARCHES=$("$CUOBJDUMP" --list-elf "$LIB" | grep -oE 'sm_[0-9]+a?' | sort -u)
+#           echo "architectures present: $(echo "$ARCHES" | tr '\n' ' ')"
+#           if [ "$ARCHES" != "sm_70" ]; then
+#             echo "expected sm_70 only, found: $ARCHES" >&2
+#             exit 1
+#           fi
 
   # ============================================================================
   # CUDA block-float converter (self-hosted GB10)
@@ -1541,8 +1776,8 @@ jobs:
   # above catches that spelling in the YAML; this catches it in the artifact,
   # which also covers a list that never reaches CMake at all (build.rs
   # auto-detects and falls back to `90a` when it cannot see the host). That
-  # trap is not hypothetical; it is the same one `cuda-sm70-compile` asserts
-  # against, for the same reason.
+  # trap is not hypothetical; it is the same one the disabled
+  # `cuda-sm70-compile` gate asserts against, for the same reason.
   #
   # Gate on SASS, never on PTX. The injection emits a cubin and no PTX, and the
   # PTX that is emitted comes from the plain `compute_121` pass, which takes the
@@ -1562,15 +1797,17 @@ jobs:
     needs: changes
     if: >-
       github.repository == 'lablup/mlxcel'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
       && (needs.changes.outputs.cuda_arch == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
     runs-on: GB10
     permissions:
       contents: read
-    # Same reasoning as `xla-link` and `cuda-sm70-compile`: minutes warm, tens
-    # of minutes cold, on the one runner that also serves clippy for every Rust
-    # PR and the release build. Keyed per PR, so PRs never cancel each other,
-    # and `main` is exempt so a merge cannot cancel the run that proves the
-    # shipped architecture still carries the converter.
+    # Same reasoning as `xla-link`: minutes warm, tens of minutes cold, on the
+    # one runner that also serves `xla-compile` and the release build. Keyed per
+    # PR, so PRs never cancel each other, and `main` is exempt so a merge cannot
+    # cancel the run that proves the shipped architecture still carries the
+    # converter.
     concurrency:
       group: cuda-blockfloat-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -1772,6 +2009,8 @@ jobs:
     # `rocm-runner-status` below says which state it is in.
     if: >-
       github.repository == 'lablup/mlxcel'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
       && (needs.changes.outputs.rocm == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
       && vars.ROCM_CI_ENABLED == 'true'
     runs-on: [self-hosted, rocm-gfx1151]
@@ -1867,7 +2106,16 @@ jobs:
       - name: Report the state of the ROCm gate
         env:
           ROCM_CI_ENABLED: ${{ vars.ROCM_CI_ENABLED }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
         run: |
+          # A fork PR never reaches the self-hosted job (head-repo guard on
+          # `rocm-build`), whatever the variable says, so say that instead.
+          if [ "${EVENT_NAME}" = "pull_request" ] && [ "${HEAD_REPO}" != "${BASE_REPO}" ]; then
+            echo "::warning title=ROCm build skipped for fork PR::'ROCm build and generate' runs on a shared self-hosted runner and is skipped for pull requests opened from a fork. A maintainer must verify the ROCm build separately."
+            exit 0
+          fi
           # Reports the variable and nothing else. An earlier version also
           # queried runner registration, which needs an `administration` scope
           # that GITHUB_TOKEN has no such key for: adding it is not a weaker
@@ -1881,6 +2129,216 @@ jobs:
           echo "::warning title=ROCm gate parked::This PR changes paths that affect the ROCm build, but 'ROCm build and generate' did not run: vars.ROCM_CI_ENABLED is not 'true'. Register a runner labelled rocm-gfx1151 and set that repository variable to 'true' to activate it (lablup/mlxcel#1811)."
           echo "ROCm gate parked: vars.ROCM_CI_ENABLED is not 'true'."
           echo "To activate: register a self-hosted runner labelled rocm-gfx1151, then set the repository variable ROCM_CI_ENABLED to 'true'."
+
+  # ============================================================================
+  # Runtime-directory host tests (hosted)
+  # ============================================================================
+  # The Windows CUDA and ROCm overlays choose the runtime DLL directory, the
+  # preload set and the hiprtc/NVRTC header directory in pure functions
+  # (`runtime_dir.h`, and `choose_rocm_include_dir()` in the ROCm
+  # `jit_module.cpp`). Their host tests compile those functions with the host
+  # C++ compiler and need no GPU SDK, so they run here rather than only in a
+  # developer's `make verify` (lablup/mlxcel#2642). `verify-rocm-overlay` also
+  # runs the offline overlay record checks; they read only this checkout and a
+  # synthetic git history they build themselves, so a shallow clone is enough.
+  #
+  # Not behind the `changes` filter, for the reason `python-tooling` is not:
+  # about 16 seconds, and what it runs (`rocm_overlay.py`, the five test
+  # scripts, their `.cpp` files, the Makefile targets, this job) is touched by
+  # changes no build-path filter matches, so a path gate let an edit to the
+  # test itself merge without the test running.
+  overlay-host-tests:
+    name: overlay runtime-dir host tests
+    needs: changes
+    # Path-filtered on the only inputs the checks read. The ROCm record check
+    # compares the overlay tree against the MLX pin, and the runtime-dir and
+    # kernel-cache tests compile against build.rs and mlxcel-core's build.rs,
+    # so neither `src/models/**` nor a documentation change can move them.
+    if: needs.changes.outputs.overlay_host == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: ROCm overlay records, runtime-dir and kernel-cache host tests, CUDA runtime-dir host test
+        env:
+          CXX: g++
+        run: make verify-rocm-overlay verify-cuda-runtime-dir
+
+  # The CUDA and ROCm Windows trust checks have no GPU dependency in their
+  # headers, and the tests that drive them through a real kernel skip themselves
+  # without a device, so this is where CI runs the walk and the entry check, with
+  # real ACLs set by icacls. Hosted, and a compile plus a run of two small
+  # programs. Bash here must be Git's, since `bash` from pwsh can resolve to WSL.
+  overlay-host-tests-windows:
+    name: overlay cache trust host tests (Windows)
+    needs: changes
+    if: >-
+      needs.changes.outputs.windows_cache_trust == 'true'
+      || contains(github.event.pull_request.labels.*.name, 'ci:full')
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      # The scripts must keep LF, and the runner's Git converts to CRLF.
+      - name: Keep line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Enter the Visual Studio x64 developer environment
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'no Visual Studio with the x64 C++ tools' }
+          $before = @{}
+          Get-ChildItem env: | ForEach-Object { $before[$_.Name] = $_.Value }
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$' -and $before[$Matches[1]] -ne $Matches[2]) {
+              "$($Matches[1])=$($Matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            }
+          }
+      - name: CUDA PTX cache host test
+        shell: bash
+        env:
+          CXX: clang++
+        run: bash scripts/mlxcelverse/cuda_ptx_cache_win_test.sh
+      - name: ROCm kernel cache host test
+        shell: bash
+        env:
+          CXX: clang++
+        run: bash scripts/mlxcelverse/rocm_hsaco_cache_test.sh
+
+  # ============================================================================
+  # Windows build (hosted, compile-only)
+  # ============================================================================
+  # Nothing else in CI runs on Windows. This job covers what only a Windows
+  # host exercises: the `#[cfg(windows)]` tests of mlxcel-mlx-pin's
+  # build_support copies, the tests/ Python suites on a Windows Python (the
+  # five that need bash or make skip themselves there and run in
+  # `python-tooling`), and mlxcel-core's `build.rs` with the `rocm` feature
+  # against a real ROCm SDK layout, which is the only place
+  # build_support/windows_rocm.rs runs as part of a build. No GPU: the
+  # runner has none, and `MLX_ROCM_ARCHITECTURES` skips detection.
+  #
+  # Hosted, so it carries no fork guard, and gated like the self-hosted jobs
+  # on its paths plus the `ci:full` label because a run costs a full MLX and
+  # HIP compile. Measured on windows-latest (4 vCPU) over three runs when it
+  # was added: 14 to 20 min per job, 12 to 17.5 min of it the `cargo check`;
+  # a cache miss adds about 20 s (download and save). The
+  # cache entry is 1.6 GB, one per TheRock version and family
+  # (lablup/mlxcel#2642).
+  windows-build:
+    name: Windows build (compile-only)
+    needs: changes
+    if: >-
+      needs.changes.outputs.windows_build == 'true'
+      || contains(github.event.pull_request.labels.*.name, 'ci:full')
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # One TheRock tarball per ROCm version and GPU family. The sha256 is
+      # pinned because AMD publishes none; bump all three together.
+      THEROCK_VERSION: 10.1.0
+      THEROCK_FAMILY: gfx1151
+      THEROCK_SHA256: 42698635d66eee273fd0ef580b68494aa2363a4fa6cf733db7806438863a8136
+      MLX_ROCM_ARCHITECTURES: gfx1151
+      # Short, as docs/installation.md advises: CMake and hipcc fail on long
+      # object paths under the default target directory.
+      CARGO_TARGET_DIR: C:\t
+      CMAKE_BUILD_PARALLEL_LEVEL: '4'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.97.1
+
+      - name: Run the mlx-pin lib tests, including the Windows-only ones
+        run: cargo test -p mlxcel-mlx-pin --lib
+
+      - name: Run the tests/ Python suites on Windows
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+
+      # Keyed on version, family and digest, so a miss downloads once per key
+      # and every later run restores it. Saved right after the digest check,
+      # not at job end, so a failing build still keeps the tarball. The digest
+      # is checked after a restore too: it costs seconds and a cache entry is
+      # not a trusted input.
+      - name: Restore the TheRock tarball
+        id: therock-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/therock.tar.gz
+          key: therock-windows-${{ env.THEROCK_FAMILY }}-${{ env.THEROCK_VERSION }}-${{ env.THEROCK_SHA256 }}
+      - name: Download the TheRock tarball
+        if: steps.therock-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/therock.tar.gz" \
+            "https://stable.repo.amd.com/rocm/core/tarball/therock-dist-windows-${THEROCK_FAMILY}-${THEROCK_VERSION}.tar.gz"
+      - name: Verify the TheRock tarball
+        shell: bash
+        run: echo "${THEROCK_SHA256}  ${RUNNER_TEMP}/therock.tar.gz" | sha256sum -c -
+      - name: Save the TheRock tarball
+        if: steps.therock-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/therock.tar.gz
+          key: ${{ steps.therock-cache.outputs.cache-primary-key }}
+      - name: Extract the ROCm SDK
+        shell: bash
+        run: |
+          mkdir -p /c/rocm-ci
+          # --force-local: GNU tar would read the drive letter in
+          # RUNNER_TEMP (a D: path) as a remote host name.
+          # The excluded files are libraries and kernel data the build never
+          # reads (composable-kernel static libraries, MIOpen, test plugins):
+          # 4.6 GB of the 8.4 GB tree, leaving 3.8 GB.
+          tar --force-local -xzf "$RUNNER_TEMP/therock.tar.gz" -C /c/rocm-ci \
+            --exclude='./lib/device_*_operations.lib' \
+            --exclude='./bin/MIOpen*' \
+            --exclude='./.kpack' \
+            --exclude='./bin/test_plugins' \
+            --exclude='./bin/hipify*'
+          echo "ROCM_PATH=C:\\rocm-ci" >> "$GITHUB_ENV"
+
+      # The build needs cl.exe, lib.exe and Ninja from Visual Studio, which a
+      # hosted Windows runner installs but does not put on PATH. Export only
+      # what vcvars64 changes.
+      - name: Enter the Visual Studio x64 developer environment
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'no Visual Studio with the x64 C++ tools' }
+          $before = @{}
+          Get-ChildItem env: | ForEach-Object { $before[$_.Name] = $_.Value }
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$' -and $before[$Matches[1]] -ne $Matches[2]) {
+              "$($Matches[1])=$($Matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            }
+          }
+
+      - name: Check mlxcel-core with the rocm feature
+        run: cargo check -p mlxcel-core --features rocm
+
+      # `cargo check` hides build-script output, so assert the HIP half ran:
+      # the backend writes mlx_rocm_kernels.lib only after its HIP compile, and
+      # link_rocm() names it for every Windows ROCm link.
+      - name: Assert the HIP kernel archive was built
+        run: |
+          $lib = Get-ChildItem "$env:CARGO_TARGET_DIR/debug/build/mlxcel-core-*/out/build/_deps/mlx-build/mlx/backend/rocm/mlx_rocm_kernels.lib" -ErrorAction SilentlyContinue
+          if (-not $lib) { throw 'cargo check finished without building mlx_rocm_kernels.lib' }
+          $lib | ForEach-Object { '{0} ({1:N1} MiB)' -f $_.FullName, ($_.Length / 1MB) }
 
   # ============================================================================
   # Workflow lint (hosted)
@@ -1946,13 +2404,16 @@ jobs:
   # ============================================================================
   # The jobs on the shared runners no longer re-run when a workflow file
   # changes. That is the point, but left silent it would be its own trap: a PR
-  # that rewrites the script inside `cuda-sm70-compile` would show no CUDA check
+  # that rewrites the script inside `cuda-blockfloat` would show no CUDA check
   # at all, and a reviewer could reasonably read that as "it passed".
   #
   # So say it. Advisory only, never failing, because failing would put the cost
   # back: a documentation PR that happens to touch a workflow comment would be
   # blocked until someone ran the heavy jobs it cannot affect. Whoever does want
-  # them run adds the `ci:full` label, which every self-hosted job now honours.
+  # them run adds the `ci:full` label, which every self-hosted job now honours
+  # on a same-repository PR (a fork PR skips them regardless, see `clippy`).
+  # `windows-build` is hosted but gated the same way, because a run compiles
+  # MLX and its HIP backend; the label opts it in on any PR, fork or not.
   self-hosted-gate-advisory:
     name: self-hosted gate advisory
     needs: changes
@@ -1968,6 +2429,6 @@ jobs:
     steps:
       - name: Note that the self-hosted jobs were not re-run for this workflow change
         run: |
-          echo "::warning title=Self-hosted jobs not re-run::This PR changes .github/workflows/**, which no longer re-runs the jobs on the shared GB10 and gfx1151 runners (lablup/mlxcel#1992). They run when the paths they actually gate change. If this PR edits the script inside one of those jobs, add the 'ci:full' label to run them and validate it before merge."
+          echo "::warning title=Self-hosted jobs not re-run::This PR changes .github/workflows/**, which no longer re-runs the jobs on the shared GB10, Linux x64 and gfx1151 runners (lablup/mlxcel#1992) or the hosted 'Windows build (compile-only)' job (lablup/mlxcel#2642). They run when the paths they actually gate change. If this PR edits the script inside one of those jobs, add the 'ci:full' label to run them and validate it before merge. The label applies to same-repository PRs only: self-hosted jobs never run for a PR opened from a fork."
           echo "Self-hosted jobs were gated on the paths they cover, not on this workflow change."
-          echo "Add the 'ci:full' label to force them."
+          echo "Add the 'ci:full' label to force them (same-repository PRs only; never for fork PRs)."

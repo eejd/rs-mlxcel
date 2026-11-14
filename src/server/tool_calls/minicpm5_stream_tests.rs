@@ -190,7 +190,9 @@ fn a_prose_opener_does_not_hide_a_later_call() {
     for size in [2, 1000] {
         assert_eq!(
             stream_chunked(&text, size).content,
-            r#"Write <function name="x"> to open a call, as in "#,
+            // The space before the call is trailing whitespace: held, then dropped at the
+            // end of the stream like the non-streamed content.
+            r#"Write <function name="x"> to open a call, as in"#,
             "size {size}"
         );
     }
@@ -231,7 +233,9 @@ fn a_filter_that_is_not_armed_passes_everything_through() {
 #[test]
 fn a_partial_opener_at_a_fragment_end_is_only_held_when_armed() {
     let mut armed = armed();
-    assert_eq!(armed.feed("a <func").content.as_deref(), Some("a "));
+    // Trailing whitespace is held until visible text decides it (#2464), so the
+    // space before the held partial opener is not out yet.
+    assert_eq!(armed.feed("a <func").content.as_deref(), Some("a"));
     let mut unarmed = StreamFilter::new();
     assert_eq!(unarmed.feed("a <func").content.as_deref(), Some("a <func"));
 }
@@ -254,7 +258,9 @@ fn text_that_only_resembles_a_call_passes_through() {
         "an unfinished <function na",
         "a <function> alone and <function\u{a0}",
     ] {
-        assert_eq!(stream_chunked(text, 1).content, text);
+        // Trailing whitespace (the final no-break space) is dropped at the end of
+        // the stream, as for every other family (#2464).
+        assert_eq!(stream_chunked(text, 1).content, text.trim_end());
     }
 }
 

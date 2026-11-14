@@ -38,6 +38,23 @@ use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 
+/// Pin full-precision f32 GEMMs for this integration binary.
+///
+/// The lib unit-test pin (`pin_full_precision_f32_matmuls_for_tests` in
+/// `src/lib.rs`) is `#[cfg(test)]` and never reaches this separate binary.
+/// Under MLX's default TF32 GEMMs (cuBLAS `CUBLAS_COMPUTE_32F_FAST_TF32`) the
+/// B=2 batched decode and the B=1 solo decode round differently (max abs error
+/// about 1e-3 against the 1e-5 bound). Runs before `main`, before MLX latches
+/// the value; an explicit operator setting wins.
+#[ctor::ctor(unsafe)]
+fn pin_full_precision_f32_matmuls() {
+    if std::env::var_os("MLX_ENABLE_TF32").is_none() {
+        // SAFETY: ctor runs before main, on one thread, before anything else
+        // can read the environment.
+        unsafe { std::env::set_var("MLX_ENABLE_TF32", "0") };
+    }
+}
+
 // ---------- synthetic-weight helpers ----------
 
 fn varied(shape: &[i32]) -> UniquePtr<MlxArray> {
@@ -491,4 +508,79 @@ fn sigmoid_moe_gate_weights_come_from_uncorrected_scores() {
         (w_expert1 - expected_corrected).abs() > 1e-3,
         "gate weight is NOT the bias-corrected score"
     );
+}
+
+#[test]
+fn text_decode_delegates_sequence_local_native_batching() {
+    use mlxcel_core::cache::{CachePool, PagedKvLayout, SequenceId, SequenceStateLayout};
+    use mlxcel_core::generate::BatchedDecodeKind;
+    let wrapper = build_wrapper();
+    assert!(wrapper.supports_batching());
+    assert!(!wrapper.supports_padded_prefill());
+    assert_eq!(wrapper.batched_decode_kind(), BatchedDecodeKind::Native);
+    assert_eq!(
+        wrapper.sequence_state_layout(),
+        wrapper.backbone.sequence_state_layout()
+    );
+
+    let mut pool = CachePool::new(1);
+    let paged = PagedKvLayout::uniform(wrapper.num_layers(), 4, 4).unwrap();
+    let paged_id = pool
+        .allocate_with_layout(&wrapper, Some(SequenceStateLayout::paged_kv_cache(paged)))
+        .unwrap();
+    wrapper.prepare_sequence_state(paged_id);
+    let prefill = mlxcel_core::from_slice_i32(&[1, 2, 3], &[1, 3]);
+    let embeddings = wrapper.backbone.get_embed_tokens(&prefill);
+    let logits = wrapper.forward_with_embeddings_and_sequence_id(
+        &prefill,
+        Some(&embeddings),
+        Some(paged_id),
+        pool.get_caches_mut(paged_id).unwrap(),
+        None,
+    );
+    mlxcel_core::eval(&logits);
+    wrapper.sync_sequence_storage(paged_id, &mut pool).unwrap();
+    assert!(
+        pool.get_paged_state(paged_id)
+            .unwrap()
+            .layers
+            .iter()
+            .all(|layer| layer.visible_len() > 0),
+        "Step3p7 must delegate model-owned paged shadow accounting"
+    );
+    wrapper.release_sequence_state_by_id(paged_id);
+
+    let ids = [SequenceId::from_raw(701), SequenceId::from_raw(702)];
+    let mut caches = [wrapper.make_caches(), wrapper.make_caches()];
+    let mut expected = Vec::new();
+    for row in 0..2 {
+        let solo = build_wrapper();
+        let prompt = if row == 0 { vec![1, 2] } else { vec![3, 4, 5] };
+        let input = mlxcel_core::from_slice_i32(&prompt, &[1, prompt.len() as i32]);
+        wrapper.prepare_sequence_state(ids[row]);
+        let embeddings = wrapper.backbone.get_embed_tokens(&input);
+        let out = wrapper.forward_with_embeddings_and_sequence_id(
+            &input,
+            Some(&embeddings),
+            Some(ids[row]),
+            &mut caches[row],
+            None,
+        );
+        mlxcel_core::eval(&out);
+        let mut solo_cache = solo.make_caches();
+        let out = solo.forward_with_embeddings(&input, Some(&embeddings), &mut solo_cache, None);
+        mlxcel_core::eval(&out);
+        let next = mlxcel_core::from_slice_i32(&[6], &[1, 1]);
+        expected.push(solo.forward(&next, &mut solo_cache, None));
+    }
+    let next = mlxcel_core::from_slice_i32(&[6, 6], &[2, 1]);
+    let mut rows: Vec<_> = caches.iter_mut().map(Vec::as_mut_slice).collect();
+    let actual = wrapper.forward_batched_with_ids(&next, Some(&ids), &mut rows, None);
+    for (row, expected) in expected.iter().enumerate() {
+        let got = mlxcel_core::slice(&actual, &[row as i32, 0, 0], &[row as i32 + 1, 1, VOCAB]);
+        let error = mlxcel_core::max_all(&mlxcel_core::abs(&mlxcel_core::subtract(&got, expected)));
+        mlxcel_core::eval(&error);
+        assert!(mlxcel_core::item_f32(&error) <= 1e-5);
+        wrapper.release_sequence_state_by_id(ids[row]);
+    }
 }
