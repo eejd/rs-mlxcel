@@ -39,7 +39,7 @@ use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{repo_binary_path, repo_model_dir};
+use common::{TestClusterSecretFile, repo_binary_path, repo_model_dir};
 
 /// qwen3 checkpoint directory name (pool-backed Fp16, the handoff scope).
 const QWEN3_DIR: &str = "qwen3-0.6b-4bit";
@@ -77,6 +77,138 @@ const GEMMA_MODEL_ALIAS: &str = "gemma-completions";
 /// `./target/release/mlxcel download mlx-community/MiniCPM-2B-sft-4bit-llama-format-mlx`
 /// and place/symlink it at `models/minicpm-2b-4bit`.
 const MINICPM_DIR: &str = "minicpm-2b-sft-4bit-llama-format-mlx";
+
+/// One MiniCPM parity request shared by the single-node reference and the
+/// router run. A `byte_fallback` case must make single node emit a character
+/// that no vocabulary piece contains, which the model can only produce as
+/// `<0xXX>` byte-fallback tokens; the test asserts that premise on the
+/// reference output before comparing the router against it (issue #2695).
+struct MiniCpmCase {
+    prompt: &'static str,
+    byte_fallback: bool,
+}
+
+/// `/v1/completions` cases. The "café" prompt (issue #387) yields non-ASCII
+/// text, but `▁café` is one vocabulary piece, so it does not reach byte
+/// fallback; it stays as a multi-byte-in-vocabulary case. The second prompt
+/// yields " Шарик": the capital `Ш` has no vocabulary piece and is emitted as
+/// two byte tokens (single node: 6 tokens, then `</s>`).
+const MINICPM_COMPLETION_CASES: &[MiniCpmCase] = &[
+    MiniCpmCase {
+        prompt: "Spell the French word for coffee. It is café. Repeat it:",
+        byte_fallback: false,
+    },
+    MiniCpmCase {
+        prompt: "Repeat exactly: Шарик\nAnswer:",
+        byte_fallback: true,
+    },
+];
+
+/// `/v1/chat/completions` cases. The "café" turn answers "Café", a single
+/// vocabulary piece followed by `</s>` (1 token): the case that exposed the
+/// decode node ignoring the configured EOS (issue #2695). The "Чай" turn
+/// answers "Чай", whose capital `Ч` has no vocabulary piece (4 tokens, then
+/// `</s>`), so it exercises the byte-fallback count path the test is named
+/// for.
+const MINICPM_CHAT_CASES: &[MiniCpmCase] = &[
+    MiniCpmCase {
+        prompt: "Spell the French word for coffee. It is café. Repeat it:",
+        byte_fallback: false,
+    },
+    MiniCpmCase {
+        prompt: "The Russian word for tea is Чай. Repeat it:",
+        byte_fallback: true,
+    },
+];
+
+/// Non-stream and stream `/v1/completions` bodies for one MiniCPM prompt.
+fn minicpm_completion_bodies(prompt: &str) -> (serde_json::Value, serde_json::Value) {
+    let nonstream_body = serde_json::json!({
+        "model": MINICPM_COMPLETIONS_MODEL_ALIAS,
+        "prompt": prompt,
+        "max_tokens": 16,
+        "temperature": 0.0
+    });
+    let stream_body = serde_json::json!({
+        "model": MINICPM_COMPLETIONS_MODEL_ALIAS,
+        "prompt": prompt,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "stream": true,
+        "stream_options": {"include_usage": true}
+    });
+    (nonstream_body, stream_body)
+}
+
+/// Non-stream and stream `/v1/chat/completions` bodies for one MiniCPM user
+/// turn.
+fn minicpm_chat_bodies(prompt: &str) -> (serde_json::Value, serde_json::Value) {
+    let messages = serde_json::json!([{"role": "user", "content": prompt}]);
+    let nonstream_body = serde_json::json!({
+        "model": MINICPM_CHAT_MODEL_ALIAS,
+        "messages": messages,
+        "max_tokens": 16,
+        "temperature": 0.0
+    });
+    let stream_body = serde_json::json!({
+        "model": MINICPM_CHAT_MODEL_ALIAS,
+        "messages": messages,
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "stream": true,
+        "stream_options": {"include_usage": true}
+    });
+    (nonstream_body, stream_body)
+}
+
+/// Every character some non-byte vocabulary piece of the checkpoint's
+/// `tokenizer.json` contains (the SentencePiece `▁` space marker removed). A
+/// character outside this set can only be generated as `<0xXX>` byte pieces.
+fn minicpm_vocab_chars(model_dir: &std::path::Path) -> std::collections::HashSet<char> {
+    let path = model_dir.join("tokenizer.json");
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let tokenizer: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+    let vocab = tokenizer["model"]["vocab"]
+        .as_object()
+        .unwrap_or_else(|| panic!("{} has no model.vocab object", path.display()));
+    assert_eq!(
+        tokenizer["model"]["byte_fallback"],
+        serde_json::json!(true),
+        "{} must be a byte-fallback tokenizer",
+        path.display()
+    );
+    let is_byte_piece =
+        |piece: &str| piece.len() == 6 && piece.starts_with("<0x") && piece.ends_with('>');
+    vocab
+        .keys()
+        .filter(|piece| !is_byte_piece(piece))
+        .flat_map(|piece| piece.chars())
+        .filter(|&c| c != '\u{2581}')
+        .collect()
+}
+
+/// Assert the reference output of a byte-fallback case contains a character
+/// the vocabulary cannot emit as a piece, so single node generated it as
+/// `<0xXX>` byte tokens and the count parity below covers byte fallback.
+fn assert_emits_byte_fallback(
+    vocab_chars: &std::collections::HashSet<char>,
+    prompt: &str,
+    text: &str,
+) {
+    let byte_fallback: Vec<char> = text
+        .chars()
+        .filter(|c| !c.is_whitespace() && !vocab_chars.contains(c))
+        .collect();
+    assert!(
+        !byte_fallback.is_empty(),
+        "single-node MiniCPM output {text:?} for {prompt:?} contains no character \
+         outside the vocabulary, so it was generated without byte-fallback tokens. \
+         Adjust the case so the output needs `<0xXX>` byte pieces."
+    );
+    eprintln!("byte-fallback characters in {text:?}: {byte_fallback:?}");
+}
 
 /// Model alias for the MiniCPM byte-fallback CHAT usage parity test (issue
 /// #398). A distinct alias from [`GEMMA_MODEL_ALIAS`] keeps the
@@ -134,6 +266,29 @@ fn spawn_role_server(args: &[&str]) -> ChildGuard {
     )
 }
 
+/// One test's disaggregated cluster: every `--node-role prefill|decode|router`
+/// process it spawns gets the same fresh cluster secret, because each role
+/// refuses to start without one (#2655). Hybrid reference servers keep using
+/// [`spawn_role_server`] directly; they read no secret.
+struct ClusterRoles {
+    secret: TestClusterSecretFile,
+}
+
+impl ClusterRoles {
+    fn new() -> Self {
+        Self {
+            secret: TestClusterSecretFile::new(),
+        }
+    }
+
+    /// Spawn a role process with `args` plus this cluster's secret file.
+    fn spawn(&self, args: &[&str]) -> ChildGuard {
+        let mut full: Vec<&str> = args.to_vec();
+        full.extend(["--cluster-secret-file", self.secret.path_arg()]);
+        spawn_role_server(&full)
+    }
+}
+
 /// Poll-connect `addr` until it accepts a TCP connection or the deadline passes.
 async fn wait_for_tcp(addr: &str, deadline: Instant) -> bool {
     while Instant::now() < deadline {
@@ -145,10 +300,38 @@ async fn wait_for_tcp(addr: &str, deadline: Instant) -> bool {
     false
 }
 
+/// Poll the router's `GET /router/stats` until every registered peer reports
+/// `online` or the deadline passes. The router's health monitor probes its
+/// peers once at startup and then every 3 s, so a peer still loading its model
+/// then is marked down until a later probe finds it. The router re-probes a
+/// prefill node marked down before refusing a request (#2763), so this wait is
+/// no longer needed to avoid a 503; the tests keep it so a peer that is not
+/// listening yet fails here, with a clear message, rather than in a request.
+async fn wait_for_router_peers_online(http_port: &str, deadline: Instant) -> bool {
+    let client = mlxcel::http_tls::client();
+    let url = format!("http://127.0.0.1:{http_port}/router/stats");
+    while Instant::now() < deadline {
+        // Bound each request so a hung connection cannot outlast the deadline.
+        let per_request = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(5));
+        if let Ok(resp) = client.get(&url).timeout(per_request).send().await
+            && let Ok(stats) = resp.json::<serde_json::Value>().await
+            && let Some(nodes) = stats["nodes"].as_array()
+            && !nodes.is_empty()
+            && nodes.iter().all(|n| n["status"] == "online")
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    false
+}
+
 /// Poll the router's `/health` HTTP endpoint until it returns 200 or the
 /// deadline passes.
 async fn wait_for_http_health(url: &str, deadline: Instant) -> bool {
-    let client = reqwest::Client::new();
+    let client = mlxcel::http_tls::client();
     while Instant::now() < deadline {
         if let Ok(resp) = client.get(url).send().await
             && resp.status().is_success()
@@ -190,9 +373,10 @@ async fn disaggregated_router_streams_correct_output() {
     let decode_serving_addr = format!("127.0.0.1:{}", ports[4]);
     let router_serving_addr = format!("127.0.0.1:{}", ports[5]);
     let model_arg = model_dir.to_string_lossy().to_string();
+    let roles = ClusterRoles::new();
 
     // Spawn decode first so it is ready before prefill starts handing off.
-    let _decode = spawn_role_server(&[
+    let _decode = roles.spawn(&[
         "-m",
         &model_arg,
         "--host",
@@ -211,7 +395,7 @@ async fn disaggregated_router_streams_correct_output() {
         &decode_serving_addr,
         "--no-warmup",
     ]);
-    let _prefill = spawn_role_server(&[
+    let _prefill = roles.spawn(&[
         "-m",
         &model_arg,
         "--host",
@@ -235,7 +419,7 @@ async fn disaggregated_router_streams_correct_output() {
     // The router needs a model path for the tokenizer and chat template but
     // does NOT load weights; --no-warmup is still needed so it does not try
     // to warm up a model.
-    let _router = spawn_role_server(&[
+    let _router = roles.spawn(&[
         "-m",
         &model_arg,
         "--host",
@@ -270,9 +454,13 @@ async fn disaggregated_router_streams_correct_output() {
         wait_for_http_health(&health_url, deadline).await,
         "router HTTP /health never returned 200 at {health_url}"
     );
+    assert!(
+        wait_for_router_peers_online(&router_http, deadline).await,
+        "the router never saw every peer online"
+    );
 
     // POST a streaming chat-completions request to the router.
-    let client = reqwest::Client::new();
+    let client = mlxcel::http_tls::client();
     let chat_url = format!("http://127.0.0.1:{router_http}/v1/chat/completions");
     let response = client
         .post(&chat_url)
@@ -361,6 +549,57 @@ fn parse_sse_deltas(body: &str) -> (String, String) {
     (content, reasoning)
 }
 
+/// The `delta.reasoning_only` of an SSE body's finish chunk (the chunk that
+/// carries `finish_reason`), `Null` when the field is absent (#2729).
+fn sse_finish_reasoning_only(body: &str) -> serde_json::Value {
+    body.lines()
+        .filter_map(|line| line.trim().strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .find(|v| v["choices"][0]["finish_reason"].is_string())
+        .map(|v| v["choices"][0]["delta"]["reasoning_only"].clone())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// The token budget of the thinking test's long turn (#2729): enough for
+/// qwen3-0.6b to close its thinking block and answer "What is 2 + 2?".
+const LONG_MAX_TOKENS: u64 = 1024;
+
+/// POST a chat body to the server on `http_port` and return the response text
+/// (an SSE body for a streamed request).
+async fn post_chat_text(
+    client: &reqwest::Client,
+    http_port: &str,
+    body: &serde_json::Value,
+) -> String {
+    let response = client
+        .post(format!("http://127.0.0.1:{http_port}/v1/chat/completions"))
+        .json(body)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("POST to port {http_port}: {e}"));
+    assert!(
+        response.status().is_success(),
+        "port {http_port} returned {}",
+        response.status()
+    );
+    response
+        .text()
+        .await
+        .unwrap_or_else(|e| panic!("read body from port {http_port}: {e}"))
+}
+
+/// [`post_chat_text`] for a non-stream body, parsed as JSON.
+async fn post_chat_json(
+    client: &reqwest::Client,
+    http_port: &str,
+    body: &serde_json::Value,
+) -> serde_json::Value {
+    let text = post_chat_text(client, http_port, body).await;
+    serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("parse JSON from port {http_port}: {e}: {text}"))
+}
+
 /// Issue #198: a THINKING-ENABLED request through the disaggregated router
 /// must produce the same `content` / `reasoning_content` split as the
 /// single-node chat route, with no structural markers (`<think>`) leaking
@@ -382,6 +621,7 @@ async fn disaggregated_router_filters_thinking_output() {
         return;
     }
     let model_arg = model_dir.to_string_lossy().to_string();
+    let roles = ClusterRoles::new();
     let request_body = serde_json::json!({
         "model": "qwen3",
         "messages": [{"role": "user", "content": "What is 2 + 2?"}],
@@ -390,10 +630,21 @@ async fn disaggregated_router_filters_thinking_output() {
         "max_tokens": 32,
         "chat_template_kwargs": {"enable_thinking": true}
     });
-    let client = reqwest::Client::new();
+    // The same turn without streaming (#2715): the router's non-stream reply
+    // must carry single node's non-stream `content` and `reasoning_content`.
+    let mut nonstream_body = request_body.clone();
+    nonstream_body["stream"] = serde_json::json!(false);
+    // #2729: the same turn with room to close the thinking block, so both
+    // `content` and `reasoning_content` are non-empty and the reasoning /
+    // answer split is compared between two real processes.
+    let mut long_body = request_body.clone();
+    long_body["max_tokens"] = serde_json::json!(LONG_MAX_TOKENS);
+    let mut long_nonstream_body = long_body.clone();
+    long_nonstream_body["stream"] = serde_json::json!(false);
+    let client = mlxcel::http_tls::client();
 
     // ---- Single-node hybrid reference ----
-    let (ref_content, ref_reasoning) = {
+    let (ref_body, ref_nonstream, ref_long_body, ref_long_nonstream) = {
         let ports = reserve_ports(1);
         let hybrid_http = ports[0].to_string();
         let _hybrid = spawn_role_server(&[
@@ -421,9 +672,28 @@ async fn disaggregated_router_filters_thinking_output() {
             .expect("POST to hybrid reference");
         assert!(response.status().is_success(), "hybrid returned an error");
         let body = response.text().await.expect("read hybrid SSE body");
-        parse_sse_deltas(&body)
+        let ns_response = client
+            .post(format!(
+                "http://127.0.0.1:{hybrid_http}/v1/chat/completions"
+            ))
+            .json(&nonstream_body)
+            .send()
+            .await
+            .expect("POST non-stream to hybrid reference");
+        assert!(
+            ns_response.status().is_success(),
+            "hybrid non-stream returned an error"
+        );
+        let ns_json = ns_response
+            .json::<serde_json::Value>()
+            .await
+            .expect("parse hybrid non-stream JSON");
+        let long_sse = post_chat_text(&client, &hybrid_http, &long_body).await;
+        let long_ns_json = post_chat_json(&client, &hybrid_http, &long_nonstream_body).await;
+        (body, ns_json, long_sse, long_ns_json)
         // _hybrid drops here, killing the reference server.
     };
+    let (ref_content, ref_reasoning) = parse_sse_deltas(&ref_body);
     eprintln!(
         "hybrid reference: content={ref_content:?} reasoning ({} chars)",
         ref_reasoning.len()
@@ -433,6 +703,58 @@ async fn disaggregated_router_filters_thinking_output() {
         "thinking-enabled hybrid reference produced no reasoning_content; \
          the parity comparison would be vacuous"
     );
+    let ref_ns_message = &ref_nonstream["choices"][0]["message"];
+    eprintln!("hybrid non-stream reference message: {ref_ns_message}");
+    assert!(
+        ref_ns_message["reasoning_content"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()),
+        "thinking-enabled hybrid non-stream reference produced no reasoning_content; \
+         the non-stream parity comparison would be vacuous"
+    );
+    // #2729: the 32-token turn is expected to end mid-thought, so single node
+    // marks both the non-stream message and the stream finish chunk
+    // `reasoning_only: true`. If a model or template change closes thinking
+    // within 32 tokens, the router-equals-reference checks would be vacuous.
+    assert_eq!(
+        ref_ns_message["reasoning_only"],
+        serde_json::Value::Bool(true),
+        "single-node 32-token non-stream reply is not reasoning_only; the turn is expected to \
+         end mid-thought, so the reasoning_only parity check would be vacuous"
+    );
+    assert_eq!(
+        sse_finish_reasoning_only(&ref_body),
+        serde_json::Value::Bool(true),
+        "single-node 32-token stream finish chunk is not reasoning_only; the turn is expected to \
+         end mid-thought, so the reasoning_only parity check would be vacuous"
+    );
+    // #2729: the long turn must have closed its thinking block on single node,
+    // or the reasoning / answer comparison below would be vacuous.
+    let ref_long_message = &ref_long_nonstream["choices"][0]["message"];
+    eprintln!("hybrid long non-stream reference message: {ref_long_message}");
+    let ref_long_deltas = parse_sse_deltas(&ref_long_body);
+    for (label, content, reasoning) in [
+        (
+            "non-stream",
+            ref_long_message["content"].as_str().unwrap_or_default(),
+            ref_long_message["reasoning_content"]
+                .as_str()
+                .unwrap_or_default(),
+        ),
+        (
+            "stream",
+            ref_long_deltas.0.as_str(),
+            ref_long_deltas.1.as_str(),
+        ),
+    ] {
+        assert!(
+            !content.is_empty() && !reasoning.is_empty(),
+            "the {LONG_MAX_TOKENS}-token {label} reference must carry both content and \
+             reasoning_content (content {content:?}, reasoning {} chars); if the model did \
+             not finish thinking, raise LONG_MAX_TOKENS",
+            reasoning.len()
+        );
+    }
 
     // ---- Three-process disaggregated router run ----
     let ports = reserve_ports(6);
@@ -443,7 +765,7 @@ async fn disaggregated_router_filters_thinking_output() {
     let decode_serving_addr = format!("127.0.0.1:{}", ports[4]);
     let router_serving_addr = format!("127.0.0.1:{}", ports[5]);
 
-    let _decode = spawn_role_server(&[
+    let _decode = roles.spawn(&[
         "-m",
         &model_arg,
         "--host",
@@ -462,7 +784,7 @@ async fn disaggregated_router_filters_thinking_output() {
         &decode_serving_addr,
         "--no-warmup",
     ]);
-    let _prefill = spawn_role_server(&[
+    let _prefill = roles.spawn(&[
         "-m",
         &model_arg,
         "--host",
@@ -483,7 +805,7 @@ async fn disaggregated_router_filters_thinking_output() {
         &decode_serving_addr,
         "--no-warmup",
     ]);
-    let _router = spawn_role_server(&[
+    let _router = roles.spawn(&[
         "-m",
         &model_arg,
         "--host",
@@ -514,6 +836,10 @@ async fn disaggregated_router_filters_thinking_output() {
     assert!(
         wait_for_http_health(&health_url, deadline).await,
         "router HTTP /health never returned 200"
+    );
+    assert!(
+        wait_for_router_peers_online(&router_http, deadline).await,
+        "the router never saw every peer online"
     );
 
     let response = client
@@ -547,6 +873,68 @@ async fn disaggregated_router_filters_thinking_output() {
     assert_eq!(
         content, ref_content,
         "router content does not match the single-node chat route"
+    );
+    // #2729: the finish chunk's `reasoning_only` matches single node's.
+    assert_eq!(
+        sse_finish_reasoning_only(&body),
+        sse_finish_reasoning_only(&ref_body),
+        "router stream finish chunk reasoning_only does not match the single-node chat route"
+    );
+
+    // Non-stream parity (#2715): the router shapes the reply with the same
+    // helper as single node, so both fields match byte for byte.
+    let ns_response = client
+        .post(format!(
+            "http://127.0.0.1:{router_http}/v1/chat/completions"
+        ))
+        .json(&nonstream_body)
+        .send()
+        .await
+        .expect("POST non-stream to router");
+    assert!(
+        ns_response.status().is_success(),
+        "router non-stream returned an error"
+    );
+    let router_ns = ns_response
+        .json::<serde_json::Value>()
+        .await
+        .expect("parse router non-stream JSON");
+    let router_ns_message = &router_ns["choices"][0]["message"];
+    eprintln!("router non-stream message: {router_ns_message}");
+    assert_eq!(
+        router_ns_message["content"], ref_ns_message["content"],
+        "router non-stream content does not match the single-node chat route"
+    );
+    assert_eq!(
+        router_ns_message["reasoning_content"], ref_ns_message["reasoning_content"],
+        "router non-stream reasoning_content does not match the single-node chat route"
+    );
+    // #2729: the 32-token turn never closes `</think>`, so single node marks
+    // it `reasoning_only: true`; the router must carry the same flag.
+    assert_eq!(
+        router_ns_message["reasoning_only"], ref_ns_message["reasoning_only"],
+        "router non-stream reasoning_only does not match the single-node chat route"
+    );
+
+    // #2729: the long turn's reasoning / answer split, non-stream and stream.
+    let router_long_ns = post_chat_json(&client, &router_http, &long_nonstream_body).await;
+    let router_long_message = &router_long_ns["choices"][0]["message"];
+    eprintln!("router long non-stream message: {router_long_message}");
+    assert_eq!(
+        router_long_message["content"], ref_long_message["content"],
+        "router {LONG_MAX_TOKENS}-token non-stream content does not match the single-node chat route"
+    );
+    assert_eq!(
+        router_long_message["reasoning_content"], ref_long_message["reasoning_content"],
+        "router {LONG_MAX_TOKENS}-token non-stream reasoning_content does not match the \
+         single-node chat route"
+    );
+    let router_long_body = post_chat_text(&client, &router_http, &long_body).await;
+    assert_eq!(
+        parse_sse_deltas(&router_long_body),
+        ref_long_deltas,
+        "router {LONG_MAX_TOKENS}-token streamed (content, reasoning_content) does not match \
+         the single-node chat route"
     );
     eprintln!("OK: router thinking-enabled output matches the single-node split.");
 }
@@ -619,6 +1007,7 @@ async fn disaggregated_router_completions_match_single_node() {
         return;
     }
     let model_arg = model_dir.to_string_lossy().to_string();
+    let roles = ClusterRoles::new();
     let prompt = "The capital of France is";
     let nonstream_body = serde_json::json!({
         "model": COMPLETION_MODEL_ALIAS,
@@ -633,7 +1022,7 @@ async fn disaggregated_router_completions_match_single_node() {
         "temperature": 0.0,
         "stream": true
     });
-    let client = reqwest::Client::new();
+    let client = mlxcel::http_tls::client();
 
     // ---- Single-node reference (started with --alias for model parity) ----
     let (ref_nonstream, ref_stream_chunks) = {
@@ -714,7 +1103,7 @@ async fn disaggregated_router_completions_match_single_node() {
     let decode_serving_addr = format!("127.0.0.1:{}", ports[4]);
     let router_serving_addr = format!("127.0.0.1:{}", ports[5]);
 
-    let _decode = spawn_role_server(&[
+    let _decode = roles.spawn(&[
         "-m",
         &model_arg,
         "--host",
@@ -733,7 +1122,7 @@ async fn disaggregated_router_completions_match_single_node() {
         &decode_serving_addr,
         "--no-warmup",
     ]);
-    let _prefill = spawn_role_server(&[
+    let _prefill = roles.spawn(&[
         "-m",
         &model_arg,
         "--host",
@@ -754,7 +1143,7 @@ async fn disaggregated_router_completions_match_single_node() {
         &decode_serving_addr,
         "--no-warmup",
     ]);
-    let _router = spawn_role_server(&[
+    let _router = roles.spawn(&[
         "-m",
         &model_arg,
         "--host",
@@ -785,6 +1174,10 @@ async fn disaggregated_router_completions_match_single_node() {
     assert!(
         wait_for_http_health(&health_url, deadline).await,
         "router HTTP /health never returned 200"
+    );
+    assert!(
+        wait_for_router_peers_online(&router_http, deadline).await,
+        "the router never saw every peer online"
     );
     let router_completions_url = format!("http://127.0.0.1:{router_http}/v1/completions");
 
@@ -846,10 +1239,13 @@ async fn disaggregated_router_completions_match_single_node() {
 /// worker's authoritative token count carried over the wire
 /// (`ResultFrame.generated_tokens`), the router reports the exact count.
 ///
-/// The prompt forces the multi-byte `é` in "café" into the output so the byte-
-/// fallback path is actually exercised; the full body is compared byte-for-byte
-/// (normalizing only the volatile `id` / `created`), and `usage.completion_tokens`
-/// plus `finish_reason` are asserted explicitly for a clear failure message.
+/// Each of [`MINICPM_COMPLETION_CASES`] is compared: the full body
+/// byte-for-byte (normalizing only the volatile `id` / `created`), with
+/// `usage.completion_tokens` plus `finish_reason` asserted explicitly for a
+/// clear failure message. The original "café" prompt never reached byte
+/// fallback (`▁café` is one vocabulary piece), so a second case whose output
+/// needs `<0xXX>` pieces was added, and its premise is checked against the
+/// checkpoint's vocabulary (issue #2695).
 ///
 /// Retargeted from Gemma to MiniCPM-2B (issue #708): the original fixture used
 /// [`GEMMA_DIR`], but gemma3 is a model-owned paged family the disaggregated
@@ -880,27 +1276,14 @@ async fn disaggregated_router_completions_match_single_node_byte_fallback() {
         return;
     }
     let model_arg = model_dir.to_string_lossy().to_string();
-    // A prompt that forces the multi-byte `é` (a byte-fallback `<0xXX>`
-    // sequence) into the greedy continuation so the count fix is exercised.
-    let prompt = "Spell the French word for coffee. It is café. Repeat it:";
-    let nonstream_body = serde_json::json!({
-        "model": MINICPM_COMPLETIONS_MODEL_ALIAS,
-        "prompt": prompt,
-        "max_tokens": 16,
-        "temperature": 0.0
-    });
-    let stream_body = serde_json::json!({
-        "model": MINICPM_COMPLETIONS_MODEL_ALIAS,
-        "prompt": prompt,
-        "max_tokens": 16,
-        "temperature": 0.0,
-        "stream": true,
-        "stream_options": {"include_usage": true}
-    });
-    let client = reqwest::Client::new();
+    let roles = ClusterRoles::new();
+    let client = mlxcel::http_tls::client();
+    // The characters this checkpoint's vocabulary can emit without `<0xXX>`
+    // byte pieces, used to prove a case really exercises byte fallback.
+    let vocab_chars = minicpm_vocab_chars(&model_dir);
 
     // ---- Single-node reference (started with --alias for model parity) ----
-    let (ref_nonstream, ref_stream_chunks) = {
+    let references: Vec<(serde_json::Value, Vec<serde_json::Value>)> = {
         let ports = reserve_ports(1);
         let http = ports[0].to_string();
         let _single = spawn_role_server(&[
@@ -922,55 +1305,65 @@ async fn disaggregated_router_completions_match_single_node_byte_fallback() {
         );
         let completions_url = format!("http://127.0.0.1:{http}/v1/completions");
 
-        let ns_resp = client
-            .post(&completions_url)
-            .json(&nonstream_body)
-            .send()
-            .await
-            .expect("POST single-node /v1/completions (non-stream)");
-        assert!(
-            ns_resp.status().is_success(),
-            "single-node non-stream completion returned HTTP {}",
-            ns_resp.status()
-        );
-        let ns_json = ns_resp
-            .json::<serde_json::Value>()
-            .await
-            .expect("parse single-node non-stream completion JSON");
+        let mut references = Vec::new();
+        for case in MINICPM_COMPLETION_CASES {
+            let (nonstream_body, stream_body) = minicpm_completion_bodies(case.prompt);
+            let ns_resp = client
+                .post(&completions_url)
+                .json(&nonstream_body)
+                .send()
+                .await
+                .expect("POST single-node /v1/completions (non-stream)");
+            assert!(
+                ns_resp.status().is_success(),
+                "single-node non-stream completion returned HTTP {}",
+                ns_resp.status()
+            );
+            let ns_json = ns_resp
+                .json::<serde_json::Value>()
+                .await
+                .expect("parse single-node non-stream completion JSON");
 
-        let st_resp = client
-            .post(&completions_url)
-            .json(&stream_body)
-            .send()
-            .await
-            .expect("POST single-node /v1/completions (stream)");
-        assert!(
-            st_resp.status().is_success(),
-            "single-node stream completion returned HTTP {}",
-            st_resp.status()
-        );
-        let st_body = st_resp.text().await.expect("read single-node SSE body");
+            let st_resp = client
+                .post(&completions_url)
+                .json(&stream_body)
+                .send()
+                .await
+                .expect("POST single-node /v1/completions (stream)");
+            assert!(
+                st_resp.status().is_success(),
+                "single-node stream completion returned HTTP {}",
+                st_resp.status()
+            );
+            let st_body = st_resp.text().await.expect("read single-node SSE body");
 
-        (
-            normalize_completion(ns_json),
-            parse_completion_chunks(&st_body),
-        )
+            references.push((
+                normalize_completion(ns_json),
+                parse_completion_chunks(&st_body),
+            ));
+        }
+        references
         // _single drops here, killing the reference server.
     };
-    eprintln!("single-node MiniCPM non-stream reference: {ref_nonstream}");
-    let ref_text = ref_nonstream["choices"][0]["text"].as_str().unwrap_or("");
-    assert!(
-        !ref_text.is_empty(),
-        "single-node MiniCPM reference produced empty completion text; parity check would be vacuous"
-    );
-    // Guard the test's premise: the byte-fallback path is only exercised if the
-    // greedy output actually contains a multi-byte character.
-    assert!(
-        !ref_text.is_ascii(),
-        "single-node MiniCPM output {ref_text:?} is pure ASCII; the byte-fallback \
-         count path is not exercised. Adjust the prompt so the output contains a \
-         multi-byte character."
-    );
+    for (case, (ref_nonstream, _)) in MINICPM_COMPLETION_CASES.iter().zip(&references) {
+        eprintln!("single-node MiniCPM non-stream reference: {ref_nonstream}");
+        let ref_text = ref_nonstream["choices"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            !ref_text.is_empty(),
+            "single-node MiniCPM reference produced empty completion text; parity check would be vacuous"
+        );
+        // Guard the test's premise: the byte-fallback path is only exercised if the
+        // greedy output actually contains a multi-byte character.
+        assert!(
+            !ref_text.is_ascii(),
+            "single-node MiniCPM output {ref_text:?} is pure ASCII; the byte-fallback \
+             count path is not exercised. Adjust the prompt so the output contains a \
+             multi-byte character."
+        );
+        if case.byte_fallback {
+            assert_emits_byte_fallback(&vocab_chars, case.prompt, ref_text);
+        }
+    }
 
     // ---- Three-process disaggregated router run ----
     let ports = reserve_ports(6);
@@ -981,7 +1374,7 @@ async fn disaggregated_router_completions_match_single_node_byte_fallback() {
     let decode_serving_addr = format!("127.0.0.1:{}", ports[4]);
     let router_serving_addr = format!("127.0.0.1:{}", ports[5]);
 
-    let _decode = spawn_role_server(&[
+    let _decode = roles.spawn(&[
         "-m",
         &model_arg,
         "--host",
@@ -1000,7 +1393,7 @@ async fn disaggregated_router_completions_match_single_node_byte_fallback() {
         &decode_serving_addr,
         "--no-warmup",
     ]);
-    let _prefill = spawn_role_server(&[
+    let _prefill = roles.spawn(&[
         "-m",
         &model_arg,
         "--host",
@@ -1021,7 +1414,7 @@ async fn disaggregated_router_completions_match_single_node_byte_fallback() {
         &decode_serving_addr,
         "--no-warmup",
     ]);
-    let _router = spawn_role_server(&[
+    let _router = roles.spawn(&[
         "-m",
         &model_arg,
         "--host",
@@ -1053,58 +1446,68 @@ async fn disaggregated_router_completions_match_single_node_byte_fallback() {
         wait_for_http_health(&health_url, deadline).await,
         "router HTTP /health never returned 200"
     );
+    assert!(
+        wait_for_router_peers_online(&router_http, deadline).await,
+        "the router never saw every peer online"
+    );
     let router_completions_url = format!("http://127.0.0.1:{router_http}/v1/completions");
 
-    // Non-streaming parity: usage.completion_tokens + finish_reason must match.
-    let router_ns_resp = client
-        .post(&router_completions_url)
-        .json(&nonstream_body)
-        .send()
-        .await
-        .expect("POST router /v1/completions (non-stream)");
-    assert!(
-        router_ns_resp.status().is_success(),
-        "router non-stream completion returned HTTP {}",
-        router_ns_resp.status()
-    );
-    let router_ns = normalize_completion(
-        router_ns_resp
-            .json::<serde_json::Value>()
+    for (case, (ref_nonstream, ref_stream_chunks)) in
+        MINICPM_COMPLETION_CASES.iter().zip(references)
+    {
+        eprintln!("MiniCPM completions case: {:?}", case.prompt);
+        let (nonstream_body, stream_body) = minicpm_completion_bodies(case.prompt);
+        // Non-streaming parity: usage.completion_tokens + finish_reason must match.
+        let router_ns_resp = client
+            .post(&router_completions_url)
+            .json(&nonstream_body)
+            .send()
             .await
-            .expect("parse router non-stream completion JSON"),
-    );
-    eprintln!("router MiniCPM non-stream: {router_ns}");
-    assert_eq!(
-        router_ns["usage"]["completion_tokens"], ref_nonstream["usage"]["completion_tokens"],
-        "router usage.completion_tokens diverges from single-node for a byte-fallback tokenizer"
-    );
-    assert_eq!(
-        router_ns["choices"][0]["finish_reason"], ref_nonstream["choices"][0]["finish_reason"],
-        "router finish_reason diverges from single-node for a byte-fallback tokenizer"
-    );
-    assert_eq!(
-        router_ns, ref_nonstream,
-        "router non-stream /v1/completions body is not byte-identical to single-node (MiniCPM)"
-    );
+            .expect("POST router /v1/completions (non-stream)");
+        assert!(
+            router_ns_resp.status().is_success(),
+            "router non-stream completion returned HTTP {}",
+            router_ns_resp.status()
+        );
+        let router_ns = normalize_completion(
+            router_ns_resp
+                .json::<serde_json::Value>()
+                .await
+                .expect("parse router non-stream completion JSON"),
+        );
+        eprintln!("router MiniCPM non-stream: {router_ns}");
+        assert_eq!(
+            router_ns["usage"]["completion_tokens"], ref_nonstream["usage"]["completion_tokens"],
+            "router usage.completion_tokens diverges from single-node for a byte-fallback tokenizer"
+        );
+        assert_eq!(
+            router_ns["choices"][0]["finish_reason"], ref_nonstream["choices"][0]["finish_reason"],
+            "router finish_reason diverges from single-node for a byte-fallback tokenizer"
+        );
+        assert_eq!(
+            router_ns, ref_nonstream,
+            "router non-stream /v1/completions body is not byte-identical to single-node (MiniCPM)"
+        );
 
-    // Streaming parity: the usage chunk and finish chunk must match too.
-    let router_st_resp = client
-        .post(&router_completions_url)
-        .json(&stream_body)
-        .send()
-        .await
-        .expect("POST router /v1/completions (stream)");
-    assert!(
-        router_st_resp.status().is_success(),
-        "router stream completion returned HTTP {}",
-        router_st_resp.status()
-    );
-    let router_st_body = router_st_resp.text().await.expect("read router SSE body");
-    let router_st_chunks = parse_completion_chunks(&router_st_body);
-    assert_eq!(
-        router_st_chunks, ref_stream_chunks,
-        "router stream /v1/completions chunks are not byte-identical to single-node (MiniCPM)"
-    );
+        // Streaming parity: the usage chunk and finish chunk must match too.
+        let router_st_resp = client
+            .post(&router_completions_url)
+            .json(&stream_body)
+            .send()
+            .await
+            .expect("POST router /v1/completions (stream)");
+        assert!(
+            router_st_resp.status().is_success(),
+            "router stream completion returned HTTP {}",
+            router_st_resp.status()
+        );
+        let router_st_body = router_st_resp.text().await.expect("read router SSE body");
+        let router_st_chunks = parse_completion_chunks(&router_st_body);
+        assert_eq!(
+            router_st_chunks, ref_stream_chunks,
+            "router stream /v1/completions chunks are not byte-identical to single-node (MiniCPM)"
+        );
+    }
     eprintln!(
         "OK: router /v1/completions matches single-node for a byte-fallback tokenizer \
          (usage + finish_reason)."
@@ -1118,15 +1521,21 @@ async fn disaggregated_router_completions_match_single_node_byte_fallback() {
 /// BYTE-FALLBACK tokenizer (MiniCPM-2B, llama-format export). Before this fix
 /// the router chat path never emitted `usage` at all.
 ///
-/// Reuses the same byte-fallback prompt idea as
-/// `disaggregated_router_completions_match_single_node_byte_fallback` (issue
-/// #387) so the authoritative wire-carried token count is exercised end to
-/// end: with a byte-fallback SentencePiece tokenizer, a multi-byte character
-/// missing from the vocab is emitted as several `<0xXX>` byte-fallback model
-/// tokens that surface as a single detokenized text piece, so a naive
-/// emitted-piece count would under-count `completion_tokens` (the divergence
-/// itself is pinned by the `resolve_completion_tokens` unit tests). Gemma
-/// cannot serve as the fixture — see [`MINICPM_DIR`].
+/// Runs every case in [`MINICPM_CHAT_CASES`] so the authoritative
+/// wire-carried token count is exercised end to end: with a byte-fallback
+/// SentencePiece tokenizer, a multi-byte character missing from the vocab is
+/// emitted as several `<0xXX>` byte-fallback model tokens that surface as a
+/// single detokenized text piece, so a naive emitted-piece count would
+/// under-count `completion_tokens` (the divergence itself is pinned by the
+/// `resolve_completion_tokens` unit tests). The "Чай" case is the one that
+/// reaches byte fallback, checked against the checkpoint's vocabulary; the
+/// "café" case answers with one vocabulary piece and then `</s>`, which pins
+/// the decode node's configured-EOS stop (issue #2695). Each case also pins
+/// `message.content` (non-stream) and the concatenated `delta.content`
+/// (stream) to single node's bytes: single node trims the non-stream reply's
+/// SentencePiece leading space (`" Café"` -> `"Café"`), and the router used to
+/// return it untrimmed (issue #2715). Gemma cannot serve as the fixture: see
+/// [`MINICPM_DIR`].
 ///
 /// Gated like the other real-model tests: `#[ignore]` plus a checkpoint-presence
 /// guard that skips cleanly when the MiniCPM checkpoint is absent.
@@ -1150,30 +1559,14 @@ async fn disaggregated_router_chat_usage_matches_single_node_byte_fallback() {
         return;
     }
     let model_arg = model_dir.to_string_lossy().to_string();
-    // Same byte-fallback-forcing prompt as the completions parity test above,
-    // phrased as a chat turn.
-    let messages = serde_json::json!([{
-        "role": "user",
-        "content": "Spell the French word for coffee. It is café. Repeat it:"
-    }]);
-    let nonstream_body = serde_json::json!({
-        "model": MINICPM_CHAT_MODEL_ALIAS,
-        "messages": messages,
-        "max_tokens": 16,
-        "temperature": 0.0
-    });
-    let stream_body = serde_json::json!({
-        "model": MINICPM_CHAT_MODEL_ALIAS,
-        "messages": messages,
-        "max_tokens": 16,
-        "temperature": 0.0,
-        "stream": true,
-        "stream_options": {"include_usage": true}
-    });
-    let client = reqwest::Client::new();
+    let roles = ClusterRoles::new();
+    let client = mlxcel::http_tls::client();
+    // See the completions twin: proves a case really exercises byte fallback.
+    let vocab_chars = minicpm_vocab_chars(&model_dir);
 
     // ---- Single-node reference (started with --alias for model parity) ----
-    let (ref_nonstream, ref_usage_chunk) = {
+    // (non-stream body, stream usage chunk, concatenated stream `delta.content`)
+    let references: Vec<(serde_json::Value, serde_json::Value, String)> = {
         let ports = reserve_ports(1);
         let http = ports[0].to_string();
         let _single = spawn_role_server(&[
@@ -1195,65 +1588,76 @@ async fn disaggregated_router_chat_usage_matches_single_node_byte_fallback() {
         );
         let chat_url = format!("http://127.0.0.1:{http}/v1/chat/completions");
 
-        let ns_resp = client
-            .post(&chat_url)
-            .json(&nonstream_body)
-            .send()
-            .await
-            .expect("POST single-node /v1/chat/completions (non-stream)");
-        assert!(
-            ns_resp.status().is_success(),
-            "single-node non-stream chat completion returned HTTP {}",
-            ns_resp.status()
-        );
-        let ns_json = ns_resp
-            .json::<serde_json::Value>()
-            .await
-            .expect("parse single-node non-stream chat completion JSON");
+        let mut references = Vec::new();
+        for case in MINICPM_CHAT_CASES {
+            let (nonstream_body, stream_body) = minicpm_chat_bodies(case.prompt);
+            let ns_resp = client
+                .post(&chat_url)
+                .json(&nonstream_body)
+                .send()
+                .await
+                .expect("POST single-node /v1/chat/completions (non-stream)");
+            assert!(
+                ns_resp.status().is_success(),
+                "single-node non-stream chat completion returned HTTP {}",
+                ns_resp.status()
+            );
+            let ns_json = ns_resp
+                .json::<serde_json::Value>()
+                .await
+                .expect("parse single-node non-stream chat completion JSON");
 
-        let st_resp = client
-            .post(&chat_url)
-            .json(&stream_body)
-            .send()
-            .await
-            .expect("POST single-node /v1/chat/completions (stream)");
-        assert!(
-            st_resp.status().is_success(),
-            "single-node stream chat completion returned HTTP {}",
-            st_resp.status()
-        );
-        let st_body = st_resp.text().await.expect("read single-node SSE body");
-        let st_chunks = parse_completion_chunks(&st_body);
-        let usage_chunk = st_chunks
-            .iter()
-            .find(|c| !c["usage"].is_null())
-            .cloned()
-            .expect("single-node chat stream must carry a final usage chunk");
+            let st_resp = client
+                .post(&chat_url)
+                .json(&stream_body)
+                .send()
+                .await
+                .expect("POST single-node /v1/chat/completions (stream)");
+            assert!(
+                st_resp.status().is_success(),
+                "single-node stream chat completion returned HTTP {}",
+                st_resp.status()
+            );
+            let st_body = st_resp.text().await.expect("read single-node SSE body");
+            let st_chunks = parse_completion_chunks(&st_body);
+            let usage_chunk = st_chunks
+                .iter()
+                .find(|c| !c["usage"].is_null())
+                .cloned()
+                .expect("single-node chat stream must carry a final usage chunk");
+            let (st_content, _) = parse_sse_deltas(&st_body);
 
-        (ns_json, usage_chunk)
+            references.push((ns_json, usage_chunk, st_content));
+        }
+        references
         // _single drops here, killing the reference server.
     };
-    eprintln!("single-node MiniCPM chat non-stream reference: {ref_nonstream}");
-    let ref_text = ref_nonstream["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("");
-    assert!(
-        !ref_text.is_empty(),
-        "single-node MiniCPM chat reference produced empty content; parity check would be vacuous"
-    );
-    // Guard the test's premise: the byte-fallback path is only exercised if the
-    // greedy output actually contains a multi-byte character.
-    assert!(
-        !ref_text.is_ascii(),
-        "single-node MiniCPM chat output {ref_text:?} is pure ASCII; the byte-fallback \
-         count path is not exercised. Adjust the prompt so the output contains a \
-         multi-byte character."
-    );
-    assert!(
-        !ref_nonstream["usage"].is_null(),
-        "single-node chat non-stream response must carry a usage object; \
-         parity check would be vacuous"
-    );
+    for (case, (ref_nonstream, _, _)) in MINICPM_CHAT_CASES.iter().zip(&references) {
+        eprintln!("single-node MiniCPM chat non-stream reference: {ref_nonstream}");
+        let ref_text = ref_nonstream["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !ref_text.is_empty(),
+            "single-node MiniCPM chat reference produced empty content; parity check would be vacuous"
+        );
+        // Guard the test's premise: the byte-fallback path is only exercised if the
+        // greedy output actually contains a multi-byte character.
+        assert!(
+            !ref_text.is_ascii(),
+            "single-node MiniCPM chat output {ref_text:?} is pure ASCII; the byte-fallback \
+             count path is not exercised. Adjust the prompt so the output contains a \
+             multi-byte character."
+        );
+        assert!(
+            !ref_nonstream["usage"].is_null(),
+            "single-node chat non-stream response must carry a usage object; \
+             parity check would be vacuous"
+        );
+        if case.byte_fallback {
+            assert_emits_byte_fallback(&vocab_chars, case.prompt, ref_text);
+        }
+    }
 
     // ---- Three-process disaggregated router run ----
     let ports = reserve_ports(6);
@@ -1264,7 +1668,7 @@ async fn disaggregated_router_chat_usage_matches_single_node_byte_fallback() {
     let decode_serving_addr = format!("127.0.0.1:{}", ports[4]);
     let router_serving_addr = format!("127.0.0.1:{}", ports[5]);
 
-    let _decode = spawn_role_server(&[
+    let _decode = roles.spawn(&[
         "-m",
         &model_arg,
         "--host",
@@ -1283,7 +1687,7 @@ async fn disaggregated_router_chat_usage_matches_single_node_byte_fallback() {
         &decode_serving_addr,
         "--no-warmup",
     ]);
-    let _prefill = spawn_role_server(&[
+    let _prefill = roles.spawn(&[
         "-m",
         &model_arg,
         "--host",
@@ -1304,7 +1708,7 @@ async fn disaggregated_router_chat_usage_matches_single_node_byte_fallback() {
         &decode_serving_addr,
         "--no-warmup",
     ]);
-    let _router = spawn_role_server(&[
+    let _router = roles.spawn(&[
         "-m",
         &model_arg,
         "--host",
@@ -1336,93 +1740,127 @@ async fn disaggregated_router_chat_usage_matches_single_node_byte_fallback() {
         wait_for_http_health(&health_url, deadline).await,
         "router HTTP /health never returned 200"
     );
+    assert!(
+        wait_for_router_peers_online(&router_http, deadline).await,
+        "the router never saw every peer online"
+    );
     let router_chat_url = format!("http://127.0.0.1:{router_http}/v1/chat/completions");
 
-    // Non-streaming parity: the router must now emit a `usage` object at all,
-    // and it must match single-node exactly for the byte-fallback tokenizer.
-    let router_ns_resp = client
-        .post(&router_chat_url)
-        .json(&nonstream_body)
-        .send()
-        .await
-        .expect("POST router /v1/chat/completions (non-stream)");
-    assert!(
-        router_ns_resp.status().is_success(),
-        "router non-stream chat completion returned HTTP {}",
-        router_ns_resp.status()
-    );
-    let router_ns = router_ns_resp
-        .json::<serde_json::Value>()
-        .await
-        .expect("parse router non-stream chat completion JSON");
-    eprintln!("router MiniCPM chat non-stream: {router_ns}");
-    assert!(
-        !router_ns["usage"].is_null(),
-        "router non-stream /v1/chat/completions must carry a usage object (issue #398)"
-    );
-    assert_eq!(
-        router_ns["usage"]["prompt_tokens"], ref_nonstream["usage"]["prompt_tokens"],
-        "router usage.prompt_tokens diverges from single-node"
-    );
-    assert_eq!(
-        router_ns["usage"]["completion_tokens"], ref_nonstream["usage"]["completion_tokens"],
-        "router usage.completion_tokens diverges from single-node for a byte-fallback tokenizer"
-    );
-    assert_eq!(
-        router_ns["usage"]["total_tokens"], ref_nonstream["usage"]["total_tokens"],
-        "router usage.total_tokens diverges from single-node"
-    );
-    assert_eq!(
-        router_ns["choices"][0]["finish_reason"], ref_nonstream["choices"][0]["finish_reason"],
-        "router finish_reason diverges from single-node for a byte-fallback tokenizer"
-    );
+    for (case, (ref_nonstream, ref_usage_chunk, ref_stream_content)) in
+        MINICPM_CHAT_CASES.iter().zip(references)
+    {
+        eprintln!("MiniCPM chat case: {:?}", case.prompt);
+        let (nonstream_body, stream_body) = minicpm_chat_bodies(case.prompt);
+        // Non-streaming parity: the router must now emit a `usage` object at all,
+        // and it must match single-node exactly for the byte-fallback tokenizer.
+        let router_ns_resp = client
+            .post(&router_chat_url)
+            .json(&nonstream_body)
+            .send()
+            .await
+            .expect("POST router /v1/chat/completions (non-stream)");
+        assert!(
+            router_ns_resp.status().is_success(),
+            "router non-stream chat completion returned HTTP {}",
+            router_ns_resp.status()
+        );
+        let router_ns = router_ns_resp
+            .json::<serde_json::Value>()
+            .await
+            .expect("parse router non-stream chat completion JSON");
+        eprintln!("router MiniCPM chat non-stream: {router_ns}");
+        assert!(
+            !router_ns["usage"].is_null(),
+            "router non-stream /v1/chat/completions must carry a usage object (issue #398)"
+        );
+        assert_eq!(
+            router_ns["usage"]["prompt_tokens"], ref_nonstream["usage"]["prompt_tokens"],
+            "router usage.prompt_tokens diverges from single-node"
+        );
+        assert_eq!(
+            router_ns["usage"]["completion_tokens"], ref_nonstream["usage"]["completion_tokens"],
+            "router usage.completion_tokens diverges from single-node for a byte-fallback tokenizer"
+        );
+        assert_eq!(
+            router_ns["usage"]["total_tokens"], ref_nonstream["usage"]["total_tokens"],
+            "router usage.total_tokens diverges from single-node"
+        );
+        assert_eq!(
+            router_ns["choices"][0]["finish_reason"], ref_nonstream["choices"][0]["finish_reason"],
+            "router finish_reason diverges from single-node for a byte-fallback tokenizer"
+        );
+        // Content parity (#2715): single node shapes the non-stream reply with
+        // `shape_plain_chat_reply`, which trims the SentencePiece leading space
+        // (" Café" -> "Café"); the router must return the same bytes.
+        assert_eq!(
+            router_ns["choices"][0]["message"]["content"],
+            ref_nonstream["choices"][0]["message"]["content"],
+            "router non-stream content diverges from single-node"
+        );
+        // `prompt_tokens_details` follows the worker's prompt cache (#2715);
+        // both sides run with the default (enabled) cache here.
+        assert_eq!(
+            router_ns["usage"].get("prompt_tokens_details").is_some(),
+            ref_nonstream["usage"]
+                .get("prompt_tokens_details")
+                .is_some(),
+            "router usage.prompt_tokens_details presence diverges from single-node"
+        );
 
-    // Streaming parity: the final usage chunk (stream_options.include_usage)
-    // must also match single-node exactly.
-    let router_st_resp = client
-        .post(&router_chat_url)
-        .json(&stream_body)
-        .send()
-        .await
-        .expect("POST router /v1/chat/completions (stream)");
-    assert!(
-        router_st_resp.status().is_success(),
-        "router stream chat completion returned HTTP {}",
-        router_st_resp.status()
-    );
-    let router_st_body = router_st_resp.text().await.expect("read router SSE body");
-    let router_st_chunks = parse_completion_chunks(&router_st_body);
-    let router_usage_chunk = router_st_chunks
-        .iter()
-        .find(|c| !c["usage"].is_null())
-        .cloned()
-        .unwrap_or_else(|| {
-            panic!(
-                "router chat stream carried no usage chunk despite \
-                 stream_options.include_usage=true (issue #398); chunks: {router_st_chunks:?}"
-            )
-        });
-    assert_eq!(
-        router_usage_chunk["usage"]["prompt_tokens"], ref_usage_chunk["usage"]["prompt_tokens"],
-        "router stream usage.prompt_tokens diverges from single-node"
-    );
-    assert_eq!(
-        router_usage_chunk["usage"]["completion_tokens"],
-        ref_usage_chunk["usage"]["completion_tokens"],
-        "router stream usage.completion_tokens diverges from single-node for a \
-         byte-fallback tokenizer"
-    );
-    assert_eq!(
-        router_usage_chunk["usage"]["total_tokens"], ref_usage_chunk["usage"]["total_tokens"],
-        "router stream usage.total_tokens diverges from single-node"
-    );
-    // The usage chunk itself carries no choices, per the OpenAI streaming-usage
-    // convention (matches the router's own /v1/completions usage chunk).
-    assert_eq!(
-        router_usage_chunk["choices"],
-        serde_json::json!([]),
-        "router chat usage chunk must carry an empty choices array"
-    );
+        // Streaming parity: the final usage chunk (stream_options.include_usage)
+        // must also match single-node exactly.
+        let router_st_resp = client
+            .post(&router_chat_url)
+            .json(&stream_body)
+            .send()
+            .await
+            .expect("POST router /v1/chat/completions (stream)");
+        assert!(
+            router_st_resp.status().is_success(),
+            "router stream chat completion returned HTTP {}",
+            router_st_resp.status()
+        );
+        let router_st_body = router_st_resp.text().await.expect("read router SSE body");
+        // Streaming content parity (#2715): neither side trims a stream, so the
+        // concatenated `delta.content` must match single node's byte for byte.
+        let (router_st_content, _) = parse_sse_deltas(&router_st_body);
+        assert_eq!(
+            router_st_content, ref_stream_content,
+            "router streamed content diverges from single-node"
+        );
+        let router_st_chunks = parse_completion_chunks(&router_st_body);
+        let router_usage_chunk = router_st_chunks
+            .iter()
+            .find(|c| !c["usage"].is_null())
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "router chat stream carried no usage chunk despite \
+                     stream_options.include_usage=true (issue #398); chunks: {router_st_chunks:?}"
+                )
+            });
+        assert_eq!(
+            router_usage_chunk["usage"]["prompt_tokens"], ref_usage_chunk["usage"]["prompt_tokens"],
+            "router stream usage.prompt_tokens diverges from single-node"
+        );
+        assert_eq!(
+            router_usage_chunk["usage"]["completion_tokens"],
+            ref_usage_chunk["usage"]["completion_tokens"],
+            "router stream usage.completion_tokens diverges from single-node for a \
+             byte-fallback tokenizer"
+        );
+        assert_eq!(
+            router_usage_chunk["usage"]["total_tokens"], ref_usage_chunk["usage"]["total_tokens"],
+            "router stream usage.total_tokens diverges from single-node"
+        );
+        // The usage chunk itself carries no choices, per the OpenAI streaming-usage
+        // convention (matches the router's own /v1/completions usage chunk).
+        assert_eq!(
+            router_usage_chunk["choices"],
+            serde_json::json!([]),
+            "router chat usage chunk must carry an empty choices array"
+        );
+    }
     eprintln!(
         "OK: router /v1/chat/completions matches single-node usage for a byte-fallback \
          tokenizer (non-stream + stream)."
@@ -1469,7 +1907,8 @@ async fn disaggregated_router_rejects_model_owned_family_and_keeps_serving() {
         return;
     }
     let model_arg = model_dir.to_string_lossy().to_string();
-    let client = reqwest::Client::new();
+    let roles = ClusterRoles::new();
+    let client = mlxcel::http_tls::client();
 
     // ---- Three-process disaggregated router run ----
     let ports = reserve_ports(6);
@@ -1480,14 +1919,15 @@ async fn disaggregated_router_rejects_model_owned_family_and_keeps_serving() {
     let decode_serving_addr = format!("127.0.0.1:{}", ports[4]);
     let router_serving_addr = format!("127.0.0.1:{}", ports[5]);
 
-    let _decode = spawn_decode(&model_arg, &decode_http, &decode_serving_addr);
+    let _decode = spawn_decode(&roles, &model_arg, &decode_http, &decode_serving_addr);
     let _prefill = spawn_prefill(
+        &roles,
         &model_arg,
         &prefill_http,
         &prefill_serving_addr,
         &decode_serving_addr,
     );
-    let _router = spawn_role_server(&[
+    let _router = roles.spawn(&[
         "-m",
         &model_arg,
         "--host",
@@ -1518,6 +1958,10 @@ async fn disaggregated_router_rejects_model_owned_family_and_keeps_serving() {
     assert!(
         wait_for_http_health(&health_url, deadline).await,
         "router HTTP /health never returned 200"
+    );
+    assert!(
+        wait_for_router_peers_online(&router_http, deadline).await,
+        "the router never saw every peer online"
     );
     let completions_url = format!("http://127.0.0.1:{router_http}/v1/completions");
     let body = serde_json::json!({
@@ -1594,8 +2038,13 @@ async fn disaggregated_router_rejects_model_owned_family_and_keeps_serving() {
 // ── Multi-node routing, balancing, and failover (issue #201) ─────────────
 
 /// Spawn a `--node-role decode` server wired to its own serving address.
-fn spawn_decode(model_arg: &str, http: &str, serving_addr: &str) -> ChildGuard {
-    spawn_role_server(&[
+fn spawn_decode(
+    roles: &ClusterRoles,
+    model_arg: &str,
+    http: &str,
+    serving_addr: &str,
+) -> ChildGuard {
+    roles.spawn(&[
         "-m",
         model_arg,
         "--host",
@@ -1619,8 +2068,14 @@ fn spawn_decode(model_arg: &str, http: &str, serving_addr: &str) -> ChildGuard {
 /// Spawn a `--node-role prefill` server wired to its serving address and a
 /// single configured decode peer (the router overrides the decode target per
 /// request via `decode_target`; the config peer is only the fallback).
-fn spawn_prefill(model_arg: &str, http: &str, serving_addr: &str, decode_peer: &str) -> ChildGuard {
-    spawn_role_server(&[
+fn spawn_prefill(
+    roles: &ClusterRoles,
+    model_arg: &str,
+    http: &str,
+    serving_addr: &str,
+    decode_peer: &str,
+) -> ChildGuard {
+    roles.spawn(&[
         "-m",
         model_arg,
         "--host",
@@ -1644,6 +2099,9 @@ fn spawn_prefill(model_arg: &str, http: &str, serving_addr: &str, decode_peer: &
 }
 
 /// POST a non-streaming completion to the router and return `(status, text)`.
+///
+/// On success `text` is the first choice's text; on failure it is the raw
+/// response body, so a failing assertion shows the router's error message.
 async fn post_completion(
     client: &reqwest::Client,
     url: &str,
@@ -1666,7 +2124,7 @@ async fn post_completion(
             .and_then(|v| v["choices"][0]["text"].as_str().map(str::to_string))
             .unwrap_or_default()
     } else {
-        String::new()
+        resp.text().await.unwrap_or_default()
     };
     (status, text)
 }
@@ -1693,6 +2151,7 @@ async fn disaggregated_router_balances_and_survives_node_failure() {
         return;
     }
     let model_arg = model_dir.to_string_lossy().to_string();
+    let roles = ClusterRoles::new();
 
     // Ports: [prefill0_http, prefill1_http, decode0_http, decode1_http,
     //         router_http, prefill0_srv, prefill1_srv, decode0_srv,
@@ -1710,18 +2169,25 @@ async fn disaggregated_router_balances_and_survives_node_failure() {
     let router_srv = format!("127.0.0.1:{}", ports[9]);
 
     // Decode nodes first so they are ready before prefill hands off.
-    let _decode0 = spawn_decode(&model_arg, &decode0_http, &decode0_srv);
-    let _decode1 = spawn_decode(&model_arg, &decode1_http, &decode1_srv);
+    let _decode0 = spawn_decode(&roles, &model_arg, &decode0_http, &decode0_srv);
+    let _decode1 = spawn_decode(&roles, &model_arg, &decode1_http, &decode1_srv);
     // Each prefill node configures decode0 as its static fallback; the router
     // overrides the decode target per request, balancing both decode nodes.
     let mut prefill0 = Some(spawn_prefill(
+        &roles,
         &model_arg,
         &prefill0_http,
         &prefill0_srv,
         &decode0_srv,
     ));
-    let _prefill1 = spawn_prefill(&model_arg, &prefill1_http, &prefill1_srv, &decode0_srv);
-    let _router = spawn_role_server(&[
+    let _prefill1 = spawn_prefill(
+        &roles,
+        &model_arg,
+        &prefill1_http,
+        &prefill1_srv,
+        &decode0_srv,
+    );
+    let _router = roles.spawn(&[
         "-m",
         &model_arg,
         "--host",
@@ -1751,8 +2217,12 @@ async fn disaggregated_router_balances_and_survives_node_failure() {
         wait_for_http_health(&health_url, deadline).await,
         "router HTTP /health never returned 200"
     );
+    assert!(
+        wait_for_router_peers_online(&router_http, deadline).await,
+        "the router never saw every peer online"
+    );
 
-    let client = reqwest::Client::new();
+    let client = mlxcel::http_tls::client();
     let completions_url = format!("http://127.0.0.1:{router_http}/v1/completions");
     let stats_url = format!("http://127.0.0.1:{router_http}/router/stats");
     let prompt = "The capital of France is";
@@ -1762,7 +2232,7 @@ async fn disaggregated_router_balances_and_survives_node_failure() {
         let (status, text) = post_completion(&client, &completions_url, "qwen3", prompt).await;
         assert!(
             status.is_success(),
-            "pre-failure request failed: HTTP {status}"
+            "pre-failure request failed: HTTP {status}: {text}"
         );
         assert!(!text.is_empty(), "pre-failure request returned empty text");
     }
@@ -1802,7 +2272,7 @@ async fn disaggregated_router_balances_and_survives_node_failure() {
         let (status, text) = post_completion(&client, &completions_url, "qwen3", prompt).await;
         assert!(
             status.is_success(),
-            "post-failure request {i} failed: HTTP {status} (router wedged after node death)"
+            "post-failure request {i} failed: HTTP {status} (router wedged after node death): {text}"
         );
         assert!(
             !text.is_empty(),
@@ -1810,4 +2280,136 @@ async fn disaggregated_router_balances_and_survives_node_failure() {
         );
     }
     eprintln!("OK: router balanced both pools and survived a prefill-node failure.");
+}
+
+/// Poll the router's `GET /router/stats` until node `id` reports `status` or
+/// the deadline passes.
+async fn wait_for_router_node_status(
+    http_port: &str,
+    id: &str,
+    status: &str,
+    deadline: Instant,
+) -> bool {
+    let client = mlxcel::http_tls::client();
+    let url = format!("http://127.0.0.1:{http_port}/router/stats");
+    while Instant::now() < deadline {
+        let per_request = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(5));
+        if let Ok(resp) = client.get(&url).timeout(per_request).send().await
+            && let Ok(stats) = resp.json::<serde_json::Value>().await
+            && let Some(nodes) = stats["nodes"].as_array()
+            && nodes.iter().any(|n| n["id"] == id && n["status"] == status)
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Issue #2763: a router started before its prefill peer serves the first
+/// request the moment that peer's port accepts, with no 503.
+///
+/// The router comes up first, so its health monitor's startup probe marks the
+/// prefill node unreachable (asserted through `GET /router/stats`). The prefill
+/// node then starts, and the request goes out as soon as its serving port
+/// accepts a connection, without waiting for a monitor cycle to restore the
+/// node: the admission check re-probes the node it has marked down and admits
+/// the request instead of answering 503.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "spawns three real mlxcel-server processes loading qwen3-0.6b-4bit; run with --ignored"]
+async fn disaggregated_router_started_before_prefill_serves_first_request() {
+    let model_dir = repo_model_dir(QWEN3_DIR);
+    if !model_dir.exists() {
+        eprintln!(
+            "Skipping {QWEN3_DIR}: model directory not found at {}",
+            model_dir.display()
+        );
+        return;
+    }
+    let binary = repo_binary_path("mlxcel-server");
+    if !binary.exists() {
+        eprintln!(
+            "Skipping: mlxcel-server binary not found at {}",
+            binary.display()
+        );
+        return;
+    }
+
+    let ports = reserve_ports(6);
+    let prefill_http = ports[0].to_string();
+    let decode_http = ports[1].to_string();
+    let router_http = ports[2].to_string();
+    let prefill_serving_addr = format!("127.0.0.1:{}", ports[3]);
+    let decode_serving_addr = format!("127.0.0.1:{}", ports[4]);
+    let router_serving_addr = format!("127.0.0.1:{}", ports[5]);
+    let model_arg = model_dir.to_string_lossy().to_string();
+    let roles = ClusterRoles::new();
+    let deadline = Instant::now() + Duration::from_secs(240);
+
+    let _decode = spawn_decode(&roles, &model_arg, &decode_http, &decode_serving_addr);
+    assert!(
+        wait_for_tcp(&decode_serving_addr, deadline).await,
+        "decode node serving transport never came up at {decode_serving_addr}"
+    );
+    let _router = roles.spawn(&[
+        "-m",
+        &model_arg,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &router_http,
+        "--node-role",
+        "router",
+        "--serving-bind",
+        &router_serving_addr,
+        "--prefill-peers",
+        &prefill_serving_addr,
+        "--decode-peers",
+        &decode_serving_addr,
+        "--no-warmup",
+    ]);
+    let health_url = format!("http://127.0.0.1:{router_http}/health");
+    assert!(
+        wait_for_http_health(&health_url, deadline).await,
+        "router HTTP /health never returned 200 at {health_url}"
+    );
+    assert!(
+        wait_for_router_node_status(&router_http, "prefill-0", "unreachable", deadline).await,
+        "the router never marked the not-yet-started prefill node unreachable"
+    );
+
+    let _prefill = spawn_prefill(
+        &roles,
+        &model_arg,
+        &prefill_http,
+        &prefill_serving_addr,
+        &decode_serving_addr,
+    );
+    assert!(
+        wait_for_tcp(&prefill_serving_addr, deadline).await,
+        "prefill node serving transport never came up at {prefill_serving_addr}"
+    );
+
+    // No wait for `/router/stats` here: the router still has the prefill node
+    // marked down unless a monitor cycle happened to land since it bound.
+    let client = mlxcel::http_tls::client();
+    let (status, text) = post_completion(
+        &client,
+        &format!("http://127.0.0.1:{router_http}/v1/completions"),
+        "qwen3",
+        "The capital of France is",
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "the first request after the prefill node came up was refused: {text}"
+    );
+    assert!(!text.is_empty(), "the router returned an empty completion");
+    assert!(
+        wait_for_router_node_status(&router_http, "prefill-0", "online", deadline).await,
+        "the router did not report the prefill node online after serving through it"
+    );
 }

@@ -40,6 +40,25 @@
 //! background demux task (`spawn_result_demux`) routes each incoming frame to
 //! the per-request channel keyed by `request_id`.
 //!
+//! The transport must be bound with the cluster secret ([`RouterState::build`]
+//! refuses an unauthenticated one), and the demux delivers a frame only when
+//! its authenticated sender identity is one of the configured
+//! `--prefill-peers` or `--decode-peers` addresses
+//! ([`RouterState::accepts_result_from`], #2692): request ids are sequential,
+//! so without the check any other holder of the secret (a pipeline stage that
+//! shares it) could inject tokens into a client's response. The sender
+//! identity is the peer's `--serving-bind` address as bound by the handshake
+//! (an unspecified bind IP is replaced by the connection's source IP), so a
+//! peer must be configured under the address it connects from. Only the IP
+//! is proven; the port is the sender's claim, and it stays that way (#2714):
+//! all members share one secret, so no handshake proof separates two secret
+//! holders on one IP (proving a port needs per-process keys, a new identity
+//! layer), accepting results only on router-dialed connections would need
+//! reads on pooled outbound connections, which `TcpTransport` never does,
+//! and the demux accepts any configured peer for any request id anyway, so
+//! the residual is an unconfigured secret holder sharing an IP with a
+//! configured peer, already a member under the threat model.
+//!
 //! # Output filtering (issue #198)
 //!
 //! Every decode text piece (and the prefill first token) passes through the
@@ -64,25 +83,30 @@
 //! Health and failover: a transport error when sending a prefill frame marks the
 //! node unreachable, re-routes its in-flight requests via `handle_node_failure`,
 //! and retries the request on a healthy node. A background [`spawn_health_monitor`]
-//! task probes every peer's liveness (TCP connect) so a dead decode node (which
-//! the router never sends to directly) is detected and skipped, and a recovered
-//! node is restored to online.
+//! task probes every peer's liveness (TCP connect), once at startup and then on
+//! an interval, so a dead decode node (which the router never sends to directly)
+//! is detected and skipped, and a recovered node is restored to online.
 //!
 //! Backpressure: every request first passes `apply_backpressure` admission
 //! control; when the prefill queue is full or no prefill node is available, the
-//! router returns HTTP 503 instead of dispatching.
+//! router returns HTTP 503 instead of dispatching. Before refusing with no
+//! prefill node available while some are marked unreachable, admission re-probes those nodes through the
+//! same per-node probe the monitor uses (single-flight, at most once per 250 ms
+//! router-wide, 500 ms connect timeout) and admits the request if one accepts,
+//! so a peer that came up after the last monitor cycle is not refused for up to
+//! one probe interval (issue #2763). A full queue never triggers a probe.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{State, rejection::JsonRejection};
 use axum::http::{Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::Event;
@@ -100,6 +124,7 @@ use crate::distributed::disaggregated::{
     BackpressureAction, DisaggRoutingStrategy, PrefillRequestFrame, RequestRouter, ResultFrame,
     RouterConfig, StreamBridge, TokenEvent, TokenSource, control_parts, sampling_to_serializable,
 };
+use crate::distributed::handshake_warn::{HandshakeWarnClass, handshake_warn_allowed};
 use crate::distributed::metrics::ClusterMetrics;
 use crate::distributed::registry::{NodeRegistry, NodeStatus};
 use crate::distributed::request_tracker::RequestId;
@@ -109,6 +134,7 @@ use crate::server::ChatTemplateProcessor;
 use crate::server::config::{
     LiveSettings, ReasoningBudgetOverride, ServerConfig, ServerGenerateOptions,
 };
+use crate::server::routes::completions::parse_completion_request;
 use crate::server::runtime_settings::{self, KnobSpec, Rejected};
 use crate::server::streaming::{SseKeepAlive, sse_response};
 use crate::server::tool_calls::stream_filter::{FilterOutput, StreamFilter};
@@ -120,14 +146,6 @@ use crate::tokenizer::MlxcelTokenizer;
 /// continuation from the serving nodes.
 const HANDOFF_TIMEOUT_SECS: u64 = 120;
 
-/// How often the background health monitor probes each registered serving peer
-/// for liveness (issue #201).
-const HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(3);
-
-/// Per-probe TCP connect timeout for the health monitor. A peer that does not
-/// accept a connection within this window is treated as unreachable.
-const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-
 // ── Router state ─────────────────────────────────────────────────────────
 
 /// Shared state for the disaggregated router front-end.
@@ -135,12 +153,18 @@ const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Injected into axum handlers via `axum::extract::State<Arc<RouterState>>`.
 pub struct RouterState {
     /// Transport bound to the router's own `--serving-bind` address; receives
-    /// [`ResultFrame`]s from the prefill and decode nodes.
+    /// [`ResultFrame`]s from the prefill and decode nodes. Always bound with
+    /// the cluster secret ([`Self::build`] refuses anything else).
     pub transport: Arc<TcpTransport>,
 
     /// Demux map: `request_id -> per-request result channel sender`.
     /// Keyed by the same `u64` that goes into [`PrefillRequestFrame::request_id`].
     pub pending: Mutex<HashMap<u64, UnboundedSender<ResultFrame>>>,
+
+    /// The authenticated sender identities the demux accepts a
+    /// [`ResultFrame`] from: every `--prefill-peers` and `--decode-peers`
+    /// address with its IP canonicalized. See [`Self::accepts_result_from`].
+    pub(crate) result_senders: HashSet<SocketAddr>,
 
     /// Monotonically increasing counter used to assign unique request ids.
     pub next_id: AtomicU64,
@@ -192,6 +216,10 @@ pub struct RouterState {
 
     /// Maximum time to wait for each half of the disaggregated response.
     pub handoff_timeout: Duration,
+
+    /// Peer-probe state shared by the health monitor and the admission
+    /// re-probe: the single-flight gate and the connect-attempt counter.
+    pub(crate) peer_probe: health::PeerProbe,
 }
 
 impl RouterState {
@@ -199,7 +227,12 @@ impl RouterState {
     ///
     /// Registers every address from `config.prefill_peers` and
     /// `config.decode_peers` in the [`NodeRegistry`] as `Online` so
-    /// `route_to_prefill` can find them.
+    /// `route_to_prefill` can find them, and as the only senders the result
+    /// demux accepts frames from.
+    ///
+    /// Fails when `transport` was bound without the cluster secret: every
+    /// frame the router acts on must come over an authenticated connection,
+    /// and the sender check below relies on the handshake-bound identity.
     pub fn build(
         config: Arc<ServerConfig>,
         transport: Arc<TcpTransport>,
@@ -208,6 +241,17 @@ impl RouterState {
         tokenizer: Arc<MlxcelTokenizer>,
         model_path: PathBuf,
     ) -> Result<Self> {
+        if !transport.is_authenticated() {
+            anyhow::bail!(
+                "the disaggregated router requires a role transport bound with the cluster secret"
+            );
+        }
+        let result_senders: HashSet<SocketAddr> = config
+            .prefill_peers
+            .iter()
+            .chain(config.decode_peers.iter())
+            .map(|addr| canonical_socket_addr(*addr))
+            .collect();
         // Build a registry of ONLY the prefill and decode peers the router can
         // route to. The router itself is deliberately NOT registered: it is a
         // front-end, not an inference worker, so registering it (as Hybrid)
@@ -240,6 +284,7 @@ impl RouterState {
                 tensor_parallel_size: 1,
                 pipeline_parallel_size: 1,
                 transport_backend: TransportBackend::default(),
+                secret_file: None,
             },
             nodes,
         };
@@ -285,6 +330,7 @@ impl RouterState {
         Ok(Self {
             transport,
             pending: Mutex::new(HashMap::new()),
+            result_senders,
             next_id: AtomicU64::new(1),
             reply_to,
             router: request_router,
@@ -300,7 +346,26 @@ impl RouterState {
             current_live,
             settings_update_lock: Arc::new(Mutex::new(())),
             handoff_timeout: Duration::from_secs(HANDOFF_TIMEOUT_SECS),
+            peer_probe: health::PeerProbe::default(),
         })
+    }
+
+    /// Whether a [`ResultFrame`] from the authenticated sender identity `from`
+    /// (what the transport's `recv()` reports) may reach a request channel.
+    ///
+    /// `from` must parse as a socket address and, with its IP canonicalized,
+    /// be one of the configured prefill or decode peer addresses; anything
+    /// else (another cluster member that holds the secret, an unparseable
+    /// identity) is refused. The identity the handshake binds is the sender's
+    /// `--serving-bind` address with an unspecified IP replaced by the
+    /// connection's source IP, so a multi-homed peer, or one bound to
+    /// `0.0.0.0` that reaches the router over an interface other than the one
+    /// in `--prefill-peers` / `--decode-peers`, has to be configured under the
+    /// address it connects from.
+    pub(crate) fn accepts_result_from(&self, from: &str) -> bool {
+        from.parse::<SocketAddr>()
+            .map(|addr| self.result_senders.contains(&canonical_socket_addr(addr)))
+            .unwrap_or(false)
     }
 
     /// Clone one immutable settings snapshot without holding the lock across
@@ -403,8 +468,22 @@ struct DecodeTarget {
 
 // ── Background demux task ────────────────────────────────────────────────
 
+/// `addr` with its IP canonicalized (an IPv4-mapped IPv6 address becomes the
+/// IPv4 address), the form both `result_senders` and the sender check use.
+fn canonical_socket_addr(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
 /// Spawn a background task that forwards incoming [`ResultFrame`]s to the
 /// per-request channels registered in `state.pending`.
+///
+/// A frame whose authenticated sender is not a configured prefill or decode
+/// peer ([`RouterState::accepts_result_from`]) is dropped with a warn through
+/// the handshake warning budget's router-drop class (#2692, its own class
+/// since #2712 so a stream of such frames cannot push a secret-mismatch
+/// warning to debug); the request it named then fails with the usual handoff
+/// timeout, and the warn line is the diagnostic for a peer configured under
+/// the wrong address.
 ///
 /// The task exits when the transport's receive loop returns an error (e.g.
 /// on shutdown).
@@ -412,6 +491,17 @@ pub fn spawn_result_demux(state: Arc<RouterState>) {
     tokio::spawn(async move {
         while let Ok((from, msg)) = state.transport.recv().await {
             tracing::debug!(%from, "router demux: received a transport frame");
+            if !state.accepts_result_from(&from) {
+                const HINT: &str = "not a configured prefill or decode peer (check \
+                                    --prefill-peers, --decode-peers and the sender's \
+                                    --serving-bind)";
+                if handshake_warn_allowed(HandshakeWarnClass::RouterDrop) {
+                    tracing::warn!(?from, "router: dropping result frame: {HINT}");
+                } else {
+                    tracing::debug!(?from, "router: dropping result frame: {HINT}");
+                }
+                continue;
+            }
             if let Ok((op, payload)) = control_parts(msg)
                 && op == ResultFrame::OPERATION
                 && let Ok(frame) = ResultFrame::decode(&payload)
@@ -432,70 +522,10 @@ pub fn spawn_result_demux(state: Arc<RouterState>) {
 
 // ── Background health monitor ────────────────────────────────────────────
 
-/// Spawn a background task that probes every registered serving peer for
-/// liveness and keeps the [`NodeRegistry`] status in sync (issue #201).
-///
-/// Each cycle TCP-connects to each node's serving address (the same address the
-/// router routes to). A node that does not accept a connection within
-/// [`HEALTH_PROBE_TIMEOUT`] is marked [`NodeStatus::Unreachable`], so
-/// `route_to_prefill` / `route_to_decode` skip it, and its in-flight requests
-/// are re-routed via [`RequestRouter::handle_node_failure`]. A previously
-/// unreachable node that starts accepting again is restored to
-/// [`NodeStatus::Online`]. This catches the cases the per-send transport-error
-/// path cannot: a decode node (which the router never sends to directly) dying,
-/// and a node recovering. The task also purges terminal tracked requests so the
-/// router's request map stays bounded.
-///
-/// Locking: `all_nodes()` returns a snapshot and releases the registry lock; no
-/// registry or request-map lock is held across the connect `await`.
-pub fn spawn_health_monitor(state: Arc<RouterState>) {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(HEALTH_PROBE_INTERVAL).await;
-            for node in state.registry.all_nodes() {
-                let addr = node.config.address.to_string();
-                let alive = matches!(
-                    tokio::time::timeout(
-                        HEALTH_PROBE_TIMEOUT,
-                        tokio::net::TcpStream::connect(&addr),
-                    )
-                    .await,
-                    Ok(Ok(_))
-                );
-                match (alive, node.status) {
-                    (false, NodeStatus::Online) => {
-                        state
-                            .registry
-                            .set_node_status(&node.config.id, NodeStatus::Unreachable);
-                        let (rerouted, failed) = state.router.handle_node_failure(&node.config.id);
-                        tracing::warn!(
-                            node = %node.config.id, %addr, rerouted, failed,
-                            "router health: peer unreachable; marked it down"
-                        );
-                    }
-                    (true, NodeStatus::Unreachable) => {
-                        state
-                            .registry
-                            .set_node_status(&node.config.id, NodeStatus::Online);
-                        tracing::info!(
-                            node = %node.config.id, %addr,
-                            "router health: peer recovered; marked it online"
-                        );
-                    }
-                    _ => {}
-                }
-            }
-            // Bound the tracked-request map: drop terminal entries older than the
-            // router config's auto-purge age.
-            let purged = state
-                .router
-                .purge_terminal(state.router.config().auto_purge_age);
-            if purged > 0 {
-                tracing::debug!(purged, "router health: purged terminal tracked requests");
-            }
-        }
-    });
-}
+#[path = "router_front_health.rs"]
+mod health;
+
+pub use health::spawn_health_monitor;
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────
 
@@ -756,16 +786,30 @@ async fn router_chat_completions(
     }
 }
 
-/// Apply router-level admission control before dispatching (issue #201).
+/// Apply router-level admission control before dispatching (issues #201,
+/// #2763).
 ///
 /// Consults [`RequestRouter::apply_backpressure`]. When the prefill queue is at
 /// capacity (`Reject`) or no prefill node is currently available (`Queue`, e.g.
-/// every prefill node is marked unreachable), the router has nowhere to send the
+/// every prefill node is marked unreachable or at critical load), the router has nowhere to send the
 /// request and no async queue to park it in, so it returns HTTP 503 instead of
 /// attempting a doomed dispatch. `Accept` returns `None` and the caller proceeds
 /// exactly as before, so the healthy path is unchanged.
-fn admission_reject(state: &RouterState) -> Option<Response> {
-    match state.router.apply_backpressure() {
+///
+/// A `Queue` verdict while some prefill node is marked unreachable may be stale:
+/// the node can have come up after the last monitor cycle. In that case the
+/// unreachable prefill nodes are re-probed first (bounded and single-flight,
+/// see [`health::reprobe_unreachable_prefill`]) and the verdict is taken again,
+/// so the request is refused only if no node came back. `Reject` never probes.
+async fn admission_reject(state: &Arc<RouterState>) -> Option<Response> {
+    let action = match state.router.apply_backpressure() {
+        BackpressureAction::Queue if health::has_unreachable_prefill(state) => {
+            health::reprobe_unreachable_prefill(state).await;
+            state.router.apply_backpressure()
+        }
+        action => action,
+    };
+    match action {
         BackpressureAction::Accept => None,
         BackpressureAction::Queue => Some(service_unavailable(
             "all serving nodes are at capacity or unreachable; retry shortly",
@@ -816,7 +860,7 @@ async fn route_chat(
 ) -> Result<Response> {
     // Admission control first: reject with 503 when the cluster cannot take the
     // request (issue #201), before spending work on template rendering.
-    if let Some(resp) = admission_reject(&state) {
+    if let Some(resp) = admission_reject(&state).await {
         return Ok(resp);
     }
 
@@ -970,11 +1014,15 @@ async fn route_chat(
     // The family the prompt primed, for the #1470 delimiter echo below.
     let primed_close_marker =
         super::routes::chat::primed_open_thinking_close_marker(&thinking_markers, &prompt);
+    // #2394: GLM-4.1V-Thinking's `<answer>` wrapper, as on the single-node
+    // route.
+    let answer_wrapper = crate::server::tool_calls::answer_wrapper_enabled(&state.tokenizer);
     let stream_filter = if primed_open_thinking {
         StreamFilter::new_primed_open_thinking()
     } else {
         StreamFilter::new()
-    };
+    }
+    .with_answer_wrapper(answer_wrapper);
 
     // b10621 chat-parsing and reasoning-placement settings (issue #1447). This
     // route serves the same `/v1/chat/completions` as the single-node one, so
@@ -1015,6 +1063,7 @@ async fn route_chat(
         // optional trailing usage chunk mirrors the router's own
         // `/v1/completions` streaming path and single-node chat (issue #398).
         let include_usage = wants_stream_usage(&request);
+        let router_cache_enabled = state.config.prompt_cache.is_enabled();
         let (chunk_tx, chunk_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
         let state2 = state.clone();
@@ -1035,57 +1084,52 @@ async fn route_chat(
             let thinking_echo = std::sync::Mutex::new(
                 super::routes::chat::ThinkingDelimiterEcho::new(primed_close_owned.as_deref()),
             );
+            // What the client received, for `reasoning_only` on the finish
+            // chunk (#2729): single node records the same two flags from the
+            // chunks it sends. Atomics because the spawned future must stay
+            // `Send`.
+            let saw_content = AtomicBool::new(false);
+            let saw_reasoning_content = AtomicBool::new(false);
             let emit_filtered = |emit: FilterOutput| {
-                let (echo_open, echo_close) = if reasoning_format.keeps_thoughts_in_content() {
+                // The thoughts-in-content form (`none` / `deepseek-legacy`),
+                // delimiters and post-close gap included, built by the same
+                // helper as the single-node route (#1470, #2464).
+                let thoughts = if reasoning_format.keeps_thoughts_in_content() {
                     match thinking_echo.lock() {
-                        Ok(mut echo) => (echo.open(&emit), echo.close(&emit)),
-                        Err(_) => (None, None),
+                        Ok(mut echo) => echo.thoughts_in_content(&emit),
+                        Err(_) => None,
                     }
                 } else {
-                    (None, None)
+                    None
                 };
+                // `--reasoning-format` decides where the thoughts go, the
+                // same way the single-node route decides it.
                 if let Some(reasoning) = emit.reasoning
                     && !reasoning.is_empty()
+                    && reasoning_format.emits_reasoning_content()
                 {
-                    // `--reasoning-format` decides where the thoughts go, the
-                    // same way the single-node route decides it.
-                    if reasoning_format.emits_reasoning_content() {
-                        let _ = chunk_tx.send(Ok(sse_event(&chat_chunk_reasoning(
-                            &request_id_str2,
-                            &model,
-                            &reasoning,
-                            reasoning_alias_field,
-                        ))));
-                    }
-                    if reasoning_format.keeps_thoughts_in_content() {
-                        let mut text = String::with_capacity(reasoning.len() + 24);
-                        if let Some(open) = echo_open {
-                            text.push_str(open);
-                        }
-                        text.push_str(&reasoning);
-                        let _ = chunk_tx.send(Ok(sse_event(&chat_chunk_content(
-                            &request_id_str2,
-                            &model,
-                            &text,
-                        ))));
-                    }
-                } else if let Some(open) = echo_open {
-                    let _ = chunk_tx.send(Ok(sse_event(&chat_chunk_content(
+                    saw_reasoning_content.store(true, Ordering::Relaxed);
+                    let _ = chunk_tx.send(Ok(sse_event(&chat_chunk_reasoning(
                         &request_id_str2,
                         &model,
-                        open,
+                        &reasoning,
+                        reasoning_alias_field,
                     ))));
                 }
-                if let Some(close) = echo_close {
+                if let Some(text) = thoughts {
+                    if !text.is_empty() {
+                        saw_content.store(true, Ordering::Relaxed);
+                    }
                     let _ = chunk_tx.send(Ok(sse_event(&chat_chunk_content(
                         &request_id_str2,
                         &model,
-                        close,
+                        &text,
                     ))));
                 }
                 if let Some(content) = emit.content
                     && !content.is_empty()
                 {
+                    saw_content.store(true, Ordering::Relaxed);
                     let _ = chunk_tx.send(Ok(sse_event(&chat_chunk_content(
                         &request_id_str2,
                         &model,
@@ -1099,6 +1143,8 @@ async fn route_chat(
             // (issue #387) so the finish_reason matches single-node even for
             // byte-fallback tokenizers.
             let mut frame_counted = 0usize;
+            // The handoff text verbatim, single node's `result.text`.
+            let mut raw = String::new();
             let result = drive_handoff_result(
                 &mut { rx },
                 &request_id_str2,
@@ -1106,6 +1152,7 @@ async fn route_chat(
                 max_tokens,
                 |text| {
                     frame_counted += 1;
+                    raw.push_str(text);
                     // `--skip-chat-parsing` forces a pure content parser, so
                     // the filter is bypassed and the piece is emitted verbatim.
                     if skip_chat_parsing {
@@ -1116,6 +1163,7 @@ async fn route_chat(
                             consumed_positions: 1,
                             thinking_open: None,
                             thinking_close: None,
+                            post_thinking_gap: None,
                         });
                     } else {
                         emit_filtered(filter.feed(text));
@@ -1144,6 +1192,20 @@ async fn route_chat(
                 Some(n) if n >= max_tokens => "length",
                 _ => "stop",
             };
+            // The worker's prompt-cache report decides `prompt_tokens_details`
+            // (#2715); an older prefill node leaves it to the router's flag.
+            let cache_enabled = result.as_ref().map_or(router_cache_enabled, |outcome| {
+                outcome.reports_prompt_cache(router_cache_enabled)
+            });
+            // Single node's rule (#2729); a handoff error generated nothing
+            // to ask the question about, as on single node.
+            let reasoning_only = completed
+                && super::routes::chat::stream_reasoning_only(
+                    &raw,
+                    saw_content.load(Ordering::Relaxed),
+                    saw_reasoning_content.load(Ordering::Relaxed),
+                    finish_reason,
+                );
             if let Err(e) = result {
                 let _ = chunk_tx.send(Ok(sse_event(&chat_chunk_error(
                     &request_id_str2,
@@ -1155,6 +1217,7 @@ async fn route_chat(
                 &request_id_str2,
                 &model,
                 finish_reason,
+                reasoning_only,
             ))));
 
             // Emit the usage chunk only on success, matching single-node
@@ -1168,6 +1231,7 @@ async fn route_chat(
                     &model,
                     prompt_tokens,
                     completion_tokens,
+                    cache_enabled,
                 ))));
             }
             let _ = chunk_tx.send(Ok(Event::default().data("[DONE]")));
@@ -1188,90 +1252,111 @@ async fn route_chat(
             SseKeepAlive::default_for_long_prefill(),
         ))
     } else {
-        // Non-streaming: collect all tokens (filtered) then return a single
-        // JSON object with `content`, `reasoning_content` when present, and a
-        // `usage` block matching single-node's `ChatCompletionResponse` shape
-        // (issue #398).
-        let mut filter = stream_filter;
-        let mut content = String::new();
-        let mut reasoning = String::new();
+        // Non-streaming: collect the generated text verbatim, then shape it
+        // exactly as the single-node no-tools path does (#2715), and return a
+        // single JSON object with `content`, `reasoning_content` when present,
+        // and a `usage` block matching single-node's `ChatCompletionResponse`
+        // shape (issue #398).
+        let mut raw = String::new();
+        let mut frame_counted = 0usize;
         let mut rx = rx;
-        let finish_reason;
-        let completion_tokens;
-        {
-            let mut frame_counted = 0usize;
-            let mut absorb = |emit: FilterOutput| {
-                if let Some(r) = emit.reasoning {
-                    // `--reasoning-format`: `none` and `deepseek-legacy` keep
-                    // the thoughts in `content` as well as, or instead of,
-                    // `reasoning_content`.
-                    if reasoning_format.keeps_thoughts_in_content() {
-                        content.push_str(&r);
-                    }
-                    if reasoning_format.emits_reasoning_content() {
-                        reasoning.push_str(&r);
-                    }
-                }
-                if let Some(c) = emit.content {
-                    content.push_str(&c);
-                }
-            };
-            let r = drive_handoff_result(
-                &mut rx,
-                &request_id_str,
-                Duration::from_secs(live.timeout_seconds),
-                opts.max_tokens,
-                |text| {
-                    frame_counted += 1;
-                    if skip_chat_parsing {
-                        absorb(FilterOutput {
-                            content: Some(text.to_owned()),
-                            reasoning: None,
-                            suppressed_positions: 0,
-                            consumed_positions: 1,
-                            thinking_open: None,
-                            thinking_close: None,
-                        });
-                    } else {
-                        absorb(filter.feed(text));
-                    }
-                },
-            )
-            .await;
-            absorb(filter.flush());
-            state.pending.lock().unwrap().remove(&request_id);
-            state.finalize_request(&request_id_str, r.is_ok());
-            let outcome = r?;
-            // Mirror single-node chat finish_reason: "length" when the whole
-            // token budget was generated, else "stop", using the worker's
-            // authoritative count when present (issue #387). The same
-            // resolved count feeds `usage.completion_tokens` below (issue #398).
-            completion_tokens = resolve_completion_tokens(&outcome, frame_counted, opts.max_tokens);
-            finish_reason = if completion_tokens >= opts.max_tokens {
-                "length"
-            } else {
-                "stop"
-            };
-        }
+        let r = drive_handoff_result(
+            &mut rx,
+            &request_id_str,
+            Duration::from_secs(live.timeout_seconds),
+            opts.max_tokens,
+            |text| {
+                frame_counted += 1;
+                raw.push_str(text);
+            },
+        )
+        .await;
+        state.pending.lock().unwrap().remove(&request_id);
+        state.finalize_request(&request_id_str, r.is_ok());
+        let outcome = r?;
+        // Mirror single-node chat finish_reason: "length" when the whole
+        // token budget was generated, else "stop", using the worker's
+        // authoritative count when present (issue #387). The same resolved
+        // count feeds `usage.completion_tokens` below (issue #398).
+        let completion_tokens = resolve_completion_tokens(&outcome, frame_counted, opts.max_tokens);
+        let finish_reason = if completion_tokens >= opts.max_tokens {
+            "length"
+        } else {
+            "stop"
+        };
+        let shaped = shape_router_chat_reply(
+            &raw,
+            skip_chat_parsing,
+            primed_open_thinking,
+            answer_wrapper,
+            reasoning_format,
+        );
+        // Single node's rule (#2729). `--skip-chat-parsing` shapes no
+        // reasoning, so the flag stays false there.
+        let reasoning_only = super::routes::chat::log_if_reasoning_only(
+            &raw,
+            &shaped.content,
+            shaped.reasoning_content.as_deref(),
+            completion_tokens,
+            finish_reason,
+        );
         Ok(Json(chat_completion_json(
             &request_id_str,
             &request.model,
-            &content,
-            &reasoning,
+            &shaped.content,
+            shaped.reasoning_content.as_deref().unwrap_or_default(),
             reasoning_alias_field,
             finish_reason,
             prompt_tokens,
             completion_tokens,
+            outcome.reports_prompt_cache(state.config.prompt_cache.is_enabled()),
+            reasoning_only,
         ))
         .into_response())
     }
 }
 
+/// The router's non-stream chat reply from the handoff's raw generated text
+/// (#2715).
+///
+/// `--skip-chat-parsing` returns the text verbatim, as single node does
+/// (`chat.rs` returns `result.text` before any shaping). Otherwise the reply
+/// goes through [`super::routes::chat::shape_plain_chat_reply`], the
+/// single-node no-tools shaping, so the router's `content` and
+/// `reasoning_content` are the bytes single node returns for the same
+/// generation (a SentencePiece `" Café"` becomes `"Café"` on both). The
+/// streamed reply is not shaped here: single-node streaming does not trim
+/// either.
+fn shape_router_chat_reply(
+    raw: &str,
+    skip_chat_parsing: bool,
+    primed_open_thinking: bool,
+    answer_wrapper: bool,
+    reasoning_format: crate::server::ReasoningFormat,
+) -> crate::server::ShapedResponse {
+    if skip_chat_parsing {
+        return crate::server::ShapedResponse {
+            content: raw.to_owned(),
+            reasoning_content: None,
+        };
+    }
+    super::routes::chat::shape_plain_chat_reply(
+        raw,
+        primed_open_thinking,
+        answer_wrapper,
+        reasoning_format,
+    )
+}
+
 /// POST /v1/completions
 async fn router_completions(
     State(state): State<Arc<RouterState>>,
-    Json(request): Json<CompletionRequest>,
+    request: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Response {
+    let request = match parse_completion_request(request) {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
     let live = state.live();
     match route_completion(state, live, request).await {
         Ok(resp) => resp,
@@ -1311,9 +1396,15 @@ async fn route_completion(
     live: Arc<LiveSettings>,
     request: CompletionRequest,
 ) -> Result<Response> {
-    // Admission control first: reject with 503 when the cluster cannot take the
-    // request (issue #201), before any per-request work.
-    if let Some(resp) = admission_reject(&state) {
+    let prompt = match request.prompt.single_prompt() {
+        Ok(prompt) => prompt.to_owned(),
+        Err(message) => {
+            return Ok(ErrorResponse::new(message, "invalid_request_error").into_response());
+        }
+    };
+    // After input validation, reject with 503 when the cluster cannot take the
+    // request (issue #201), before any handoff work.
+    if let Some(resp) = admission_reject(&state).await {
         return Ok(resp);
     }
 
@@ -1348,7 +1439,6 @@ async fn route_completion(
         request.params.thinking_budget,
     );
 
-    let prompt = request.prompt.clone();
     // Same default/override resolution as the single-node completion route.
     //
     // Loop-detection amplifier signal (issue #967): `CompletionRequest` has no
@@ -1393,6 +1483,7 @@ async fn route_completion(
             .as_ref()
             .map(|o| o.include_usage)
             .unwrap_or(false);
+        let router_cache_enabled = state.config.prompt_cache.is_enabled();
         let (chunk_tx, chunk_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
         let state2 = state.clone();
@@ -1460,12 +1551,13 @@ async fn route_completion(
             // `stream_completion` which guards `if include_usage && let Ok(ref r)
             // = result`. On a handoff failure (finish_reason "error") no usage
             // chunk is sent.
-            if include_usage && result.is_ok() {
-                let usage = CompletionChunk::usage(
+            if include_usage && let Ok(outcome) = &result {
+                let usage = completion_usage_chunk(
                     response_id2.clone(),
                     model.clone(),
                     prompt_tokens,
                     completion_tokens,
+                    outcome.reports_prompt_cache(router_cache_enabled),
                 );
                 let _ = chunk_tx.send(Ok(sse_serialize(&usage)));
             }
@@ -1520,14 +1612,14 @@ async fn route_completion(
         } else {
             "stop"
         };
-        let response = CompletionResponse::new_with_logprobs(
+        let response = completion_response(
             response_id,
             request.model.clone(),
             text,
             prompt_tokens,
             completion_tokens,
-            Some(finish_reason.to_string()),
-            None,
+            finish_reason,
+            outcome.reports_prompt_cache(state.config.prompt_cache.is_enabled()),
         );
         Ok(Json(response).into_response())
     }
@@ -1712,6 +1804,24 @@ struct HandoffOutcome {
     /// predates the wire field; the caller then falls back to counting emitted
     /// text pieces.
     generated_tokens: Option<u64>,
+    /// Whether the prefill node that served the request has a prompt-cache
+    /// store, from its first-token frame (#2715). `None` from a prefill node
+    /// predating the wire field; see [`Self::reports_prompt_cache`].
+    prompt_cache_enabled: Option<bool>,
+}
+
+impl HandoffOutcome {
+    /// Whether the request's `usage` carries `prompt_tokens_details` (#2715).
+    ///
+    /// Single node includes the field exactly when its prompt-cache store
+    /// exists, and in a disaggregated deployment that store lives on the
+    /// worker, so the worker's report decides. `router_cache_enabled` (the
+    /// router's own `config.prompt_cache.is_enabled()`) applies only when the
+    /// prefill node predates the report, which keeps an older node's
+    /// behavior unchanged.
+    fn reports_prompt_cache(&self, router_cache_enabled: bool) -> bool {
+        self.prompt_cache_enabled.unwrap_or(router_cache_enabled)
+    }
 }
 
 /// Resolve a request's `completion_tokens` from the disaggregated result.
@@ -1785,6 +1895,7 @@ async fn drive_handoff_result(
         anyhow::bail!("prefill node error: {e}");
     }
     add_count(first.generated_tokens);
+    let prompt_cache_enabled = first.prompt_cache_enabled;
     if let Some(text) = first.tokens.first() {
         bridge
             .submit_first_token(&TokenEvent {
@@ -1799,7 +1910,10 @@ async fn drive_handoff_result(
     }
     if first.done {
         bridge.finalize();
-        return Ok(HandoffOutcome { generated_tokens });
+        return Ok(HandoffOutcome {
+            generated_tokens,
+            prompt_cache_enabled,
+        });
     }
 
     // Transition to the decode phase and consume the incrementally streamed
@@ -1836,8 +1950,12 @@ async fn drive_handoff_result(
         // the next expected position (frames could in principle reorder
         // across pooled transport connections). This is a liveness and
         // debugging aid against benign loss or reordering, NOT a tamper
-        // defense: the transport is unauthenticated and the disaggregated
-        // deployment model assumes a trusted network segment.
+        // defense. Tamper, replay and reorder rejection on the wire is the
+        // role transport's job: it authenticates connections with the
+        // cluster secret (#2655) and authenticates and encrypts every frame
+        // under per-connection keys (#2656). Frames from authenticated
+        // members are trusted, so a member that holds the secret can still
+        // send any sequence value here.
         if cont.start_sequence != 0 && cont.start_sequence != seq {
             anyhow::bail!(
                 "decode continuation frame out of order: expected sequence {seq}, \
@@ -1863,7 +1981,10 @@ async fn drive_handoff_result(
         }
     }
     bridge.finalize();
-    Ok(HandoffOutcome { generated_tokens })
+    Ok(HandoffOutcome {
+        generated_tokens,
+        prompt_cache_enabled,
+    })
 }
 
 // ── Small JSON helpers ───────────────────────────────────────────────────
@@ -1946,14 +2067,27 @@ fn chat_chunk_reasoning(
 /// this stream is assembled from the handoff protocol, whose outcome reports a
 /// generated-token count and no speculative acceptance counters. Surfacing them
 /// here is a handoff-protocol change rather than a response-shaping one.
-fn chat_chunk_finish(id: &str, model: &str, finish_reason: &str) -> serde_json::Value {
+///
+/// `delta.reasoning_only: true` is set only when `reasoning_only` is true and
+/// left out otherwise, as single node's `ChatCompletionChunk::with_reasoning_only`
+/// does (#2729).
+fn chat_chunk_finish(
+    id: &str,
+    model: &str,
+    finish_reason: &str,
+    reasoning_only: bool,
+) -> serde_json::Value {
+    let mut delta = serde_json::json!({});
+    if reasoning_only {
+        delta["reasoning_only"] = serde_json::Value::Bool(true);
+    }
     serde_json::json!({
         "id": id,
         "object": "chat.completion.chunk",
         "model": model,
         "choices": [{
             "index": 0,
-            "delta": {},
+            "delta": delta,
             "finish_reason": finish_reason
         }]
     })
@@ -1978,26 +2112,97 @@ fn chat_chunk_error(id: &str, model: &str, msg: &str) -> serde_json::Value {
 /// `choices` is empty per the OpenAI streaming-usage-chunk convention.
 /// `completion_tokens` is the caller's already-resolved authoritative count
 /// (issue #387); mirrors the router's own `/v1/completions` streaming usage
-/// chunk (`CompletionChunk::usage`) and single-node chat's
-/// `ChatCompletionChunk::usage_with_cache` (without the prompt-cache
-/// breakdown, which the router does not track).
+/// chunk ([`completion_usage_chunk`]) and single-node chat's
+/// `ChatCompletionChunk::usage_with_cache`, including its
+/// `prompt_tokens_details` rule (see [`router_usage_json`]).
 fn chat_chunk_usage(
     id: &str,
     model: &str,
     prompt_tokens: usize,
     completion_tokens: usize,
+    cache_enabled: bool,
 ) -> serde_json::Value {
     serde_json::json!({
         "id": id,
         "object": "chat.completion.chunk",
         "model": model,
         "choices": [],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens
-        }
+        "usage": router_usage_json(prompt_tokens, completion_tokens, cache_enabled)
     })
+}
+
+/// The `usage` object of a router chat response or usage chunk, in the shape
+/// single-node chat serializes from `Usage` (#2695).
+///
+/// `prompt_tokens_details` is present exactly when single node would include
+/// it: when the worker that served the request has a prompt-cache store
+/// (`cache_enabled`, resolved by [`HandoffOutcome::reports_prompt_cache`] from
+/// the prefill node's first-token frame, with the router's own
+/// `config.prompt_cache.is_enabled()` as the fallback for a prefill node that
+/// predates the report, #2715). Its `cached_tokens` is always 0, and that is
+/// exact rather than a placeholder: the handoff prefill never consults a
+/// prompt cache (`already_cached_tokens: 0` in the prefill node's handoff
+/// path), so no prompt token of a routed request is ever served from one.
+fn router_usage_json(
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    cache_enabled: bool,
+) -> serde_json::Value {
+    let mut usage = serde_json::json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens
+    });
+    if cache_enabled {
+        usage["prompt_tokens_details"] = serde_json::json!({"cached_tokens": 0});
+    }
+    usage
+}
+
+/// Non-streaming `/v1/completions` body, identical in shape to single node's
+/// (`routes/completions.rs`): `logprobs` is rejected up front so it is always
+/// `None`, and `usage.prompt_tokens_details` follows the same rule as the chat
+/// builders (see [`router_usage_json`]): `cached_tokens: 0` when the serving
+/// worker's prompt cache is enabled, absent otherwise (#2695, #2715).
+fn completion_response(
+    id: String,
+    model: String,
+    text: String,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    finish_reason: &str,
+    cache_enabled: bool,
+) -> CompletionResponse {
+    CompletionResponse::new_with_logprobs(
+        id,
+        model,
+        text,
+        prompt_tokens,
+        completion_tokens,
+        Some(finish_reason.to_string()),
+        None,
+    )
+    .with_cached_tokens(0, cache_enabled)
+}
+
+/// Streaming `/v1/completions` usage chunk, matching single node's
+/// `CompletionChunk::usage_with_cache` call, with `cached_tokens: 0` for the
+/// reason given on [`router_usage_json`] (#2695).
+fn completion_usage_chunk(
+    id: String,
+    model: String,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    cache_enabled: bool,
+) -> CompletionChunk {
+    CompletionChunk::usage_with_cache(
+        id,
+        model,
+        prompt_tokens,
+        completion_tokens,
+        0,
+        cache_enabled,
+    )
 }
 
 /// Non-streaming response body. `reasoning_content` is included only when
@@ -2005,12 +2210,15 @@ fn chat_chunk_usage(
 /// is derived from the worker's authoritative token count (issue #387) so it
 /// matches the single-node chat route. `usage` mirrors single-node's
 /// `ChatCompletionResponse` shape (`prompt_tokens`, `completion_tokens`,
-/// `total_tokens`); `completion_tokens` is the caller's already-resolved
-/// authoritative count (issue #398).
+/// `total_tokens`, and `prompt_tokens_details` per [`router_usage_json`]);
+/// `completion_tokens` is the caller's already-resolved authoritative count
+/// (issue #398).
 ///
 /// Like the streaming finish chunk it carries no `timings` block (#1314), for
 /// the same reason: the handoff outcome reports a generated-token count and no
-/// speculative acceptance counters.
+/// speculative acceptance counters. `message.reasoning_only: true` is set only
+/// when `reasoning_only` is true, as single node's
+/// `ChatCompletionResponse::with_reasoning_only` does (#2729).
 fn chat_completion_json(
     id: &str,
     model: &str,
@@ -2020,6 +2228,8 @@ fn chat_completion_json(
     finish_reason: &str,
     prompt_tokens: usize,
     completion_tokens: usize,
+    cache_enabled: bool,
+    reasoning_only: bool,
 ) -> serde_json::Value {
     let mut message = serde_json::json!({"role": "assistant", "content": content});
     if !reasoning.is_empty() {
@@ -2027,6 +2237,9 @@ fn chat_completion_json(
         if alias_field.emits_reasoning() {
             message["reasoning"] = serde_json::Value::String(reasoning.to_string());
         }
+    }
+    if reasoning_only {
+        message["reasoning_only"] = serde_json::Value::Bool(true);
     }
     serde_json::json!({
         "id": id,
@@ -2037,11 +2250,7 @@ fn chat_completion_json(
             "message": message,
             "finish_reason": finish_reason
         }],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens
-        }
+        "usage": router_usage_json(prompt_tokens, completion_tokens, cache_enabled)
     })
 }
 

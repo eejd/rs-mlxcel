@@ -346,3 +346,80 @@ fn mamba2_rejects_a_config_that_overstates_vocab_size() {
     Mamba2Model::from_weights(embedding_config(0, 0), padded)
         .expect("a table with more rows than vocab_size must still load");
 }
+
+fn batching_model() -> super::Mamba2Model {
+    use crate::models::embedding_test_support::Rng;
+    let config = serde_json::from_value(serde_json::json!({
+        "model_type": "mamba2", "vocab_size": 16, "hidden_size": 8,
+        "num_heads": 2, "head_dim": 4, "state_size": 4,
+        "num_hidden_layers": 2, "conv_kernel": 4, "n_groups": 1,
+        "tie_word_embeddings": true
+    }))
+    .unwrap();
+    let mut weights = WeightMap::new();
+    let mut rng = Rng::new(2571);
+    rng.insert(&mut weights, "backbone.embeddings.weight", &[16, 8], 0.2);
+    weights.insert(
+        "backbone.norm_f.weight".into(),
+        mlxcel_core::ones(&[8], dtype::FLOAT32),
+    );
+    for layer in 0..2 {
+        let prefix = format!("backbone.layers.{layer}");
+        for key in ["norm.weight", "mixer.norm.weight"] {
+            weights.insert(
+                format!("{prefix}.{key}"),
+                mlxcel_core::ones(&[8], dtype::FLOAT32),
+            );
+        }
+        rng.insert(
+            &mut weights,
+            &format!("{prefix}.mixer.in_proj.weight"),
+            &[26, 8],
+            0.1,
+        );
+        rng.insert(
+            &mut weights,
+            &format!("{prefix}.mixer.out_proj.weight"),
+            &[8, 8],
+            0.1,
+        );
+        rng.insert(
+            &mut weights,
+            &format!("{prefix}.mixer.conv1d.weight"),
+            &[16, 4, 1],
+            0.1,
+        );
+        for key in ["dt_bias", "A_log"] {
+            weights.insert(
+                format!("{prefix}.mixer.{key}"),
+                mlxcel_core::zeros(&[2], dtype::FLOAT32),
+            );
+        }
+        weights.insert(
+            format!("{prefix}.mixer.D"),
+            mlxcel_core::ones(&[2], dtype::FLOAT32),
+        );
+    }
+    super::Mamba2Model::from_weights(config, weights).unwrap()
+}
+
+#[test]
+fn mamba2_model_owned_batched_multistep() {
+    let _guard = crate::models::embedding_test_support::mlx_test_guard();
+    crate::models::batched_decode_harness::assert_model_owned_multistep_with_paged_lengths(
+        batching_model,
+        &[0, 0],
+    );
+}
+
+#[test]
+fn mamba2_fresh_and_mixed_recurrent_states_match_solo_rows() {
+    let _guard = crate::models::embedding_test_support::mlx_test_guard();
+    // The shared harness forces every forward before the next reference is
+    // built. The hand-rolled copy this replaced left the native -> B=1
+    // transition unevaluated, and that step then read its own pending cache
+    // write and compared as NaN (issue #2807).
+    crate::models::batched_decode_harness::assert_model_owned_fresh_mixed_and_transition(
+        batching_model,
+    );
+}

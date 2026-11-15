@@ -45,27 +45,38 @@
 pub mod backpressure;
 pub mod bench;
 pub mod bench_activation;
+pub mod cluster_auth;
+pub mod cluster_handshake;
 pub mod cluster_init;
 pub mod config;
 pub mod connection_pool;
 pub mod correlation;
 pub mod disaggregated;
 pub mod discovery;
+pub mod discovery_beacon;
 pub mod failure_detector;
+pub mod frame_protection;
 pub mod handoff_queue;
+pub(crate) mod handshake_warn;
 pub mod heartbeat;
 pub mod kv_cache_serde;
 pub mod kv_cache_transfer;
 pub mod metrics;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock_transport;
+pub mod peer_identity;
+pub(crate) mod peer_text;
+pub mod pending_handshakes;
 pub mod pipeline;
+pub mod platform;
 pub mod rdma_capabilities;
 pub mod rdma_transport;
 pub mod registry;
 pub mod request_tracker;
 pub mod routing;
 pub mod scheduler;
+pub mod stage_assignment;
+pub mod tcp_frame;
 pub mod tcp_transport;
 pub mod tensor_chunked;
 pub mod tensor_compress;
@@ -86,11 +97,21 @@ pub use bench_activation::{
     ActivationBenchConfig, ActivationTransferReport, DrainHandle, measure_activation_transfer,
     render_markdown_report, spawn_drain_task,
 };
+pub use cluster_auth::{
+    CLUSTER_SECRET_ENV, CLUSTER_SECRET_FILE_ENV, CLUSTER_SECRET_FILE_FLAG,
+    CLUSTER_SECRET_SOURCES_HELP, ClusterAuth, ClusterSecret, ClusterSecretSources,
+    MIN_CLUSTER_SECRET_BYTES,
+};
+pub use cluster_handshake::{
+    ClientAbortedAfterServerProof, ConnectionLimitReached, FrameSuiteMismatch, HANDSHAKE_TIMEOUT,
+    HandshakeRejected, IdentityNotOwned, PeerClosedBeforeHandshake, ServerAtCapacity,
+    client_handshake, client_handshake_on, server_handshake, server_handshake_on,
+};
 pub use cluster_init::{
     ClusterDiscoveryMode, ClusterInitPlan, ClusterInitRequest, DEFAULT_CONTROL_BASE_PORT,
     DEFAULT_DISCOVERY_PORT, DEFAULT_DISCOVERY_TIMEOUT, DiscoveryBeacon, allocate_data_ports,
     broadcast_beacon_loop, discover_peers, is_port_available, plan_cluster,
-    render_deterministic_toml, write_plan_toml,
+    render_deterministic_toml, render_peer_assignment_toml, write_plan_toml,
 };
 pub use config::{ClusterConfig, ClusterMeta, NodeConfig, NodeResources, NodeRole};
 pub use connection_pool::{ConnectionPool, PoolConfig, PoolStats};
@@ -109,6 +130,7 @@ pub use disaggregated::{
 };
 pub use discovery::{initialize_distributed, log_cluster_topology, probe_peers};
 pub use failure_detector::{FailureDetector, FailureDetectorConfig, FailureEvent};
+pub use frame_protection::{FrameChannel, FrameRejected, FrameSuite, SessionKeys};
 pub use handoff_queue::{
     HandoffItem, HandoffQueue, HandoffQueueConfig, HandoffQueueManager, OverflowPolicy, QueueStats,
 };
@@ -142,22 +164,23 @@ pub use pipeline::{
     PipelineMetricsCollector, PipelineRequest, PipelineResponse, PipelineSchedule,
     PipelineServingConfig, PipelineWorkerInput, PipelineWorkerOutput, SafeTensorsIndex,
     ScalingResult, ScheduleAction, StageAssignment, StageEndpoint, StageExecutionInput,
-    StageExecutionOutput, StageExecutor, StageHealth, StageLifecycleRequest,
-    StageLifecycleResponse, StageLifecycleSnapshot, StageLifecycleState, StageLink, StageMetrics,
-    StageQuality, StageRole, TransportStageEndpoint, TransportStageLink, WeightClass,
-    activation_channel, activation_latency, auto_partition, auto_partition_with_report,
-    build_manual_assignments, build_model_profile, build_pipeline_links, build_profile_from_json,
-    build_quality_report, build_quality_report_with_actuals, classify_weight_key,
-    create_gpipe_schedule, detect_pipeline_config, estimate_partial_memory, filter_weight_keys,
-    filter_weight_map, format_benchmark_report, format_quality_report, identify_required_shards,
-    install_stage_control_service, load_in_process_stage_worker, log_partition_quality,
-    parse_manual_partition, populate_actual_memory, resolve_in_process_pipeline_num_layers,
+    StageExecutionOutput, StageExecutor, StageHealth, StageLifecycleSnapshot, StageLifecycleState,
+    StageLink, StageMetrics, StageQuality, StageRole, TransportStageEndpoint, TransportStageLink,
+    WeightClass, activation_channel, activation_latency, auto_partition,
+    auto_partition_with_report, build_manual_assignments, build_model_profile,
+    build_pipeline_links, build_profile_from_json, build_quality_report,
+    build_quality_report_with_actuals, classify_weight_key, create_gpipe_schedule,
+    detect_pipeline_config, estimate_partial_memory, filter_weight_keys, filter_weight_map,
+    format_benchmark_report, format_quality_report, identify_required_shards,
+    load_in_process_stage_worker, log_partition_quality, parse_manual_partition,
+    populate_actual_memory, resolve_in_process_pipeline_num_layers,
     resolve_in_process_stage_assignments, resolve_in_process_stage_assignments_for_model,
     run_pipeline_benchmark, run_scaling_benchmark, should_load_key, should_use_pipeline,
     split_into_micro_batches, suggested_micro_batch_size, summarize_quality_warnings,
     to_pipeline_schedule_config, validate_activation, validate_adjacency, validate_memory_fit,
     validate_partial_memory, validate_partition,
 };
+pub use platform::ensure_distributed_supported;
 pub use rdma_capabilities::{
     RDMA_PROTOCOL_VERSION, RdmaAcceleration, RdmaCapabilities, negotiate_protocol_version,
     probe_capabilities,
@@ -173,6 +196,14 @@ pub use routing::{
     TrafficClass,
 };
 pub use scheduler::{CoordinationMode, Scheduler, SchedulerConfig};
+pub use stage_assignment::{
+    ASSIGNMENT_ACK_TIMEOUT, ASSIGNMENT_COMMIT_TIMEOUT, ASSIGNMENT_IO_TIMEOUT,
+    ASSIGNMENT_PROTOCOL_VERSION, AssignmentFrame, AssignmentPushFailed, AssignmentRefused,
+    AssignmentRejectReason, CommittedAssignment, MAX_ASSIGNMENT_FRAME_BYTES, ModelIdentity,
+    PEER_ASSIGNMENT_TIMEOUT, PeerAssignmentFailure, PeerJoinConfig, StageAssignmentOffer,
+    await_stage_assignment, push_stage_assignments,
+};
+pub use tcp_frame::ProtectedStream;
 pub use tcp_transport::{TcpTransport, TcpTransportConfig};
 pub use tensor_chunked::{ChunkAssembler, ChunkedTensor, ChunkedTransferConfig};
 pub use tensor_parallel::{
@@ -194,7 +225,8 @@ pub use tensor_protocol::{
     PROTOCOL_VERSION, QuantizationMode, TensorDtype, TensorFlags, TensorHeader, TensorKind,
 };
 pub use tensor_serialize::{
-    DeserializedTensor, SerializeOptions, deserialize_tensor, serialize_tensor,
+    DeserializedTensor, DimBound, SerializeOptions, ShapeBound, TensorDecodeLimits,
+    deserialize_tensor, deserialize_tensor_with_limits, serialize_tensor,
     serialize_tensor_to_bytes,
 };
 pub use thunderbolt_transport::{ThunderboltTransport, ThunderboltTransportConfig};

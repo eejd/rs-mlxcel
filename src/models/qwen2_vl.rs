@@ -20,8 +20,12 @@
 //! Used by: Qwen2-VL
 //! Reference: https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/qwen2_vl/language.py
 
-use crate::models::qwen_mrope_state::MRopeState;
+use crate::models::qwen_mrope_state::{
+    MRopeState, concatenate_scattered, decode_offsets, scatter_group_logits, select_cache_rows,
+    take_rows,
+};
 use mlxcel_core::cache::SequenceId;
+use mlxcel_core::generate::{BatchedDecodeKind, LanguageModel, route_batched_decode_with_ids};
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
@@ -29,6 +33,7 @@ use serde::Deserialize;
 
 // Config.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Qwen2VLConfig {
     pub hidden_size: usize,
     pub num_hidden_layers: usize,
@@ -50,6 +55,8 @@ pub struct Qwen2VLConfig {
     #[serde(default)]
     pub quantization: Option<QuantConfig>,
 }
+
+mlxcel_core::impl_rope_lifting_deserialize!(Qwen2VLConfig);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RopeScaling {
@@ -294,6 +301,50 @@ struct Attention {
     scale: f32,
     /// `rope_theta`, kept for the text-only path's plain 1-D RoPE.
     rope_base: f32,
+}
+
+impl mlxcel_core::batched_decode::SplitAttention for Attention {
+    fn split_shape(&self) -> mlxcel_core::batched_decode::SplitAttentionShape {
+        mlxcel_core::batched_decode::SplitAttentionShape {
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            scale: self.scale,
+        }
+    }
+
+    fn rope_batched(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        offsets: &[i32],
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        (
+            mlxcel_core::fast_rope_batched(q, self.head_dim, false, self.rope_base, 1.0, offsets),
+            mlxcel_core::fast_rope_batched(k, self.head_dim, false, self.rope_base, 1.0, offsets),
+        )
+    }
+}
+
+struct Qwen2VLMropeAttention<'a> {
+    attention: &'a Attention,
+    cos: &'a MlxArray,
+    sin: &'a MlxArray,
+}
+
+impl mlxcel_core::batched_decode::SplitAttention for Qwen2VLMropeAttention<'_> {
+    fn split_shape(&self) -> mlxcel_core::batched_decode::SplitAttentionShape {
+        mlxcel_core::batched_decode::SplitAttention::split_shape(self.attention)
+    }
+
+    fn rope_batched(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        _offsets: &[i32],
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        apply_multimodal_rotary_pos_emb(q, k, self.cos, self.sin)
+    }
 }
 
 impl Attention {
@@ -565,6 +616,31 @@ impl DecoderLayer {
             .attn
             .forward_text_only(&self.input_layernorm.forward(x), cache, mask);
         let h = mlxcel_core::add(x, &r);
+        let r = self.mlp.forward(&self.post_attention_layernorm.forward(&h));
+        mlxcel_core::add(&h, &r)
+    }
+
+    fn forward_batched<A: mlxcel_core::batched_decode::SplitAttention + ?Sized>(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut KVCache],
+        layer_idx: usize,
+        mask: Option<&MlxArray>,
+        attention: &A,
+    ) -> UniquePtr<MlxArray> {
+        let normed = self.input_layernorm.forward(x);
+        let q = self.attn.q_proj.forward(&normed);
+        let k = self.attn.k_proj.forward(&normed);
+        let v = self.attn.v_proj.forward(&normed);
+        let seq_len = mlxcel_core::array_shape(&q)[1];
+        let metadata = crate::models::batched_decode_cache::uniform_layer_metadata(
+            caches, seq_len, 0, "Qwen2VL", layer_idx,
+        );
+        let attention_output = mlxcel_core::batched_decode::forward_split_attention(
+            attention, &q, &k, &v, caches, &metadata, mask,
+        );
+        let attention_output = self.attn.o_proj.forward(&attention_output);
+        let h = mlxcel_core::add(x, &attention_output);
         let r = self.mlp.forward(&self.post_attention_layernorm.forward(&h));
         mlxcel_core::add(&h, &r)
     }
@@ -887,10 +963,165 @@ impl Qwen2VLModel {
     pub fn make_caches(&self) -> Vec<KVCache> {
         (0..self.layers.len()).map(|_| KVCache::new()).collect()
     }
+
+    /// Native single-token decode for sequence-aware continuous batches.
+    /// Rows are partitioned into plain-RoPE and MRoPE groups so each group's
+    /// projections, MLPs, final norm and head run as batched tensor programs.
+    pub(crate) fn forward_batched_decode_with_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        route_batched_decode_with_ids(self, input_ids, seq_ids, batch_caches, |batch_caches| {
+            let shape = mlxcel_core::array_shape(input_ids);
+            let Some(seq_ids) = seq_ids.filter(|ids| ids.len() == batch_caches.len()) else {
+                return crate::multimodal::qwen_vl::forward_batched_with_seq_ids_dispatch(
+                    self,
+                    input_ids,
+                    seq_ids,
+                    batch_caches,
+                    mask,
+                );
+            };
+            if shape.len() != 2 || shape[1] != 1 {
+                return crate::multimodal::qwen_vl::forward_batched_with_seq_ids_dispatch(
+                    self,
+                    input_ids,
+                    Some(seq_ids),
+                    batch_caches,
+                    mask,
+                );
+            }
+
+            let offsets = decode_offsets(batch_caches, "Qwen2VL");
+            let Some(positions) = self.mrope_state.batched_decode_positions(seq_ids, &offsets)
+            else {
+                return crate::multimodal::qwen_vl::forward_batched_with_seq_ids_dispatch(
+                    self,
+                    input_ids,
+                    Some(seq_ids),
+                    batch_caches,
+                    mask,
+                );
+            };
+
+            let mut plain_rows = Vec::new();
+            let mut mrope_rows = Vec::new();
+            for (row, &seq_id) in seq_ids.iter().enumerate() {
+                if self.can_use_text_only_fast_path(Some(seq_id)) {
+                    plain_rows.push(row);
+                } else {
+                    mrope_rows.push(row);
+                }
+            }
+
+            self.forward_decode_groups(
+                input_ids,
+                seq_ids,
+                batch_caches,
+                mask,
+                &positions,
+                &plain_rows,
+                &mrope_rows,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_decode_groups(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: &[SequenceId],
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+        positions: &MlxArray,
+        plain_rows: &[usize],
+        mrope_rows: &[usize],
+    ) -> UniquePtr<MlxArray> {
+        let mut outputs: Vec<Option<UniquePtr<MlxArray>>> = std::iter::repeat_with(|| None)
+            .take(seq_ids.len())
+            .collect();
+        for (rows, use_mrope) in [(plain_rows, false), (mrope_rows, true)] {
+            if rows.is_empty() {
+                continue;
+            }
+            let logits = if rows.len() == 1 {
+                let row = rows[0];
+                let ids = take_rows(input_ids, rows, 0);
+                let row_mask = mask.map(|value| take_rows(value, rows, 0));
+                self.forward_with_sequence_id(
+                    &ids,
+                    Some(seq_ids[row]),
+                    batch_caches[row],
+                    row_mask.as_deref(),
+                )
+            } else {
+                let ids = take_rows(input_ids, rows, 0);
+                let row_mask = mask.map(|value| take_rows(value, rows, 0));
+                let mut caches = select_cache_rows(batch_caches, rows);
+                let row_positions = use_mrope.then(|| take_rows(positions, rows, 1));
+                self.forward_decode_group(
+                    &ids,
+                    &mut caches,
+                    row_mask.as_deref(),
+                    row_positions.as_deref(),
+                )
+            };
+            scatter_group_logits(&mut outputs, rows, &logits);
+        }
+        concatenate_scattered(outputs, "Qwen2VL")
+    }
+
+    fn forward_decode_group(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+        positions: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let mut h = self.embed_tokens.forward(input_ids);
+        let tables = positions.map(|positions| self.mrope.forward(positions));
+        for layer_idx in 0..self.layers.len() {
+            let mut layer_caches = crate::models::batched_decode_cache::collect_layer_caches(
+                batch_caches,
+                "Qwen2VL",
+                layer_idx,
+            );
+            h = if let Some((cos, sin)) = tables.as_ref() {
+                let attention = Qwen2VLMropeAttention {
+                    attention: &self.layers[layer_idx].attn,
+                    cos,
+                    sin,
+                };
+                self.layers[layer_idx].forward_batched(
+                    &h,
+                    &mut layer_caches,
+                    layer_idx,
+                    mask,
+                    &attention,
+                )
+            } else {
+                self.layers[layer_idx].forward_batched(
+                    &h,
+                    &mut layer_caches,
+                    layer_idx,
+                    mask,
+                    &self.layers[layer_idx].attn,
+                )
+            };
+        }
+        self.lm_head.forward(&self.norm.forward(&h))
+    }
 }
 
 // LanguageModel trait implementation.
 impl mlxcel_core::generate::LanguageModel for Qwen2VLModel {
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
@@ -929,6 +1160,16 @@ impl mlxcel_core::generate::LanguageModel for Qwen2VLModel {
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         self.forward_for_sequence(input_ids, input_embeddings, caches, mask, seq_id)
+    }
+
+    fn forward_batched_with_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_batched_decode_with_ids(input_ids, seq_ids, batch_caches, mask)
     }
 
     fn release_sequence_state_by_id(&self, seq_id: SequenceId) {
@@ -982,3 +1223,7 @@ mod mrope_section_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "qwen2_vl_batched_tests.rs"]
+pub(crate) mod batched_tests;

@@ -306,15 +306,30 @@ impl<M: LanguageModel> DirectEngine<M> {
 
     /// Open a sequence under this client's KV mode. The model's own modes go
     /// in before [`Engine::open`]: a model-owned family (Gemma 3/4, Llama 4,
-    /// Qwen 3.5, their VLM wrappers) builds the sequence's caches in
+    /// Qwen 3.5, ExaOne 4, GPT-OSS, Ministral 3, Step 3.5, Mellum, Laguna,
+    /// their VLM wrappers) builds the sequence's caches in
     /// `prepare_sequence_state` from the modes it holds at that moment, and
     /// a later `set_kv_cache_layer_modes` rebuilds only its fallback slot.
+    ///
+    /// A model that cannot batch keeps one set of caches inside itself
+    /// (NemotronNAS and LongCat-Flash / LongCat-Flash-Ngram hold them in one
+    /// shared `RefCell` slot; the batching families above key theirs per
+    /// sequence in `ModelOwnedSequenceState`), and its model-owned pool
+    /// entry never calls `make_caches`, so every sequence would continue on
+    /// the previous one's KV. The client resets them here, as the scheduler
+    /// does at prefill time
+    /// (`BatchScheduler::execute_full_prefill`) and the retired CLI loop did
+    /// per generation (#2494): without it the timed run of `mlxcel generate`
+    /// prefilled on top of its warmup's prompt.
     pub(super) fn open_sequence(&mut self) -> Result<SequenceId, DirectEngineError> {
         self.inject_model_kv_cache_modes();
         let id = self
             .engine
             .open(SequenceSpec::default())
             .map_err(DirectEngineError::Open)?;
+        if !self.model().supports_batching() {
+            let _ = self.model().make_caches();
+        }
         self.apply_pool_kv_cache_mode(id);
         Ok(id)
     }
@@ -467,8 +482,14 @@ impl<M: LanguageModel> DirectEngine<M> {
         // The server reseeds right before a row's first token is sampled.
         seed_rng_if_needed(sampling);
         let eval_start = profile_ttft.then(Instant::now);
+        let weights_before = profile_ttft
+            .then(crate::weight_materialize::WeightTransferStats::snapshot)
+            .flatten();
         let first = self.engine.complete_prefill(&logits, &mut state.row());
         let eval_ns = eval_start.map_or(0, |t| t.elapsed().as_nanos());
+        let weights = weights_before
+            .zip(crate::weight_materialize::WeightTransferStats::snapshot())
+            .map(|(before, after)| after.since(&before));
         self.mark_prefilled(id, prompt_tokens.len());
         let post_start = profile_ttft.then(Instant::now);
         self.prepare_turbo4_delegated_before_decode(id, max_tokens);
@@ -484,6 +505,7 @@ impl<M: LanguageModel> DirectEngine<M> {
                 sample_ns: 0,
                 eval_ns,
                 post_ns,
+                weights,
             };
             eprintln!(
                 "{}",

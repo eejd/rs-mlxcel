@@ -24,8 +24,11 @@
 //! Reference: https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/molmo2/vision.py
 
 use mlxcel_core::layers::{LayerNorm, Linear};
+use mlxcel_core::utils::GeluActivation;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
+
+use crate::vision::weights::load_dense_param;
 
 #[cfg(any(feature = "xla-diagnostics", feature = "xla-diagnostics-cpu"))]
 const MOLMO2_VIT_PROBE_LAYER: usize = 18;
@@ -87,25 +90,8 @@ fn diagnostic_probe_stage(
 
 /// Hugging Face's `gelu_pytorch_tanh`, evaluated in F32 so the eager Molmo2
 /// reference matches both the checkpoint's declared activation and StableHLO.
-fn gelu_pytorch_tanh(x: &MlxArray) -> UniquePtr<MlxArray> {
-    let output_dtype = mlxcel_core::array_dtype(x);
-    let x = mlxcel_core::astype(x, mlxcel_core::dtype::FLOAT32);
-    let half = mlxcel_core::full_f32(&[1], 0.5, mlxcel_core::dtype::FLOAT32);
-    let one = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::dtype::FLOAT32);
-    let sqrt_two_over_pi = mlxcel_core::full_f32(&[1], 0.797_884_6, mlxcel_core::dtype::FLOAT32);
-    let cubic_coefficient = mlxcel_core::full_f32(&[1], 0.044_715, mlxcel_core::dtype::FLOAT32);
-    let squared = mlxcel_core::multiply(&x, &x);
-    let cubed = mlxcel_core::multiply(&squared, &x);
-    let cubic = mlxcel_core::multiply(&cubic_coefficient, &cubed);
-    let inner = mlxcel_core::multiply(&sqrt_two_over_pi, &mlxcel_core::add(&x, &cubic));
-    let cdf = mlxcel_core::multiply(&half, &mlxcel_core::add(&one, &mlxcel_core::tanh(&inner)));
-    let activated = mlxcel_core::multiply(&x, &cdf);
-    if output_dtype == mlxcel_core::dtype::FLOAT32 {
-        activated
-    } else {
-        mlxcel_core::astype(&activated, output_dtype)
-    }
-}
+/// The shared `mlxcel_core` helper computes the same op sequence (#2423).
+const MOLMO2_VIT_GELU: GeluActivation = GeluActivation::TanhF32;
 
 // ViT MLP.
 pub(crate) struct ViTMLP {
@@ -116,7 +102,7 @@ pub(crate) struct ViTMLP {
 impl ViTMLP {
     fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         let h = self.w1.forward(x);
-        let h = gelu_pytorch_tanh(&h);
+        let h = MOLMO2_VIT_GELU.apply(&h);
         self.w2.forward(&h)
     }
 
@@ -500,11 +486,17 @@ impl Molmo2VisionTransformer {
         image_num_pos: usize,
         layer_norm_eps: f32,
         float32_attention: bool,
+        group_size: i32,
+        bits: i32,
     ) -> Result<Self, String> {
         let patch_embedding =
             Linear::from_weights(weights, &format!("{}.patch_embedding", prefix))?;
-        let positional_embedding =
-            get_weight_copy(weights, &format!("{}.positional_embedding", prefix))?;
+        let positional_embedding = load_dense_param(
+            weights,
+            &format!("{prefix}.positional_embedding"),
+            &[image_num_pos as i32, hidden_size],
+            Some((group_size, bits)),
+        )?;
 
         let mut blocks = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
@@ -1052,6 +1044,8 @@ impl Molmo2VisionModel {
         adapter_float32_attention: bool,
         vit_layers: &[usize],
         pooling_attention_mask: bool,
+        group_size: i32,
+        bits: i32,
     ) -> Result<Self, String> {
         if vit_layers.is_empty() {
             return Err("Molmo2 adapter must select at least one ViT layer".to_string());
@@ -1073,6 +1067,8 @@ impl Molmo2VisionModel {
             vit_image_num_pos,
             vit_layer_norm_eps,
             vit_float32_attention,
+            group_size,
+            bits,
         )?;
 
         // Pool dim = hidden_size * len(vit_layers)
@@ -1111,14 +1107,14 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
 
 #[cfg(test)]
 mod tests {
-    use super::gelu_pytorch_tanh;
+    use super::MOLMO2_VIT_GELU;
     #[cfg(any(feature = "xla-diagnostics", feature = "xla-diagnostics-cpu"))]
     use super::{MOLMO2_VIT_PROBE_FLAT_ROW, diagnostic_flat_row_snapshot};
 
     #[test]
     fn molmo2_uses_the_checkpoint_pytorch_tanh_gelu() {
         let input = mlxcel_core::from_slice_f32(&[-3.0, -1.0, 0.0, 1.0, 3.0], &[5]);
-        let output = gelu_pytorch_tanh(&input);
+        let output = MOLMO2_VIT_GELU.apply(&input);
         mlxcel_core::eval(&output);
         let expected = [-0.003_637_433, -0.158_808, 0.0, 0.841_192, 2.996_362_7];
         for (index, expected) in expected.into_iter().enumerate() {

@@ -27,14 +27,18 @@
 
 use anyhow::Result;
 
+#[cfg(test)]
+pub(crate) mod addmm_oracle_test_support;
 pub mod config;
 pub mod connectors;
+pub mod dense;
 pub mod detection;
 pub mod encoders;
 pub mod feature_cache;
 pub mod image_token_overrides;
 pub mod merge;
 pub mod processors;
+pub(crate) mod weights;
 
 // VLM model implementations
 pub mod cohere_compass;
@@ -77,6 +81,7 @@ pub mod mage_vl_config;
 pub mod minicpmo_vl;
 pub mod minicpmv4_6_vl;
 pub mod minimax_m3_vl;
+pub mod mllama_image_state;
 pub mod mllama_vl;
 pub mod molmo2_vl;
 pub mod molmo_point_vl;
@@ -95,9 +100,16 @@ pub mod qwen3_5_vl;
 pub mod qwen3_omni_moe;
 pub mod qwen3_vl;
 pub mod qwen3_vl_moe;
+pub mod qwen4_exp_vl;
+#[cfg(test)]
+mod qwen_vl_batched_decode_tests;
 pub mod smolvlm;
 pub mod step3p7;
 pub mod unlimited_ocr;
+#[cfg(test)]
+pub(crate) mod vlm_family_batched_decode_tests;
+#[cfg(test)]
+mod wrapper_native_batched_decode_tests;
 pub mod youtu_vl;
 
 // Re-export VLM model types
@@ -150,6 +162,7 @@ pub use qwen3_5_vl::Qwen35VLModel;
 pub use qwen3_omni_moe::Qwen3OmniMoeModel;
 pub use qwen3_vl::Qwen3VLModel;
 pub use qwen3_vl_moe::Qwen3VLMoeModel;
+pub use qwen4_exp_vl::Qwen4ExpVLModel;
 pub use smolvlm::SmolVLMModel;
 pub use step3p7::Step3p7VlModel;
 pub use unlimited_ocr::UnlimitedOcrVlModel;
@@ -173,13 +186,19 @@ fn require_array_ref<'a>(array: &'a UniquePtr<MlxArray>, label: &str) -> Result<
 /// Merge strategy for combining vision and text embeddings
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeStrategy {
-    /// Used by: Gemma3, Gemma3n
+    /// Used by: Gemma3 VLM (`loading::vlm_gemma::load_gemma3_vlm`)
     ///
-    /// Gemma-style multimodal routing keeps a 4D attention mask and merges
-    /// image features with a masked-scatter style operation.
+    /// Scales and masked-scatters the image features and returns a 4D
+    /// attention mask: causal, plus bidirectional attention inside each
+    /// image block, as transformers builds it for Gemma3.
     Gemma3,
-    /// Used by: LLaVA, Aya Vision, PaliGemma, Pixtral, Mistral3, Qwen2/2.5/3-VL,
-    /// Phi3V, Molmo2, Llama4
+    /// Used by: PaliGemma (`loading::vlm_siglip::load_paligemma_vlm`)
+    ///
+    /// The same merge as `Gemma3`, with a prefix-LM mask: the whole prompt,
+    /// image and text, attends bidirectionally at prefill.
+    PaliGemma,
+    /// Used by: LLaVA, Aya Vision, Pixtral, Mistral3, FastVLM, and the other
+    /// `VisionModule` loaders that replace image tokens directly
     ///
     /// LLaVA-style routing replaces image-token positions directly and then
     /// relies on standard causal masking.
@@ -224,6 +243,11 @@ pub struct VisionModule {
     /// Tokens to insert after each image block during expansion.
     /// Gemma3 VLM: `[108]` (\n\n token) to match Python processor behavior.
     pub block_suffix_tokens: Vec<i32>,
+    /// Newline-run token table for fusing the block wrapper with template
+    /// newlines (`multimodal::gemma3_vlm_prompt`), probed with the request
+    /// tokenizer on the first image request and reused after (issue #2761).
+    /// Every loader starts it empty with `OnceLock::new()`.
+    pub newline_runs: std::sync::OnceLock<Vec<i32>>,
     /// Dynamic aspect-ratio row-structured layout for Pixtral / Mistral3.
     ///
     /// When `Some`, the model is routed to the Pixtral runtime path
@@ -289,6 +313,17 @@ impl VisionModule {
                 self.hidden_size,
                 self.pad_token_id,
                 self.image_token_id,
+                merge::MultimodalMask::Gemma3ImageBlocks,
+                &image_features,
+                &inputs_embeds,
+                input_ids,
+                attention_mask,
+            ),
+            MergeStrategy::PaliGemma => merge::prepare_inputs_for_multimodal(
+                self.hidden_size,
+                self.pad_token_id,
+                self.image_token_id,
+                merge::MultimodalMask::PrefixLm,
                 &image_features,
                 &inputs_embeds,
                 input_ids,
@@ -313,6 +348,10 @@ pub struct VisionLanguageModel {
 }
 
 impl LanguageModel for VisionLanguageModel {
+    fn batched_decode_kind(&self) -> mlxcel_core::generate::BatchedDecodeKind {
+        self.text_model.batched_decode_kind()
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
@@ -349,6 +388,10 @@ impl LanguageModel for VisionLanguageModel {
         self.text_model.kv_cache_layer_modes()
     }
 
+    fn kv_cache_storage_modes(&self) -> Option<Vec<Option<KVCacheMode>>> {
+        self.text_model.kv_cache_storage_modes()
+    }
+
     fn num_layers(&self) -> usize {
         self.text_model.num_layers()
     }
@@ -382,6 +425,10 @@ impl LanguageModel for VisionLanguageModel {
 
     fn supports_decode_lookahead_rewind(&self) -> bool {
         self.text_model.supports_decode_lookahead_rewind()
+    }
+
+    fn kv_cache_captures_sequence_state(&self) -> bool {
+        self.text_model.kv_cache_captures_sequence_state()
     }
 
     fn rewind_decode_appends(
@@ -602,3 +649,9 @@ mod moondream3_vl_tests;
 #[cfg(test)]
 #[path = "moondream2_vl_tests.rs"]
 mod moondream2_vl_tests;
+
+#[cfg(test)]
+#[path = "deepseekocr_batched_tests.rs"]
+mod deepseekocr_batched_tests;
+#[cfg(test)]
+mod dense_wrapper_batched_decode_tests;

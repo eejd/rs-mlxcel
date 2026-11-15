@@ -744,9 +744,9 @@ fn nemotron_h_conv_state_shape_plateaus_after_50_steps() {
     }
 }
 
-/// `QuantizedSwitchLinear` has no named constructor: `NemotronHModel::from_weights`
-/// builds the quantized variant as a bare struct literal, storing the declared
-/// `group_size` / `bits` and handing them to `gather_qmm` without ever reaching
+/// `NemotronHModel::from_weights` stores the declared `group_size` / `bits` on
+/// each expert plane (`SwitchLinear`, since issue #2665; a local struct literal
+/// before) and hands them to `gather_qmm` without ever reaching
 /// `reconcile_quantization_layout` (issue #958). `gather_qmm` crosses the cxx
 /// bridge as `UniquePtr<MlxArray>` rather than `Result`, so a hostile pair used
 /// to abort the process at the first routed forward pass rather than failing at
@@ -1134,4 +1134,276 @@ fn config_without_any_layer_stack_description_is_rejected() {
     let mut cfg: NemotronHConfig =
         serde_json::from_value(transformers_config(serde_json::json!({}))).unwrap();
     assert!(cfg.post_init().is_err());
+}
+
+/// An mlx-lm NVFP4 export of Nemotron-H (for example
+/// `mlx-community/Nemotron-Cascade-2-30B-A3B-nvfp4`) ships its expert planes
+/// with uint8 E4M3 scales and no `.biases`. The loader required affine biases
+/// and refused it ("Missing switch_mlp.fc1.biases for layer 1"); the planes
+/// now load as nvfp4 (issue #2665). The routed experts must then match a
+/// dequantized reference both on the unsorted decode layout and on the sorted
+/// prefill layout, which the MoE takes from 64 (token, expert) pairs on.
+#[test]
+fn nemotron_h_runs_nvfp4_experts_sorted_and_unsorted() {
+    use super::{BlockType, NemotronHMixer, NemotronHModel};
+    use mlxcel_core::weights::WeightMap;
+
+    const HIDDEN: i32 = 32;
+    const EXPERTS: i32 = 4;
+    const FF: i32 = 48;
+    const TOP_K: i32 = 2;
+
+    let mut config: NemotronHConfig = serde_json::from_value(serde_json::json!({
+        "model_type": "nemotron_h",
+        "vocab_size": 8,
+        "hidden_size": HIDDEN,
+        "intermediate_size": FF,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "mamba_num_heads": 1,
+        "mamba_head_dim": 4,
+        "ssm_state_size": 4,
+        "conv_kernel": 4,
+        "n_groups": 1,
+        "n_routed_experts": EXPERTS,
+        "num_experts_per_tok": TOP_K,
+        "moe_intermediate_size": FF,
+        "hybrid_override_pattern": "E",
+        "quantization": { "group_size": 16, "bits": 4, "mode": "nvfp4" },
+    }))
+    .expect("test config must parse");
+    config.post_init().expect("test config must pass post_init");
+
+    // Deterministic weights with a spread of magnitudes, quantized to nvfp4.
+    let dense = |shape: &[i32], salt: usize| {
+        let n: i32 = shape.iter().product();
+        let v: Vec<f32> = (0..n as usize)
+            .map(|i| (((i * 37 + salt) % 29) as f32 - 14.0) / 16.0)
+            .collect();
+        mlxcel_core::from_slice_f32(&v, shape)
+    };
+    let mut weights = WeightMap::new();
+    let zeros = |shape: &[i32]| {
+        let n: i32 = shape.iter().product();
+        mlxcel_core::from_slice_f32(&vec![0.0; n as usize], shape)
+    };
+    weights.insert("backbone.embeddings.weight".into(), zeros(&[8, HIDDEN]));
+    weights.insert("lm_head.weight".into(), zeros(&[8, HIDDEN]));
+    weights.insert("backbone.norm_f.weight".into(), zeros(&[HIDDEN]));
+    weights.insert("backbone.layers.0.norm.weight".into(), zeros(&[HIDDEN]));
+    weights.insert(
+        "backbone.layers.0.mixer.gate.weight".into(),
+        zeros(&[EXPERTS, HIDDEN]),
+    );
+    let mut reference_planes = Vec::new();
+    for (fc, shape, salt) in [
+        ("fc1", [EXPERTS, FF, HIDDEN], 3),
+        ("fc2", [EXPERTS, HIDDEN, FF], 11),
+    ] {
+        let q = mlxcel_core::quantize_weights_with_mode(&dense(&shape, salt), 16, 4, "nvfp4");
+        let packed = mlxcel_core::quantized_weights_w(&q);
+        let scales = mlxcel_core::quantized_weights_scales(&q);
+        assert_eq!(mlxcel_core::array_dtype(&scales), dtype::UINT8);
+        // SAFETY: null is the bridge's documented value for absent biases.
+        let deq =
+            unsafe { mlxcel_core::dequantize(&packed, &scales, std::ptr::null(), 16, 4, "nvfp4") };
+        reference_planes.push(mlxcel_core::astype(&deq, dtype::FLOAT32));
+        let prefix = format!("backbone.layers.0.mixer.switch_mlp.{fc}");
+        weights.insert(format!("{prefix}.weight"), packed);
+        weights.insert(format!("{prefix}.scales"), scales);
+    }
+
+    let model = NemotronHModel::from_weights(config, weights, vec![BlockType::MoE])
+        .expect("nvfp4 expert planes without biases must load");
+    let NemotronHMixer::MoE(moe) = &model.layers[0].mixer else {
+        panic!("layer 0 must be the MoE block");
+    };
+
+    // tokens * TOP_K pairs: 10 stays unsorted, 40 (80 pairs) takes the sort.
+    for tokens in [5, 40] {
+        let x_vals: Vec<f32> = (0..(tokens * HIDDEN) as usize)
+            .map(|i| (((i * 13 + 7) % 17) as f32 - 8.0) / 8.0)
+            .collect();
+        let x = mlxcel_core::from_slice_f32(&x_vals, &[tokens, HIDDEN]);
+        let experts: Vec<i32> = (0..tokens * TOP_K)
+            .map(|p| (p * 3 + p / TOP_K) % EXPERTS)
+            .collect();
+        let indices = mlxcel_core::astype(
+            &mlxcel_core::from_slice_i32(&experts, &[tokens, TOP_K]),
+            dtype::UINT32,
+        );
+        let got = moe.switch_mlp.forward(&x, &indices);
+        let got = mlxcel_core::astype(&got, dtype::FLOAT32);
+        mlxcel_core::try_eval(&got).expect("the routed experts evaluate");
+        assert_eq!(mlxcel_core::array_shape(&got), [tokens, TOP_K, HIDDEN]);
+
+        // relu(x @ W1[e].T)^2 @ W2[e].T per (token, expert) pair.
+        let idx = mlxcel_core::from_slice_i32(&experts, &[tokens * TOP_K]);
+        let w1 = mlxcel_core::take(&reference_planes[0], &idx, 0);
+        let w2 = mlxcel_core::take(&reference_planes[1], &idx, 0);
+        let token_of: Vec<i32> = (0..tokens * TOP_K).map(|p| p / TOP_K).collect();
+        let xs = mlxcel_core::take(
+            &x,
+            &mlxcel_core::from_slice_i32(&token_of, &[tokens * TOP_K]),
+            0,
+        );
+        let xs = mlxcel_core::reshape(&xs, &[tokens * TOP_K, 1, HIDDEN]);
+        let h = mlxcel_core::matmul(&xs, &mlxcel_core::swap_axes(&w1, -1, -2));
+        let h = mlxcel_core::utils::relu_squared(&h);
+        let want = mlxcel_core::matmul(&h, &mlxcel_core::swap_axes(&w2, -1, -2));
+        let want = mlxcel_core::reshape(&want, &[tokens, TOP_K, HIDDEN]);
+        let close = mlxcel_core::allclose(&got, &want, 1e-3, 1e-3);
+        assert!(
+            mlxcel_core::item_bool(&close),
+            "nvfp4 routed experts differ from the dequantized reference at {tokens} tokens"
+        );
+    }
+}
+
+pub(crate) fn batching_model() -> super::NemotronHModel {
+    use crate::models::embedding_test_support::Rng;
+    use mlxcel_core::dtype;
+    use mlxcel_core::weights::WeightMap;
+    let mut config:super::NemotronHConfig=serde_json::from_value(serde_json::json!({"model_type":"nemotron_h","vocab_size":16,"hidden_size":8,"intermediate_size":16,"num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":1,"mamba_num_heads":2,"mamba_head_dim":4,"ssm_state_size":32,"conv_kernel":4,"n_groups":1,"hybrid_override_pattern":"M*"})).unwrap();
+    config.post_init().unwrap();
+    let mut weights = WeightMap::new();
+    let mut rng = Rng::new(2571);
+    rng.insert(&mut weights, "backbone.embeddings.weight", &[16, 8], 0.2);
+    weights.insert(
+        "backbone.norm_f.weight".into(),
+        mlxcel_core::ones(&[8], dtype::FLOAT32),
+    );
+    rng.insert(&mut weights, "lm_head.weight", &[16, 8], 0.1);
+    weights.insert(
+        "backbone.layers.0.norm.weight".into(),
+        mlxcel_core::ones(&[8], dtype::FLOAT32),
+    );
+    weights.insert(
+        "backbone.layers.0.mixer.norm.weight".into(),
+        mlxcel_core::ones(&[8], dtype::FLOAT32),
+    );
+    rng.insert(
+        &mut weights,
+        "backbone.layers.0.mixer.in_proj.weight",
+        &[82, 8],
+        0.1,
+    );
+    rng.insert(
+        &mut weights,
+        "backbone.layers.0.mixer.out_proj.weight",
+        &[8, 8],
+        0.1,
+    );
+    rng.insert(
+        &mut weights,
+        "backbone.layers.0.mixer.conv1d.weight",
+        &[72, 4, 1],
+        0.1,
+    );
+    weights.insert(
+        "backbone.layers.0.mixer.dt_bias".into(),
+        mlxcel_core::zeros(&[2], dtype::FLOAT32),
+    );
+    weights.insert(
+        "backbone.layers.0.mixer.A_log".into(),
+        mlxcel_core::zeros(&[2], dtype::FLOAT32),
+    );
+    weights.insert(
+        "backbone.layers.0.mixer.D".into(),
+        mlxcel_core::ones(&[2], dtype::FLOAT32),
+    );
+    weights.insert(
+        "backbone.layers.1.norm.weight".into(),
+        mlxcel_core::ones(&[8], dtype::FLOAT32),
+    );
+    rng.insert(
+        &mut weights,
+        "backbone.layers.1.mixer.q_proj.weight",
+        &[8, 8],
+        0.1,
+    );
+    rng.insert(
+        &mut weights,
+        "backbone.layers.1.mixer.k_proj.weight",
+        &[4, 8],
+        0.1,
+    );
+    rng.insert(
+        &mut weights,
+        "backbone.layers.1.mixer.v_proj.weight",
+        &[4, 8],
+        0.1,
+    );
+    rng.insert(
+        &mut weights,
+        "backbone.layers.1.mixer.o_proj.weight",
+        &[8, 8],
+        0.1,
+    );
+    super::NemotronHModel::from_weights(
+        config,
+        weights,
+        vec![super::BlockType::Mamba, super::BlockType::Attention],
+    )
+    .unwrap()
+}
+#[test]
+fn nemotron_h_model_owned_batched_multistep() {
+    let _guard = crate::models::embedding_test_support::mlx_test_guard();
+    crate::models::batched_decode_harness::assert_model_owned_multistep_with_paged_lengths(
+        batching_model,
+        &[0, 3],
+    );
+}
+#[test]
+fn nemotron_h_fresh_and_mixed_recurrent_states_match_solo_rows() {
+    use mlxcel_core::cache::SequenceId;
+    use mlxcel_core::generate::LanguageModel;
+    let _guard = crate::models::embedding_test_support::mlx_test_guard();
+    for mixed in [false, true] {
+        let batched = batching_model();
+        let solo = [batching_model(), batching_model()];
+        let ids = [SequenceId::from_raw(1001), SequenceId::from_raw(1002)];
+        let mut caches: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                batched.prepare_sequence_state(*id);
+                LanguageModel::make_caches(&batched)
+            })
+            .collect();
+        let mut single: Vec<_> = solo
+            .iter()
+            .zip(ids)
+            .map(|(m, id)| {
+                m.prepare_sequence_state(id);
+                LanguageModel::make_caches(m)
+            })
+            .collect();
+        if mixed {
+            let prompt = mlxcel_core::from_slice_i32(&[1, 2, 3], &[1, 3]);
+            let _ = batched.forward_with_sequence_id(&prompt, Some(ids[0]), &mut caches[0], None);
+            let _ = solo[0].forward_with_sequence_id(&prompt, Some(ids[0]), &mut single[0], None);
+        }
+        for step in 0..3 {
+            let tokens = [2 + step, 3 + step];
+            let input = mlxcel_core::from_slice_i32(&tokens, &[2, 1]);
+            let mut refs: Vec<_> = caches.iter_mut().map(Vec::as_mut_slice).collect();
+            let actual = batched.forward_batched_with_ids(&input, Some(&ids), &mut refs, None);
+            for row in 0..2 {
+                let input = mlxcel_core::from_slice_i32(&[tokens[row]], &[1, 1]);
+                let expected = solo[row].forward_with_sequence_id(
+                    &input,
+                    Some(ids[row]),
+                    &mut single[row],
+                    None,
+                );
+                let actual = mlxcel_core::utils::slice_axis(&actual, 0, row as i32, row as i32 + 1);
+                let delta = mlxcel_core::max_all(&mlxcel_core::abs(&mlxcel_core::subtract(
+                    &actual, &expected,
+                )));
+                assert!(mlxcel_core::item_f32(&delta) <= 1e-5);
+            }
+        }
+    }
 }

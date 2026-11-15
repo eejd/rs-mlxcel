@@ -125,6 +125,7 @@ pub struct Quantization {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(remote = "Self")]
 pub struct ModelArgs {
     pub model_type: String,
     pub hidden_size: usize,
@@ -169,6 +170,8 @@ pub struct ModelArgs {
     #[serde(skip)]
     pub checkpoint_label: Option<String>,
 }
+
+mlxcel_core::impl_rope_lifting_deserialize!(ModelArgs);
 
 impl ModelArgs {
     pub fn head_dim(&self) -> usize {
@@ -225,6 +228,18 @@ impl ModelArgs {
     /// `RotatingKVCache` that stores nothing, leaving every local-branch
     /// attention row empty and softmaxing to NaN at the first token rather than
     /// at load.
+    /// The validated pass-2 `RotatingKVCache` window (issue #2798): every
+    /// layer builds a `loop_window_size` ring, so `0` or a value above
+    /// `i32::MAX` must fail here rather than leave the local branch with no
+    /// keys or narrow the window silently.
+    pub(crate) fn validated_loop_window_size(&self) -> Result<i32, String> {
+        mlxcel_core::cache::cache_window(
+            "IQuest Loop Coder loop_window_size",
+            self.loop_window_size,
+            self.num_hidden_layers > 0,
+        )
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.loop_num != SUPPORTED_LOOP_NUM {
             return Err(format!(
@@ -233,13 +248,7 @@ impl ModelArgs {
                 self.loop_num, SUPPORTED_LOOP_NUM
             ));
         }
-        if self.loop_window_size == 0 {
-            return Err(
-                "iquestloopcoder: loop_window_size must be positive; 0 leaves the pass-2 local \
-                 attention branch with no keys"
-                    .to_string(),
-            );
-        }
+        self.validated_loop_window_size()?;
         Ok(())
     }
 
@@ -379,6 +388,48 @@ impl Attention {
         let v = self.split_heads(&v, b, l, self.num_kv_heads);
         let (q, k) = self.apply_rope(&q, &k, offset);
         (q, k, v)
+    }
+
+    pub(crate) fn get_qkv_batched(
+        &self,
+        x: &MlxArray,
+        offsets: &[i32],
+    ) -> (
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+    ) {
+        let b = offsets.len() as i32;
+        let (q, k, v) = self.qkv_proj.forward(x);
+        let q = self.split_heads(&q, b, 1, self.num_heads);
+        let k = self.split_heads(&k, b, 1, self.num_kv_heads);
+        let v = self.split_heads(&v, b, 1, self.num_kv_heads);
+        let rotate = |x: &MlxArray| match &self.rope_freqs {
+            Some(freqs) => {
+                let scaled = if self.rope_mscale != 1.0 {
+                    mlxcel_core::multiply_scalar(x, self.rope_mscale)
+                } else {
+                    mlxcel_core::copy(x)
+                };
+                mlxcel_core::fast_rope_batched_with_freqs(
+                    &scaled,
+                    self.rope_dims,
+                    false,
+                    self.rope_scale,
+                    offsets,
+                    freqs,
+                )
+            }
+            None => mlxcel_core::fast_rope_batched(
+                x,
+                self.rope_dims,
+                false,
+                self.rope_base,
+                self.rope_scale,
+                offsets,
+            ),
+        };
+        (rotate(&q), rotate(&k), v)
     }
 
     fn split_heads(&self, x: &MlxArray, b: i32, l: i32, heads: i32) -> UniquePtr<MlxArray> {

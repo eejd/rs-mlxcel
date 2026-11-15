@@ -15,7 +15,7 @@
 # replace: an overlay that silently drops part of an upstream change shows up
 # here as a new hunk, even if it was wrong before the bump.
 #
-# pin: 243bdf09c0cccbb85ca6a686dab3cc0102cf1f7e
+# pin: 7ca40033132dae444d45f7fc3daae57e24c13f6c
 # fork: 75915908dfe5028335d318b10340313744fd3a8d
 # fork_upstream_merge_base: 39886de461d4f014cd60a3a68ad42fd8d776754a
 # overlay-sha256: 965377d80af426d42b3e106da236cf63d0d1fc6c19130a9b9b16e1fa51734c74 CMakeLists.txt
@@ -24,21 +24,23 @@
 # overlay-sha256: c255fb0f18fb597cd7ba1708dcc5799ea26ee8541820dedb8997a279d9257496 mlx/backend/common/buffer_cache.h
 # overlay-sha256: 6755397b3410b82fe451c1aa0455ba722d4106a67d72fb9ce6a4eecda61ca920 mlx/backend/common/compiled.cpp
 # overlay-sha256: 28759d52cd6ec6f55a6ba85ae6e594e24c042fc55bfe139ac1856e556ee42e10 mlx/backend/common/compiled.h
-# overlay-sha256: 293cc82e52a6b3d98fb06c66f8c7e471790d908ab29f48a8a33d6e2d77341c81 mlx/backend/gpu/primitives.cpp
+# overlay-sha256: c538cb3119b20893647ea069d22e1368f9a84bcd574e6a4e62c1d7b90ac91cbc mlx/backend/gpu/primitives.cpp
 # overlay-sha256: 849838a3e3354496e7c4e571b98491e7c80f94f4b84fe9e642093f332069fc8a mlx/compile.cpp
 # overlay-sha256: 67e68d6e70df6271ed2f54d75957c4762653b6a32fa6c666ea3b014c5d425acd mlx/device.cpp
-# overlay-sha256: 26584a93a3720250aa59c6dd9f091863f8c047691ce55f9a988a01da390ab02a mlx/fast.cpp
-# overlay-sha256: b1a5366b31412246256ea56f9114bfe7df2fcb93329301ce7ec924f7200c7695 mlx/fast.h
-# overlay-sha256: 8839267c3bc469b6a3f7d67c6028701a1a3bd02d0f09b6ac31b15407204d2653 mlx/fast_primitives.h
-# overlay-sha256: f5fccd165887c2860c04fecf3fcf6073397789081183c2bcaaacad8f8f4d8e9e mlx/io/safetensors.cpp
-# overlay-sha256: 555e31c93e5acd1678862d53820ebafaa0dc4a9074c61501b355ce198a76b81a mlx/ops.cpp
-# overlay-sha256: 5af152117800d10f56baf0540418aa8a2d80804106563d4a7190a1a357531c5f mlx/primitives.cpp
+# overlay-sha256: bb13b8d196919ecfeca8f19b6ff7a5d11cddc426cc6ddd9e10ad6d7df6fdc6aa mlx/fast.cpp
+# overlay-sha256: eef8d1bb737e84e5d431c4586af1c29b512f5a6dac17cf0e5af86a83680240cf mlx/fast.h
+# overlay-sha256: df85f8c1b5c0fdf1c53dd7ea66e77f4d938fe52aff6f747fcdda5f33c96f70f9 mlx/fast_primitives.h
+# overlay-sha256: 78008a41de160e14cb1e2963d9ce0fb005653298a2cbf0e121ae38d1c71ccf0f mlx/io/safetensors.cpp
+# overlay-sha256: 758cd7dfc5aa32b92948ba715254f16c225a391aadb35eade729bd8eed615ce5 mlx/ops.cpp
+# overlay-sha256: 0ca9d6063aba60ec1e6b5e5aef1f7a1f6e93963700ebcfea2244a9745c8dc504 mlx/primitives.cpp
 # overlay-sha256: 5223221a04503b7f9ab5215fc594e57884b1388a1ca84e6b2ad33edb451d2525 mlx/stream.cpp
 # note mlx/allocator.h: LOCAL_FIXES.md item 47 (owned ROCm asynchronous Data allocation friendship).
 # note mlx/backend/common/compiled.cpp: LOCAL_FIXES.md item 1: resolves the pin/fork conflict, keeping upstream's negative_strides tracking and the fork's constant-input skipping.
-# note mlx/backend/gpu/primitives.cpp: LOCAL_FIXES.md item 24: DynamicSliceUpdate copies through copy_gpu (donates only when is_donatable holds) and drops the fork's graph_active() forced donation.
+# note mlx/backend/gpu/primitives.cpp: LOCAL_FIXES.md items 24 and 50: DynamicSliceUpdate copies through copy_gpu (donates only when is_donatable holds) and drops the fork's graph_active() forced donation; AsStrided retains its temporary through the ROCm command encoder.
+# note mlx/fast.cpp: LOCAL_FIXES.md item 5: retain window/array mask composition while keeping the fork's four-dimensional repeated-head GQA fallback.
 # note mlx/fast_primitives.h: LOCAL_FIXES.md item 1: resolves the pin/fork conflict, keeping upstream's compile_options and the fork's output_input_aliases on fast::CustomKernel.
-# note mlx/io/safetensors.cpp: LOCAL_FIXES.md item 1: resolves the pin/fork conflict, keeping upstream's empty-tensor guard (as an early continue) and the fork's ROCm staged_write.
+# note mlx/io/safetensors.cpp: LOCAL_FIXES.md items 1 and 49: resolves the pin/fork conflict (empty-tensor guard + ROCm staged_write) and schedules load_safetensors on the GPU stream when rocm::is_available().
+# note mlx/ops.cpp: LOCAL_FIXES.md item 70: fp_dequantize builds fast::Quantize for NVFP4 without a global scale on a GPU stream (MLX_ROCM_NVFP4_GPU_DEQUANTIZE=0 restores the CPU route).
 
 --- a/mlx/allocator.h
 +++ b/mlx/allocator.h
@@ -102,7 +104,16 @@
    std::vector<Strides> strides_vec{out.strides()};
 --- a/mlx/backend/gpu/primitives.cpp
 +++ b/mlx/backend/gpu/primitives.cpp
-@@ -16,13 +16,6 @@
+@@ -9,6 +9,8 @@
+ #if defined(MLX_USE_CUDA)
+ #include <nvtx3/nvtx3.hpp>
+ #include "mlx/backend/cuda/device.h"
++#elif defined(MLX_USE_ROCM)
++#include "mlx/backend/rocm/device.h"
+ #else
+ #include "mlx/backend/metal/device.h"
+ #endif
+@@ -19,13 +21,6 @@
  #define MLX_PROFILER_RANGE(message) nvtx3::scoped_range r(message)
  #else
  #define MLX_PROFILER_RANGE(message)
@@ -116,7 +127,16 @@
  #endif
  
  namespace mlx::core {
-@@ -142,29 +135,14 @@
+@@ -39,6 +34,8 @@
+     auto copy = contiguous_copy_gpu(inputs[0], stream());
+ #if defined(MLX_USE_CUDA)
+     cu::get_command_encoder(stream()).add_temporary(copy);
++#elif defined(MLX_USE_ROCM)
++    rocm::get_command_encoder(stream()).add_temporary(copy);
+ #else
+     metal::get_command_encoder(stream()).add_temporary(copy);
+ #endif
+@@ -156,29 +153,14 @@
      return;
    }
  
@@ -153,9 +173,38 @@
  
    auto out_offset =
        compute_dynamic_offset(start_indices, out.strides(), axes_, s);
+--- a/mlx/fast.cpp
++++ b/mlx/fast.cpp
+@@ -874,8 +874,6 @@
+         return inputs[3];
+       };
+       auto mask = make_or_fetch_mask();
+-<<<<<<< pin
+-
+       // If we have an array mask on top of a built mask
+       if ((do_causal || window_size > 0) && has_arr_mask) {
+         auto arr_mask = inputs[3];
+@@ -887,16 +885,7 @@
+           mask = where(mask, arr_mask, minarr, s);
+         }
+       }
+-
+-      if (n_repeats > 1 && mask.ndim() >= 3) {
+-        if (mask.shape(-3) == 1) {
+-          mask = expand_dims(mask, -3, s);
+-        } else {
+-          mask = unflatten(mask, -3, {n_kv_heads, n_repeats}, s);
+-        }
+-      }
+-=======
+->>>>>>> fork
++      // K/V heads are repeated above, so scores and masks stay four-dimensional.
+       if (mask.dtype() == bool_) {
+         scores = where(
+             mask, scores, array(finfo(scores.dtype()).min, scores.dtype()), s);
 --- a/mlx/fast_primitives.h
 +++ b/mlx/fast_primitives.h
-@@ -519,11 +519,8 @@
+@@ -524,11 +524,8 @@
        std::vector<ScalarArg> scalar_arguments,
        bool is_precompiled,
        int shared_memory,
@@ -168,7 +217,7 @@
        : Primitive(stream),
          name_(std::move(name)),
          source_(std::move(source)),
-@@ -535,11 +532,8 @@
+@@ -540,11 +537,8 @@
          scalar_arguments_(std::move(scalar_arguments)),
          is_precompiled_(is_precompiled),
          shared_memory_(shared_memory),
@@ -181,7 +230,7 @@
  
    void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
        override {
-@@ -576,12 +570,9 @@
+@@ -581,12 +575,9 @@
    std::vector<ScalarArg> scalar_arguments_;
    bool is_precompiled_;
    int shared_memory_;
@@ -196,7 +245,26 @@
  } // namespace mlx::core::fast
 --- a/mlx/io/safetensors.cpp
 +++ b/mlx/io/safetensors.cpp
-@@ -274,13 +274,11 @@
+@@ -6,6 +6,7 @@
+ #include <stack>
+ 
+ #include "mlx/backend/cuda/cuda.h"
++#include "mlx/backend/rocm/rocm.h"
+ #include "mlx/io.h"
+ #include "mlx/io/load.h"
+ #include "mlx/ops.h"
+@@ -126,7 +127,9 @@
+     throw std::runtime_error(msg.str());
+   }
+ 
+-  auto stream = cu::is_available() ? to_stream(s) : to_stream(s, Device::cpu);
++  auto stream = (cu::is_available() || rocm::is_available())
++      ? to_stream(s)
++      : to_stream(s, Device::cpu);
+ 
+   uint64_t jsonHeaderLength = 0;
+   // This is the same limit as in the original Rust Safetensors code.
+@@ -274,13 +277,11 @@
    out_stream->write(reinterpret_cast<char*>(&header_len), 8);
    out_stream->write(header.c_str(), header_len);
    for (auto& [key, arr] : a) {
@@ -213,7 +281,7 @@
  #ifdef MLX_ROCM_HOST_STAGE
      // On ROCm the array lives in BAR-mapped VRAM: writing straight from
      // arr.data<char>() makes the CPU read it uncached at ~30 MB/s. staged_write
-@@ -291,7 +289,6 @@
+@@ -291,7 +292,6 @@
      }
  #endif
      out_stream->write(arr.data<char>(), arr.nbytes());
@@ -221,3 +289,45 @@
    }
  }
  
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -5,6 +5,7 @@
+ #include <algorithm>
+ #include <climits>
+ #include <cmath>
++#include <cstdlib>
+ #include <numeric>
+ #include <set>
+ #include <sstream>
+@@ -5678,6 +5679,31 @@
+   };
+ 
+ #if defined(MLX_USE_ROCM)
++  // mlxcelverse (lablup/mlxcel#2698): the ROCm fp_dequantize kernel does not
++  // decode block-float scales, so these modes dequantize on the CPU stream.
++  // NVFP4 without a global scale has an exact GPU kernel
++  // (nvfp4_dequantize_dense, reached through fast::Quantize::eval_gpu). On
++  // the CPU path an NVFP4 embedding lookup read the gathered rows from
++  // fine-grained memory at about 2 ms a token on gfx1151, two thirds of a
++  // 512-token Nemotron-H prefill and about a fifth of each decode step.
++  // MLX_ROCM_NVFP4_GPU_DEQUANTIZE=0 restores the CPU route.
++  static const bool nvfp4_gpu_dequantize = [] {
++    const char* e = std::getenv("MLX_ROCM_NVFP4_GPU_DEQUANTIZE");
++    return !(e && e[0] == '0' && e[1] == '\0');
++  }();
++  if (s.device == Device::gpu && mode == QuantizationMode::Nvfp4 &&
++      !global_scale.has_value() && nvfp4_gpu_dequantize &&
++      (out_type == float32 || out_type == float16 ||
++       out_type == bfloat16)) {
++    auto out_shape = w.shape();
++    out_shape.back() = out_size;
++    return array(
++        std::move(out_shape),
++        out_type,
++        std::make_shared<fast::Quantize>(
++            s, fallback, group_size, bits, mode, true),
++        inputs);
++  }
+   if (s.device == Device::gpu) {
+     return dequantize(
+         w,

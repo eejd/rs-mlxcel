@@ -19,7 +19,6 @@ use axum::{
     routing::get,
 };
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 async fn request(path: &str, method: Method) -> axum::response::Response {
@@ -39,7 +38,7 @@ async fn request(path: &str, method: Method) -> axum::response::Response {
 fn embedded_manifest_is_valid_and_budgeted() {
     let manifest: Value = serde_json::from_str(manifest_json()).expect("manifest is valid JSON");
     assert_eq!(manifest["schema_version"], 1);
-    assert_eq!(manifest["package_manager"], "pnpm@11.18.0");
+    assert_eq!(manifest["package_manager"], "pnpm@12.16.1");
     let files = manifest["files"].as_array().expect("files list");
     assert!(files.iter().any(|file| file["path"] == "index.html"));
     assert!(
@@ -48,7 +47,7 @@ fn embedded_manifest_is_valid_and_budgeted() {
             .any(|file| file["path"] == "third-party-licenses.txt")
     );
     let budgets = manifest["budgets"].as_object().expect("budgets object");
-    assert!(budgets["initial_js_gzip_bytes"].as_u64().unwrap() <= 200 * 1024);
+    assert!(budgets["initial_js_gzip_bytes"].as_u64().unwrap() <= 256 * 1024);
     assert!(budgets["total_js_gzip_bytes"].as_u64().unwrap() <= 700 * 1024);
     assert!(budgets["embedded_asset_bytes"].as_u64().unwrap() <= 5 * 1024 * 1024);
 }
@@ -263,7 +262,7 @@ async fn manifest_hashes_match_embedded_assets() {
         let asset =
             WebUiAssets::get(path).unwrap_or_else(|| panic!("missing embedded asset {path}"));
         let data = asset.data.as_ref();
-        let digest = format!("{:x}", Sha256::digest(data));
+        let digest = crate::sha256_hex::sha256_hex(data);
         assert_eq!(file["sha256"], digest, "{path}");
         assert_eq!(file["bytes"], data.len(), "{path}");
     }

@@ -187,6 +187,11 @@ pub(crate) struct WorkerSchedulerConfig {
     /// router via `ServerConfig`, not by the worker, so it is not threaded here.)
     pub decode_peers: Vec<std::net::SocketAddr>,
     pub serving_bind: Option<std::net::SocketAddr>,
+    /// Cluster authentication for the role transport (#2655). Startup resolves
+    /// it before the worker starts and fails closed, so a `PrefillOnly` or
+    /// `DecodeOnly` worker always has `Some`; the worker refuses to bind an
+    /// unauthenticated role transport if it ever sees `None`.
+    pub cluster_auth: Option<Arc<crate::distributed::ClusterAuth>>,
     /// resolved speculative-decoding dispatch shape.
     ///
     /// Constructed once at worker construction (or
@@ -275,6 +280,11 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             // `load_model()` around its own task queue.
             let mut request_rx = request_rx;
             let mut pending_request: Option<ModelRequest> = None;
+            // One per worker (that is, per model): the scheduler rebuilt on
+            // every wake shares it, so the context-shift fallback warning is
+            // logged once per model, not once per process (issue #2783).
+            let context_shift_fallback_warned =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             loop {
                 tracing::info!("Model worker thread starting, loading model...");
 
@@ -353,6 +363,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                             peak_bytes = snap.peak_bytes,
                             cache_bytes = snap.cache_bytes,
                             limit_bytes = snap.limit_bytes,
+                            host_shadow_bytes = snap.host_shadow_bytes,
                             "Model {worker_model_id} loaded in {:.3}s (resident after load: {:.2} GB)",
                             load_elapsed.as_secs_f64(),
                             snap.active_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -383,7 +394,6 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                         }
                         snapshot_reuse_capable
                             .store(model.supports_snapshot_reuse(), Ordering::Release);
-                        loaded.store(true, Ordering::Release);
                         (model, tokenizer)
                     }
                     Err(err) => {
@@ -397,6 +407,59 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                 if !config_eos.is_empty() {
                     tracing::info!("EOS tokens from config: {:?}", config_eos);
                 }
+
+                // A full-model drafter (#2757) is an ordinary checkpoint and
+                // loads through the same loader as the target, here on the
+                // worker thread so its arrays share the target's stream. A
+                // load failure is a startup failure, as the target's is: the
+                // operator asked for a drafter and would otherwise get plain
+                // decode with nothing but a debug line saying so.
+                let full_model_drafter = match sched_config
+                    .speculative_dispatch
+                    .full_model_draft_path()
+                {
+                    Some(draft_path) => {
+                        let draft_start = Instant::now();
+                        tracing::info!("Loading full-model drafter from {}", draft_path.display());
+                        match backend.load_model(draft_path) {
+                            Ok((drafter, _tokenizer)) => {
+                                if let Some(problem) =
+                                    mlxcel_core::speculative::full_model_drafter::full_model_pair_problem(
+                                        &model, &drafter,
+                                    )
+                                {
+                                    chat_unavailable.store(true, Ordering::Release);
+                                    tracing::error!(
+                                        "Refusing the full-model drafter {}: {problem}",
+                                        draft_path.display()
+                                    );
+                                    return;
+                                }
+                                let snap = mlxcel_core::memory::snapshot();
+                                tracing::info!(
+                                    load_seconds = draft_start.elapsed().as_secs_f64(),
+                                    active_bytes = snap.active_bytes,
+                                    "Full-model drafter loaded in {:.3}s (resident after load: {:.2} GB)",
+                                    draft_start.elapsed().as_secs_f64(),
+                                    snap.active_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                                );
+                                Some(drafter)
+                            }
+                            Err(err) => {
+                                chat_unavailable.store(true, Ordering::Release);
+                                tracing::error!(
+                                    "Failed to load the full-model drafter from {}: {err}",
+                                    draft_path.display()
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                // `/health` turns ready only once the drafter is up too, so a
+                // refused or failed drafter never reads as a healthy server.
+                loaded.store(true, Ordering::Release);
 
                 // DiffusionGemma (issue #217 phase 3): block-diffusion models are
                 // model-owned single-stream generators (`supports_batching() == false`)
@@ -580,6 +643,18 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                     }
                     1
                 };
+                if model.supports_batching() {
+                    match model.batched_decode_kind() {
+                        mlxcel_core::generate::BatchedDecodeKind::Native => tracing::info!(
+                            "Model {} decode path: native batched forward",
+                            worker_model_id
+                        ),
+                        mlxcel_core::generate::BatchedDecodeKind::PerRowFallback => tracing::info!(
+                            "Model {} decode path: per-row fallback (aggregate decode throughput will not scale with --parallel)",
+                            worker_model_id
+                        ),
+                    }
+                }
                 let effective_max_kv_size = resolve_worker_effective_max_kv_size(
                     sched_config.max_kv_size,
                     sched_config.context_size_total,
@@ -765,6 +840,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                 })
                 // b10621 context-retention policy (#1472).
                 .with_context_retention(sched_config.context_retention)
+                .with_context_shift_fallback_warned(context_shift_fallback_warned.clone())
                 // install the resolved paged KV block budget (epic #116 #122 b3).
                 .with_paged_block_budget(paged_block_budget)
                 // keep decode headroom at admission under that budget (#2088).
@@ -777,6 +853,8 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                 // scheduler can branch per-request once the round-loop dispatch
                 // hook is wired in `decode_single_step`.
                 .with_speculative_dispatch(sched_config.speculative_dispatch.clone())
+                // the loaded draft model of a full-model dispatch (#2757).
+                .with_full_model_drafter(full_model_drafter)
                 // attach the adaptive MTP policy (issue #333). Keyed on the served
                 // model's directory basename (the coarse, non-request-identifying
                 // target identity) plus the drafter basename and hardware class. A
@@ -825,6 +903,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                             sched_config.serving_mode,
                             sched_config.serving_bind,
                             &sched_config.decode_peers,
+                            sched_config.cluster_auth.clone(),
                         ) {
                             scheduler.serve();
                         }
@@ -858,6 +937,15 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                     "Server is entering sleeping state, model freed"
                 );
                 match request_rx.recv() {
+                    Ok(ModelRequest::Shutdown) => {
+                        // A shutdown is not a wake request: reload the model
+                        // and a slow load reopens the #2738 exit race, and
+                        // nothing waits on it anyway. Leave `sleeping` set so
+                        // the observable state stays truthful until exit
+                        // (#2745).
+                        tracing::info!("Shutdown requested while sleeping, worker exiting");
+                        break;
+                    }
                     Ok(req) => {
                         sleeping.store(false, Ordering::Release);
                         tracing::info!("Server is exiting sleeping state, reloading model");
@@ -883,10 +971,15 @@ pub(crate) fn spawn_model_worker_with_batch_config(
 /// decode role loop ([`serve_prefill_role_networked_blocking`] /
 /// [`serve_decode_role_networked_blocking`]), which returns when the transport
 /// closes. Returns `false` without starting a loop when the role is
-/// misconfigured (no `serving_bind`, or a prefill node with no `decode_peers`),
-/// so the caller falls back to the standard single-node scheduler loop rather
-/// than hanging a half-configured node. A role-loop error is logged before the
+/// misconfigured (no `serving_bind`, a prefill node with no `decode_peers`, or
+/// no `cluster_auth`), so the caller falls back to the standard single-node
+/// scheduler loop rather than hanging a half-configured node or binding an
+/// unauthenticated role transport. A role-loop error is logged before the
 /// worker exits.
+///
+/// The role transport always carries `cluster_auth` (#2655): every connection
+/// to it runs the cluster handshake, so a raw TCP client that skips it never
+/// gets a frame to the role loop.
 ///
 /// [`serve_prefill_role_networked_blocking`]: crate::distributed::disaggregated::coordinator::serve_prefill_role_networked_blocking
 /// [`serve_decode_role_networked_blocking`]: crate::distributed::disaggregated::coordinator::serve_decode_role_networked_blocking
@@ -895,12 +988,13 @@ fn run_disaggregated_serving_role(
     serving_mode: crate::distributed::disaggregated::ServingMode,
     serving_bind: Option<std::net::SocketAddr>,
     decode_peers: &[std::net::SocketAddr],
+    cluster_auth: Option<Arc<crate::distributed::ClusterAuth>>,
 ) -> bool {
     use crate::distributed::disaggregated::ServingMode;
     use crate::distributed::disaggregated::coordinator::{
-        serve_decode_role_networked_blocking, serve_prefill_role_networked_blocking,
+        disaggregated_role_transport_config, serve_decode_role_networked_blocking,
+        serve_prefill_role_networked_blocking,
     };
-    use crate::distributed::tcp_transport::TcpTransportConfig;
 
     let Some(bind_addr) = serving_bind else {
         tracing::error!(
@@ -910,10 +1004,19 @@ fn run_disaggregated_serving_role(
         );
         return false;
     };
-    let bind = TcpTransportConfig {
-        bind_address: bind_addr.to_string(),
-        ..TcpTransportConfig::default()
+    let Some(cluster_auth) = cluster_auth else {
+        // Startup fails closed before the worker exists, so this is a
+        // programming error rather than an operator one; still never bind an
+        // unauthenticated role transport.
+        tracing::error!(
+            serving_mode = %serving_mode,
+            "Disaggregated serving role has no cluster secret ({}); \
+             falling back to the single-node scheduler loop",
+            crate::distributed::CLUSTER_SECRET_SOURCES_HELP
+        );
+        return false;
     };
+    let bind = disaggregated_role_transport_config(bind_addr, cluster_auth);
 
     let result = match serving_mode {
         ServingMode::PrefillOnly => {
@@ -1197,6 +1300,7 @@ pub(crate) fn spawn_legacy_model_worker(
                         peak_bytes = snap.peak_bytes,
                         cache_bytes = snap.cache_bytes,
                         limit_bytes = snap.limit_bytes,
+                        host_shadow_bytes = snap.host_shadow_bytes,
                         "Model {worker_model_id} loaded in {:.3}s (resident after load: {:.2} GB)",
                         load_elapsed.as_secs_f64(),
                         snap.active_bytes as f64 / (1024.0 * 1024.0 * 1024.0),

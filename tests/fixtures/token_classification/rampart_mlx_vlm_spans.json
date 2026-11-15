@@ -1,0 +1,729 @@
+{
+  "oracle": "mlx-vlm 0.7.8 (git 73d366ecf9233b3fc6549531a7f2386726d09ff6)",
+  "model": "nativ-community/rampart-mlx-fp16",
+  "keep_labels": [
+    "CITY",
+    "STATE",
+    "ZIP_CODE"
+  ],
+  "cases": [
+    {
+      "text": "I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net",
+      "spans": [
+        {
+          "label": "GIVEN_NAME",
+          "start": 4,
+          "end": 9,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 10,
+          "end": 16,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "BUILDING_NUMBER",
+          "start": 18,
+          "end": 22,
+          "text": "1984",
+          "placeholder": "<BUILDING_NUMBER>"
+        },
+        {
+          "label": "STREET_NAME",
+          "start": 23,
+          "end": 36,
+          "text": "Cyberdyne Ave",
+          "placeholder": "<STREET_NAME>"
+        },
+        {
+          "label": "CITY",
+          "start": 38,
+          "end": 49,
+          "text": "Los Angeles",
+          "placeholder": "<CITY>"
+        },
+        {
+          "label": "STATE",
+          "start": 50,
+          "end": 52,
+          "text": "CA",
+          "placeholder": "<STATE>"
+        },
+        {
+          "label": "ZIP_CODE",
+          "start": 53,
+          "end": 58,
+          "text": "90012",
+          "placeholder": "<ZIP_CODE>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 60,
+          "end": 73,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        }
+      ],
+      "redacted_text": "I'm <GIVEN_NAME> <SURNAME>, <BUILDING_NUMBER> <STREET_NAME>, Los Angeles CA 90012, <EMAIL>",
+      "tokens": 23,
+      "min_margin": 2.3359
+    },
+    {
+      "text": "Call Maria Garcia on 617-555-0142.",
+      "spans": [
+        {
+          "label": "GIVEN_NAME",
+          "start": 5,
+          "end": 10,
+          "text": "Maria",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 11,
+          "end": 17,
+          "text": "Garcia",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "PHONE",
+          "start": 21,
+          "end": 33,
+          "text": "617-555-0142",
+          "placeholder": "<PHONE>"
+        }
+      ],
+      "redacted_text": "Call <GIVEN_NAME> <SURNAME> on <PHONE>.",
+      "tokens": 12,
+      "min_margin": 0.0508
+    },
+    {
+      "text": "Café Müller: Jürgen Weiß wohnt in der Hauptstraße 12, 10115 Berlin, E-Mail juergen.weiss@example.de, Tel. 030 1234567.",
+      "spans": [
+        {
+          "label": "GIVEN_NAME",
+          "start": 13,
+          "end": 19,
+          "text": "Jürgen",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "STREET_NAME",
+          "start": 38,
+          "end": 49,
+          "text": "Hauptstraße",
+          "placeholder": "<STREET_NAME>"
+        },
+        {
+          "label": "BUILDING_NUMBER",
+          "start": 50,
+          "end": 52,
+          "text": "12",
+          "placeholder": "<BUILDING_NUMBER>"
+        },
+        {
+          "label": "ZIP_CODE",
+          "start": 54,
+          "end": 59,
+          "text": "10115",
+          "placeholder": "<ZIP_CODE>"
+        },
+        {
+          "label": "CITY",
+          "start": 60,
+          "end": 66,
+          "text": "Berlin",
+          "placeholder": "<CITY>"
+        },
+        {
+          "label": "PHONE",
+          "start": 106,
+          "end": 117,
+          "text": "030 1234567",
+          "placeholder": "<PHONE>"
+        }
+      ],
+      "redacted_text": "Café Müller: <GIVEN_NAME> Weiß wohnt in der <STREET_NAME> <BUILDING_NUMBER>, 10115 Berlin, E-Mail juergen.weiss@example.de, Tel. <PHONE>.",
+      "tokens": 42,
+      "min_margin": 0.4453
+    },
+    {
+      "text": "Please review. Please review. Please review. Please review. Please review. Please review. Please review. Please review. Please review. Please review. Note 0. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 1. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 2. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 3. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 4. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 5. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 6. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 7. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 8. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 9. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 10. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 11. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 12. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 13. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 14. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 15. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 16. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 17. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 18. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 19. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 20. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 21. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 22. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 23. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 24. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net Note 25. I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net",
+      "spans": [
+        {
+          "label": "GIVEN_NAME",
+          "start": 162,
+          "end": 167,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 168,
+          "end": 174,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 218,
+          "end": 231,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 244,
+          "end": 249,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 250,
+          "end": 256,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 300,
+          "end": 313,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 326,
+          "end": 331,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 332,
+          "end": 338,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 382,
+          "end": 395,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 408,
+          "end": 413,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 414,
+          "end": 420,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 464,
+          "end": 477,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 490,
+          "end": 495,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 496,
+          "end": 502,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 546,
+          "end": 559,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 572,
+          "end": 577,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 578,
+          "end": 584,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 628,
+          "end": 641,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 654,
+          "end": 659,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 660,
+          "end": 666,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 710,
+          "end": 723,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 736,
+          "end": 741,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 742,
+          "end": 748,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 792,
+          "end": 805,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 818,
+          "end": 823,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 824,
+          "end": 830,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 874,
+          "end": 887,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 900,
+          "end": 905,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 906,
+          "end": 912,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 956,
+          "end": 969,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 983,
+          "end": 988,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 989,
+          "end": 995,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 1039,
+          "end": 1052,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 1066,
+          "end": 1071,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 1072,
+          "end": 1078,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 1122,
+          "end": 1135,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 1149,
+          "end": 1154,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 1155,
+          "end": 1161,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "STATE",
+          "start": 1195,
+          "end": 1197,
+          "text": "CA",
+          "placeholder": "<STATE>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 1205,
+          "end": 1218,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 1232,
+          "end": 1237,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 1238,
+          "end": 1244,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 1288,
+          "end": 1301,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 1315,
+          "end": 1320,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 1321,
+          "end": 1327,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 1371,
+          "end": 1384,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 1398,
+          "end": 1403,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 1404,
+          "end": 1410,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 1454,
+          "end": 1467,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 1481,
+          "end": 1486,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 1487,
+          "end": 1493,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 1537,
+          "end": 1550,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 1564,
+          "end": 1569,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 1570,
+          "end": 1576,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 1620,
+          "end": 1633,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 1647,
+          "end": 1652,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 1653,
+          "end": 1659,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "STREET_NAME",
+          "start": 1666,
+          "end": 1679,
+          "text": "Cyberdyne Ave",
+          "placeholder": "<STREET_NAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 1703,
+          "end": 1716,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 1730,
+          "end": 1735,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 1736,
+          "end": 1742,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 1786,
+          "end": 1799,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 1813,
+          "end": 1818,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 1819,
+          "end": 1825,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 1869,
+          "end": 1882,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 1896,
+          "end": 1901,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 1902,
+          "end": 1908,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 1952,
+          "end": 1965,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 1979,
+          "end": 1984,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 1985,
+          "end": 1991,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 2035,
+          "end": 2048,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 2062,
+          "end": 2067,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 2068,
+          "end": 2074,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 2118,
+          "end": 2131,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 2145,
+          "end": 2150,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 2151,
+          "end": 2157,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 2201,
+          "end": 2214,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        },
+        {
+          "label": "GIVEN_NAME",
+          "start": 2228,
+          "end": 2233,
+          "text": "Sarah",
+          "placeholder": "<GIVEN_NAME>"
+        },
+        {
+          "label": "SURNAME",
+          "start": 2234,
+          "end": 2240,
+          "text": "Connor",
+          "placeholder": "<SURNAME>"
+        },
+        {
+          "label": "STATE",
+          "start": 2274,
+          "end": 2276,
+          "text": "CA",
+          "placeholder": "<STATE>"
+        },
+        {
+          "label": "EMAIL",
+          "start": 2284,
+          "end": 2297,
+          "text": "sarah@sky.net",
+          "placeholder": "<EMAIL>"
+        }
+      ],
+      "redacted_text": "Please review. Please review. Please review. Please review. Please review. Please review. Please review. Please review. Please review. Please review. Note 0. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 1. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 2. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 3. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 4. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 5. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 6. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 7. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 8. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 9. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 10. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 11. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 12. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 13. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 14. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 15. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 16. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 17. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 18. I'm <GIVEN_NAME> <SURNAME>, 1984 <STREET_NAME>, Los Angeles CA 90012, <EMAIL> Note 19. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 20. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 21. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 22. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 23. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 24. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL> Note 25. I'm <GIVEN_NAME> <SURNAME>, 1984 Cyberdyne Ave, Los Angeles CA 90012, <EMAIL>",
+      "tokens": 706,
+      "min_margin": 0.1094
+    }
+  ]
+}

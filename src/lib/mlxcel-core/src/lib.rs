@@ -178,6 +178,12 @@ mod ffi {
         /// Get the shape of an array
         fn array_shape(arr: &MlxArray) -> Vec<i32>;
 
+        /// Get the strides of an array, in elements. MLX ignores the stride
+        /// of a size-1 axis when it classifies an array as row-contiguous,
+        /// so that stride can be anything; kernels that read it as a leading
+        /// dimension must not (issue #2462).
+        fn array_strides(arr: &MlxArray) -> Vec<i64>;
+
         /// Get the dtype of an array (as integer code)
         fn array_dtype(arr: &MlxArray) -> i32;
 
@@ -225,12 +231,14 @@ mod ffi {
         /// independent error so tests can exercise consuming read boundaries.
         fn array_with_failed_event_for_test() -> UniquePtr<MlxArray>;
 
-        /// Test-only (issue #1792). Run fixed graph `graph` on `(a, b)`
-        /// eagerly (`mode` 0), through `mlx::core::compile` (1), or through
-        /// a shapeless compile (2), and return the evaluated output. The
-        /// graphs (comparisons, `isnan` / `isinf`, the min-p filter, mixed
-        /// bf16/f32 arithmetic) are listed in `compiled_dtype_cast_tests.rs`.
-        /// Errors on an unknown graph or mode.
+        /// Test-only (issues #1792, #2333). Run fixed graph `graph` on
+        /// `(a, b)` eagerly (`mode` 0), through `mlx::core::compile` (1), or
+        /// through a shapeless compile (2), and return the evaluated output.
+        /// The graphs (comparisons, `isnan` / `isinf`, the min-p filter,
+        /// mixed bf16/f32 arithmetic, and `real` / `imag` of a complex64
+        /// `a + i*b` built in the graph or passed in as a complex64 input)
+        /// are listed in `compiled_dtype_cast_tests.rs`. Errors on an unknown
+        /// graph or mode.
         fn compile_dtype_probe_for_test(
             graph: i32,
             a: &MlxArray,
@@ -424,6 +432,12 @@ mod ffi {
 
         /// Mean along axis
         fn mean_axis(a: &MlxArray, axis: i32, keepdims: bool) -> UniquePtr<MlxArray>;
+
+        /// Reduce with MLX's native dtype semantics, without float32 promotion.
+        /// Used by Qwen4-Exp hyper-connections to match bf16 reference rounding.
+        fn mean_axis_native_dtype(a: &MlxArray, axis: i32, keepdims: bool) -> UniquePtr<MlxArray>;
+        /// Sum with native MLX rounding for reference-sensitive model paths.
+        fn sum_axis_native_dtype(a: &MlxArray, axis: i32, keepdims: bool) -> UniquePtr<MlxArray>;
 
         /// Max of all elements
         fn max_all(a: &MlxArray) -> UniquePtr<MlxArray>;
@@ -710,6 +724,13 @@ mod ffi {
         /// Report collected by the opt-in shapeless compile hardware audit.
         fn shapeless_compile_audit_report() -> String;
 
+        /// `std::getenv(name)` in the bridge. Fills `value` and returns true
+        /// when set (#2803).
+        fn native_env_read(name: &str, value: &mut Vec<u8>) -> bool;
+
+        /// `mlx::core::env::get_var(name, default_value)`, inside MLX (#2803).
+        fn mlx_env_get_var_int(name: &str, default_value: i32) -> i32;
+
         /// Compiled SwiGLU activation with kernel fusion
         /// Uses mlx::core::compile(shapeless=true) like Python's @mx.compile
         /// output = silu(gate) * x
@@ -757,14 +778,35 @@ mod ffi {
         /// Compiled silu: x * sigmoid(x) — single fused kernel
         fn compiled_silu(x: &MlxArray) -> UniquePtr<MlxArray>;
 
-        /// Compiled gelu: x * 0.5 * (1 + erf(x / sqrt(2))) — single fused kernel
-        /// Used by: StarCoder2 and other precise GELU-based models
-        fn compiled_gelu(x: &MlxArray) -> UniquePtr<MlxArray>;
+        /// Qwen4-Exp compiled hyper-connection graphs; preserve activation dtype.
+        fn qwen4_hyper_activate(x: &MlxArray, count: i32) -> UniquePtr<MlxArray>;
+        fn qwen4_hyper_gate(x: &MlxArray, count: i32) -> UniquePtr<MlxArray>;
+        fn qwen4_hyper_mix(projected: &MlxArray, normed: &MlxArray) -> UniquePtr<MlxArray>;
+        fn qwen4_hyper_inject(
+            branch: &MlxArray,
+            weights: &MlxArray,
+            hyper: &MlxArray,
+        ) -> UniquePtr<MlxArray>;
 
-        /// Compiled gelu_approx: erf-based GELU (x * 0.5 * (1 + erf(x / sqrt(2))))
-        /// Uses erf instead of tanh for numerical stability with bf16 inputs.
-        /// Used by: legacy/tests
+        /// Explicit float32 RMS normalization and scale, rounded once to the input dtype.
+        /// Matches Qwen4-Exp's compiled zero-centered normalization graph.
+        fn compiled_scaled_rms_norm(
+            x: &MlxArray,
+            scale: &MlxArray,
+            eps: f32,
+        ) -> UniquePtr<MlxArray>;
+
+        /// Compiled `gelu_approx`: despite the name, the exact erf GELU
+        /// `x * 0.5 * (1 + erf(x / sqrt(2)))` (MLX `nn.gelu`), not MLX's tanh
+        /// `nn.gelu_approx`. For the tanh form use `gelu_tanh` (#2423).
+        /// Used by: tests only.
         fn compiled_gelu_approx(x: &MlxArray) -> UniquePtr<MlxArray>;
+
+        /// Compiled tanh GELU evaluated in f32 and cast back: one fused kernel
+        /// for the eager `gelu_tanh_f32` chain. Can differ from it by f32
+        /// rounding (FMA contraction inside the fused kernel).
+        /// Used by: `GeluActivation::TanhF32Compiled` (#2423).
+        fn compiled_gelu_tanh_f32(x: &MlxArray) -> UniquePtr<MlxArray>;
 
         /// Compiled GeGLU activation: gelu(gate) * x — single fused kernel
         /// Used by: legacy/tests for precise GeGLU
@@ -775,7 +817,8 @@ mod ffi {
         fn compiled_geglu_approx_activation(gate: &MlxArray, x: &MlxArray) -> UniquePtr<MlxArray>;
 
         /// Compiled gelu_topk: sparse GELU with dynamic threshold — single fused kernel
-        /// gelu_approx(max(0, x - (mean + std * multiplier)))
+        /// gelu_tanh(max(0, x - (mean + std * multiplier))) in the input dtype,
+        /// matching mlx-lm's `gelu_topk` and Hugging Face (#2548).
         /// Used by: Gemma3n MLP layers with activation_sparsity > 0
         fn compiled_gelu_topk(x: &MlxArray, std_multiplier: f32) -> UniquePtr<MlxArray>;
 
@@ -916,9 +959,10 @@ mod ffi {
             down_bias: *const MlxArray,
         ) -> UniquePtr<MlxArray>;
 
-        /// Compiled GELU MLP forward for non-quantized (FP16/BF16) weights
-        /// Fuses gate_proj + gelu + up_proj + multiply + down_proj into compiled graph
-        /// Used by: Gemma, Gemma4 and other GELU-gated FP models
+        /// Compiled GELU MLP forward for non-quantized (FP16/BF16) weights:
+        /// `down_proj(gelu_tanh(gate_proj(x)) * up_proj(x))`, the tanh GeGLU
+        /// compiled, the matmuls eager (#2548; erf before).
+        /// Used by: Gemma v1, Gemma4 dense MLP and the Gemma4 assistant drafter
         unsafe fn compiled_gelu_mlp_forward_fp16(
             x: &MlxArray,
             gate_weight: &MlxArray,
@@ -1045,8 +1089,21 @@ mod ffi {
         /// GELU activation
         fn gelu(a: &MlxArray) -> UniquePtr<MlxArray>;
 
-        /// Approximate GELU (erf-based for numerical stability)
+        /// Exact erf GELU despite the name: `x * 0.5 * (1 + erf(x / sqrt(2)))`,
+        /// MLX `nn.gelu`. NOT MLX `nn.gelu_approx` / `nn.GELU(approx="precise")`,
+        /// which are the tanh form (`gelu_tanh`). See
+        /// `mlxcel_core::utils::GeluActivation` for an explicit selector (#2423).
         fn gelu_approx(a: &MlxArray) -> UniquePtr<MlxArray>;
+
+        /// tanh-approximate GELU in the input dtype: MLX `nn.gelu_approx` /
+        /// `nn.GELU(approx="precise" | "tanh")`, built on the C++
+        /// `gelu_tanh_approx` helper the fused GeGLU kernels use.
+        fn gelu_tanh(a: &MlxArray) -> UniquePtr<MlxArray>;
+
+        /// tanh-approximate GELU evaluated in f32 and cast back to the input
+        /// dtype (Hugging Face `gelu_pytorch_tanh` as the SigLIP, Molmo2 and
+        /// Qwen3-VL encoders compute it).
+        fn gelu_tanh_f32(a: &MlxArray) -> UniquePtr<MlxArray>;
 
         /// ReLU activation
         fn relu(a: &MlxArray) -> UniquePtr<MlxArray>;
@@ -1055,6 +1112,17 @@ mod ffi {
         fn leaky_relu(a: &MlxArray, negative_slope: f32) -> UniquePtr<MlxArray>;
 
         // Sorting and searching.
+        /// Find insertion indices in a sorted one-dimensional sequence.
+        ///
+        /// Returns uint32 indices with the same shape as `values`. When
+        /// `right` is false, equal values are inserted before existing
+        /// entries; when true, they are inserted after existing entries.
+        fn searchsorted(
+            sorted_sequence: &MlxArray,
+            values: &MlxArray,
+            right: bool,
+        ) -> UniquePtr<MlxArray>;
+
         /// Argsort along axis
         fn argsort(a: &MlxArray, axis: i32) -> UniquePtr<MlxArray>;
 
@@ -1330,6 +1398,67 @@ mod ffi {
             offset: i32,
         ) -> UniquePtr<MlxArray>;
 
+        /// Compiled Sapiens2 packed 2D RoPE.
+        ///
+        /// # Safety
+        ///
+        /// `x` must be floating point rank-4 `[B, heads, tokens, head_dim]`
+        /// with a nonzero even `head_dim`. `sin` and `cos` must be float32
+        /// arrays shaped `[1, 1, tokens, 2, head_dim / 2]` and
+        /// `[1, 1, tokens, 1, head_dim / 2]`, respectively.
+        unsafe fn compiled_sapiens2_rope(
+            x: &MlxArray,
+            sin: &MlxArray,
+            cos: &MlxArray,
+        ) -> UniquePtr<MlxArray>;
+
+        /// SAM Objects x * (1 + scale) + shift, with checked broadcasting/dtypes.
+        fn compiled_objects_modulate(
+            x: &MlxArray,
+            scale: &MlxArray,
+            shift: &MlxArray,
+        ) -> Result<UniquePtr<MlxArray>>;
+
+        /// SAM Objects x + h * gate; checks broadcasting into x and matching dtypes.
+        fn compiled_objects_gated_residual(
+            x: &MlxArray,
+            h: &MlxArray,
+            gate: &MlxArray,
+        ) -> Result<UniquePtr<MlxArray>>;
+
+        /// SAM Objects/DINO exact erf GELU with weak scalars in input dtype.
+        /// Used by: SAM 3D Objects / DINOv2 policy encoder, LLaDA-Image
+        /// (SigVQ `nn.gelu`).
+        fn compiled_objects_gelu(x: &MlxArray) -> Result<UniquePtr<MlxArray>>;
+
+        /// SAM Objects tanh GELU with the upstream Power(x, 3) primitive.
+        /// Used by: SAM 3D Objects, LLaDA-Image (QueryFormer and text
+        /// projection `nn.gelu_approx`).
+        fn compiled_objects_gelu_tanh(x: &MlxArray) -> Result<UniquePtr<MlxArray>>;
+
+        /// Objects-only bundled MoGe focal solver, eager initialization plus 30
+        /// compiled steps. Checks F32 UV[B,N,2]/XYZ[B,N,3]; returns F32[B,2]
+        /// columns focal, shift. Mask/degenerate fallback belongs to the caller.
+        fn compiled_objects_focal_shift(
+            uv: &MlxArray,
+            xyz: &MlxArray,
+        ) -> Result<UniquePtr<MlxArray>>;
+
+        /// Diagnostic initial plus 30 states from the identical solver graph.
+        /// F32[31,B,7]: shift, lambda, done, cost, gradient, Hessian, focal.
+        /// Bool done is cast only for this diagnostic output.
+        fn objects_focal_shift_states_for_test(
+            uv: &MlxArray,
+            xyz: &MlxArray,
+        ) -> Result<UniquePtr<MlxArray>>;
+
+        /// SAM Objects F32 head normalization with a cast back to input dtype.
+        /// Expects BNHW x and HW gamma of the same floating dtype.
+        fn compiled_objects_head_norm(
+            x: &MlxArray,
+            gamma: &MlxArray,
+        ) -> Result<UniquePtr<MlxArray>>;
+
         /// Compiled Gemma 4 Q-path with proportional RoPE:
         /// `reshape → fast::rms_norm → transpose → full-head ProportionalRoPE`
         /// folded into one compile window. `q_proj_out` is shaped
@@ -1388,6 +1517,39 @@ mod ffi {
             eps: f32,
         ) -> UniquePtr<MlxArray>;
 
+        /// Test-only (issue #2619): the gradient of `fast_rms_norm(x,
+        /// weight, eps)` with respect to input `wrt` (0 = x, 1 = weight)
+        /// under cotangent `cotan`, through MLX's `vjp`, so the backend's
+        /// `RMSNormVJP` primitive runs. Any other `wrt` is an `Err`. No model
+        /// path uses it; `tests/rocm_hip_grid_clamp.rs` drives the ROCm VJP
+        /// launch through it.
+        fn fast_rms_norm_vjp_for_test(
+            x: &MlxArray,
+            weight: &MlxArray,
+            cotan: &MlxArray,
+            eps: f32,
+            wrt: i32,
+        ) -> Result<UniquePtr<MlxArray>>;
+
+        /// Test-only (issue #2619): the gradient of `fast_layer_norm(x,
+        /// weight, bias, eps)` with respect to input `wrt` (0 = x, 1 =
+        /// weight, 2 = bias) under cotangent `cotan`, through MLX's `vjp`
+        /// (the `LayerNormVJP` primitive). Any other `wrt` is an `Err`.
+        /// A null `weight` (issue #2632) normalizes without one, and `wrt`
+        /// 1 is then an `Err`.
+        ///
+        /// # Safety
+        ///
+        /// `weight` is null or points to a live `MlxArray` for the call.
+        unsafe fn fast_layer_norm_vjp_for_test(
+            x: &MlxArray,
+            weight: *const MlxArray,
+            bias: &MlxArray,
+            cotan: &MlxArray,
+            eps: f32,
+            wrt: i32,
+        ) -> Result<UniquePtr<MlxArray>>;
+
         /// Dtype code SDPA over `q`, `k` and `v` attends in: `result_type(q,
         /// k, v)` under this backend's promotion table, which is the dtype
         /// MLX casts the three to before it picks a kernel. A bf16 query over
@@ -1403,8 +1565,8 @@ mod ffi {
             mask: *const MlxArray,
         ) -> UniquePtr<MlxArray>;
 
-        /// Fast SDPA with optional sinks (per-head attention bias for first position)
-        /// Used by: GptOss
+        /// Fast SDPA with optional attention sinks: an extra per-head logit added to the softmax denominator, with no value row
+        /// Used by: GptOss, Laguna, DeepSeekV4, FalconOcr, OpenAIPrivacyFilter
         #[allow(clippy::too_many_arguments)]
         unsafe fn fast_scaled_dot_product_attention_with_sinks(
             q: &MlxArray,
@@ -1627,6 +1789,25 @@ mod ffi {
         /// Whether two handles refer to the same MLX array node.
         fn array_same_handle(a: &MlxArray, b: &MlxArray) -> bool;
 
+        /// Opaque weak reference to an MLX array node (#1564).
+        type MlxWeakArray;
+
+        /// A weak reference to `a`'s node, which keeps neither the node nor
+        /// its buffer alive. The weight materialization scope (#1564) holds
+        /// these, so a checkpoint tensor a loader evaluated and dropped during
+        /// the load is freed at once.
+        fn array_weak_ref(a: &MlxArray) -> UniquePtr<MlxWeakArray>;
+
+        /// A handle to the node if any handle, or the input list of any lazy
+        /// array, still holds it; null otherwise.
+        fn array_weak_upgrade(w: &MlxWeakArray) -> UniquePtr<MlxArray>;
+
+        /// Fill `out` with the CUDA weight-upload counters of
+        /// `Load::eval_gpu` (#1564), in the field order of
+        /// `mlx::core::cu::LoadTransferStats`. Returns false, leaving `out`
+        /// untouched, on a build without the CUDA backend.
+        fn weight_load_transfer_stats(out: &mut [u64]) -> bool;
+
         /// `dst` with `rows` written at `start`, sharing `dst`'s buffer
         /// instead of copying it (#1959). Sound only when no reader of `dst`
         /// needs the written region's old contents and the caller owns the
@@ -1676,6 +1857,41 @@ mod ffi {
             window_size: i32,
             use_metal4: bool,
         ) -> UniquePtr<MlxArray>;
+
+        /// Native sliding-window causal SDPA (issue #2621): upstream MLX's
+        /// `window_size` with `mask_mode = "causal"`, no mask array. The
+        /// queries are the suffix of the keys; row `r` sees key `c` iff
+        /// `c <= r && r - c < window_size`. `window_size` must be positive.
+        /// Only `window_sdpa` calls this; every other SDPA entry keeps
+        /// `window_size = -1`.
+        #[rust_name = "ffi_fast_scaled_dot_product_attention_causal_window"]
+        fn fast_scaled_dot_product_attention_causal_window(
+            q: &MlxArray,
+            k: &MlxArray,
+            v: &MlxArray,
+            scale: f32,
+            window_size: i32,
+        ) -> UniquePtr<MlxArray>;
+
+        /// MLX's own verdict on whether an SDPA over these shapes and dtypes
+        /// runs a fused kernel (`true`) or the graph fallback (`false`).
+        /// Probed over lazily built zero arrays, so nothing is evaluated, but
+        /// each call builds graph nodes; call it through
+        /// `window_sdpa::native_arm_is_fused`, which memoizes. Never throws:
+        /// any MLX error answers `false`. Metal only: `false` on every other
+        /// backend.
+        #[allow(clippy::too_many_arguments)]
+        fn sdpa_uses_fused_kernel(
+            q_shape: &[i32],
+            k_shape: &[i32],
+            v_shape: &[i32],
+            q_dtype: i32,
+            k_dtype: i32,
+            v_dtype: i32,
+            has_arr_mask: bool,
+            do_causal: bool,
+            window_size: i32,
+        ) -> bool;
 
         /// Fused QKV projection + reshape + transpose + RoPE
         /// Reduces ~5 FFI calls (projection, reshape, transpose, rope) to 1
@@ -1830,6 +2046,74 @@ mod ffi {
             indices_out: &mut UniquePtr<MlxArray>,
             scores_out: &mut UniquePtr<MlxArray>,
         );
+
+        // Whole post-matmul Inkling MoE routing chain as one Metal kernel
+        // (issue #2479): sigmoid + correction bias + top-k + logsigmoid
+        // softmax + scaling, emitting the shared-expert weights
+        // pre-broadcast. Matches mlx-vlm inkling_moe_route.
+        ///
+        /// `Result` because the launcher refuses on a backend with no kernel
+        /// port rather than falling into the Metal arm and aborting the
+        /// process on a C++ throw across a `noexcept` extern (issues #1885,
+        /// #1801). Production gates on `inkling_moe_kernels_available` and
+        /// falls back to the graph routing chain on `Err`, so a truthful
+        /// gate never sees the refusal except through a direct call.
+        fn inkling_moe_route_kernel(
+            logits: &MlxArray,
+            corr: &MlxArray,
+            wscale: &MlxArray,
+            n_routed: i32,
+            n_shared: i32,
+            top_k: i32,
+            intermediate: i32,
+            indices_out: &mut UniquePtr<MlxArray>,
+            weights_out: &mut UniquePtr<MlxArray>,
+            gamma_out: &mut UniquePtr<MlxArray>,
+        ) -> Result<()>;
+
+        // Weighted routed-expert down-projection for decode as one Metal
+        // kernel (issue #2479): in-kernel q4/g64 row dequant with the top-k
+        // weighted expert sum folded in. The caller's gate pins bits=4,
+        // group_size=64, affine with biases, and in_dims 2048. Matches
+        // mlx-vlm inkling_moe_down_combine.
+        ///
+        /// `Result` because the launcher refuses on a backend with no kernel
+        /// port rather than falling into the Metal arm and aborting the
+        /// process on a C++ throw across a `noexcept` extern (issues #1885,
+        /// #1801). Production gates on `inkling_moe_kernels_available` and
+        /// falls back to the gather path on `Err`, so a truthful gate never
+        /// sees the refusal except through a direct call.
+        unsafe fn inkling_moe_down_combine_kernel(
+            act: &MlxArray,
+            wq: &MlxArray,
+            sc: &MlxArray,
+            bi: &MlxArray,
+            idx: &MlxArray,
+            wk: &MlxArray,
+            top_k: i32,
+            out: &mut UniquePtr<MlxArray>,
+        ) -> Result<()>;
+
+        // Selected gate/up projection for affine q4 switch experts as one
+        // Metal kernel: in-kernel q4/g64 dequant over both planes' packed
+        // weights. The caller's gate pins bits=4, affine with biases, equal
+        // plane shapes, scales/biases in the activation dtype, and
+        // k_size % 512 == 0 / n_size % 8 == 0. Matches mlx-vlm
+        // short_block_affine4_switch_gate_up.
+        fn moe_switch_gate_up_kernel(
+            x: &MlxArray,
+            idx: &MlxArray,
+            up_w: &MlxArray,
+            up_scales: &MlxArray,
+            up_biases: &MlxArray,
+            gate_w: &MlxArray,
+            gate_scales: &MlxArray,
+            gate_biases: &MlxArray,
+            top_k: i32,
+            group_size: i32,
+            up_out: &mut UniquePtr<MlxArray>,
+            gate_out: &mut UniquePtr<MlxArray>,
+        ) -> Result<()>;
 
         // Fused MoE forward: gate + switch_mlp + score weighting + shared expert
         /// Combines ~25 FFI calls into a single C++ function
@@ -2103,6 +2387,41 @@ mod ffi {
         /// Used by: Qwen3.5, Qwen3Next, KimiLinear
         #[allow(clippy::too_many_arguments)]
         unsafe fn metal_gated_delta_forward(
+            q: &MlxArray,
+            k: &MlxArray,
+            v: &MlxArray,
+            g: &MlxArray,
+            beta: &MlxArray,
+            state: &MlxArray,
+            mask: *const MlxArray, // nullable
+            output: &mut UniquePtr<MlxArray>,
+            new_state: &mut UniquePtr<MlxArray>,
+        );
+
+        /// Native half-split MRoPE for rank-4 activations and [3, B, L] positions.
+        /// Used by Qwen4-Exp after checking Metal/GPU availability.
+        fn qwen4_mrope_apply(
+            x: &MlxArray,
+            positions: &MlxArray,
+            frequencies: &MlxArray,
+            selector: &MlxArray,
+        ) -> UniquePtr<MlxArray>;
+
+        /// Qwen4-Exp indexed causal prefill. Caller validates Metal availability,
+        /// matching half dtypes, head widths divisible by 32, and selection shapes.
+        fn qwen4_qsa_attention(
+            q: &MlxArray,
+            k: &MlxArray,
+            v: &MlxArray,
+            blocks: &MlxArray,
+            ends: &MlxArray,
+            scale: f32,
+            block_size: i32,
+        ) -> UniquePtr<MlxArray>;
+
+        /// Preserve the float32 gate and recurrent state used by Qwen4-Exp.
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn metal_gated_delta_forward_precise(
             q: &MlxArray,
             k: &MlxArray,
             v: &MlxArray,
@@ -2395,6 +2714,26 @@ mod ffi {
         /// entries, bytes. Seven zeros off ROCm. Prefer
         /// [`crate::rocm_qmm_cache::dequant_cache_stats`].
         fn rocm_dequant_cache_stats() -> Vec<u64>;
+
+        /// Raw counters of the ROCm host shadows (issue #2643): pinned bytes
+        /// held, device-to-host copies, host-to-device flushes. Three zeros
+        /// off ROCm; on Linux ROCm they count only stream-ordered pool
+        /// buffers. Prefer
+        /// [`crate::rocm_host_shadow::host_shadow_stats`].
+        fn rocm_host_shadow_stats() -> Vec<u64>;
+
+        /// Test-only (issue #2643): one element of an evaluated,
+        /// row-contiguous float32 array through the bridge's read-only host
+        /// path. Errors for another dtype, a non-contiguous array or an
+        /// index past the end. Prefer the wrapper
+        /// [`crate::rocm_host_shadow::host_read_f32_for_test`].
+        fn host_read_f32_for_test(arr: &MlxArray, index: usize) -> Result<f32>;
+
+        /// Test-only (issue #2643): writes one element of an evaluated,
+        /// row-contiguous float32 array through `array::data<T>()`, the
+        /// mutable host path. Errors as `host_read_f32_for_test` does. Prefer
+        /// the wrapper [`crate::rocm_host_shadow::host_write_f32_for_test`].
+        fn host_write_f32_for_test(arr: &MlxArray, index: usize, value: f32) -> Result<()>;
 
         /// Test-only seam (issue #2147): replaces the wavefront width the
         /// ROCm port tables are checked against for the rest of the process
@@ -3551,19 +3890,24 @@ pub use lang_analyzer::cache_root;
 /// Default the CUDA NVRTC PTX cache to a persistent, MLX-pin-scoped directory
 /// under the mlxcel cache root, unless `MLX_PTX_CACHE_DIR` is already set.
 ///
-/// MLX's own default places the JIT cache in the system temp dir
-/// (`$TMPDIR/mlx/<version>/ptx`), which is cleared on reboot, so the first-run
-/// kernel compilation is paid again every boot. A persistent location pays it
-/// once per machine. The directory is scoped by the pinned MLX commit because
-/// the cache is keyed only by kernel name and is not validated against the
-/// kernel source, so entries must not survive an MLX upgrade. No-op on non-CUDA
-/// builds, when `MLX_PTX_CACHE_DIR` is already set, and when the cache root
-/// cannot be resolved. Call once at startup before the first inference.
+/// MLX's own default places the JIT cache in the system temp dir (the
+/// overlay's per-user `$TMPDIR/mlx-<euid>/<version>/ptx`, #2539), which is
+/// cleared on reboot, so the first-run kernel compilation is paid again every
+/// boot. A persistent location pays it once per machine. The directory is
+/// scoped by the pinned MLX commit because built-in kernels are keyed by
+/// kernel name alone and are not validated against the kernel source, so those
+/// entries must not survive an MLX upgrade. Custom kernels
+/// (`mx.fast.cuda_kernel`) are keyed by name, template arguments and a hash of
+/// the full source. No-op on non-CUDA builds, when `MLX_PTX_CACHE_DIR` is
+/// already set, and when the cache root cannot be resolved or is relative
+/// (the overlay then refuses `MLXCEL_CACHE_DIR` with its notice, #2797). Call
+/// once at startup before the first inference.
 pub fn ensure_persistent_ptx_cache() {
     if !cfg!(feature = "cuda") {
         return;
     }
-    if std::env::var_os("MLX_PTX_CACHE_DIR").is_some() {
+    // An empty value counts as unset, as in the overlay (#2797).
+    if std::env::var_os("MLX_PTX_CACHE_DIR").is_some_and(|value| !value.is_empty()) {
         return;
     }
     let Some(root) = cache_root() else {
@@ -3571,15 +3915,34 @@ pub fn ensure_persistent_ptx_cache() {
     };
     let commit = env!("MLXCEL_MLX_COMMIT");
     let scope = &commit[..commit.len().min(12)];
-    let dir = root.join("cuda-ptx").join(scope);
-    if std::fs::create_dir_all(&dir).is_ok() {
+    let Some(dir) = ptx_cache_dirs::persistent_ptx_cache_dir(&root, scope) else {
+        return;
+    };
+    // The jit_module.cpp overlay refuses a cache directory with a group- or
+    // other-writable component (#2539), and a umask of 002 (user private
+    // groups) would make create_dir_all produce a group-writable one, so every
+    // directory created here is private. Group write left that way by earlier
+    // releases is repaired: on the directories mlxcel manages, plus the root
+    // when it is the default (an explicit MLXCEL_CACHE_DIR is left as the user
+    // set it). On Windows the overlay checks ACLs and nothing is repaired.
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    if builder.create(&dir).is_ok() {
+        #[cfg(unix)]
+        ptx_cache_dirs::tighten_persistent_ptx_dirs(
+            &root,
+            &dir,
+            std::env::var_os("MLXCEL_CACHE_DIR").is_none_or(|value| value.is_empty()),
+        );
         // SAFETY: set_var mutates the process-global environment and is unsound
         // only under a concurrent getenv/setenv on another thread. Per this
         // function's documented contract, all in-tree callers invoke it once at
         // startup right after CLI parsing (src/main.rs, src/bin/mlx_server.rs),
         // before the first CUDA NVRTC JIT compile, any model load, or any worker
         // thread touches the environment, so no other thread is accessing it here.
-        unsafe { std::env::set_var("MLX_PTX_CACHE_DIR", &dir) };
+        unsafe { native_env::set_native_var("MLX_PTX_CACHE_DIR", &dir) };
     }
 }
 
@@ -3721,7 +4084,7 @@ pub fn fast_rope_batched(
 ///
 /// Used by: Llama3 batched decode with a `rope_scaling` table (#1355), and
 /// through it Qwen2 / Qwen2.5 and every VLM whose text backbone is the shared
-/// Llama decoder.
+/// Llama decoder; Ministral3 batched decode with YaRN frequencies.
 pub fn fast_rope_batched_with_freqs(
     x: &MlxArray,
     dims: i32,
@@ -3778,14 +4141,18 @@ pub fn fast_rope_batched_with_freqs(
 /// Sliding-window handling splits by query length: a single-query decode
 /// (`q_len == 1`) slices K/V to the trailing `window_size` keys and uses the
 /// clamped `(1, window_size)` mask, while a multi-token prefill that exceeds
-/// the window (`q_len > 1 && k_len > window_size`) keeps all keys and builds a
-/// full-width windowed-causal mask over them. Slicing K/V for a multi-token
-/// prefill would strand the earliest query rows with an all-`-inf` row -> NaN
-/// (issue #401/#408); the windowed correctness instead comes from the mask.
+/// the window (`q_len > 1 && k_len > window_size`) keeps all keys. Slicing
+/// K/V for a multi-token prefill would strand the earliest query rows with an
+/// all-`-inf` row -> NaN (issue #401/#408); the windowed correctness comes
+/// from the window band instead, which [`window_sdpa::causal_window_attention`]
+/// hands to MLX's native `window_size` entry on eligible Metal shapes and
+/// otherwise builds as a full-width windowed-causal mask over every key
+/// (issue #2621). A softcapped over-window prefill always takes the mask.
 ///
 /// Used by: Llama, Qwen, Mixtral, Gemma, Gemma 2, Cohere, Phi, OLMo, Exaone,
 /// GLM4, MiniCPM, DeepSeek, Hunyuan, InternLM3, StarCoder2 and other causal
-/// prefill call sites
+/// prefill call sites; `RotatingKVCache::attend` (Gemma 3), Gemma 4 and
+/// Ministral 3 reach the over-window prefill branch
 pub fn causal_attention(
     q: &MlxArray,
     k: &MlxArray,
@@ -3818,6 +4185,15 @@ pub fn causal_attention(
         // single-query decode path (`q_len == 1`) keeps the trailing-window K/V
         // slice fast path, byte-for-byte unchanged.
         let over_window_prefill = needs_window_mask && q_len > 1;
+
+        // Causal plus window and nothing else: `window_sdpa` picks MLX's
+        // native `window_size` entry on Metal where it is eligible and
+        // otherwise builds the same full-width mask this branch always built
+        // (issue #2621). A softcapped over-window prefill keeps the mask
+        // route below, since the softcap composite needs the scores.
+        if over_window_prefill && softcap == 0.0 {
+            return window_sdpa::causal_window_attention(q, k, v, scale, window_size);
+        }
 
         let (k_used, v_used, effective_k_len) = if needs_window_mask && !over_window_prefill {
             // Decode (`q_len == 1`) beyond the window: slice K/V to the last
@@ -3916,10 +4292,17 @@ pub fn fast_scaled_dot_product_attention_causal(
 }
 
 // High-level layer abstractions
+pub mod native_env;
+
+#[cfg(test)]
+#[path = "native_env_tests.rs"]
+mod native_env_tests;
+
 pub mod layers;
 
 // Cache state machines shared by attention families.
 // Public so that `server` and `CachePool` consumers can import directly.
+pub mod batched_decode;
 pub mod cache;
 
 // Pure-Rust wrappers around frequently used FFI entry points.
@@ -3928,8 +4311,23 @@ mod ops;
 // Common utility functions
 pub mod utils;
 
+// Native sliding-window SDPA route for Metal prefill (issue #2621): the one
+// place that decides between MLX's `window_size` entry and the explicit
+// window mask, with its A/B switch and dispatch evidence.
+pub mod window_sdpa;
+#[cfg(test)]
+#[path = "window_sdpa_tests.rs"]
+mod window_sdpa_tests;
+
 // Weight loading utilities
 pub mod weights;
+
+// When checkpoint weights are read and uploaded: at model load or at the first
+// token (#1564).
+pub mod weight_materialize;
+#[cfg(test)]
+#[path = "weight_materialize_tests.rs"]
+mod weight_materialize_tests;
 
 // Token generation
 pub mod generate;
@@ -3988,10 +4386,6 @@ pub mod speculative;
 
 // Drafter trait + DrafterKind enum + model_type auto-detection. Foundational scaffolding for the Gemma 4 MTP and Qwen 3.5
 // DFlash drafter ports. Concrete drafter impls land.
-// The existing classic `SpeculativeGenerator` above is unchanged — MTP and
-// DFlash are peer code paths, not replacements.
-// TODO: wrap the existing SpeculativeGenerator in a
-// Drafter-trait adapter so the round-loop drivers can dispatch uniformly.
 pub mod drafter;
 /// Shared Inkling decoder-layer primitives used by the target and native MTP drafter.
 pub mod inkling_layer;
@@ -4012,6 +4406,11 @@ pub mod rocm_arch;
 // Counters of the ROCm QuantizedMatmul dequantized-weight cache (#2151), for
 // tests and memory diagnostics.
 pub mod rocm_qmm_cache;
+
+// Counters of the Windows ROCm host shadows (#2643): the pinned bytes they
+// hold, read into `memory::snapshot`, and the copy counts
+// `tests/rocm_host_shadow.rs` checks, with that test's two host accessors.
+pub mod rocm_host_shadow;
 
 // Deliberate ROCm GPU failures for tests (#1804): a typed wrapper over the
 // bridge's fault-probe fixture, so `tests/rocm_gpu_faults.rs` can provoke a
@@ -4046,6 +4445,10 @@ pub mod memory;
 // Currently: proportional RoPE used by Gemma 4 full-attention layers.
 pub mod rope_proportional;
 
+// transformers 5 `rope_parameters` lift shared by every config struct that
+// reads the flat `rope_theta` / `rope_scaling` keys (#2443).
+pub mod rope_parameters;
+
 // How many positions the sequence currently being prefilled will span, so a
 // model whose RoPE table is chosen from the whole prompt length can still make
 // that choice from inside a chunked prefill (Phi-3 / Phi-4 LongRoPE, #1358).
@@ -4068,6 +4471,9 @@ pub mod runtime_lora;
 // Public so that mlxcel (the main crate) and downstream sub-issues (B3–B8)
 // can consume it without further structural changes.
 pub mod lang_analyzer;
+
+// Path and mode rules for the persistent PTX cache directories (#2539, #2797).
+mod ptx_cache_dirs;
 
 // Shape-bucketed kernel autotuner (issue #906): the TunableOp contract, the
 // median-of-N profiling harness, the persistent tactic cache, and the first
@@ -4105,6 +4511,11 @@ pub(crate) mod test_support;
 #[path = "ffi_tests.rs"]
 mod ffi_tests;
 
+// Bit-exact bf16 carrier of the Gemma3n sparse `compiled_gelu_topk` (#2795).
+#[cfg(test)]
+#[path = "ffi_gelu_topk_tests.rs"]
+mod ffi_gelu_topk_tests;
+
 #[cfg(test)]
 #[path = "array_evaluated_bytes_tests.rs"]
 mod array_evaluated_bytes_tests;
@@ -4123,6 +4534,12 @@ mod one_bit_tests;
 #[cfg(test)]
 #[path = "compiled_dtype_cast_tests.rs"]
 mod compiled_dtype_cast_tests;
+
+// A convolution cuDNN has no execution plan for falls back to the gemm
+// convolution on CUDA instead of throwing at eval (issue #2739).
+#[cfg(test)]
+#[path = "conv_no_plan_tests.rs"]
+mod conv_no_plan_tests;
 
 // CPU quantized matmul accumulates in f32 for bf16 and f16 activations (issue
 // #2248): affine transposed and plain, 3/4/6/8-bit, and MXFP4, each against a
@@ -4146,6 +4563,14 @@ mod cuda_arch_tests;
 #[cfg(test)]
 #[path = "qmm_naive_tile_tests.rs"]
 mod qmm_naive_tile_tests;
+
+// The CUDA QuantizedMatmul batch fold (#2690): a [B, 1, K] activation against
+// a shared 2D weight agrees bit for bit with the same rows as [B, K], and both
+// stay within a dequantized reference. Needs a GPU default device; skips
+// otherwise.
+#[cfg(all(test, feature = "cuda"))]
+#[path = "qmm_fold_batch_tests.rs"]
+mod qmm_fold_batch_tests;
 
 // The pre-first-token phase breakdown (#1545) reported by
 // `MLXCEL_PROFILE_TTFT`. The phases are timed around GPU work, but whether
@@ -4313,3 +4738,7 @@ fn pin_full_precision_f32_matmuls_for_tests() {
         unsafe { std::env::set_var("MLX_ENABLE_TF32", "0") };
     }
 }
+
+#[cfg(test)]
+#[path = "objects_focal_tests.rs"]
+mod objects_focal_tests;

@@ -98,9 +98,54 @@ fn ordinary_public_addresses_are_allowed() {
         "8.8.4.4",
         "2606:4700::1111",
         "::ffff:8.8.8.8",
+        "64:ff9b::808:808",
+        "2002:808:808::1",
     ] {
         let parsed: IpAddr = addr.parse().expect("address parses");
         assert!(is_public_address(parsed), "{addr} must be allowed");
+    }
+}
+
+#[test]
+fn nat64_and_6to4_forms_of_a_refused_ipv4_address_are_refused() {
+    // A NAT64 gateway translates `64:ff9b::/96` to the embedded IPv4 address,
+    // so `64:ff9b::a9fe:a9fe` reaches the metadata service on a host whose
+    // IPv6 route goes through one. 6to4 embeds its IPv4 endpoint the same way.
+    for addr in [
+        "64:ff9b::7f00:1",
+        "64:ff9b::a9fe:a9fe",
+        "64:ff9b::a00:5",
+        "64:ff9b::c0a8:101",
+        "2002:7f00:1::1",
+        "2002:a9fe:a9fe::",
+        "2002:a00:5::1",
+    ] {
+        let parsed: IpAddr = addr.parse().expect("address parses");
+        assert!(!is_public_address(parsed), "{addr} must be refused");
+    }
+}
+
+#[test]
+fn numeric_ipv4_host_spellings_are_checked_as_literals() {
+    // getaddrinfo would read `0x7f.1` or `2130706433` as 127.0.0.1. The URL
+    // parser normalizes them to the dotted literal first, so they meet the
+    // literal check instead of reaching a resolver as a name.
+    for raw in [
+        "http://0x7f.1/x.png",
+        "http://2130706433/x.png",
+        "http://0177.0.0.1/x.png",
+        "http://127.1/x.png",
+        "http://0xa9.0xfe.0xa9.0xfe/latest/meta-data/",
+    ] {
+        let parsed = url(raw);
+        assert!(
+            matches!(
+                ensure_media_url_shape_with(&parsed, false),
+                Err(MediaUrlError::BlockedAddress { .. })
+            ),
+            "{raw} parsed as host {:?} must be refused",
+            parsed.host_str()
+        );
     }
 }
 
@@ -163,21 +208,174 @@ fn a_public_hostname_passes_the_shape_check() {
 }
 
 #[test]
-fn a_blocked_peer_address_is_reported_with_the_host_and_the_escape_hatch() {
+fn a_blocked_peer_address_keeps_the_host_and_the_address_out_of_its_text() {
+    // Issue #2644: the rendered text reaches API clients, so it must not name
+    // the host, the address it resolved to, or the operator opt-in. Those stay
+    // on the structured fields for the debug log.
     let addr: SocketAddr = "127.0.0.1:9090".parse().expect("socket address");
     let err = ensure_socket_addr_allowed_with("images.example.com", addr, false)
         .expect_err("loopback is refused");
     let rendered = err.to_string();
-    assert!(rendered.contains("images.example.com"), "{rendered}");
-    assert!(rendered.contains("127.0.0.1"), "{rendered}");
-    assert!(
-        rendered.contains(ALLOW_PRIVATE_MEDIA_URLS_ENV),
-        "the operator has to be told how to opt in: {rendered}"
+    // Spelled out rather than read from `MEDIA_HOST_REFUSED`, so the client
+    // text is pinned and this file still compiles against the pre-#2644 type.
+    assert_eq!(
+        rendered,
+        "media URL host is not allowed or could not be resolved"
     );
+    for leaked in [
+        "images.example.com",
+        "127.0.0.1",
+        ALLOW_PRIVATE_MEDIA_URLS_ENV,
+    ] {
+        assert!(!rendered.contains(leaked), "{leaked} leaked: {rendered}");
+    }
+    assert!(matches!(
+        err,
+        MediaUrlError::BlockedAddress { ref host, address }
+            if host == "images.example.com" && address == addr.ip()
+    ));
+}
+
+#[test]
+fn a_blocked_host_and_an_unresolvable_host_render_the_same_text() {
+    // A caller must not be able to tell "this internal name exists" from "this
+    // name does not exist" by comparing the two responses.
+    let blocked = MediaUrlError::BlockedAddress {
+        host: "intranet-admin.internal".to_owned(),
+        address: "10.0.0.7".parse().expect("address parses"),
+    };
+    let unresolvable = MediaUrlError::Unresolvable {
+        host: "intranet-admin.internal".to_owned(),
+    };
+    assert_eq!(blocked.to_string(), unresolvable.to_string());
+    assert!(!blocked.to_string().contains("intranet-admin"));
+    assert!(!blocked.to_string().contains("10.0.0.7"));
 }
 
 #[test]
 fn a_public_peer_address_passes() {
     let addr: SocketAddr = "93.184.216.34:443".parse().expect("socket address");
     assert!(ensure_socket_addr_allowed_with("example.com", addr, false).is_ok());
+}
+
+#[test]
+fn this_network_ipv4_block_is_refused_whole() {
+    // 0.0.0.0/8 is "this network" (RFC 791), not globally reachable. A NAT64
+    // prefix listed shorter than the translator's real length decodes a /96
+    // synthesis into `0.0.0.x`, so refusing only `0.0.0.0` would let
+    // `64:ff9b::a9fe:a9fe` (169.254.169.254) through as `0.0.0.169`.
+    for addr in ["0.0.0.0", "0.1.2.3", "0.0.0.169", "0.255.255.255"] {
+        let parsed: IpAddr = addr.parse().expect("address parses");
+        assert!(
+            !is_public_address_with(parsed, &[]),
+            "{addr} must be refused"
+        );
+    }
+    for (prefix, addr) in [
+        ("64:ff9b::/64", "64:ff9b::a9fe:a9fe"),
+        ("64:ff9b:1::/64", "64:ff9b:1::a9fe:a9fe"),
+    ] {
+        // `64:ff9b::/64` is rejected by `Nat64Prefix::parse`, so build the
+        // too-short operator prefix the way a pre-fix build would have held it.
+        let listed = [Nat64Prefix::parse_unchecked_for_test(prefix)];
+        let parsed: IpAddr = addr.parse().expect("address parses");
+        assert!(
+            !is_public_address_with(parsed, &listed),
+            "{addr} under {prefix} must be refused"
+        );
+    }
+}
+
+#[test]
+fn ipv6_special_purpose_ranges_are_refused() {
+    // IANA IPv6 Special-Purpose Address Registry rows whose "Globally
+    // Reachable" column is not `True`, plus reserved space outside the
+    // `2000::/3` global unicast allocation (issue #2713). Every row is checked
+    // before failing, so the message lists all the blocks that pass.
+    let rows = [
+        ("fec0::1", "fec0::/10 site-local", "RFC 3879"),
+        (
+            "::ffff:0:a9fe:a9fe",
+            "::ffff:0:0:0/96 IPv4-translated",
+            "RFC 2765",
+        ),
+        (
+            "::ffff:0:7f00:1",
+            "::ffff:0:0:0/96 IPv4-translated",
+            "RFC 2765",
+        ),
+        ("100::1", "100::/64 discard-only", "RFC 6666"),
+        ("100:0:0:1::1", "100:0:0:1::/64 dummy prefix", "RFC 9780"),
+        ("5f00::1", "5f00::/16 SRv6 SIDs", "RFC 9602"),
+        ("::1:0:0:0:1", "reserved outside 2000::/3", "RFC 4291"),
+        ("4000::1", "reserved outside 2000::/3", "RFC 3587"),
+        (
+            "2001:1::4",
+            "2001::/23 IETF protocol assignments",
+            "RFC 2928",
+        ),
+        (
+            "2001:5::1",
+            "2001::/23 IETF protocol assignments",
+            "RFC 2928",
+        ),
+        (
+            "2001:1ff::1",
+            "2001::/23 IETF protocol assignments",
+            "RFC 2928",
+        ),
+        ("2001::1", "2001::/32 Teredo", "RFC 4380, RFC 8190"),
+        (
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "2001::/32 Teredo",
+            "RFC 4380, RFC 8190",
+        ),
+        (
+            "2001:2::1",
+            "2001:2::/48 benchmarking",
+            "RFC 5180, Errata 1752",
+        ),
+        ("2001:10::1", "2001:10::/28 deprecated ORCHID", "RFC 4843"),
+        // Exception edges: inside 2001::/23, outside AS112-v6 and DETs.
+        ("2001:4::1", "2001::/23 outside AS112-v6", "RFC 2928"),
+        ("2001:4:113::1", "2001::/23 past AS112-v6", "RFC 2928"),
+        ("2001:40::1", "2001::/23 past DETs", "RFC 2928"),
+        ("3fff::1", "3fff::/20 documentation", "RFC 9637"),
+        ("3fff:fff::1", "3fff::/20 documentation", "RFC 9637"),
+    ];
+    let passed: Vec<String> = rows
+        .iter()
+        .filter(|(addr, _, _)| is_public_address_with(addr.parse().expect("address parses"), &[]))
+        .map(|(addr, block, rfc)| format!("{addr} ({block}, {rfc})"))
+        .collect();
+    assert!(passed.is_empty(), "must be refused: {}", passed.join("; "));
+}
+
+#[test]
+fn ipv6_globally_reachable_neighbours_stay_public() {
+    // Registry rows marked globally reachable inside `2001::/23`, the first
+    // address past it, the first address past `3fff::/20`, and ordinary
+    // global unicast and translated forms of a public IPv4 address.
+    for addr in [
+        "2001:1::1",
+        "2001:1::2",
+        "2001:1::3",
+        "2001:3::1",
+        "2001:4:112::1",
+        "2001:20::1",
+        "2001:30::1",
+        "2001:200::1",
+        "3fff:1000::1",
+        "2620:4f:8000::1",
+        "2606:4700::1111",
+        "2002:808:808::1",
+        "64:ff9b::808:808",
+        "::ffff:8.8.8.8",
+    ] {
+        let parsed: IpAddr = addr.parse().expect("address parses");
+        assert!(
+            is_public_address_with(parsed, &[]),
+            "{addr} is globally reachable and must stay public"
+        );
+    }
 }

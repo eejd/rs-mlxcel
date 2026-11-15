@@ -44,6 +44,7 @@ use crate::tokenizer::{self, MlxcelTokenizer};
 use mlxcel_core::weights::WeightMap;
 
 pub(crate) mod config_backed;
+mod materialize;
 pub(crate) mod nonstandard;
 pub(crate) mod special;
 mod vlm;
@@ -51,6 +52,7 @@ mod vlm;
 use self::config_backed::{
     try_load_config_backed_model_from_dir, try_load_config_backed_model_from_weights,
 };
+use self::materialize::with_weight_materialization;
 use self::nonstandard::try_load_nonstandard_model_from_dir;
 use self::special::try_load_special_model_from_weights;
 use self::vlm::*;
@@ -290,6 +292,7 @@ fn try_load_vlm_model_from_dir(
                 Qwen35VlmKind::Moe => load_qwen3_5_moe_vlm(model_path)?,
             })
         }
+        ModelType::Qwen4ExpVLM => Some(load_qwen4_exp_vlm(model_path)?),
         ModelType::Gemma3VLM => Some(load_gemma3_vlm(model_path)?),
         ModelType::Gemma4VLM => Some(load_gemma4_vlm(model_path)?),
         ModelType::Gemma4Unified => Some(load_gemma4_unified(model_path)?),
@@ -436,6 +439,11 @@ fn load_llama_family_from_weights(
 /// Returns an empty default set when the file is missing, unreadable, or
 /// malformed so legacy callers keep their built-in sampling defaults.
 pub fn read_generation_config_defaults(model_dir: &Path) -> GenerationConfigDefaults {
+    // An empty path (image-only serving, #2825) would resolve to the process
+    // working directory; there is no checkpoint there to read.
+    if model_dir.as_os_str().is_empty() {
+        return GenerationConfigDefaults::default();
+    }
     let config_path = model_dir.join("generation_config.json");
     let Ok(content) = std::fs::read_to_string(&config_path) else {
         return GenerationConfigDefaults::default();
@@ -486,6 +494,68 @@ pub fn read_eos_token_ids(model_dir: &Path) -> Vec<i32> {
     ids
 }
 
+/// The EOS ids a model reports when its args declare `declared` (#2729): the
+/// declared ids in order, then each id [`read_eos_token_ids`] resolves from the
+/// checkpoint sidecars that is not already present. Loaders whose args miss
+/// the sidecar ids (LLaVA's `text_config`, the tensor-parallel Llama runtime's
+/// top-level `config.json`) then report the same set as the
+/// `loading::special` loaders.
+pub(crate) fn merged_eos_token_ids(declared: Vec<i32>, model_dir: &Path) -> Vec<i32> {
+    let mut ids = declared;
+    for id in read_eos_token_ids(model_dir) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// Read the model's vocabulary size from `config.json`.
+///
+/// Consulted top-level first, then `text_config` (vision-language
+/// checkpoints nest the language model there). The remote pipeline
+/// coordinator uses it to validate the logits a stage returns before they
+/// become model output (#2637). Returns `None` when `config.json` is missing
+/// or declares no `vocab_size`; the coordinator then skips the vocab check
+/// but still enforces rank and batch shape. The JSON is sanitized like every
+/// other `config.json` reader (`Infinity`, `NaN`), so a checkpoint whose
+/// config carries those tokens still gets the vocab check.
+pub fn read_vocab_size(model_dir: &Path) -> Option<usize> {
+    let model_dir = resolve_model_dir(model_dir);
+    let content = std::fs::read_to_string(model_dir.join("config.json")).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&sanitize_config_json(&content)).ok()?;
+    config
+        .get("vocab_size")
+        .or_else(|| config.get("text_config")?.get("vocab_size"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())
+        .filter(|v| *v > 0)
+}
+
+/// Read the language model's hidden size from `config.json`.
+///
+/// Consulted in `text_config` first (vision-language checkpoints nest the
+/// language model there, and a top-level `hidden_size` may then describe
+/// another tower), then the top level, like [`context_window_from_config`].
+/// A pipeline stage bounds the hidden states it accepts from a peer with it.
+/// Returns `None` when `config.json` is missing or declares no positive
+/// `hidden_size`.
+pub fn read_hidden_size(model_dir: &Path) -> Option<usize> {
+    let model_dir = resolve_model_dir(model_dir);
+    let content = std::fs::read_to_string(model_dir.join("config.json")).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&sanitize_config_json(&content)).ok()?;
+    let positive = |obj: &serde_json::Value| {
+        obj.get("hidden_size")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|v| *v > 0)
+    };
+    config
+        .get("text_config")
+        .and_then(positive)
+        .or_else(|| positive(&config))
+        .and_then(|v| usize::try_from(v).ok())
+}
+
 /// Read the model's context window from `config.json`.
 ///
 /// Mirrors llama.cpp's `n_ctx_train`: the value generation treats as the upper
@@ -497,6 +567,11 @@ pub fn read_eos_token_ids(model_dir: &Path) -> Vec<i32> {
 /// context length; callers fall back to
 /// [`crate::cli::max_tokens::DEFAULT_CONTEXT_WINDOW_FALLBACK`].
 pub fn read_model_context_window(model_dir: &Path) -> Option<usize> {
+    // An empty path (image-only serving, #2825) would resolve to the process
+    // working directory; there is no checkpoint there to read.
+    if model_dir.as_os_str().is_empty() {
+        return None;
+    }
     let config_path = resolve_model_dir(model_dir).join("config.json");
     let content = std::fs::read_to_string(&config_path).ok()?;
     let config: serde_json::Value = parse_model_config(&content).ok()?;
@@ -620,7 +695,8 @@ fn maybe_disable_cuda_graphs_for_model(model_type: ModelType) {
     // `hardware::apply_metal_ops_per_buffer_default`, and
     // `TurboKvCacheArgs::apply_to_environment`, all written upstream of runtime
     // bring-up.
-    unsafe { std::env::set_var("MLX_USE_CUDA_GRAPHS", "0") };
+    unsafe { mlxcel_core::native_env::set_native_var("MLX_USE_CUDA_GRAPHS", "0") };
+    mlxcel_core::native_env::log_effective_native_env();
     tracing::info!(
         "{family} detected: disabling CUDA graph capture (MLX_USE_CUDA_GRAPHS=0) to \
          avoid the decode-path graph hazard from issue {issue}. Set MLX_USE_CUDA_GRAPHS \
@@ -645,7 +721,14 @@ pub(crate) fn maybe_disable_cuda_graphs_for_model_for_path(model_path: &Path) {
 }
 
 /// Load a model from a directory (or file — parent directory will be used)
+///
+/// The weights are resident when this returns, except modality towers, under
+/// the default weight materialization policy (#1564, `materialize.rs`).
 pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
+    with_weight_materialization(|| load_model_unscoped(model_path))
+}
+
+fn load_model_unscoped(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
     let model_path = resolve_model_dir(model_path);
     let model_path = model_path.as_path();
     let model_type = get_model_type(model_path)?;
@@ -777,6 +860,10 @@ pub fn load_model_with_tensor_parallel(
         };
     }
 
+    // The sharded runtimes stay outside the weight materialization scope
+    // (#1564) and keep first-use materialization: each rank holds a slice of
+    // every checkpoint tensor, and materializing the unsliced sources at load
+    // has not been measured on a multi-GPU host.
     let model_path = resolve_model_dir(model_path);
     let model_path = model_path.as_path();
     let support = validate_supported_runtime(model_path, shard_config.clone(), adapter_path)?;
@@ -821,6 +908,13 @@ pub fn load_model_with_adapter(
     model_path: &Path,
     adapter_path: &Path,
 ) -> Result<(LoadedModel, MlxcelTokenizer)> {
+    with_weight_materialization(|| load_model_with_adapter_unscoped(model_path, adapter_path))
+}
+
+fn load_model_with_adapter_unscoped(
+    model_path: &Path,
+    adapter_path: &Path,
+) -> Result<(LoadedModel, MlxcelTokenizer)> {
     let model_path = resolve_model_dir(model_path);
     let model_path = model_path.as_path();
     // Disable CUDA graphs for Gemma 4 before any weight realisation (issue #688).
@@ -851,6 +945,16 @@ pub fn load_model_with_adapter(
 /// (`--lora-init-without-apply`) is validated by loading its configuration
 /// and skipped at fusion, which is b10621's scale-0.0 initial state.
 pub fn load_model_with_adapter_specs(
+    model_path: &Path,
+    specs: &[lora::LoraAdapterSpec],
+    runtime: Option<&lora::RuntimeLoraSet>,
+) -> Result<(LoadedModel, MlxcelTokenizer)> {
+    with_weight_materialization(|| {
+        load_model_with_adapter_specs_unscoped(model_path, specs, runtime)
+    })
+}
+
+fn load_model_with_adapter_specs_unscoped(
     model_path: &Path,
     specs: &[lora::LoraAdapterSpec],
     runtime: Option<&lora::RuntimeLoraSet>,

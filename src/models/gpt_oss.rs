@@ -25,13 +25,17 @@
 //!
 //! Reference: mlx-lm gpt_oss.py
 
-use crate::models::switch_layers::validate_expert_quantization_params;
+use crate::models::gpt_oss_common::{
+    ExpertLinear, YarnRopeParams, gpt_oss_swiglu, yarn_rope_freqs,
+};
+use crate::models::model_owned::{KvCacheLayerModes, LayerKv, ModelOwnedSequenceState};
+use mlxcel_core::cache::{CachePool, KVCacheMode, SequenceId, SequenceStateLayout};
+use mlxcel_core::generate::{BatchedDecodeKind, route_batched_decode_with_ids};
 use mlxcel_core::layers::{KVCache, RMSNorm, RotatingKVCache, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, create_sliding_window_prefill_mask};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -41,6 +45,7 @@ use crate::distributed::pipeline::partial_loading::filter_weight_map;
 
 // Configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(remote = "Self")]
 pub struct ModelArgs {
     pub model_type: String,
     pub vocab_size: usize,
@@ -71,6 +76,8 @@ pub struct ModelArgs {
     #[serde(default)]
     pub quantization: Option<Quantization>,
 }
+
+mlxcel_core::impl_rope_lifting_deserialize!(ModelArgs);
 
 /// Replace layer number with 0 for quantization config lookup
 fn regex_replace_layer(prefix: &str) -> String {
@@ -230,6 +237,17 @@ impl ModelArgs {
             .unwrap_or_else(|| (64, 4, "affine".to_string()))
     }
 
+    /// The sliding window as the `i32` the rotating caches take, checked at
+    /// load when `layer_types` has a sliding layer (issue #2790); a config
+    /// with none keeps any window, unused.
+    pub(crate) fn validated_sliding_window(&self) -> Result<i32, String> {
+        let has_sliding_layer = self
+            .layer_types_list()
+            .iter()
+            .any(|layer_type| layer_type != "full_attention");
+        crate::models::model_owned::cache_window("GPT-OSS", self.sliding_window, has_sliding_layer)
+    }
+
     /// Get the layer_types list, defaulting to alternating sliding/full pattern
     pub fn layer_types_list(&self) -> Vec<String> {
         self.layer_types.clone().unwrap_or_else(|| {
@@ -258,279 +276,31 @@ impl ModelArgs {
             return None;
         }
 
-        let factor = rope_scaling
-            .get("factor")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1.0) as f32;
-        let original_max_pos = rope_scaling
-            .get("original_max_position_embeddings")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(4096) as f32;
-        let beta_fast = rope_scaling
-            .get("beta_fast")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(32.0) as f32;
-        let beta_slow = rope_scaling
-            .get("beta_slow")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1.0) as f32;
-        let mscale = rope_scaling
-            .get("mscale")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1.0) as f32;
-        let mscale_all_dim = rope_scaling
-            .get("mscale_all_dim")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0) as f32;
-
-        let dims = self.head_dim as f32;
-        let base = self.rope_theta;
-        let half_dims = self.head_dim / 2;
-
-        // yarn_find_correction_dim
-        let find_correction_dim = |num_rotations: f32| -> f32 {
-            (dims * (original_max_pos / (num_rotations * 2.0 * std::f32::consts::PI)).ln())
-                / (2.0 * base.ln())
+        let read = |key: &str, default: f64| -> f32 {
+            rope_scaling
+                .get(key)
+                .and_then(|v| v.as_f64())
+                .unwrap_or(default) as f32
         };
-
-        // yarn_find_correction_range
-        let low = find_correction_dim(beta_fast).floor().max(0.0) as usize;
-        let high = find_correction_dim(beta_slow).ceil().min(dims - 1.0) as usize;
-
-        // yarn_get_mscale
-        let get_mscale = |scale: f32, ms: f32| -> f32 {
-            if scale <= 1.0 {
-                1.0
-            } else {
-                0.1 * ms * scale.ln() + 1.0
-            }
+        let params = YarnRopeParams {
+            dims: self.head_dim,
+            base: self.rope_theta,
+            factor: read("factor", 1.0),
+            original_max_position_embeddings: rope_scaling
+                .get("original_max_position_embeddings")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(4096) as f32,
+            beta_fast: read("beta_fast", 32.0),
+            beta_slow: read("beta_slow", 1.0),
+            mscale: read("mscale", 1.0),
+            mscale_all_dim: read("mscale_all_dim", 0.0),
+            // mlx-lm's YarnRoPE always floors / ceils the correction range.
+            truncate: true,
         };
-
-        let rope_mscale = get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim);
-
-        // Compute frequencies
-        let mut freqs_data = vec![0.0f32; half_dims];
-        for (i, freq_out) in freqs_data.iter_mut().enumerate().take(half_dims) {
-            let freq_extra = base.powf((2 * i) as f32 / dims);
-            let freq_inter = factor * freq_extra;
-
-            // yarn_linear_ramp_mask
-            let ramp_min = low as f32;
-            let ramp_max = if high == low {
-                high as f32 + 0.001
-            } else {
-                high as f32
-            };
-            let ramp = ((i as f32 - ramp_min) / (ramp_max - ramp_min)).clamp(0.0, 1.0);
-            let freq_mask = 1.0 - ramp;
-
-            // Interpolate: (freq_inter * freq_extra) / (freq_inter * freq_mask + freq_extra * (1 - freq_mask))
-            *freq_out = (freq_inter * freq_extra)
-                / (freq_inter * freq_mask + freq_extra * (1.0 - freq_mask));
-        }
-
-        let freqs = mlxcel_core::from_slice_f32(&freqs_data, &[half_dims as i32]);
+        let (freqs_data, rope_mscale) = yarn_rope_freqs(&params);
+        let freqs = mlxcel_core::from_slice_f32(&freqs_data, &[freqs_data.len() as i32]);
         Some((freqs, rope_mscale))
     }
-}
-
-// Expert Linear Layer for GptOss
-// Handles both affine quantization (with quant biases) and MXFP4 (E8M0 scales, no quant biases),
-// plus optional per-expert linear bias.
-enum ExpertLinear {
-    Quantized {
-        weight: UniquePtr<MlxArray>,
-        scales: UniquePtr<MlxArray>,
-        quant_biases: Option<UniquePtr<MlxArray>>,
-        linear_bias: Option<UniquePtr<MlxArray>>,
-        group_size: i32,
-        bits: i32,
-        mode: String,
-    },
-    Regular {
-        weight: UniquePtr<MlxArray>,
-        linear_bias: Option<UniquePtr<MlxArray>>,
-    },
-}
-
-impl ExpertLinear {
-    fn forward(&self, x: &MlxArray, indices: &MlxArray, sorted: bool) -> UniquePtr<MlxArray> {
-        let out = match self {
-            Self::Quantized {
-                weight,
-                scales,
-                quant_biases,
-                group_size,
-                bits,
-                mode,
-                ..
-            } => {
-                let biases_ptr = quant_biases
-                    .as_ref()
-                    .map(|b| b.as_ref().unwrap() as *const _)
-                    .unwrap_or(std::ptr::null());
-                unsafe {
-                    mlxcel_core::gather_qmm(
-                        x,
-                        weight,
-                        scales,
-                        biases_ptr,
-                        std::ptr::null(), // lhs_indices
-                        indices as *const _,
-                        true,
-                        *group_size,
-                        *bits,
-                        sorted,
-                        mode,
-                        std::ptr::null(),
-                    )
-                }
-            }
-            Self::Regular { weight, .. } => {
-                let wt = mlxcel_core::swap_axes(weight, -1, -2);
-                unsafe {
-                    mlxcel_core::gather_mm(x, &wt, std::ptr::null(), indices as *const _, sorted)
-                }
-            }
-        };
-        // Add per-expert linear bias if present
-        let linear_bias = match self {
-            Self::Quantized { linear_bias, .. } | Self::Regular { linear_bias, .. } => {
-                linear_bias.as_ref()
-            }
-        };
-        if let Some(bias) = linear_bias {
-            let gathered_bias = mlxcel_core::take(bias, indices, 0);
-            let gathered_bias = mlxcel_core::expand_dims(&gathered_bias, -2);
-            mlxcel_core::add(&out, &gathered_bias)
-        } else {
-            out
-        }
-    }
-
-    fn from_weights(
-        weights: &WeightMap,
-        prefix: &str,
-        group_size: i32,
-        bits: i32,
-        mode: &str,
-    ) -> Result<Self, String> {
-        let weight = weights
-            .get(&format!("{}.weight", prefix))
-            .map(|w| mlxcel_core::copy(w))
-            .ok_or_else(|| format!("Missing weight: {}", prefix))?;
-
-        // Per-expert linear bias (e.g., gate_proj.bias [num_experts, out_dim])
-        let linear_bias = weights
-            .get(&format!("{}.bias", prefix))
-            .map(|w| mlxcel_core::copy(w));
-
-        // A per-expert NVFP4 tensor scale (mlx-lm `global_scale: true`, resolved
-        // to `.native_global_scale` by the load funnel) or a bare `.global_scale`
-        // has no slot in this expert path, which calls `gather_qmm` without
-        // one; loading the plane anyway would decode every expert wrong
-        // (issue #2351).
-        for leaf in ["native_global_scale", "global_scale"] {
-            if weights.contains_key(&format!("{prefix}.{leaf}")) {
-                return Err(format!(
-                    "{prefix}: carries a per-expert NVFP4 global scale ({prefix}.{leaf}), which \
-                     the gpt-oss expert path does not apply"
-                ));
-            }
-        }
-
-        let scales_key = format!("{}.scales", prefix);
-        if weights.contains_key(&scales_key) {
-            // Bound the declared pair here, where it is stored: `ExpertLinear`
-            // never reaches `reconcile_quantization_layout` and hands the stored
-            // pair to `gather_qmm` (issue #958). Unlike every sibling projection
-            // in this family, the expert pair comes from `Quantization::defaults`
-            // rather than from `quant_for`, so the per-prefix overrides that the
-            // guarded `UnifiedLinear` / `UnifiedEmbedding` loaders see do not
-            // describe it, and a valid override on `model.embed_tokens` (the
-            // shape every real gpt-oss checkpoint ships) leaves a hostile
-            // top-level pair reaching the experts alone.
-            validate_expert_quantization_params(prefix, group_size, bits)?;
-
-            let scales = weights
-                .get(&scales_key)
-                .map(|w| mlxcel_core::copy(w))
-                .unwrap();
-
-            // Quantized biases (only present for affine mode)
-            let quant_biases = weights
-                .get(&format!("{}.biases", prefix))
-                .map(|w| mlxcel_core::copy(w));
-
-            // Bound the declared mode on the same terms as the pair, and on the
-            // same reasoning: it is stored below and handed to `gather_qmm`
-            // verbatim (issue #973). The bias-presence half matters here in a way
-            // it does not for the shared loaders: this branch selects the
-            // quantized path on `.scales` alone and makes `.biases` an `Option`
-            // that becomes a null pointer when absent, so a plane with scales and
-            // no zero points under a declared `affine` mode used to be built
-            // without complaint and abort in `gather_qmm` with "Biases must be
-            // provided for affine quantization". This is MLX's own precondition,
-            // so it refuses only a load that was already going to abort; the
-            // canonical mxfp4 checkpoint pairs its 72 mode-less expert planes with
-            // block-float and its 122 `.biases`-carrying planes with affine, and
-            // is unaffected.
-            mlxcel_core::layers::validate_quantization_biases(mode, quant_biases.is_some())
-                .map_err(|e| format!("{prefix}: {e}"))?;
-            // A mode the running backend has no kernel for (issue #1806).
-            mlxcel_core::layers::validate_quantization_mode_for_running_backend(mode)
-                .map_err(|e| format!("{prefix}: {e}"))?;
-
-            Ok(Self::Quantized {
-                weight,
-                scales,
-                quant_biases,
-                linear_bias,
-                group_size,
-                bits,
-                mode: mode.to_string(),
-            })
-        } else {
-            Ok(Self::Regular {
-                weight,
-                linear_bias,
-            })
-        }
-    }
-}
-
-// GptOss custom SwiGLU activation
-// swiglu(x_linear, x_glu, alpha=1.702, limit=7.0):
-//   x_glu = clamp(x_glu, max=limit)
-//   x_linear = clamp(x_linear, min=-limit, max=limit)
-//   out_glu = x_glu * sigmoid(alpha * x_glu)
-//   return out_glu * (x_linear + 1)
-fn gpt_oss_swiglu(x_linear: &MlxArray, x_glu: &MlxArray, limit: f32) -> UniquePtr<MlxArray> {
-    if (limit - 7.0).abs() <= f32::EPSILON {
-        return mlxcel_core::compiled_gpt_oss_swiglu_activation(x_linear, x_glu);
-    }
-
-    let input_dtype = mlxcel_core::array_dtype(x_linear);
-    let alpha = 1.702f32;
-
-    // Clamp values
-    let neg_limit = mlxcel_core::full_f32(&[1], -limit, input_dtype);
-    let pos_limit = mlxcel_core::full_f32(&[1], limit, input_dtype);
-    let x_glu = mlxcel_core::minimum(x_glu, &pos_limit);
-    let x_linear = mlxcel_core::maximum(x_linear, &neg_limit);
-    let x_linear = mlxcel_core::minimum(&x_linear, &pos_limit);
-
-    // glu_scaled = alpha * x_glu -> sigmoid -> out_glu = x_glu * sig
-    let alpha_arr = mlxcel_core::full_f32(&[1], alpha, input_dtype);
-    let glu_scaled = mlxcel_core::multiply(&alpha_arr, &x_glu);
-    let sig = mlxcel_core::sigmoid(&glu_scaled);
-    let out_glu = mlxcel_core::multiply(&x_glu, &sig);
-
-    // (x_linear + 1) * out_glu
-    let one = mlxcel_core::full_f32(&[1], 1.0, input_dtype);
-    let x_linear_plus_1 = mlxcel_core::add(&x_linear, &one);
-    let result = mlxcel_core::multiply(&out_glu, &x_linear_plus_1);
-    mlxcel_core::astype(&result, input_dtype)
 }
 
 // SwitchGLU for GptOss (custom activation, MXFP4 support)
@@ -791,6 +561,108 @@ impl Attention {
         self.o_proj.forward(&attn_out)
     }
 
+    fn forward_batched_decode(
+        &self,
+        x: &MlxArray,
+        caches: &mut [Vec<Cache>],
+        layer_idx: usize,
+    ) -> UniquePtr<MlxArray> {
+        let b = caches.len() as i32;
+        let project = |projection: &UnifiedLinear, heads| {
+            let projected = projection.forward(x);
+            let projected = mlxcel_core::reshape(&projected, &[b, 1, heads, self.head_dim]);
+            mlxcel_core::transpose_axes(&projected, &[0, 2, 1, 3])
+        };
+        let q = project(&self.q_proj, self.num_heads);
+        let k = project(&self.k_proj, self.num_kv_heads);
+        let v = project(&self.v_proj, self.num_kv_heads);
+        let offsets: Vec<_> = caches
+            .iter()
+            .map(|row| gpt_oss_cache_offset(&row[layer_idx]))
+            .collect();
+        let rope = |x: &MlxArray| {
+            if let Some(freqs) = &self.rope_freqs {
+                let scaled = if (self.rope_mscale - 1.0).abs() > 1e-6 {
+                    mlxcel_core::multiply_scalar(x, self.rope_mscale)
+                } else {
+                    mlxcel_core::copy(x)
+                };
+                mlxcel_core::fast_rope_batched_with_freqs(
+                    &scaled,
+                    self.rope_dims,
+                    false,
+                    1.0,
+                    &offsets,
+                    freqs,
+                )
+            } else {
+                mlxcel_core::fast_rope_batched(
+                    x,
+                    self.rope_dims,
+                    false,
+                    self.rope_base,
+                    1.0,
+                    &offsets,
+                )
+            }
+        };
+        let q = rope(&q);
+        let k = rope(&k);
+        let attended = self.attend_rows_with_sinks(&q, &k, &v, caches, layer_idx);
+        let attended = mlxcel_core::transpose_axes(&attended, &[0, 2, 1, 3]);
+        let attended = mlxcel_core::reshape(&attended, &[b, 1, self.num_heads * self.head_dim]);
+        self.o_proj.forward(&attended)
+    }
+
+    // KvAttention::attend / attend_batched_rows cannot carry learned sinks.
+    // Keep the sink-aware SDPA and mixed-cache updates per row, while all
+    // projections and the rest of the transformer run once for the batch.
+    fn attend_rows_with_sinks(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        v: &MlxArray,
+        caches: &mut [Vec<Cache>],
+        layer_idx: usize,
+    ) -> UniquePtr<MlxArray> {
+        let rows: Vec<_> = caches
+            .iter_mut()
+            .enumerate()
+            .map(|(row, caches)| {
+                let slice_row = |x: &MlxArray, heads| {
+                    mlxcel_core::slice(
+                        x,
+                        &[row as i32, 0, 0, 0],
+                        &[row as i32 + 1, heads, 1, self.head_dim],
+                    )
+                };
+                let q = slice_row(q, self.num_heads);
+                let k = slice_row(k, self.num_kv_heads);
+                let v = slice_row(v, self.num_kv_heads);
+                let (k, v) = caches[layer_idx].as_interface().update_and_fetch(k, v);
+                // SAFETY: sinks is a live per-head array; the null mask requests
+                // unmasked width-one decode over this row's visible KV only.
+                unsafe {
+                    mlxcel_core::fast_scaled_dot_product_attention_with_sinks(
+                        &q,
+                        &k,
+                        &v,
+                        self.scale,
+                        std::ptr::null(),
+                        self.sinks.as_ref().unwrap() as *const _,
+                    )
+                }
+            })
+            .collect();
+        mlxcel_core::concatenate_many(
+            &rows
+                .iter()
+                .map(|row| row.as_ref().unwrap())
+                .collect::<Vec<_>>(),
+            0,
+        )
+    }
+
     fn from_weights(
         weights: &WeightMap,
         args: &ModelArgs,
@@ -963,6 +835,13 @@ impl Cache {
             Cache::Rotating(c) => c,
         }
     }
+
+    fn visible_len(&self) -> usize {
+        match self {
+            Cache::Standard(cache) => cache.live_len().max(0) as usize,
+            Cache::Rotating(cache) => cache.visible_len().max(0) as usize,
+        }
+    }
 }
 
 pub(crate) fn gpt_oss_cache_offset(cache: &Cache) -> i32 {
@@ -979,7 +858,8 @@ pub struct GptOssModel {
     norm: RMSNorm,
     lm_head: Option<UnifiedLinear>,
     layer_types: Vec<String>,
-    sliding_window: usize,
+    /// Validated at load ([`ModelArgs::validated_sliding_window`]).
+    sliding_window: i32,
 }
 
 impl GptOssModel {
@@ -1012,7 +892,7 @@ impl GptOssModel {
             let full_mask = create_causal_mask(seq_len, global_offset);
 
             let sliding_offset = caches[swa_idx].as_interface().offset();
-            let max_cache = self.sliding_window as i32;
+            let max_cache = self.sliding_window;
             // Full-width windowed mask for a fresh single-pass prefill that
             // exceeds the window (RotatingKVCache keeps all prefill keys),
             // clamped mask otherwise. See issue #408.
@@ -1043,14 +923,44 @@ impl GptOssModel {
         }
     }
 
-    fn make_caches(&self) -> Vec<Cache> {
+    fn forward_batched_decode_with_caches(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [Vec<Cache>],
+    ) -> UniquePtr<MlxArray> {
+        let mut h = self.embed_tokens.forward(input_ids);
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let normed = layer.input_layernorm.forward(&h);
+            let attention = layer.self_attn.forward_batched_decode(&normed, caches, idx);
+            h = mlxcel_core::add(&h, &attention);
+            let normed = layer.post_attention_layernorm.forward(&h);
+            h = mlxcel_core::add(&h, &layer.mlp.forward(&normed));
+        }
+        let h = self.norm.forward(&h);
+        match &self.lm_head {
+            Some(head) => head.forward(&h),
+            None => self.embed_tokens.as_linear(&h),
+        }
+    }
+
+    /// One cache per layer: `KVCache` on full-attention layers and
+    /// `RotatingKVCache(sliding_window)` elsewhere, each stored in its
+    /// resolved KV cache mode (`None` keeps all layers FP16).
+    fn make_caches_with_modes(&self, modes: Option<&KvCacheLayerModes>) -> Vec<Cache> {
         self.layer_types
             .iter()
-            .map(|lt| {
+            .enumerate()
+            .map(|(layer_idx, lt)| {
                 if lt == "full_attention" {
-                    Cache::Standard(KVCache::new())
+                    let mode =
+                        modes.map_or(KVCacheMode::Fp16, |modes| modes.mode_for_layer(layer_idx));
+                    Cache::Standard(KVCache::new_with_mode(mode))
                 } else {
-                    Cache::Rotating(RotatingKVCache::new(self.sliding_window as i32))
+                    let window = self.sliding_window;
+                    let mode = modes.map_or(KVCacheMode::Fp16, |modes| {
+                        modes.rotating_mode_for_layer(layer_idx, window)
+                    });
+                    Cache::Rotating(RotatingKVCache::new_with_mode(window, mode))
                 }
             })
             .collect()
@@ -1086,6 +996,7 @@ impl GptOssModel {
             None => (None, 1.0),
         };
 
+        let sliding_window = args.validated_sliding_window()?;
         let layer_types = args.layer_types_list();
 
         let mut layers = Vec::with_capacity(args.num_hidden_layers);
@@ -1113,7 +1024,7 @@ impl GptOssModel {
             norm,
             lm_head,
             layer_types,
-            sliding_window: args.sliding_window,
+            sliding_window,
         })
     }
 }
@@ -1122,20 +1033,49 @@ impl GptOssModel {
 // Used by: LoadedModel::GptOss
 pub struct GptOssWrapper {
     model: GptOssModel,
-    caches: RefCell<Vec<Cache>>,
+    sequence_state: ModelOwnedSequenceState<Cache>,
+    kv_cache_layer_modes: KvCacheLayerModes,
 }
 
 impl GptOssWrapper {
+    #[cfg(test)]
+    pub(crate) fn sequence_kv_modes(&self, id: SequenceId) -> Vec<KVCacheMode> {
+        self.sequence_state
+            .with_sequence_state_ref(id, |caches| {
+                caches
+                    .iter()
+                    .map(|cache| match cache {
+                        Cache::Standard(c) => c.mode,
+                        Cache::Rotating(c) => c.mode,
+                    })
+                    .collect()
+            })
+            .expect("test sequence exists")
+    }
+
     pub fn new(model: GptOssModel) -> Self {
-        let caches = model.make_caches();
+        let caches = model.make_caches_with_modes(None);
         Self {
             model,
-            caches: RefCell::new(caches),
+            sequence_state: ModelOwnedSequenceState::new(caches),
+            kv_cache_layer_modes: KvCacheLayerModes::new(),
         }
     }
 
+    /// Fresh caches in the KV cache modes the server or CLI injected.
+    fn fresh_caches(&self) -> Vec<Cache> {
+        self.model
+            .make_caches_with_modes(Some(&self.kv_cache_layer_modes))
+    }
+
     fn reset_caches(&self) {
-        *self.caches.borrow_mut() = self.model.make_caches();
+        self.sequence_state.replace_internal(self.fresh_caches());
+    }
+
+    fn assert_prepared_sequence_ids(&self, seq_ids: &[SequenceId]) {
+        self.sequence_state
+            .validate_sequence_states(seq_ids)
+            .unwrap_or_else(|err| panic!("gpt-oss batched decode: {err}"));
     }
 }
 
@@ -1146,8 +1086,11 @@ impl mlxcel_core::generate::LanguageModel for GptOssWrapper {
         _caches: &mut [KVCache],
         _mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let mut caches = self.caches.borrow_mut();
-        self.model.forward_with_caches(input_ids, &mut caches)
+        self.sequence_state.with_or_create_sequence_state(
+            None,
+            || self.fresh_caches(),
+            |caches| self.model.forward_with_caches(input_ids, caches),
+        )
     }
 
     fn make_caches(&self) -> Vec<KVCache> {
@@ -1162,8 +1105,143 @@ impl mlxcel_core::generate::LanguageModel for GptOssWrapper {
         self.model.layers.len()
     }
 
+    fn set_kv_cache_layer_modes(&self, modes: Vec<KVCacheMode>) {
+        self.kv_cache_layer_modes.set(modes);
+        self.reset_caches();
+    }
+
+    fn kv_cache_layer_modes(&self) -> Option<Vec<KVCacheMode>> {
+        self.kv_cache_layer_modes.clone_modes()
+    }
+
+    /// Sliding layers hold a `RotatingKVCache`, which stores FP16 for every
+    /// mode but an aligned `Turbo4Asym` (issue #2783).
+    fn kv_cache_storage_modes(&self) -> Option<Vec<Option<KVCacheMode>>> {
+        let window = self.model.sliding_window;
+        self.kv_cache_layer_modes.storage_modes(|layer_idx| {
+            self.model
+                .layer_types
+                .get(layer_idx)
+                .is_some_and(|layer_type| layer_type != "full_attention")
+                .then_some(window)
+                .map_or(LayerKv::Full, LayerKv::Sliding)
+        })
+    }
+
     fn supports_batching(&self) -> bool {
-        false // Mixed internal caches not compatible with per-sequence KV isolation
+        true
+    }
+
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
+    }
+
+    fn sequence_state_layout(&self) -> SequenceStateLayout {
+        SequenceStateLayout::model_owned(self.model.layers.len())
+    }
+
+    fn supports_padded_prefill(&self) -> bool {
+        // Rotating caches cannot trim padding back out of model-owned state.
+        false
+    }
+
+    fn prepare_sequence_state(&self, seq_id: SequenceId) {
+        self.sequence_state
+            .prepare_sequence_state(seq_id, self.fresh_caches());
+    }
+
+    fn release_sequence_state_by_id(&self, seq_id: SequenceId) {
+        self.sequence_state.release_sequence_state(seq_id);
+    }
+
+    fn forward_with_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        seq_id: Option<SequenceId>,
+        _caches: &mut [KVCache],
+        _mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.sequence_state.with_or_create_sequence_state(
+            seq_id,
+            || self.fresh_caches(),
+            |caches| self.model.forward_with_caches(input_ids, caches),
+        )
+    }
+
+    fn sync_sequence_storage(
+        &self,
+        seq_id: SequenceId,
+        cache_pool: &mut CachePool,
+    ) -> Result<(), String> {
+        self.sequence_state
+            .with_existing_sequence_state(seq_id, |caches| {
+                let visible_lens: Vec<_> = caches.iter().map(Cache::visible_len).collect();
+                cache_pool.sync_paged_state_with_lengths(seq_id, &visible_lens)
+            })?
+    }
+
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_batched_with_ids(input_ids, None, batch_caches, mask)
+    }
+
+    fn forward_batched_with_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(input_ids);
+        assert_eq!(shape.len(), 2, "gpt-oss batched input must be rank 2");
+        assert_eq!(
+            shape[0] as usize,
+            batch_caches.len(),
+            "gpt-oss input batch must match cache rows"
+        );
+        if let Some(ids) = seq_ids {
+            assert_eq!(
+                ids.len(),
+                batch_caches.len(),
+                "gpt-oss requires one sequence id per row"
+            );
+        }
+
+        route_batched_decode_with_ids(self, input_ids, seq_ids, batch_caches, |batch_caches| {
+            let ids = seq_ids.expect("gpt-oss model-owned batched decode requires sequence ids");
+            if shape[1] != 1 || mask.is_some() {
+                self.assert_prepared_sequence_ids(ids);
+                let rows: Vec<_> = batch_caches
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(row, caches)| {
+                        let input = mlxcel_core::slice(
+                            input_ids,
+                            &[row as i32, 0],
+                            &[row as i32 + 1, shape[1]],
+                        );
+                        self.forward_with_sequence_id(&input, Some(ids[row]), caches, mask)
+                    })
+                    .collect();
+                return mlxcel_core::concatenate_many(
+                    &rows
+                        .iter()
+                        .map(|row| row.as_ref().unwrap())
+                        .collect::<Vec<_>>(),
+                    0,
+                );
+            }
+            self.sequence_state
+                .with_batched_sequence_states(ids, |caches| {
+                    self.model
+                        .forward_batched_decode_with_caches(input_ids, caches)
+                })
+                .unwrap_or_else(|err| panic!("gpt-oss batched decode: {err}"))
+        })
     }
 
     fn eos_token_ids(&self) -> Vec<i32> {
@@ -1186,7 +1264,8 @@ pub(crate) struct GptOssStageModel {
     norm: Option<RMSNorm>,
     lm_head: Option<UnifiedLinear>,
     layer_types: Vec<String>,
-    sliding_window: usize,
+    /// Validated at load ([`ModelArgs::validated_sliding_window`]).
+    sliding_window: i32,
 }
 
 impl GptOssStageModel {
@@ -1237,6 +1316,7 @@ impl GptOssStageModel {
             None => (None, 1.0),
         };
 
+        let sliding_window = args.validated_sliding_window()?;
         let layer_types = args.layer_types_list()[filter.layer_range.clone()].to_vec();
 
         let mut layers = Vec::with_capacity(filter.num_layers());
@@ -1281,7 +1361,7 @@ impl GptOssStageModel {
             norm,
             lm_head,
             layer_types,
-            sliding_window: args.sliding_window,
+            sliding_window,
         })
     }
 
@@ -1296,7 +1376,7 @@ impl GptOssStageModel {
                 if lt == "full_attention" {
                     Cache::Standard(KVCache::new())
                 } else {
-                    Cache::Rotating(RotatingKVCache::new(self.sliding_window as i32))
+                    Cache::Rotating(RotatingKVCache::new(self.sliding_window))
                 }
             })
             .collect()
@@ -1353,7 +1433,7 @@ impl GptOssStageModel {
                 .map(|offset| {
                     // See issue #408: full-width windowed mask for a fresh
                     // >window prefill, clamped otherwise.
-                    let max_cache = self.sliding_window as i32;
+                    let max_cache = self.sliding_window;
                     create_sliding_window_prefill_mask(seq_len, offset, max_cache)
                 })
         } else {
@@ -1760,3 +1840,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "gpt_oss_tests.rs"]
+pub(super) mod batching_tests;

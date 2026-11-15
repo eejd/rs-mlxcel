@@ -79,9 +79,17 @@ pub enum EngineError {
     /// The pool could not assemble the batch view for these rows.
     #[error("batch caches: {0}")]
     Batch(String),
-    /// Allocating a sequence's state failed (pool capacity, paged budget).
+    /// Allocating a sequence's state failed (pool capacity, paged budget);
+    /// the pool entry is released before this is returned.
     #[error("open: {0}")]
     Open(String),
+    /// The model refused to prepare the sequence
+    /// ([`LanguageModel::try_prepare_sequence_state`]): a remote pipeline
+    /// stage declined it (#2714, #2727). The text is the model's
+    /// client-safe message and is shown to the request as is; the pool
+    /// entry is released before this is returned.
+    #[error("{0}")]
+    Prepare(String),
     /// Padding trim after a prefill piece failed; the sequence's state may
     /// disagree with its token count and must be finished with an error.
     #[error("trim: {0}")]
@@ -94,6 +102,14 @@ pub enum EngineError {
     /// unwinds them with [`Engine::unwind_appends`].
     #[error("eval: {0}")]
     Eval(String),
+    /// The model's forward failed before it produced logits
+    /// ([`LanguageModel::try_forward_with_sequence_id`] and its batched and
+    /// last-logits variants): a remote pipeline stage answered with an error
+    /// or timed out (#2727). The text is the model's client-safe message;
+    /// the caller finishes every row of the step with it. Nothing was
+    /// appended to any row's state, so there is nothing to unwind.
+    #[error("forward: {0}")]
+    Forward(String),
 }
 
 /// What [`Engine::open`] needs to allocate a sequence.
@@ -186,12 +202,26 @@ impl<M: LanguageModel> Engine<M> {
     /// Allocate a sequence: its pool entry (dense caches from
     /// `make_caches`, a paged state, or a model-owned placeholder, per the
     /// layout) and the model's own per-sequence state.
+    ///
+    /// A model that refuses to prepare the sequence (a remote pipeline
+    /// coordinator whose stages declined it, #2714) fails only this open:
+    /// the entry just allocated is closed again and the model's message is
+    /// returned as [`EngineError::Prepare`], so the caller fails one request
+    /// with that text and keeps serving (#2727).
     pub fn open(&mut self, spec: SequenceSpec) -> Result<SequenceId, EngineError> {
         let id = self
             .pool
             .allocate_with_layout(&self.model, spec.layout_override)
             .map_err(EngineError::Open)?;
-        self.model.prepare_sequence_state(id);
+        if let Err(err) = self.model.try_prepare_sequence_state(id) {
+            tracing::warn!(
+                seq_id = %id,
+                error = %err,
+                "the model refused to prepare the sequence; failing its open"
+            );
+            self.close(id);
+            return Err(EngineError::Prepare(err));
+        }
         Ok(id)
     }
 
@@ -447,27 +477,26 @@ impl<M: LanguageModel> Engine<M> {
                     .pool
                     .get_caches_mut(*id)
                     .ok_or(EngineError::MissingSequence(*id))?;
-                Ok(self
-                    .model
-                    .forward_with_sequence_id(batch.input, Some(*id), caches, None))
+                self.model
+                    .try_forward_with_sequence_id(batch.input, Some(*id), caches, None)
+                    .map_err(EngineError::Forward)
             }
             ids => {
                 let mut batch_caches = self
                     .pool
                     .get_batch_caches_mut(ids)
                     .map_err(EngineError::Batch)?;
-                Ok(self.model.forward_batched_with_ids(
-                    batch.input,
-                    Some(ids),
-                    &mut batch_caches,
-                    None,
-                ))
+                self.model
+                    .try_forward_batched_with_ids(batch.input, Some(ids), &mut batch_caches, None)
+                    .map_err(EngineError::Forward)
             }
         }
     }
 
     /// Undo `n` speculative KV appends on `id`: trim the pool caches and, for
-    /// a model-owned family, rewind the model's own state. A trim that
+    /// a model-owned family or a dense family with state beside its KV
+    /// caches ([`LanguageModel::kv_cache_captures_sequence_state`] is
+    /// `false`), rewind the model's own state. A trim that
     /// removes fewer positions than asked is logged (the KV may be out of
     /// sync); a failed model rewind is [`EngineError::Rewind`], and the caller
     /// must finish that row with an error rather than donate its state.
@@ -490,7 +519,9 @@ impl<M: LanguageModel> Engine<M> {
                 );
             }
         }
-        if self.model.sequence_state_layout().backend == SequenceStateBackend::ModelOwned {
+        if self.model.sequence_state_layout().backend == SequenceStateBackend::ModelOwned
+            || !self.model.kv_cache_captures_sequence_state()
+        {
             self.model
                 .rewind_decode_appends(id, n)
                 .map_err(EngineError::Rewind)?;
@@ -515,13 +546,23 @@ fn schedule(array: &MlxArray) -> Result<(), EngineError> {
 }
 
 #[cfg(test)]
+mod after_prefill_tests;
+#[cfg(test)]
 mod direct_decode_rows_tests;
 #[cfg(test)]
 mod direct_decode_tests;
 #[cfg(test)]
+mod shared_cache_tests;
+#[cfg(test)]
+mod speculative_distribution_tests;
+#[cfg(test)]
+mod speculative_full_model_tests;
+#[cfg(test)]
 mod speculative_plain_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod verify_round_rollback_tests;
 #[cfg(test)]
 mod verify_round_tests;
 

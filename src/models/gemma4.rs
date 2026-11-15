@@ -24,6 +24,8 @@
 //! - Dense + MoE feed-forward paths
 //! - Final logit softcapping
 
+#[path = "gemma4_batched.rs"]
+mod batched;
 #[path = "gemma4_probe.rs"]
 mod probe_trace;
 #[path = "gemma4_attention.rs"]
@@ -37,7 +39,7 @@ use crate::distributed::pipeline::LayerFilter;
 use crate::distributed::pipeline::StageExecutionOutput;
 use crate::distributed::pipeline::partial_loading::filter_weight_map;
 use crate::models::kv_snapshot::{self, KvSnapshotNames};
-use crate::models::model_owned::{KvCacheLayerModes, ModelOwnedSequenceState};
+use crate::models::model_owned::{KvCacheLayerModes, LayerKv, ModelOwnedSequenceState};
 use crate::models::speculative_exactness::{
     BlockChainExactness, ProbeKey, compare_block_against_chain, mtp_exactness_gate,
 };
@@ -592,6 +594,23 @@ impl SwitchGeGLU {
         let n_tokens = indices_shape[0];
         let top_k = indices_shape[1];
         let do_sort = n_tokens * top_k >= 64;
+        if profile_inner {
+            // Each (token, expert) pair reads one expert matrix, so `distinct`
+            // is what a per-expert grouped read could cut `pairs` to (#2784).
+            let picked = mlxcel_core::utils::array_to_vec_f32(&mlxcel_core::astype(
+                indices,
+                mlxcel_core::dtype::FLOAT32,
+            ));
+            let distinct = picked
+                .iter()
+                .map(|&expert| expert as u32)
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            eprintln!(
+                "[MOE] name=distinct_experts tokens={n_tokens} pairs={} distinct={distinct}",
+                picked.len()
+            );
+        }
 
         // `Experts::forward` always passes a flattened `[tokens, hidden]`
         // input here. Python writes this as `expand_dims((-2, -3))`, which
@@ -3347,6 +3366,15 @@ pub(crate) mod mtp_verify_log {
 }
 
 impl Gemma4TextModel {
+    /// The first sliding layer's attention, whose head counts and head dim
+    /// every sliding layer shares; `None` for a model with no sliding layer.
+    fn first_sliding_attention(&self) -> Option<&Attention> {
+        self.layers
+            .iter()
+            .find(|layer| layer.layer_type != "full_attention")
+            .map(|layer| &layer.self_attn)
+    }
+
     /// Whether this forward is a B > 1 MTP verify that must run per batch
     /// row (issue #2190).
     ///
@@ -3674,46 +3702,17 @@ impl Gemma4TextModel {
                 lp,
             );
             (Some(global_mask), Some(sliding_mask))
-        } else if l > DENSE_PREFILL_MASK_MAX_TOKENS
-            && bidirectional_block_ids.is_none()
-            && per_row_valid_end.is_none()
-        {
-            // Long text-only prefill: leave both masks `None` so `attend`
-            // routes through `causal_attention`'s flag paths instead of
-            // shipping dense `[l, l + offset]` f32 masks through every layer.
-            // At 32k tokens the two retained masks alone are ~8 GiB and their
-            // construction transients more, on top of the O(heads*L^2) score
-            // materialization they used to feed (issue #672). Semantics are
-            // unchanged: full-attention layers (`window_size == 0`) take the
-            // bottom-right-aligned causal path (row `q` attends `k <= q +
-            // offset`, exactly `create_causal_mask(l, live_len)`), and
-            // sliding layers take the over-window prefill path, which builds
-            // the same `create_causal_mask_with_window_full(l, offset,
-            // window)` mask per layer as a transient instead of retaining it
-            // for the whole forward. Short prefills and every verify /
-            // padding / vision-overlay shape keep the dense masks below,
-            // byte-identical to the previous behavior.
-            (None, None)
         } else if l > 1 && bidirectional_block_ids.is_none() && per_row_valid_end.is_none() {
-            // Text-only prefill / verify with no padding: both masks would be
-            // plain bottom-right causal while every live key is inside the
-            // window, so leave them `None` and let `attend` take MLX's
-            // maskless causal SDPA (mlx-lm passes `"causal"` for `N <=
-            // window`). Full-attention layers always qualify; sliding layers
-            // until the live keys outgrow the window, after which they keep
-            // the dense sliding mask built as in the branch below.
-            let sliding_live_len = first_cache_live_len(caches, "sliding_attention");
-            let window = self.config.sliding_window as i32;
-            let sliding_mask = if sliding_live_len + l <= window {
-                None
-            } else {
-                Some(create_sliding_window_prefill_mask(
-                    l,
-                    sliding_live_len,
-                    window,
-                ))
-            };
-            (None, sliding_mask)
+            // Text-only prefill / verify with no padding: see
+            // [`text_prefill_masks`], which the pipeline stage model shares so
+            // both run the same attention kernels (issue #2654).
+            text_prefill_masks(
+                self.first_sliding_attention(),
+                &h,
+                caches,
+                l,
+                self.config.sliding_window as i32,
+            )
         } else if l > 1 {
             // Non-ragged prefill / multi-token verify: derive both masks from
             // the cache's live window (`live_len`), not the monotonic
@@ -4068,6 +4067,17 @@ impl Gemma4TextModel {
         config: &TextConfig,
         prefix: &str,
     ) -> Result<Self, String> {
+        // Every cache builder casts `sliding_window` to the `RotatingKVCache`
+        // size; a zero or over-`i32::MAX` window fails the load instead
+        // (issue #2790). A config with no sliding layer keeps any window.
+        crate::models::model_owned::cache_window(
+            "Gemma 4",
+            config.sliding_window,
+            config
+                .layer_types
+                .iter()
+                .any(|layer_type| layer_type != "full_attention"),
+        )?;
         let embed_tokens = UnifiedEmbedding::from_weights(
             weights,
             &format!("{}.embed_tokens", prefix),
@@ -4147,16 +4157,17 @@ impl Gemma4TextModel {
             .iter()
             .enumerate()
             .map(|(idx, layer_type)| {
-                let mode = modes
-                    .map(|modes| modes.mode_for_layer(idx))
-                    .unwrap_or(KVCacheMode::Fp16);
                 if layer_type == "full_attention" {
+                    let mode = modes
+                        .map(|modes| modes.mode_for_layer(idx))
+                        .unwrap_or(KVCacheMode::Fp16);
                     Cache::Standard(KVCache::new_with_mode(mode))
                 } else {
-                    Cache::Rotating(RotatingKVCache::new_with_mode(
-                        self.config.sliding_window as i32,
-                        mode,
-                    ))
+                    let window = self.config.sliding_window as i32;
+                    let mode = modes.map_or(KVCacheMode::Fp16, |modes| {
+                        modes.rotating_mode_for_layer(idx, window)
+                    });
+                    Cache::Rotating(RotatingKVCache::new_with_mode(window, mode))
                 }
             })
             .collect()
@@ -4311,6 +4322,19 @@ pub(crate) fn first_cache_live_len(caches: &[Cache], layer_type: &str) -> i32 {
     0
 }
 
+/// [`mlxcel_core::window_sdpa::sliding_caches_kv_dtype`] over this model's
+/// sliding (`Rotating`) caches. Used by: `sliding_prefill_plans_native`
+/// (issue #2621).
+pub(crate) fn sliding_caches_kv_dtype(caches: &[Cache], activation_dtype: i32) -> Option<i32> {
+    mlxcel_core::window_sdpa::sliding_caches_kv_dtype(
+        caches.iter().filter_map(|cache| match cache {
+            Cache::Rotating(c) => Some(c),
+            Cache::Standard(_) => None,
+        }),
+        activation_dtype,
+    )
+}
+
 pub(crate) fn slice_layer_input(
     layer_inputs: &MlxArray,
     layer_idx: i32,
@@ -4344,6 +4368,117 @@ const SUPPORTED_QUANT_SCHEMES: [&str; 4] = mlxcel_core::layers::SUPPORTED_QUANTI
 /// avoiding the O(L^2) retained masks entirely (issue #672). 4096 keeps every
 /// dense mask under ~64 MiB and leaves short-context behavior byte-identical.
 const DENSE_PREFILL_MASK_MAX_TOKENS: i32 = 4096;
+
+/// Whether a text-only sliding-layer prefill of `l` rows after
+/// `sliding_live_len` live keys plans the native window route (issue #2621).
+/// `sliding_attn` is the first sliding layer's attention (the head counts and
+/// head dim come from it); with no sliding layer the plan is never native.
+/// When it is, the forward leaves the sliding mask `None` and `attend` takes
+/// `causal_attention`'s over-window branch, which applies the band natively
+/// or, should the per-layer decision decline, through the same full-width
+/// mask this model built before.
+///
+/// The K/V dtype comes from the sliding caches ([`sliding_caches_kv_dtype`]):
+/// a `Turbo4Asym` ring returns FP16 under bf16 activations, which MLX
+/// promotes to float32 and serves from its graph fallback at head dim 256, so
+/// the plan says legacy and the mask is built once per forward rather than
+/// once per sliding layer. Sliding caches that disagree (Boundary-V keeps the
+/// outer layers at FP16) also plan legacy.
+fn sliding_prefill_plans_native(
+    sliding_attn: Option<&Attention>,
+    h: &MlxArray,
+    caches: &[Cache],
+    l: i32,
+    sliding_live_len: i32,
+    window: i32,
+) -> bool {
+    let Some(attn) = sliding_attn else {
+        return false;
+    };
+    let activation_dtype = mlxcel_core::array_dtype(h);
+    let Some(kv_dtype) = sliding_caches_kv_dtype(caches, activation_dtype) else {
+        return false;
+    };
+    let shape = mlxcel_core::window_sdpa::WindowSdpaShape::prefill(
+        mlxcel_core::array_shape(h)[0],
+        attn.n_heads,
+        attn.n_kv_heads,
+        l,
+        mlxcel_core::window_sdpa::rotating_prefill_key_len(l, sliding_live_len, window),
+        attn.head_dim,
+        activation_dtype,
+    )
+    .with_kv_dtype(kv_dtype);
+    mlxcel_core::window_sdpa::plan(
+        &shape,
+        window,
+        mlxcel_core::window_sdpa::WindowSdpaExtras::default(),
+    )
+    .is_native()
+}
+
+/// The `(global, sliding)` masks of a text-only prefill of `l > 1` rows (no
+/// caller mask, no resident padding, no vision overlay, no per-row valid
+/// ends).
+///
+/// Both masks would be plain bottom-right causal while every live key is
+/// inside the window, so both stay `None` and `attend` takes MLX's maskless
+/// causal SDPA (mlx-lm passes `"causal"` for `N <= window`). Full-attention
+/// layers always qualify. A sliding layer keeps a dense band only once the
+/// live keys outgrow the window and the native window route is not planned
+/// ([`sliding_prefill_plans_native`]).
+///
+/// Above [`DENSE_PREFILL_MASK_MAX_TOKENS`] both stay `None` regardless, so
+/// `attend` routes through `causal_attention`'s flag paths instead of
+/// shipping dense `[l, l + offset]` f32 masks through every layer. At 32k
+/// tokens the two retained masks alone are ~8 GiB and their construction
+/// transients more, on top of the O(heads*L^2) score materialization they
+/// used to feed (issue #672). Semantics are unchanged: full-attention layers
+/// (`window_size == 0`) take the bottom-right-aligned causal path, and
+/// sliding layers the over-window prefill path, which builds the same
+/// `create_causal_mask_with_window_full(l, offset, window)` mask per layer as
+/// a transient instead of retaining it for the whole forward.
+///
+/// The single-process forward and the pipeline stage model both build their
+/// masks here. When the stage built explicit masks instead, its layers took
+/// the masked SDPA kernels while the dense model took the maskless ones, and
+/// remote pipeline logits drifted from dense logits (issue #2654). A stage
+/// without a sliding layer passes `sliding_attn = None` and gets `(None,
+/// None)` without building anything (#2694).
+///
+/// Used by: `Gemma4TextModel::forward_with_speculative_sinks`,
+/// `Gemma4StageModel::execute_hidden`.
+fn text_prefill_masks(
+    sliding_attn: Option<&Attention>,
+    h: &MlxArray,
+    caches: &[Cache],
+    l: i32,
+    window: i32,
+) -> (Option<UniquePtr<MlxArray>>, Option<UniquePtr<MlxArray>>) {
+    if l > DENSE_PREFILL_MASK_MAX_TOKENS {
+        return (None, None);
+    }
+    // A pipeline stage whose layers are all full attention has no sliding
+    // layer to feed a sliding mask to; building one would only allocate an
+    // `[l, l]` mask that no layer reads (#2694). The dense model always has a
+    // sliding layer, so this is the stage path only.
+    if sliding_attn.is_none() {
+        return (None, None);
+    }
+    let sliding_live_len = first_cache_live_len(caches, "sliding_attention");
+    let sliding_mask = if sliding_live_len + l <= window
+        || sliding_prefill_plans_native(sliding_attn, h, caches, l, sliding_live_len, window)
+    {
+        None
+    } else {
+        Some(create_sliding_window_prefill_mask(
+            l,
+            sliding_live_len,
+            window,
+        ))
+    };
+    (None, sliding_mask)
+}
 
 /// Whether a `quantization_config` object declares NVIDIA ModelOpt NVFP4:
 /// `quant_method: "modelopt"`, `quant_algo: "NVFP4"`, and every config group's
@@ -4810,6 +4945,16 @@ impl Gemma4StageModel {
         weight_backing: super::sanitize::Gemma4WeightBacking,
     ) -> Result<Self, String> {
         let config = args.text_args();
+        // Same load-time window check as `Gemma4TextModel::from_weights`:
+        // the stage cache builder casts `sliding_window` too (issue #2790).
+        crate::models::model_owned::cache_window(
+            "Gemma 4",
+            config.sliding_window,
+            config
+                .layer_types
+                .iter()
+                .any(|layer_type| layer_type != "full_attention"),
+        )?;
         let prefix = "language_model.model";
 
         let embed_tokens = if filter.has_embedding || filter.has_lm_head {
@@ -5007,24 +5152,19 @@ impl Gemma4StageModel {
         let batch = shape[0];
         let seq_len = shape[1];
 
+        // The masks the single-process text forward builds for the same
+        // prefill, so every layer runs the same attention kernels as the
+        // dense model (issue #2654). Decode derives its own masks.
         let (global_mask, sliding_mask) = if seq_len > 1 {
-            // Size the prefill masks from the cache's live window
-            // (`live_len`), not the monotonic `offset`, so the mask key axis
-            // matches the K/V `update_and_fetch` returns after a
-            // `--max-kv-size` trim (`live_start` advances while `offset` keeps
-            // growing for RoPE). Byte-identical when untrimmed (`live_len ==
-            // offset`). See issue #430 (mirrors #419/#420, #421/#422).
-            let global_live_len = first_cache_live_len(caches, "full_attention");
-            let sliding_live_len = first_cache_live_len(caches, "sliding_attention");
-            (
-                Some(create_causal_mask(seq_len, global_live_len)),
-                // Shared helper hoisted in #410; behaviour-preserving for Gemma 4
-                // (see the gate-divergence note in `forward_with_speculative_sinks`).
-                Some(create_sliding_window_prefill_mask(
-                    seq_len,
-                    sliding_live_len,
-                    self.config.sliding_window as i32,
-                )),
+            text_prefill_masks(
+                self.layers
+                    .iter()
+                    .find(|(_, layer)| layer.layer_type != "full_attention")
+                    .map(|(_, layer)| &layer.self_attn),
+                hidden.as_ref().unwrap(),
+                caches,
+                seq_len,
+                self.config.sliding_window as i32,
             )
         } else {
             (None, None)
@@ -5176,6 +5316,25 @@ impl Gemma4StageModel {
         Ok(mlxcel_core::concatenate(hidden, &flat_aux, -1))
     }
 
+    /// Last-axis width of the hidden states this stage receives from
+    /// upstream. With per-layer inputs, every upstream stage appends the
+    /// per-layer inputs of all layers from this stage on to the hidden state
+    /// ([`Self::pack_hidden_for_downstream`]), so the width is
+    /// `hidden_size + (num_hidden_layers - layer_range.start) *
+    /// hidden_size_per_layer_input`; otherwise it is `hidden_size`.
+    pub(crate) fn inbound_activation_width(&self) -> u64 {
+        let hidden_size = self.config.hidden_size as u64;
+        let per_layer = self.config.hidden_size_per_layer_input as u64;
+        if per_layer == 0 {
+            return hidden_size;
+        }
+        let remaining_layers = self
+            .config
+            .num_hidden_layers
+            .saturating_sub(self.filter.layer_range.start) as u64;
+        hidden_size + remaining_layers * per_layer
+    }
+
     fn unpack_stage_hidden(
         &self,
         packed_hidden: &MlxArray,
@@ -5202,7 +5361,7 @@ impl Gemma4StageModel {
             packed_hidden,
             -1,
             hidden_size,
-            hidden_size + remaining_layers * self.config.hidden_size_per_layer_input as i32,
+            self.inbound_activation_width() as i32,
         );
         let aux = mlxcel_core::reshape(
             &flat_aux,
@@ -6249,6 +6408,10 @@ impl Gemma4Wrapper {
 }
 
 impl LanguageModel for Gemma4Wrapper {
+    fn batched_decode_kind(&self) -> mlxcel_core::generate::BatchedDecodeKind {
+        mlxcel_core::generate::BatchedDecodeKind::Native
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
@@ -6296,6 +6459,65 @@ impl LanguageModel for Gemma4Wrapper {
                 )
             },
         )
+    }
+
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        _mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        match batch_caches.len() {
+            0 => mlxcel_core::zeros(&[0, 1, 1], mlxcel_core::dtype::FLOAT32),
+            1 => self.forward(input_ids, batch_caches[0], None),
+            // Anonymous rows cannot select independent model-owned cache
+            // stacks: the historical trait fallback advances the one legacy
+            // internal stack serially. Preserve that compatibility contract;
+            // callers needing independent rows must use ids, as the scheduler
+            // does through the native serving route below.
+            _ => forward_gemma4_rows(self, input_ids, None, batch_caches, None),
+        }
+    }
+
+    fn forward_batched_with_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let batch = batch_caches.len();
+        if batch == 0 {
+            return mlxcel_core::zeros(&[0, 1, 1], mlxcel_core::dtype::FLOAT32);
+        }
+        if batch == 1 {
+            return self.forward_with_sequence_id(
+                input_ids,
+                seq_ids.and_then(|ids| ids.first().copied()),
+                batch_caches[0],
+                mask,
+            );
+        }
+
+        let shape = mlxcel_core::array_shape(input_ids);
+        let Some(seq_ids) = seq_ids else {
+            return self.forward_batched(input_ids, batch_caches, mask);
+        };
+        if shape.len() != 2 || shape[0] as usize != batch || shape[1] != 1 || mask.is_some() {
+            return forward_gemma4_rows(self, input_ids, Some(seq_ids), batch_caches, mask);
+        }
+        assert_eq!(
+            seq_ids.len(),
+            batch,
+            "Gemma 4 batched decode needs one sequence id per row"
+        );
+
+        self.sequence_state
+            .with_batched_sequence_states(seq_ids, |sequence_caches| {
+                self.model
+                    .forward_batched_decode_with_caches(input_ids, sequence_caches)
+            })
+            .expect("Gemma 4 batched decode needs prepared sequence-local cache state")
     }
 
     /// Prefill override: project only the last real position through the
@@ -6400,6 +6622,21 @@ impl LanguageModel for Gemma4Wrapper {
 
     fn kv_cache_layer_modes(&self) -> Option<Vec<KVCacheMode>> {
         self.kv_cache_layer_modes.clone_modes()
+    }
+
+    /// Sliding layers hold a `RotatingKVCache`, which stores FP16 for every
+    /// mode but an aligned `Turbo4Asym` (issue #2783).
+    fn kv_cache_storage_modes(&self) -> Option<Vec<Option<KVCacheMode>>> {
+        let config = &self.model.text_model.config;
+        let window = config.sliding_window as i32;
+        self.kv_cache_layer_modes.storage_modes(|layer_idx| {
+            config
+                .layer_types
+                .get(layer_idx)
+                .is_some_and(|layer_type| layer_type != "full_attention")
+                .then_some(window)
+                .map_or(LayerKv::Full, LayerKv::Sliding)
+        })
     }
 
     fn sequence_state_layout(&self) -> SequenceStateLayout {
@@ -6552,12 +6789,11 @@ impl LanguageModel for Gemma4Wrapper {
         self.model.eos_token_ids.clone()
     }
 
-    /// Gemma 4 supports batched decode now that
-    /// [`ModelOwnedSequenceState`] isolates per-`SequenceId` cache state.
-    /// The vision wrapper's `forward_batched_with_ids`
-    /// override (in `vision::Gemma4VLModel`) routes each row through
-    /// [`Self::forward_with_sequence_id`] which resolves to a distinct
-    /// per-sequence `Vec<Cache>` — no shared-RefCell leakage across rows.
+    /// Gemma 4 supports native batched decode while
+    /// [`ModelOwnedSequenceState`] keeps each row's mixed full/sliding cache
+    /// stack isolated. Identified single-token rows share projections, norms,
+    /// dense/MoE feed-forward work and the LM head across the batch; only
+    /// cache append and attention reduction stay row-local.
     fn supports_batching(&self) -> bool {
         true
     }
@@ -6583,6 +6819,35 @@ impl LanguageModel for Gemma4Wrapper {
         // does (issue #1755).
         false
     }
+}
+
+fn forward_gemma4_rows(
+    model: &Gemma4Wrapper,
+    input_ids: &MlxArray,
+    seq_ids: Option<&[SequenceId]>,
+    batch_caches: &mut [&mut [KVCache]],
+    mask: Option<&MlxArray>,
+) -> UniquePtr<MlxArray> {
+    let shape = mlxcel_core::array_shape(input_ids);
+    let row_len = shape.get(1).copied().unwrap_or(1);
+    let first = mlxcel_core::slice(input_ids, &[0, 0], &[1, row_len]);
+    let mut logits = model.forward_with_sequence_id(
+        &first,
+        seq_ids.and_then(|ids| ids.first().copied()),
+        batch_caches[0],
+        mask,
+    );
+    for (row, caches) in batch_caches.iter_mut().enumerate().skip(1) {
+        let input = mlxcel_core::slice(input_ids, &[row as i32, 0], &[row as i32 + 1, row_len]);
+        let row_logits = model.forward_with_sequence_id(
+            &input,
+            seq_ids.and_then(|ids| ids.get(row).copied()),
+            caches,
+            mask,
+        );
+        logits = mlxcel_core::concatenate(&logits, &row_logits, 0);
+    }
+    logits
 }
 
 #[cfg(test)]
@@ -8121,3 +8386,10 @@ mod quant_override_diagnostics_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "gemma4_stage_tests.rs"]
+mod gemma4_stage_tests;
+#[cfg(test)]
+#[path = "gemma4_stage_width_tests.rs"]
+mod gemma4_stage_width_tests;

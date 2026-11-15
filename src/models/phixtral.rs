@@ -124,7 +124,9 @@
 //! config. An MLX C++ exception crossing the cxx bridge is an uncatchable
 //! `std::terminate` at the first forward pass, not a Rust error.
 
-use mlxcel_core::generate::LanguageModel;
+use mlxcel_core::batched_decode::{SplitAttention, SplitAttentionShape, forward_split_attention};
+use mlxcel_core::cache::BatchedAttentionMetadata;
+use mlxcel_core::generate::{BatchedDecodeKind, LanguageModel, route_batched_decode};
 use mlxcel_core::layers::{KVCache, LayerNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::slice_axis;
 use mlxcel_core::weights::WeightMap;
@@ -144,6 +146,7 @@ use crate::models::switch_layers::{SwitchLinear, gather_sort, moe_weighted_sum, 
 /// reads only the alias and therefore falls back to a default for all four; see
 /// the module docs.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(remote = "Self")]
 pub struct ModelArgs {
     #[serde(default = "default_model_type")]
     pub model_type: String,
@@ -200,6 +203,8 @@ pub struct ModelArgs {
     #[serde(default)]
     pub quantization: Option<Quantization>,
 }
+
+mlxcel_core::impl_rope_lifting_deserialize!(ModelArgs);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Quantization {
@@ -556,7 +561,54 @@ impl Attention {
     }
 }
 
+impl SplitAttention for Attention {
+    fn split_shape(&self) -> SplitAttentionShape {
+        SplitAttentionShape {
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_heads,
+            head_dim: self.head_dim,
+            scale: self.scale,
+        }
+    }
+
+    fn rope_batched(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        offsets: &[i32],
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        (
+            mlxcel_core::fast_rope_batched(q, self.rope_dims, false, self.rope_base, 1.0, offsets),
+            mlxcel_core::fast_rope_batched(k, self.rope_dims, false, self.rope_base, 1.0, offsets),
+        )
+    }
+
+    fn custom_row_attend(&self) -> bool {
+        true
+    }
+
+    fn attend_row(
+        &self,
+        q: &MlxArray,
+        k: UniquePtr<MlxArray>,
+        v: UniquePtr<MlxArray>,
+        cache: &mut KVCache,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let dtype = mlxcel_core::array_dtype(&v);
+        let q = mlxcel_core::astype(q, mlxcel_core::dtype::FLOAT32);
+        let out = cache.attend(&q, k, v, self.scale, mask);
+        mlxcel_core::astype(&out, dtype)
+    }
+}
+
 // Experts.
+
+/// The expert GELU: tanh, as mlx-lm's `SwitchMLP` default
+/// (`nn.GELU(approx="precise")`) and the checkpoints' `gelu_new` compute it,
+/// evaluated in f32 as one compiled kernel (erf before #2548).
+const PHIXTRAL_GELU: mlxcel_core::utils::GeluActivation =
+    mlxcel_core::utils::GeluActivation::TanhF32Compiled;
 
 /// Upstream's `SwitchMLP`: `fc2(gelu(fc1(x)))` over the selected experts.
 ///
@@ -603,14 +655,14 @@ impl PhixtralSwitchMlp {
             let (sorted_x, sorted_idx, inv_order) = gather_sort(&x_exp, indices);
             let h = self.fc1.forward(&sorted_x, &sorted_idx, true);
             let h = add_expert_bias(&h, &self.fc1_bias, &sorted_idx);
-            let h = mlxcel_core::utils::gelu_approx(&h);
+            let h = PHIXTRAL_GELU.apply(&h);
             let out = self.fc2.forward(&h, &sorted_idx, true);
             let out = add_expert_bias(&out, &self.fc2_bias, &sorted_idx);
             scatter_unsort(&out, &inv_order, &indices_shape)
         } else {
             let h = self.fc1.forward(&x_exp, indices, false);
             let h = add_expert_bias(&h, &self.fc1_bias, indices);
-            let h = mlxcel_core::utils::gelu_approx(&h);
+            let h = PHIXTRAL_GELU.apply(&h);
             let out = self.fc2.forward(&h, indices, false);
             let out = add_expert_bias(&out, &self.fc2_bias, indices);
             mlxcel_core::squeeze_axis(&out, -2)
@@ -758,6 +810,27 @@ impl ParallelBlock {
         mlxcel_core::add(&mlxcel_core::add(&attn_out, &moe_out), x)
     }
 
+    pub fn forward_batched(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let h = self.ln.forward(x);
+        let width = self.mixer.num_heads * self.mixer.head_dim;
+        let qkv = self.mixer.wqkv.forward(&h);
+        let q = mlxcel_core::slice_last_dim(&qkv, 0, width);
+        let k = mlxcel_core::slice_last_dim(&qkv, width, 2 * width);
+        let v = mlxcel_core::slice_last_dim(&qkv, 2 * width, 3 * width);
+        let seq_len = mlxcel_core::array_shape(&q)[1];
+        let metadata = BatchedAttentionMetadata::uniform_kv_caches(caches, seq_len, 0)
+            .expect("valid Phixtral batched attention metadata");
+        let attn = forward_split_attention(&self.mixer, &q, &k, &v, caches, &metadata, mask);
+        let attn_out = self.mixer.out_proj.forward(&attn);
+        let moe_out = self.moe.forward(&h);
+        mlxcel_core::add(&mlxcel_core::add(&attn_out, &moe_out), x)
+    }
+
     pub fn from_weights(
         weights: &WeightMap,
         args: &ModelArgs,
@@ -821,6 +894,27 @@ impl PhixtralModel {
 
     pub fn make_caches(&self) -> Vec<KVCache> {
         (0..self.layers.len()).map(|_| KVCache::new()).collect()
+    }
+
+    pub fn forward_batched_impl(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let mut h = self.wte.forward(input_ids);
+        for layer_idx in 0..self.layers.len() {
+            let mut layer_caches: Vec<&mut KVCache> = batch_caches
+                .iter_mut()
+                .map(|caches| &mut caches[layer_idx])
+                .collect();
+            h = self.layers[layer_idx].forward_batched(&h, &mut layer_caches, mask);
+        }
+        let h = self.lm_head_ln.forward(&h);
+        match &self.lm_head {
+            Some(head) => head.forward(&h),
+            None => self.wte.as_linear(&h),
+        }
     }
 
     pub fn load<P: AsRef<Path>>(model_dir: P) -> Result<(Self, ModelArgs), String> {
@@ -1159,6 +1253,10 @@ pub fn validate_weights(weights: &WeightMap, args: &ModelArgs) -> Result<(), Str
 // LanguageModel trait implementation.
 
 impl LanguageModel for PhixtralModel {
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
@@ -1178,6 +1276,17 @@ impl LanguageModel for PhixtralModel {
 
     fn eos_token_ids(&self) -> Vec<i32> {
         self.eos_token_ids.clone()
+    }
+
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        route_batched_decode(self, input_ids, batch_caches, |batch_caches| {
+            self.forward_batched_impl(input_ids, batch_caches, mask)
+        })
     }
 }
 

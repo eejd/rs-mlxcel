@@ -29,14 +29,21 @@ An API change lands in one PR that updates the producer schema (`docs/webui/api.
 
 Page-specific behavior is documented per screen: [catalog.md](catalog.md) (Models), [chat.md](chat.md), [activity.md](activity.md), [settings.md](settings.md), and [runtime.md](runtime.md).
 
+## The ui-common CLI and agent guidance
+
+`@lablup/ui-common-cli` is a dev dependency at the same exact version as `@lablup/ui-common`; bump the two together. It answers what a component offers before you wrap it: from the repository root, `pnpm --dir webui run ui-common component <Name>`, `... search "<thing>"` or `... docs <topic>` (inside `webui/`, `pnpm exec ui-common <cmd>`). Its template and theme scaffolds assume a StyleX compiler this build does not run, so they are reference only.
+
+`webui/AGENTS.md` (loaded by agents through `webui/CLAUDE.md`, which only imports it) is the agent guidance for `webui/` and nothing else. The block between its `UI-COMMON` markers is generated: after a ui-common bump, run `pnpm exec ui-common agents --write AGENTS.md` inside `webui/`, which rewrites only the block and keeps the WebUI-specific PROJECT LINES after it. `pnpm --dir webui run check:agents` fails while the block is stale; the `webui-bundle` CI job and `make verify-webui-frontend` run it. These are the only `AGENTS.md` and `CLAUDE.md` files the repository tracks; `.gitignore` keeps every other one local.
+
 ## Build the frontend and regenerate assets
 
-The toolchain is pinned exactly: Node 26.5.1 and pnpm 11.18.0. From the repository root:
+The toolchain is pinned exactly: Node 26.5.1 and pnpm 12.16.1. From the repository root:
 
 ```bash
 pnpm --dir webui install --frozen-lockfile
 pnpm --dir webui run typecheck
 pnpm --dir webui run lint
+pnpm --dir webui run check:agents
 pnpm --dir webui run unit
 python3 scripts/webui/build_bundle.py
 make verify-webui-bundle
@@ -61,4 +68,4 @@ Cargo embeds the committed files in `src/webui/assets/`; it never runs Node or d
 
 ## Licenses
 
-Frontend runtime dependencies that end up in the bundle must have their license text in `webui/public/third-party-licenses.txt` (copied into the bundle) and an entry in the top-level `NOTICE`. A file adapted from another project carries a header comment naming the source, as `webui/src/design-system/themes/glass.css` does. Do not add font files, Apple design-kit assets, SF Symbols, or icons you did not author; the WebUI uses system fonts and project-authored SVG icons.
+Frontend runtime dependencies that end up in the bundle must have their license text in `webui/public/third-party-licenses.txt` (copied into the bundle) and an entry in the top-level `NOTICE`. A file adapted from another project carries a header comment naming the source, as `webui/src/design-system/themes/glass.css` does. Do not add font files, Apple design-kit assets, SF Symbols, or a second icon set; the WebUI uses system fonts and lucide-react icons, the family Astryx draws its own controls with.

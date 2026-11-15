@@ -41,6 +41,8 @@ pub mod gbnf;
 pub mod gcp_compat;
 pub mod grammar;
 mod http_timeout;
+pub mod image_model;
+pub mod image_worker;
 pub mod in_process;
 pub mod infill;
 pub mod kimi_k3_chat;
@@ -65,6 +67,7 @@ pub mod reasoning_format;
 mod request_options;
 pub mod rerank_model;
 pub mod rerank_worker;
+pub(crate) mod responses_compaction;
 pub mod responses_store;
 pub mod responses_translator;
 pub mod router_cache;
@@ -81,6 +84,7 @@ pub mod slot_persist;
 pub mod slots_state;
 pub mod speculative_dispatch;
 mod startup;
+pub mod startup_notice;
 mod state;
 mod store_budget;
 pub(crate) mod stream_session;
@@ -109,21 +113,22 @@ pub use chat_template_kwargs::{
     env_fallback_chat_template_kwargs,
 };
 pub use cli_input::{
-    ServerStartupInput, env_fallback_apc_block_size, env_fallback_apc_enabled,
-    env_fallback_apc_hash, env_fallback_apc_num_blocks, env_fallback_api_key_files,
-    env_fallback_api_keys, env_fallback_batch_size, env_fallback_cache_type_k,
-    env_fallback_cache_type_v, env_fallback_cors_credentials, env_fallback_draft_model,
+    ServerStartupInput, apply_bool_pair_env_bindings, env_fallback_allowed_origins,
+    env_fallback_apc_block_size, env_fallback_apc_enabled, env_fallback_apc_hash,
+    env_fallback_apc_num_blocks, env_fallback_api_key_files, env_fallback_api_keys,
+    env_fallback_batch_size, env_fallback_cache_type_k, env_fallback_cache_type_v,
+    env_fallback_cors_credentials, env_fallback_cors_origins, env_fallback_draft_model,
     env_fallback_embedding_model, env_fallback_endpoint_slots, env_fallback_kv_bits,
     env_fallback_kv_group_size, env_fallback_kv_quant_scheme, env_fallback_kv_skip_last_layer,
     env_fallback_lang_bias, env_fallback_lang_bias_include_byte_fragments, env_fallback_log_file,
-    env_fallback_prompt_cache_capacity_bytes, env_fallback_prompt_cache_enabled,
-    env_fallback_prompt_cache_max_entries, env_fallback_prompt_cache_min_prefix,
-    env_fallback_prompt_cache_snapshot_capacity_bytes,
+    env_fallback_models_autoload, env_fallback_prompt_cache_capacity_bytes,
+    env_fallback_prompt_cache_enabled, env_fallback_prompt_cache_max_entries,
+    env_fallback_prompt_cache_min_prefix, env_fallback_prompt_cache_snapshot_capacity_bytes,
     env_fallback_prompt_cache_snapshot_max_entries, env_fallback_prompt_cache_snapshot_ttl,
     env_fallback_prompt_cache_ttl, env_fallback_reasoning_budget, env_fallback_reranker_model,
-    env_fallback_settings_endpoint, env_fallback_ubatch_size, long_cli_flag_was_set,
-    resolve_batch_kv_quant_config, resolve_compat_toggle, resolve_kv_cache_mode,
-    resolve_n_parallel,
+    env_fallback_settings_endpoint, env_fallback_ubatch_size, long_cli_flag_in,
+    long_cli_flag_was_set, resolve_batch_kv_quant_config, resolve_compat_toggle,
+    resolve_kv_cache_mode, resolve_n_parallel,
 };
 pub use config::{
     DEFAULT_KV_ADMISSION_WATERMARK, MAX_KV_ADMISSION_WATERMARK, clamp_kv_admission_watermark,
@@ -142,11 +147,15 @@ pub use media::{
 pub(crate) use media::{
     current_image_input_limits, is_combined_video_audio_rejection, media_capability_rejection,
 };
-pub use media_net::{configure_private_media_urls, private_media_urls_allowed_from_env};
-pub use model_provider::{GenerationResult, ModelProvider};
+pub use media_net::{
+    configure_media_nat64_prefixes_from_env, configure_private_media_urls,
+    private_media_urls_allowed_from_env,
+};
+pub use model_provider::{GenerationResult, ModelProvider, WORKER_EXIT_TIMEOUT};
 pub use model_source::{
     LLAMA_ARG_OFFLINE, LlamaModelSourceArgs, ResolvedModelSource, env_fallback_offline,
-    parse_hf_repo, parse_model_aliases, resolve_llama_model_source, superseded_model_notice,
+    parse_hf_repo, parse_model_aliases, resolve_image_only_mode, resolve_llama_model_source,
+    superseded_model_notice,
 };
 pub use prompt_cache::{
     ApcBlockHash, ApcConfig, ApcHashAlgo, BlockHashChain, CacheEntry, DEFAULT_APC_BLOCK_SIZE,
@@ -158,14 +167,18 @@ pub use prompt_cache::{
 pub use reasoning_format::{ReasoningFormat, ShapedResponse, shape_response};
 pub use speculative_dispatch::{SpeculativeDispatch, SpeculativeDispatchError};
 pub use startup::{
-    MIN_PARALLEL_CONTEXT_SIZE, ServerStartupConfig, effective_parallel_context_slots,
-    ensure_chat_template_is_not_a_builtin_name, is_b10621_builtin_chat_template,
-    resolve_parallel_context_size, start_server,
+    MIN_PARALLEL_CONTEXT_SIZE, ServerDistributedFlags, ServerStartupConfig,
+    effective_parallel_context_slots, ensure_chat_template_is_not_a_builtin_name,
+    is_b10621_builtin_chat_template, resolve_parallel_context_size, start_server,
 };
+pub use startup_notice::{StartupNotice, StartupNoticeLevel};
 pub use state::{AppState, BatchMetrics, Metrics, ModelMediaSupport};
 
 #[cfg(test)]
 mod got_chat_template_tests;
+
+#[cfg(test)]
+mod minicpm_chat_template_tests;
 
 #[cfg(test)]
 mod llama_compat_tests;
@@ -183,7 +196,13 @@ mod muse_glimmer_template_tests;
 mod reasoning_effort_tests;
 
 #[cfg(test)]
+mod store_budget_tests;
+
+#[cfg(test)]
 mod responses_input_parts_tests;
+
+#[cfg(test)]
+mod responses_compaction_tests;
 
 #[cfg(test)]
 mod muse_atem_roundtrip_tests;

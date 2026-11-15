@@ -4,19 +4,20 @@
 [![Latest Release](https://img.shields.io/github/v/release/lablup/mlxcel)](https://github.com/lablup/mlxcel/releases/latest)
 [![CI](https://github.com/lablup/mlxcel/actions/workflows/ci.yml/badge.svg)](https://github.com/lablup/mlxcel/actions/workflows/ci.yml)
 
-High-performance LLM, VLM, embedding, reranking, and audio inference for Apple Silicon and NVIDIA CUDA systems, with experimental AMD ROCm support on Linux. The CLI and server are implemented in Rust and execute MLX SafeTensors checkpoints through native MLX C++ bindings, without Python in the request path or a checkpoint-conversion step.
+High-performance LLM, VLM, embedding, reranking, image generation, and audio inference for Apple Silicon and NVIDIA CUDA systems, with experimental AMD ROCm support on Linux. The CLI and server are implemented in Rust and execute MLX SafeTensors checkpoints through native MLX C++ bindings, without Python in the request path or a checkpoint-conversion step.
 
 ## Overview
 
-`mlxcel` is both a local inference CLI and a production-oriented model server. It runs text generation, multimodal input, embeddings, reranking, speech workloads, continuous batching, prompt caching, speculative decoding, and distributed inference in one native runtime.
+`mlxcel` is both a local inference CLI and a production-oriented model server. It runs text generation, multimodal input, embeddings, reranking, token classification, image generation and editing, speech transcription and synthesis, continuous batching, prompt caching, speculative decoding, and distributed inference in one native runtime.
 
-Apple Silicon is the primary target. Linux/CUDA is supported as a secondary target. AMD GPUs on Linux (ROCm) are an experimental, source-build-only target, and an opt-in OpenXLA/IREE backend is available as an alpha development path.
+Apple Silicon is the primary target. Linux/CUDA is supported as a secondary target. AMD GPUs on Linux (ROCm) and native Windows with NVIDIA CUDA are experimental, source-build-only targets, and an opt-in OpenXLA/IREE backend is available as an alpha development path.
 
 ## Current main highlights
 
-The current `main` branch is v0.7.0 plus unreleased work. Install from source to use features that have not reached the latest tagged release; see the [changelog](CHANGELOG.md) for the release-by-release record.
+The current `main` branch is v0.8.1 plus unreleased work. Install from source to use features that have not reached the latest tagged release; see the [changelog](CHANGELOG.md) for the release-by-release record.
 
 - **Experimental AMD GPU (ROCm) support.** `--features rocm` builds mlxcel on Linux against an MLX ROCm backend vendored into the source tree as the ROCm part of mlxcelverse, applied on the same pinned MLX commit as the Metal and CUDA builds. Affine, mxfp8, and mxfp4 checkpoints, including gpt-oss MoE experts, run on RDNA 3.5 (`gfx1151`); the fused kernels with a HIP port (BitLinear, the samplers, the SSM update step, the Mamba1 scan, the decode-MoE kernels, xIELU, the add3 LayerNorm, and the fused add-RMSNorm and RoPE + append, which are on by default on ROCm) run natively and the rest fall back to MLX graphs. See [Linux with AMD ROCm](docs/installation.md#linux-with-amd-rocm-experimental) for the build and the open gaps.
+- **Bundled WebUI.** `--webui` serves a browser interface from `mlxcel serve` or `mlxcel-server`: a model library with download, load, unload, and delete; local streaming chat; runtime activity; and scoped settings with next-load profiles. See the [WebUI guide](docs/webui/README.md).
 - **Verified `llama-server` compatibility.** A frozen b10621 manifest classifies all 376 pinned options, routes, and native request fields, with no deferred entries. Native completion, embedding, tokenization, template, infill, props, slots, metrics, resumable-stream, router, and LoRA surfaces are implemented or explicitly classified instead of being silently ignored.
 - **OpenAI, Anthropic, and Vertex-compatible serving.** Chat Completions, Completions, Responses, Embeddings, Reranking, Audio, and Anthropic Messages are available alongside the native `llama-server` routes. Optional Vertex AI custom-container routing is supported through the standard `AIP_*` variables.
 - **Multi-model routing and live adapters.** Router mode discovers checkpoints from the model store, a model directory, or INI presets; loads them on demand; and bounds the resident set with LRU eviction. Multiple LoRA adapters can remain unfused for per-request or live scale changes, or be fused for zero decode overhead.
@@ -27,6 +28,9 @@ The current `main` branch is v0.7.0 plus unreleased work. Install from source to
 - **DeepSeek-V4 support.** The `deepseek_v4` architecture includes HyperConnections, rotating shared-KV attention, per-layer compression, HiSA sparse selection, and hash-routed early MoE layers.
 - **Inkling across four modalities.** The text backbone runs hybrid sliding/global NoPE attention with per-layer short-convolution state and logsigmoid-normalized experts, and carries HMLP image tiling, adjacent-frame video, dMel audio, and a native MTP drafter.
 - **Half-precision paths keep their dtype.** Activation helpers, the multimodal rotary, the Gemma3n load policy, and the GraniteMoeHybrid gated norm no longer widen a half-precision hidden state to f32, which had made every later matmul promote its own weight. The affected checkpoints move by up to 3.26x, and the bridge's reductions accumulate in f32 to close a bfloat16 `max` that returned NaN for a finite input.
+- **Native batched decode across most families.** Dense, MoE, MLA, VLM text, recurrent and tensor-parallel models run one batched forward under `--parallel` instead of one forward per row. On M1 Ultra, Llama 3.1 8B 4-bit reaches 1.99x aggregate at 8 concurrent requests over 1.
+- **Image-only serving.** `--image-model` with no chat model source starts either server binary in an image-only mode: the image worker is the primary model, chat and tokenizer routes answer a structured 501 naming the mode, and `/v1/models`, `/health` and the image routes serve normally.
+- **Xiaomi MiMo v2 Flash support.** The `mimo_v2_flash` architecture is a 48-layer hybrid sliding/full attention sparse decoder with 256 routed experts, selective head widths (192 for Q/K, 128 for V), per-layer partial RoPE bases, and a `noaux_tc` sigmoid router with a selection-only correction bias. `mlx-community/MiMo-V2-Flash-4bit` loads directly.
 
 See [Server features](docs/server-features.md) for the route and deployment map and [llama-server compatibility](docs/llama-server-compat.md) for the exact b10621 boundary.
 
@@ -89,7 +93,7 @@ mlxcel inspect --json -m Qwen3.5-0.8B-4bit --max-tokens 32768 | python3 -m json.
 mlxcel generate -m Qwen3.5-0.8B-4bit -p "Hello" -n 32768 --estimate-memory
 ```
 
-`generate` is the raw-completion client of the same batch-native engine (`mlxcel_core::engine::DirectEngine`): no server worker or HTTP request path in between, the rendered prompt goes straight through the engine's prefill and decode, so it decodes with the same sampler, finish step and lookahead pipeline as the server's single-sequence row (`MLXCEL_FORCE_SYNC` turns the pipeline off). `--prompt-lookup` runs drafter-free speculative decoding on that engine for any model. The classic draft-model path (`--draft-model` without `--draft-kind mtp` or `dflash`) is deprecated and will be removed in v0.8.0.
+`generate` is the raw-completion client of the same batch-native engine (`mlxcel_core::engine::DirectEngine`): no server worker or HTTP request path in between, the rendered prompt goes straight through the engine's prefill and decode, so it decodes with the same sampler, finish step and lookahead pipeline as the server's single-sequence row (`MLXCEL_FORCE_SYNC` turns the pipeline off). `--prompt-lookup` runs drafter-free speculative decoding on that engine for any model. `--draft-model` takes an MTP drafter, a DFlash drafter on a target with an offline round loop, or an ordinary smaller checkpoint that shares the target's tokenizer, which drafts from its own KV caches on the same engine loop (`--draft-kind full-model`, auto-detected); `mlxcel-server` serves the same pairing.
 
 `mlxcel inspect --json` prints a single JSON object with byte-exact `weights_bytes`, `kv_bytes_total`, `activation_bytes`, `backend_inflight_bytes` (ROCm builds only, else 0), `headroom_bytes`, `budget_bytes`, `total_bytes`, `fits`, input flags, and per-token FP16/INT8 KV rates when the model config exposes KV geometry. TurboQuant per-token sizing is reported as `null` until the estimator models those widths directly.
 
@@ -172,6 +176,18 @@ mlxcel-server -m Qwen3.5-0.8B-4bit \
 
 See [Embeddings and reranking](docs/embeddings.md) for multimodal inputs, supported families, pooling, request schemas, and side-model serving.
 
+### Tag and redact entities
+
+`mlxcel tag` runs a BIO / BIOES token classifier (BERT or XLM-RoBERTa `ForTokenClassification`) and prints the tagged spans with character offsets plus a redacted copy of the text.
+
+```bash
+mlxcel tag -m nativ-community/rampart-mlx-fp16 --keep CITY,STATE,ZIP_CODE \
+  "I'm Sarah Connor, 1984 Cyberdyne Ave, Los Angeles CA 90012, sarah@sky.net"
+# "redacted_text": "I'm <GIVEN_NAME> <SURNAME>, <BUILDING_NUMBER> <STREET_NAME>, Los Angeles CA 90012, <EMAIL>"
+```
+
+See [Token classification and span extraction](docs/token-classification.md) for the pipeline, the output schema, and `mlxcel extract` for span extractors that take labels per request.
+
 ### Transcribe and synthesize audio
 
 An audio-capable chat checkpoint serves transcription. Phi-4 Multimodal and Gemma 3n accept WAV, MP3, and FLAC detected from their bytes; other current audio families accept WAV. A dedicated Whisper checkpoint also provides a WAV-only transcription server.
@@ -194,6 +210,22 @@ cargo run --release --example voicechat_file_client -- \
   --system-prompt "Be concise and answer in one sentence."
 ```
 
+### Generate and edit images
+
+`mlxcel generate-image` runs a Diffusers-layout checkpoint for text-to-image generation and image editing, and both server entry points expose the same runtime at `POST /v1/images/generations` and `POST /v1/images/edits` behind `--image-model`.
+
+```bash
+# Generate an image, or edit a reference image.
+mlxcel generate-image -m models/flux2-klein -p "a watercolor fox" -o fox.png
+mlxcel generate-image -m models/flux2-klein --task edit --image fox.png -p "make it night"
+
+# Serve the image routes beside a chat model, or with no chat model at all.
+mlxcel-server -m Qwen3.5-0.8B-4bit --image-model models/flux2-klein --port 8080
+mlxcel-server --image-model models/flux2-klein --port 8080
+```
+
+Registered families are FLUX.2 Klein, Z-Image, Prism Bonsai, ERNIE-Image, Mage-Flow, Qwen-Image, Ideogram 4, Ming-Image and LLaDA-Image. With `--image-model` and no `-m`, the server runs image-only: the image worker is the primary model and the chat routes answer a 501 that names the mode. See [Image generation](docs/image-generation.md) for the family table, per-family step and guidance defaults, the request schema, and the queue and timeout limits.
+
 ### Manage downloaded models
 
 ```bash
@@ -212,8 +244,9 @@ mlxcel rm mlx-community/Qwen3.5-0.8B-4bit --yes
 ### Other CLI tools
 
 ```bash
-# Object detection with an RT-DETRv2 checkpoint.
+# Object or document-layout detection.
 mlxcel detect -m models/rt-detr-v2 -i image.jpg --format json
+mlxcel detect -m models/PP-DocLayoutV3 -i page.png --format json
 
 # Inspect the hardware-specific kernel tuning matrix without profiling it.
 mlxcel tune --dry-run
@@ -248,6 +281,8 @@ Linux/AMD builds are experimental and need a ROCm installation with its HIP, roc
 ```bash
 cargo build --release --features rocm
 ```
+
+Native Windows builds with NVIDIA CUDA are experimental and single-node: run `cargo build --release --features cuda` from a Visual Studio developer prompt with `CUDA_PATH` pointing at a CUDA 13 toolkit that has cuDNN 9. See [Windows with NVIDIA CUDA](docs/installation.md#windows-with-nvidia-cuda-experimental).
 
 A plain Linux build has no GPU feature and runs on the CPU, which is not a validated release target and is much slower. See [Installation](docs/installation.md) for the complete prerequisite, CUDA and ROCm architecture, runtime-header, and packaging matrix, and [Linux with AMD ROCm](docs/installation.md#linux-with-amd-rocm-experimental) for the current ROCm status.
 
@@ -338,6 +373,8 @@ Install with `pip install ./python`. See [Python client](docs/python-client.md) 
 - [Tensor and pipeline parallelism](docs/distributed.md)
 - [OpenAI Responses API](docs/responses-api.md)
 - [Embeddings and reranking](docs/embeddings.md)
+- [Image generation](docs/image-generation.md)
+- [Dense prediction maps and keypoints](docs/dense-prediction.md)
 - [Audio API](docs/audio-api.md)
 - [Nemotron VoiceChat (full-duplex speech)](docs/nemotron-voicechat.md)
 - [TurboQuant KV cache](docs/turbo-kv-cache.md)

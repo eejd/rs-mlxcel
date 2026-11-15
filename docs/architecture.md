@@ -65,9 +65,8 @@ src/
   for request bias, language bias and output suppression, called once per request by the CLI and
   the server.
 - `src/lib/mlxcel-core/src/generate.rs` — the `LanguageModel` trait, `SamplingConfig` and `GenerationStats`. Decode loops live in `engine/`: `engine/direct.rs` is `DirectEngine`, the raw-completion client `mlxcel generate`, the benchmarks and the inference session run (ADR 0007, #2176), and `engine/speculative.rs` is its token-only speculative loop for drafters such as prompt lookup.
-- `src/lib/mlxcel-core/src/drafter/` and `src/lib/mlxcel-core/src/speculative/` — speculative decoding support.
-  `speculative/stochastic_accept.rs` holds the acceptance rules and the distribution-preservation
-  guarantee; see [`speculative-acceptance.md`](speculative-acceptance.md) for which rule each path runs.
+- `src/lib/mlxcel-core/src/drafter/` and `src/lib/mlxcel-core/src/speculative/` — speculative decoding support; see
+  [`speculative-acceptance.md`](speculative-acceptance.md) for which rule each path runs.
 - `src/lib/mlxcel-core/src/layers.rs`, `src/lib/mlxcel-core/src/weights.rs`, `src/lib/mlxcel-core/src/utils.rs` — model building blocks,
   SafeTensors loading, masks, and helper operations.
 - `src/lib/mlxcel-core/src/autotune/`: shape-bucketed kernel autotuner (issue #906), covering the
@@ -140,6 +139,11 @@ Important control surfaces:
   implementation.
 - `src/loaded_model.rs` and `src/loaded_model_capabilities.rs` keep downstream
   CLI/server code from matching on every concrete model type.
+- `src/vision/detection/mod.rs` is the separate object-detection load boundary.
+  It dispatches exact `config.json` model types to RT-DETRv2 or
+  PP-DocLayoutV3 and exposes the common `Detector` result consumed by
+  `mlxcel detect`. PP-DocLayoutV3 supplies model-predicted reading order;
+  RT-DETRv2 leaves it absent so the CLI retains its geometric fallback.
 - `src/backend/` is the compute-backend seam. CLI and server load sites call
   `select_backend().load_model(...)` rather than `loading::load_model` directly,
   so the engine that runs `LanguageModel::forward` is chosen at the load

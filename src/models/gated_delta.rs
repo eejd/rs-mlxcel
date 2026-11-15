@@ -17,7 +17,7 @@
 //! This module provides the core gated delta net primitives used by models
 //! that employ hybrid transformer + linear attention architectures.
 //!
-//! Used by: Qwen3Next, Qwen3.5, KimiLinear, KimiK3
+//! Used by: Qwen3Next, Qwen3.5, Qwen4-Exp, KimiLinear, KimiK3
 //!
 //! Reference: https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gated_delta.py
 
@@ -51,7 +51,7 @@ const GATED_DELTA_CHUNK_SIZE: usize = 64;
 /// Cache for GatedDeltaNet (linear attention) layers.
 /// Stores conv1d state and recurrent SSM state.
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear
+/// Used by: Qwen3Next, Qwen3.5, Qwen4-Exp, KimiLinear
 pub struct GatedDeltaCache {
     pub conv_state: Option<UniquePtr<MlxArray>>, // [batch, kernel-1, conv_dim]
     pub state_cache: Option<UniquePtr<MlxArray>>, // [batch, num_v_heads, head_v_dim, head_k_dim]
@@ -115,7 +115,7 @@ impl Default for GatedDeltaCache {
 /// so the ops-path state accumulation stays in higher precision (the Python
 /// Metal kernel path uses float32 state internally for the same reason).
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear, KimiK3 (through
+/// Used by: Qwen3Next, Qwen3.5, Qwen4-Exp, KimiLinear, KimiK3 (through
 /// [`compute_g_lower_bounded`] with `lower_bound = None`)
 pub fn compute_g(a_log: &MlxArray, a: &MlxArray, dt_bias: &MlxArray) -> UniquePtr<MlxArray> {
     let a_plus_dt = mlxcel_core::add(a, dt_bias);
@@ -125,6 +125,26 @@ pub fn compute_g(a_log: &MlxArray, a: &MlxArray, dt_bias: &MlxArray) -> UniquePt
     let exp_a_log = mlxcel_core::exp(&a_log_f32);
     let neg_product = mlxcel_core::negative(&mlxcel_core::multiply(&exp_a_log, &sp));
     // Keep result in float32 (no cast back to input dtype)
+    mlxcel_core::exp(&neg_product)
+}
+
+/// [`compute_g`] with the softplus term promoted to float32 before it meets
+/// the float32 `exp(A_log)`, as upstream promotion does on every backend.
+///
+/// mlxcel's CUDA build patches bf16 with f32 to give bf16
+/// (`overlays/cuda/mlx/dtype.cpp`), so [`compute_g`] returns a bf16 gate there
+/// for bf16 activations. The explicit cast is exact and is the cast MLX
+/// inserts itself on Metal, so this is bit-identical to [`compute_g`] there.
+/// Only the precise (Qwen4-Exp) policy uses it; the other models keep
+/// [`compute_g`] unchanged (issue #2739).
+///
+/// Used by: [`gated_delta_update_precise`]
+fn compute_g_float32(a_log: &MlxArray, a: &MlxArray, dt_bias: &MlxArray) -> UniquePtr<MlxArray> {
+    let a_plus_dt = mlxcel_core::add(a, dt_bias);
+    let sp = mlxcel_core::astype(&softplus(&a_plus_dt), dtype::FLOAT32);
+    let a_log_f32 = mlxcel_core::astype(a_log, dtype::FLOAT32);
+    let exp_a_log = mlxcel_core::exp(&a_log_f32);
+    let neg_product = mlxcel_core::negative(&mlxcel_core::multiply(&exp_a_log, &sp));
     mlxcel_core::exp(&neg_product)
 }
 
@@ -175,7 +195,7 @@ pub fn compute_g_lower_bounded(
 ///
 /// Returns: (y: [B, H, Dv] in q dtype, new_state: [B, H, Dv, Dk] in float32)
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear, KimiK3
+/// Used by: Qwen3Next, Qwen3.5, Qwen4-Exp, KimiLinear, KimiK3
 pub fn gated_delta_step(
     q: &MlxArray,
     k: &MlxArray,
@@ -266,7 +286,7 @@ pub fn gated_delta_step(
 ///
 /// Returns: (y: [B, T, Hv, Dv] in q dtype, state: [B, Hv, Dv, Dk] in float32)
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear, KimiK3
+/// Used by: Qwen3Next, Qwen3.5, Qwen4-Exp, KimiLinear, KimiK3
 pub fn gated_delta_ops(
     q: &MlxArray,
     k: &MlxArray,
@@ -276,7 +296,7 @@ pub fn gated_delta_ops(
     state: Option<&MlxArray>,
     mask: Option<&MlxArray>,
 ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
-    gated_delta_ops_with_parity(q, k, v, g, beta, state, mask, false)
+    gated_delta_ops_with_parity(q, k, v, g, beta, state, mask, false, false)
 }
 
 /// Body of [`gated_delta_ops`] with the chain-parity switch.
@@ -302,6 +322,7 @@ fn gated_delta_ops_with_parity(
     state: Option<&MlxArray>,
     mask: Option<&MlxArray>,
     chain_parity: bool,
+    preserve_precision: bool,
 ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
     let shape = mlxcel_core::array_shape(q);
     let b = shape[0];
@@ -335,7 +356,19 @@ fn gated_delta_ops_with_parity(
         // SAFETY: Metal kernel reads from valid input arrays, writes to output/new_state.
         // mask_ptr is null when mask is None, which the C++ side handles correctly.
         unsafe {
-            if chain_parity {
+            if preserve_precision {
+                mlxcel_core::metal_gated_delta_forward_precise(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    &current_state,
+                    mask_ptr,
+                    &mut output,
+                    &mut new_state,
+                );
+            } else if chain_parity {
                 warn_if_chain_parity_forfeited_by_shape(g, mask);
                 mlxcel_core::metal_gated_delta_forward_chain_parity(
                     q,
@@ -391,6 +424,14 @@ fn gated_delta_ops_with_parity(
     // Fast path: single-token decode (T=1) -- skip slice+squeeze loop entirely.
     // Directly squeeze the time dimension and call gated_delta_step once.
     if t == 1 {
+        let precise = preserve_precision.then(|| PreciseOperands::new(q_ref, k_ref, v, g, beta));
+        let (q_ref, k_ref, v, g, beta) = match &precise {
+            Some(p) => p.refs(),
+            None => (q_ref, k_ref, v, g, beta),
+        };
+        if preserve_precision {
+            current_state = to_float32(&current_state);
+        }
         let q_t = mlxcel_core::squeeze_axis(q_ref, 1);
         let k_t = mlxcel_core::squeeze_axis(k_ref, 1);
         let v_t = mlxcel_core::squeeze_axis(v, 1);
@@ -413,7 +454,7 @@ fn gated_delta_ops_with_parity(
 
         // Add back time dimension: [B, Hv, Dv] -> [B, 1, Hv, Dv]
         let y = mlxcel_core::expand_dims(&y, 1);
-        return (y, new_state);
+        return (cast_output(y, q, preserve_precision), new_state);
     }
 
     // Multi-token path (prefill). On the non-Metal fallback, scalar gating with
@@ -444,6 +485,14 @@ fn gated_delta_ops_with_parity(
 
     // Sequential fallback (chain-parity block, vectorized gating, or mask):
     // one step per timestep.
+    let precise = preserve_precision.then(|| PreciseOperands::new(q_ref, k_ref, v, g, beta));
+    let (q_ref, k_ref, v, g, beta) = match &precise {
+        Some(p) => p.refs(),
+        None => (q_ref, k_ref, v, g, beta),
+    };
+    if preserve_precision {
+        current_state = to_float32(&current_state);
+    }
     let mut ys = Vec::with_capacity(t);
     for t_idx in 0..t {
         let q_t = mlxcel_core::squeeze_axis(
@@ -517,7 +566,65 @@ fn gated_delta_ops_with_parity(
     // Stack outputs: [B, T, Hv, Dv]
     let y = stack_arrays(&ys, 1);
 
-    (y, current_state)
+    (cast_output(y, q, preserve_precision), current_state)
+}
+
+/// Float32 copies of the step operands for the `preserve_precision` policy
+/// (Qwen4-Exp) on the ops fallback.
+///
+/// MLX's standard promotion keeps the step in float32 once the state and gate
+/// are float32, but mlxcel's CUDA build patches bf16 with f32 to give bf16
+/// (`overlays/cuda/mlx/dtype.cpp`), so `state + k * delta` would store a bf16
+/// state there (issue #2739). Casting the operands first is exact and gives
+/// every backend the float32 step that upstream promotion computes; where the
+/// inputs are already float32 the casts are no-ops. Paths without the policy
+/// (Qwen3Next, Qwen3.5, KimiLinear) never build these and keep their state
+/// policy.
+struct PreciseOperands {
+    q: UniquePtr<MlxArray>,
+    k: UniquePtr<MlxArray>,
+    v: UniquePtr<MlxArray>,
+    g: UniquePtr<MlxArray>,
+    beta: UniquePtr<MlxArray>,
+}
+
+impl PreciseOperands {
+    fn new(q: &MlxArray, k: &MlxArray, v: &MlxArray, g: &MlxArray, beta: &MlxArray) -> Self {
+        Self {
+            q: to_float32(q),
+            k: to_float32(k),
+            v: to_float32(v),
+            g: to_float32(g),
+            beta: to_float32(beta),
+        }
+    }
+
+    fn refs(&self) -> (&MlxArray, &MlxArray, &MlxArray, &MlxArray, &MlxArray) {
+        (&self.q, &self.k, &self.v, &self.g, &self.beta)
+    }
+}
+
+fn to_float32(x: &MlxArray) -> UniquePtr<MlxArray> {
+    if mlxcel_core::array_dtype(x) == dtype::FLOAT32 {
+        mlxcel_core::copy(x)
+    } else {
+        mlxcel_core::astype(x, dtype::FLOAT32)
+    }
+}
+
+/// The step output in the caller's query dtype when the precise policy ran
+/// the step on float32 operands; unchanged otherwise.
+fn cast_output(
+    y: UniquePtr<MlxArray>,
+    q: &MlxArray,
+    preserve_precision: bool,
+) -> UniquePtr<MlxArray> {
+    let q_dtype = mlxcel_core::array_dtype(q);
+    if preserve_precision && mlxcel_core::array_dtype(&y) != q_dtype {
+        mlxcel_core::astype(&y, q_dtype)
+    } else {
+        y
+    }
 }
 
 /// Chunked parallel prefill scan for the gated delta rule (scalar gating).
@@ -542,7 +649,7 @@ fn gated_delta_ops_with_parity(
 /// `Ainv = (I + T)^{-1}` is formed by the finite Neumann series (T is nilpotent).
 /// All decay ratios are kept in the log domain and clamped so no entry overflows.
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear, KimiK3
+/// Used by: Qwen3Next, Qwen3.5, Qwen4-Exp, KimiLinear, KimiK3
 #[allow(clippy::too_many_arguments)]
 fn gated_delta_chunked(
     q_ref: &MlxArray,
@@ -738,7 +845,7 @@ fn gated_delta_chunked(
 /// lane, so `Dk` must cover at least one full SIMD group and be exactly
 /// divisible by 32. Its GQA mapping also requires an integral `Hv / Hk`.
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear, KimiK3, `speculative_burst::mtp_capable_target`
+/// Used by: Qwen3Next, Qwen3.5, Qwen4-Exp, KimiLinear, KimiK3, `speculative_burst::mtp_capable_target`
 /// (the Qwen 3.5 MTP capability gate, issue #1165 hardening)
 pub(crate) fn supports_metal_gated_delta_kernel(hk: i32, hv: i32, dk: i32, dv: i32) -> bool {
     hk > 0 && hv > 0 && dv > 0 && dk >= 32 && dk % 32 == 0 && hv >= hk && hv % hk == 0
@@ -749,7 +856,7 @@ pub(crate) fn supports_metal_gated_delta_kernel(hk: i32, hv: i32, dk: i32, dv: i
 /// Computes beta = sigmoid(b) and g = exp(-exp(A_log.float32) * softplus(a + dt_bias)),
 /// then runs the ops-based implementation with float32 state accumulation.
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear
+/// Used by: Qwen3Next, Qwen3.5, Qwen4-Exp, KimiLinear
 pub fn gated_delta_update(
     q: &MlxArray,
     k: &MlxArray,
@@ -762,6 +869,26 @@ pub fn gated_delta_update(
     mask: Option<&MlxArray>,
 ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
     gated_delta_update_with_lower_bound(q, k, v, a, b, a_log, dt_bias, state, mask, None)
+}
+
+/// Qwen4-Exp keeps decay gates and persistent recurrent state in float32,
+/// including when activations use bf16. Other model paths retain their existing
+/// state-storage policy.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_update_precise(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    a: &MlxArray,
+    b: &MlxArray,
+    a_log: &MlxArray,
+    dt_bias: &MlxArray,
+    state: Option<&MlxArray>,
+    mask: Option<&MlxArray>,
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    let beta = mlxcel_core::sigmoid(b);
+    let g = compute_g_float32(a_log, a, dt_bias);
+    gated_delta_ops_with_parity(q, k, v, &g, &beta, state, mask, false, true)
 }
 
 /// [`gated_delta_update`] with the optional gate lower bound of
@@ -825,7 +952,17 @@ pub fn gated_delta_update_chain_parity(
 ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
     let beta = mlxcel_core::sigmoid(b);
     let g = compute_g(a_log, a, dt_bias);
-    gated_delta_ops_with_parity(q, k, v, &g, &beta, state, mask, chain_parity_enabled())
+    gated_delta_ops_with_parity(
+        q,
+        k,
+        v,
+        &g,
+        &beta,
+        state,
+        mask,
+        chain_parity_enabled(),
+        false,
+    )
 }
 
 /// Diagnostic escape hatch for the chain-parity kernel:
@@ -900,10 +1037,55 @@ fn warn_if_chain_parity_forfeited_by_shape(g: &MlxArray, mask: Option<&MlxArray>
 /// attention q/k normalization, avoiding the expanded square/mean/sqrt/divide
 /// graph on every decode step.
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear, KimiK3
-pub fn scaled_fast_rms_norm_no_weight(x: &MlxArray, scale: f32, eps: f32) -> UniquePtr<MlxArray> {
+/// Used by: normalize_qk
+pub(crate) fn scaled_fast_rms_norm_no_weight(
+    x: &MlxArray,
+    scale: f32,
+    eps: f32,
+) -> UniquePtr<MlxArray> {
     let normed = mlxcel_core::fast_rms_norm_no_weight(x, eps);
     mlxcel_core::multiply_scalar(&normed, scale)
+}
+
+/// The reference l2norm eps of the GDN/KDA q/k normalization,
+/// `l2norm(x) = x / sqrt(sum(x^2) + 1e-6)`. Passed as `eps` to
+/// [`normalize_qk`].
+///
+/// Used by: Qwen3Next, Qwen3.5, KimiLinear, KimiK3
+pub const QK_L2NORM_EPS: f32 = 1e-6;
+
+/// The `rms_norm` eps that makes `inv_scale * rms_norm(x)` equal the
+/// reference `l2norm(x) = x / sqrt(sum(x^2) + eps)`.
+///
+/// `rms_norm` adds its eps to `mean(x^2) = sum(x^2) / D`, so the l2norm eps
+/// is divided by `D = inv_scale^-2`. The product runs in f64 from the f32
+/// `inv_scale`, as mlx-lm computes it in Python floats.
+pub(crate) fn normalize_qk_rms_eps(inv_scale: f32, eps: f32) -> f32 {
+    let inv_scale = f64::from(inv_scale);
+    (f64::from(eps) * inv_scale * inv_scale) as f32
+}
+
+/// L2-normalize the linear-attention q/k and fold the `head_k_dim^-0.5`
+/// readout scale into q, mirroring mlx-lm's `gated_delta.normalize_qk`.
+///
+/// Returns `(inv_scale * l2norm(q), l2norm(k))` over the last axis, computed
+/// as `inv_scale^2 * rms_norm(q)` and `inv_scale * rms_norm(k)` with the eps
+/// from [`normalize_qk_rms_eps`]. `eps` is the reference l2norm eps
+/// ([`QK_L2NORM_EPS`]), not an `rms_norm` eps: handing `1e-6` straight to
+/// `rms_norm` makes it `head_k_dim` times too large, which shows on rows whose
+/// `sum(x^2)` is near the eps.
+///
+/// Used by: Qwen3Next, Qwen3.5, KimiLinear, KimiK3
+pub fn normalize_qk(
+    q: &MlxArray,
+    k: &MlxArray,
+    inv_scale: f32,
+    eps: f32,
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    let rms_eps = normalize_qk_rms_eps(inv_scale, eps);
+    let q = scaled_fast_rms_norm_no_weight(q, inv_scale * inv_scale, rms_eps);
+    let k = scaled_fast_rms_norm_no_weight(k, inv_scale, rms_eps);
+    (q, k)
 }
 
 // RMSNorm with optional gating.
@@ -959,3 +1141,7 @@ fn precise_swiglu_gate(x: &MlxArray, gate: &MlxArray, target_dtype: i32) -> Uniq
 #[cfg(test)]
 #[path = "gated_delta_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "gated_delta_normalize_qk_tests.rs"]
+mod normalize_qk_tests;

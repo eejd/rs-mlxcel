@@ -19,7 +19,7 @@
 //! negative seed sentinels at the edge so server startup and request handling do
 //! not need to remember llama-server compatibility rules.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use mlxcel_core::cache::{BatchKvQuantConfig, DEFAULT_KV_GROUP_SIZE, KvQuantScheme};
@@ -29,7 +29,7 @@ use super::chat_template_kwargs::resolve_server_default_kwargs;
 use super::thinking_budget::{
     ThinkingBudget, ThinkingBudgetError, resolve_server_default_reasoning_budget,
 };
-use super::{DecodeStorageBackend, ServerStartupConfig};
+use super::{DecodeStorageBackend, ServerStartupConfig, StartupNotice};
 use crate::lang_bias::LangBiasCliArgs;
 
 /// Raw server startup input captured from CLI/front-end binaries.
@@ -111,6 +111,18 @@ pub struct ServerStartupInput {
     /// b10621 CORS flags, raw. `--cors-origins` accepts `*`, the special
     /// value `localhost`, or a literal origin string.
     pub cors_origins: String,
+    /// Operator-facing lines collected before a tracing subscriber exists
+    /// (#2697, #2722): an invalid or ignored environment variable reported
+    /// by an `env_fallback_*` helper (for example an unparseable
+    /// `LLAMA_ARG_KV_BITS`, or a CORS origin variable that a command-line
+    /// flag overrode, #2664), and the INFO line those helpers raise when a
+    /// command-line flag takes precedence over a variable. The binaries run
+    /// those helpers before `start_server` installs logging, so a `tracing::`
+    /// macro there is written to nothing. [`Self::into_startup_config`]
+    /// appends its own warnings and carries the list into
+    /// [`super::ServerStartupConfig::startup_notices`], which `start_server`
+    /// logs at each notice's level once the subscriber exists.
+    pub startup_notices: Vec<StartupNotice>,
     pub cors_methods: String,
     pub cors_headers: String,
     pub cors_credentials: bool,
@@ -142,6 +154,9 @@ pub struct ServerStartupInput {
     /// `--embedding-model`: resolved embedding checkpoint directory served on
     /// `/v1/embeddings` next to the chat model.
     pub embedding_model_path: Option<PathBuf>,
+    /// `--image-model`: resolved image-generation checkpoint directory served on
+    /// `/v1/images/*` next to the chat model.
+    pub image_model_path: Option<PathBuf>,
     /// `--embedding-batch-size`: texts per embedding forward pass.
     pub embedding_batch_size: usize,
     /// `--embedding-max-length`: token cap override for embedding inputs.
@@ -294,10 +309,16 @@ pub struct ServerStartupInput {
     pub cluster_peers: Vec<SocketAddr>,
     /// Optional UDP port for the discovery beacon.
     pub cluster_discovery_port: Option<u16>,
-    /// Optional coordinator control-plane bind address.
+    /// Where a `--pp-peer` sends its discovery beacons in mdns mode
+    /// (`--cluster-discovery-target`, default `255.255.255.255`).
+    pub cluster_discovery_target: IpAddr,
+    /// Control address: the coordinator's control bind address on
+    /// `--pp-auto`, the stage listen address on `--pp-peer`.
     pub cluster_control_addr: Option<SocketAddr>,
     /// Optional output path for the emitted cluster TOML.
     pub cluster_config_out: Option<PathBuf>,
+    /// Path to the pre-shared cluster secret file (`--cluster-secret-file`).
+    pub cluster_secret_file: Option<PathBuf>,
     /// When `true`, plan the cluster and exit without starting workers.
     pub dry_run: bool,
 
@@ -659,7 +680,13 @@ impl ServerStartupInput {
     /// JSON object cannot be silently "ignored" without degrading into a
     /// confusing state where the operator thinks they configured kwargs but
     /// didn't.
-    pub fn into_startup_config(self) -> anyhow::Result<ServerStartupConfig> {
+    pub fn into_startup_config(mut self) -> anyhow::Result<ServerStartupConfig> {
+        // Every warning raised while resolving the input is collected here
+        // rather than logged: this runs before `initialize_server_logging`
+        // installs a tracing subscriber, so a `tracing::warn!` would be
+        // written to nothing. `start_server` logs the list once logging
+        // exists (#1350, #2664, #2697).
+        let mut startup_notices = std::mem::take(&mut self.startup_notices);
         // b10621 multi-adapter LoRA surface (#1439): parse `--lora` /
         // `--lora-scaled` / `--lora-init-without-apply` into an ordered
         // specification, validate every adapter directory up front, and
@@ -754,6 +781,28 @@ impl ServerStartupInput {
             .resolve()
             .map_err(|message| anyhow::anyhow!(message))?;
 
+        // `--image-model` with no model source serves image generation alone
+        // (#2825). The binaries leave `model_path` empty in that mode, so its
+        // emptiness is the model-source signal here; a router selector and the
+        // embedding/reranking modes are refused because either would leave the
+        // image worker unreachable behind another surface.
+        let image_only = crate::server::model_source::resolve_image_only_mode(
+            self.image_model_path.is_some(),
+            !self.model_path.as_os_str().is_empty(),
+            &[
+                ("--models-dir", self.router_models_dir.is_some()),
+                ("--models-preset", self.models_preset.is_some()),
+                ("--webui", self.webui_enabled),
+                ("--embedding-model", self.embedding_model_path.is_some()),
+                ("--reranker-model", self.reranker_model_path.is_some()),
+                ("--reranking", embedding_compat.rerank_only),
+                (
+                    "--embeddings",
+                    embedding_compat.embedding_only && !embedding_compat.rerank_only,
+                ),
+            ],
+        )?;
+
         // b10621's prompt-cache and batching spellings, folded onto mlxcel's
         // own settings below. Resolved here for the same reason: a
         // `--cache-reuse` mlxcel cannot serve must fail the command line, not
@@ -793,10 +842,11 @@ impl ServerStartupInput {
             .prompt_cache_capacity_bytes
             .or(cache_compat.capacity_bytes);
         if self.prompt_cache_capacity_bytes.is_some() && cache_compat.capacity_bytes.is_some() {
-            tracing::warn!(
+            startup_notices.push(StartupNotice::warn(
                 "--cache-ram and --prompt-cache-capacity-bytes both provided; \
                  --prompt-cache-capacity-bytes takes precedence"
-            );
+                    .to_string(),
+            ));
         }
         // `--no-cont-batching` pins the decode width to one sequence. It is
         // deliberately NOT mlxcel's `--no-batch`, which swaps the scheduler for
@@ -821,13 +871,15 @@ impl ServerStartupInput {
         let reasoning_budget = match ThinkingBudget::from_raw_i32(self.reasoning_budget) {
             Ok(budget) => budget,
             Err(ThinkingBudgetError::InvalidNegative(v)) => {
-                tracing::warn!(
+                startup_notices.push(StartupNotice::warn(format!(
                     "--reasoning-budget {v} is invalid (must be >= -1); ignoring (treating as unbounded)"
-                );
+                )));
                 None
             }
             Err(err) => {
-                tracing::warn!("--reasoning-budget validation error: {err}; treating as unbounded");
+                startup_notices.push(StartupNotice::warn(format!(
+                    "--reasoning-budget validation error: {err}; treating as unbounded"
+                )));
                 None
             }
         };
@@ -849,6 +901,7 @@ impl ServerStartupInput {
         let chat_template_kwargs = apply_reasoning_template_kwargs(
             chat_template_kwargs,
             &self.chat_compat.template_kwargs,
+            &mut startup_notices,
         );
         // build PromptCacheConfig from raw CLI/env-resolved values.
         // Any field left at `None` picks up the compiled-in default.
@@ -877,6 +930,14 @@ impl ServerStartupInput {
             self.kv_cache_mode_legacy.as_deref(),
         )
         .map_err(|e| anyhow::anyhow!("KV cache mode error: {e}"))?;
+        startup_notices.extend(
+            crate::cli::turbo_args::kv_cache_mode_precedence_notice(
+                self.cache_type_k.as_deref(),
+                self.cache_type_v.as_deref(),
+                self.kv_cache_mode_legacy.as_deref(),
+            )
+            .map(StartupNotice::warn),
+        );
 
         // resolve the batch KV quantization config from the
         // new `--kv-bits` / `--kv-group-size` / `--kv-quant-scheme` /
@@ -902,18 +963,12 @@ impl ServerStartupInput {
         // to Turbo4Asym and `--kv-bits 8` to Int8, and the scheduler prefers
         // that table over `kv_cache_mode`), so a family that cannot hold a
         // quantized cache has to be taken off both.
-        //
-        // The notices are collected rather than logged: this runs before
-        // `initialize_server_logging` installs a tracing subscriber, so a
-        // `tracing::warn!` here would be written to nothing. `start_server`
-        // emits them once logging exists.
-        let mut kv_cache_mode_notices = Vec::new();
         let (kv_cache_mode, kv_mode_warning) =
             crate::cli::turbo_args::resolve_effective_kv_cache_mode(
                 kv_cache_mode,
                 &self.model_path,
             );
-        kv_cache_mode_notices.extend(kv_mode_warning);
+        startup_notices.extend(kv_mode_warning.map(StartupNotice::warn));
         if batch_kv_quant.is_enabled() {
             let requested_batch_mode = batch_kv_quant.base_mode();
             // The resolver's own warning is deliberately discarded here. It is
@@ -935,12 +990,12 @@ impl ServerStartupInput {
             // a future rule that substitutes something other than Fp16 still
             // disables the batch table instead of silently keeping it.
             if batch_effective != requested_batch_mode {
-                kv_cache_mode_notices.push(format!(
+                startup_notices.push(StartupNotice::warn(format!(
                     "warning: disabling batched KV quantization (--kv-bits {}) for this model \
                      family; it selects a {requested_batch_mode} KV cache, which this family \
                      cannot hold. Serving its KV caches at fp16",
                     self.kv_bits
-                ));
+                )));
                 batch_kv_quant.bits = 0;
             }
         }
@@ -991,15 +1046,15 @@ impl ServerStartupInput {
             self.timeout_was_set,
             self.decode_timeout_was_set,
         ) {
-            tracing::warn!("{warning}");
+            startup_notices.push(StartupNotice::warn(warning));
         }
         if !api_prefix.is_empty() && !(self.api_keys.is_empty() && self.api_key_files.is_empty()) {
-            tracing::warn!(
+            startup_notices.push(StartupNotice::warn(format!(
                 "--api-prefix {api_prefix} is set together with an API key. llama-server b10621 \
                  compares its public-endpoint list against the unprefixed paths, so \
                  {api_prefix}/health and {api_prefix}/v1/health require authentication while \
                  /health does not. mlxcel matches that behavior"
-            );
+            )));
         }
 
         // `-a/--alias` is a comma-separated list in b10621; mlxcel serves the
@@ -1061,6 +1116,7 @@ impl ServerStartupInput {
             audio_queue_depth: self.audio_queue_depth,
             audio_request_timeout_secs: self.audio_request_timeout_secs,
             embedding_model_path: self.embedding_model_path,
+            image_model_path: self.image_model_path,
             embedding_batch_size: self.embedding_batch_size,
             embedding_max_length: self.embedding_max_length,
             embedding_queue_depth: self.embedding_queue_depth,
@@ -1092,7 +1148,11 @@ impl ServerStartupInput {
             model_store_root: self.model_store_root,
             spm_infill: self.infill.spm_infill,
             embd_normalize: embedding_compat.embd_normalize,
-            embedding_serving_mode: embedding_serving_mode(&embedding_compat),
+            embedding_serving_mode: if image_only {
+                crate::server::config::EmbeddingServingMode::ImageOnly
+            } else {
+                embedding_serving_mode(&embedding_compat)
+            },
             pooling: embedding_compat.pooling,
             enable_metrics: self.metrics || self.metrics_port.is_some(),
             enable_settings: self.settings,
@@ -1122,14 +1182,18 @@ impl ServerStartupInput {
             dry_allowed_length: self.dry_allowed_length,
             dry_penalty_last_n: self.dry_penalty_last_n,
             dry_sequence_breakers: self.dry_sequence_breakers,
-            grammar: self.grammar_source.as_ref().map(|s| s.load()).transpose()?,
+            grammar: self
+                .grammar_source
+                .as_ref()
+                .map(|s| s.load(&mut startup_notices))
+                .transpose()?,
             mirostat: resolve_mirostat(self.mirostat)?,
             mirostat_tau: self.mirostat_tau,
             mirostat_eta: self.mirostat_eta,
             dynatemp_range: self.dynatemp_range,
             dynatemp_exponent: self.dynatemp_exponent,
             adaptive_target: self.adaptive_target,
-            adaptive_decay: sanitize_adaptive_decay(self.adaptive_decay),
+            adaptive_decay: sanitize_adaptive_decay(self.adaptive_decay, &mut startup_notices),
             logit_bias: parse_logit_bias_flags(&self.logit_bias)?,
             verbose: self.verbose,
             log_disable: self.log_disable,
@@ -1150,8 +1214,10 @@ impl ServerStartupInput {
             cluster_name: self.cluster_name,
             cluster_peers: self.cluster_peers,
             cluster_discovery_port: self.cluster_discovery_port,
+            cluster_discovery_target: self.cluster_discovery_target,
             cluster_control_addr: self.cluster_control_addr,
             cluster_config_out: self.cluster_config_out,
+            cluster_secret_file: self.cluster_secret_file,
             dry_run: self.dry_run,
             tp_size: self.tp_size,
             tp_moe_mode: self.tp_moe_mode,
@@ -1176,7 +1242,7 @@ impl ServerStartupInput {
             chat_template_kwargs,
             prompt_cache,
             kv_cache_mode,
-            kv_cache_mode_notices,
+            startup_notices,
             batch_kv_quant,
             // lower the raw `usize` (0 = disabled) into a
             // semantic `Option<usize>` after `resolve_max_kv_size` has
@@ -1357,10 +1423,10 @@ pub fn resolve_batch_kv_quant_config(
 /// - When the CLI value is the off-sentinel (`0`) and the env var is a
 ///   parseable integer, the env value takes effect.
 /// - When the CLI value is non-zero and the env var is also set, the CLI
-///   value wins and an INFO log is emitted.
+///   value wins and an INFO startup notice is collected.
 /// - Unparseable env values are logged and ignored (the CLI default `0`
 ///   is kept so the server still starts).
-pub fn env_fallback_kv_bits(value: &mut i32) {
+pub fn env_fallback_kv_bits(value: &mut i32, notices: &mut Vec<StartupNotice>) {
     let cli_default = *value == 0;
     if !cli_default {
         // The CLI was set to a non-default value. Only warn if the env var
@@ -1369,20 +1435,18 @@ pub fn env_fallback_kv_bits(value: &mut i32) {
         if let Ok(raw) = std::env::var("LLAMA_ARG_KV_BITS")
             && raw.trim().parse::<i32>().ok().as_ref() != Some(value)
         {
-            tracing::info!(
-                "LLAMA_ARG_KV_BITS env var is set but --kv-bits CLI flag takes precedence; ignoring LLAMA_ARG_KV_BITS"
-            );
+            notices.push(StartupNotice::info(
+                "LLAMA_ARG_KV_BITS env var is set but --kv-bits CLI flag takes precedence; ignoring LLAMA_ARG_KV_BITS",
+            ));
         }
         return;
     }
     if let Ok(raw) = std::env::var("LLAMA_ARG_KV_BITS") {
         match raw.trim().parse::<i32>() {
             Ok(parsed) => *value = parsed,
-            Err(err) => {
-                tracing::warn!(
-                    "LLAMA_ARG_KV_BITS=\"{raw}\" is not a valid integer ({err}); keeping --kv-bits=0"
-                );
-            }
+            Err(err) => notices.push(StartupNotice::warn(format!(
+                "LLAMA_ARG_KV_BITS={raw:?} is not a valid integer ({err}); keeping --kv-bits=0"
+            ))),
         }
     }
 }
@@ -1393,7 +1457,7 @@ pub fn env_fallback_kv_bits(value: &mut i32) {
 /// Same precedence rule as [`env_fallback_kv_bits`]. The CLI default is
 /// [`DEFAULT_KV_GROUP_SIZE`] (`64`); the env var only takes effect when
 /// the CLI value matches that default.
-pub fn env_fallback_kv_group_size(value: &mut i32) {
+pub fn env_fallback_kv_group_size(value: &mut i32, notices: &mut Vec<StartupNotice>) {
     let cli_default = *value == DEFAULT_KV_GROUP_SIZE;
     if !cli_default {
         // Only log a conflict when the env var differs from the current
@@ -1402,25 +1466,21 @@ pub fn env_fallback_kv_group_size(value: &mut i32) {
         if let Ok(raw) = std::env::var("LLAMA_ARG_KV_GROUP_SIZE")
             && raw.trim().parse::<i32>().ok().as_ref() != Some(value)
         {
-            tracing::info!(
-                "LLAMA_ARG_KV_GROUP_SIZE env var is set but --kv-group-size CLI flag takes precedence; ignoring LLAMA_ARG_KV_GROUP_SIZE"
-            );
+            notices.push(StartupNotice::info(
+                "LLAMA_ARG_KV_GROUP_SIZE env var is set but --kv-group-size CLI flag takes precedence; ignoring LLAMA_ARG_KV_GROUP_SIZE",
+            ));
         }
         return;
     }
     if let Ok(raw) = std::env::var("LLAMA_ARG_KV_GROUP_SIZE") {
         match raw.trim().parse::<i32>() {
             Ok(parsed) if parsed > 0 => *value = parsed,
-            Ok(parsed) => {
-                tracing::warn!(
-                    "LLAMA_ARG_KV_GROUP_SIZE={parsed} is non-positive; keeping --kv-group-size={DEFAULT_KV_GROUP_SIZE}"
-                );
-            }
-            Err(err) => {
-                tracing::warn!(
-                    "LLAMA_ARG_KV_GROUP_SIZE=\"{raw}\" is not a valid integer ({err}); keeping --kv-group-size={DEFAULT_KV_GROUP_SIZE}"
-                );
-            }
+            Ok(parsed) => notices.push(StartupNotice::warn(format!(
+                "LLAMA_ARG_KV_GROUP_SIZE={parsed} is non-positive; keeping --kv-group-size={DEFAULT_KV_GROUP_SIZE}"
+            ))),
+            Err(err) => notices.push(StartupNotice::warn(format!(
+                "LLAMA_ARG_KV_GROUP_SIZE={raw:?} is not a valid integer ({err}); keeping --kv-group-size={DEFAULT_KV_GROUP_SIZE}"
+            ))),
         }
     }
 }
@@ -1429,8 +1489,13 @@ pub fn env_fallback_kv_group_size(value: &mut i32) {
 /// `--kv-quant-scheme` CLI value.
 ///
 /// Same precedence rule as [`env_fallback_cache_type_k`].
-pub fn env_fallback_kv_quant_scheme(value: &mut Option<String>) {
-    apply_optional_string_env_fallback(value, "LLAMA_ARG_KV_QUANT_SCHEME", "kv-quant-scheme");
+pub fn env_fallback_kv_quant_scheme(value: &mut Option<String>, notices: &mut Vec<StartupNotice>) {
+    apply_optional_string_env_fallback(
+        value,
+        "LLAMA_ARG_KV_QUANT_SCHEME",
+        "kv-quant-scheme",
+        notices,
+    );
 }
 
 /// Apply `LLAMA_ARG_KV_SKIP_LAST_LAYER` / `MLXCEL_KV_SKIP_LAST_LAYER` env
@@ -1440,7 +1505,7 @@ pub fn env_fallback_kv_quant_scheme(value: &mut Option<String>) {
 /// value matches that default. Acceptable env values are
 /// `1`/`0`/`true`/`false`/`on`/`off` (case-insensitive). Any unparseable
 /// value is logged and ignored.
-pub fn env_fallback_kv_skip_last_layer(value: &mut bool) {
+pub fn env_fallback_kv_skip_last_layer(value: &mut bool, notices: &mut Vec<StartupNotice>) {
     let cli_default = *value;
     for var in ["LLAMA_ARG_KV_SKIP_LAST_LAYER", "MLXCEL_KV_SKIP_LAST_LAYER"] {
         let env_val = std::env::var_os(var);
@@ -1459,9 +1524,9 @@ pub fn env_fallback_kv_skip_last_layer(value: &mut bool) {
                 }
             });
             if env_parsed.is_none_or(|v| v != *value) {
-                tracing::info!(
+                notices.push(StartupNotice::info(format!(
                     "{var} env var is set but --kv-skip-last-layer CLI flag takes precedence; ignoring {var}"
-                );
+                )));
             }
             return;
         }
@@ -1478,9 +1543,9 @@ pub fn env_fallback_kv_skip_last_layer(value: &mut bool) {
                 other => {
                     // Unparseable value: log and fall through to try the
                     // next env var (MLXCEL_KV_SKIP_LAST_LAYER) before giving up.
-                    tracing::warn!(
-                        "{var}=\"{other}\" is not a valid boolean; trying next fallback env var"
-                    );
+                    notices.push(StartupNotice::warn(format!(
+                        "{var}={other:?} is not a valid boolean; trying next fallback env var"
+                    )));
                 }
             }
         }
@@ -1489,14 +1554,20 @@ pub fn env_fallback_kv_skip_last_layer(value: &mut bool) {
 
 /// Shared helper: if `value` is `None` and the named env var is set, fill
 /// `value` from the env var. If `value` is `Some` (CLI was set) and the env
-/// var is also present and differs, log an INFO and keep the CLI value.
+/// var is also present and differs, collect an INFO startup notice and keep
+/// the CLI value.
 /// When `value` already equals the env var string (because clap's `env = "..."`
 /// injected it), no conflict log is emitted since there is no real conflict.
 ///
 /// Used locally by [`env_fallback_kv_quant_scheme`]. The cache-type-K/V
 /// helpers re-exported above use the equivalent helper that lives next to
 /// their canonical definitions in `crate::cli::turbo_args`.
-fn apply_optional_string_env_fallback(value: &mut Option<String>, key: &str, flag_name: &str) {
+fn apply_optional_string_env_fallback(
+    value: &mut Option<String>,
+    key: &str,
+    flag_name: &str,
+    notices: &mut Vec<StartupNotice>,
+) {
     if value.is_some() {
         if let Ok(raw) = std::env::var(key) {
             let trimmed = raw.trim();
@@ -1504,9 +1575,9 @@ fn apply_optional_string_env_fallback(value: &mut Option<String>, key: &str, fla
             // clap injected the env var as the CLI value they are equal
             // and logging would be misleading.
             if value.as_deref() != Some(trimmed) {
-                tracing::info!(
+                notices.push(StartupNotice::info(format!(
                     "{key} env var is set but --{flag_name} CLI flag takes precedence; ignoring {key}"
-                );
+                )));
             }
         }
         return;
@@ -1519,14 +1590,19 @@ fn apply_optional_string_env_fallback(value: &mut Option<String>, key: &str, fla
     }
 }
 
-fn apply_optional_path_env_fallback(value: &mut Option<PathBuf>, key: &str, flag_name: &str) {
+fn apply_optional_path_env_fallback(
+    value: &mut Option<PathBuf>,
+    key: &str,
+    flag_name: &str,
+    notices: &mut Vec<StartupNotice>,
+) {
     if value.is_some() {
         if let Ok(raw) = std::env::var(key) {
             let trimmed = raw.trim();
             if value.as_deref() != Some(std::path::Path::new(trimmed)) {
-                tracing::info!(
+                notices.push(StartupNotice::info(format!(
                     "{key} env var is set but --{flag_name} CLI flag takes precedence; ignoring {key}"
-                );
+                )));
             }
         }
         return;
@@ -1553,37 +1629,46 @@ fn apply_optional_path_env_fallback(value: &mut Option<PathBuf>, key: &str, flag
 /// `ServerStartupInput` is constructed so the CLI flag, env var, and
 /// request-body paths all converge on the same [`ThinkingBudget::from_raw_i32`]
 /// validation point.
-pub fn env_fallback_reasoning_budget(cli_value: &mut i32, cli_was_set: bool) {
-    *cli_value = resolve_server_default_reasoning_budget(*cli_value, cli_was_set);
+pub fn env_fallback_reasoning_budget(
+    cli_value: &mut i32,
+    cli_was_set: bool,
+    notices: &mut Vec<StartupNotice>,
+) {
+    *cli_value = resolve_server_default_reasoning_budget(*cli_value, cli_was_set, notices);
 }
 
 /// Apply the legacy `LLAMA_ARG_BATCH_SIZE` alias after clap has resolved the
 /// canonical `LLAMA_ARG_BATCH` binding.
-pub fn env_fallback_batch_size(value: &mut Option<usize>) {
-    apply_optional_usize_env_fallback(value, "LLAMA_ARG_BATCH_SIZE", "batch-size");
+pub fn env_fallback_batch_size(value: &mut Option<usize>, notices: &mut Vec<StartupNotice>) {
+    apply_optional_usize_env_fallback(value, "LLAMA_ARG_BATCH_SIZE", "batch-size", notices);
 }
 
 /// Apply the legacy `LLAMA_ARG_UBATCH_SIZE` alias after clap has resolved the
 /// canonical `LLAMA_ARG_UBATCH` binding.
-pub fn env_fallback_ubatch_size(value: &mut Option<usize>) {
-    apply_optional_usize_env_fallback(value, "LLAMA_ARG_UBATCH_SIZE", "ubatch-size");
+pub fn env_fallback_ubatch_size(value: &mut Option<usize>, notices: &mut Vec<StartupNotice>) {
+    apply_optional_usize_env_fallback(value, "LLAMA_ARG_UBATCH_SIZE", "ubatch-size", notices);
 }
 
 /// Apply the legacy `LLAMA_ARG_MODEL_DRAFT` alias after clap has resolved the
 /// canonical `LLAMA_ARG_SPEC_DRAFT_MODEL` binding.
-pub fn env_fallback_draft_model(value: &mut Option<PathBuf>) {
-    apply_optional_path_env_fallback(value, "LLAMA_ARG_MODEL_DRAFT", "draft-model");
+pub fn env_fallback_draft_model(value: &mut Option<PathBuf>, notices: &mut Vec<StartupNotice>) {
+    apply_optional_path_env_fallback(value, "LLAMA_ARG_MODEL_DRAFT", "draft-model", notices);
 }
 
 /// Apply the legacy `LLAMA_LOG_FILE` alias after clap has resolved the
 /// canonical `LLAMA_ARG_LOG_FILE` binding.
-pub fn env_fallback_log_file(value: &mut Option<PathBuf>) {
-    apply_optional_path_env_fallback(value, "LLAMA_LOG_FILE", "log-file");
+pub fn env_fallback_log_file(value: &mut Option<PathBuf>, notices: &mut Vec<StartupNotice>) {
+    apply_optional_path_env_fallback(value, "LLAMA_LOG_FILE", "log-file", notices);
 }
 
 /// Apply `LLAMA_ARG_ENDPOINT_SLOTS` without making clap treat its env value as
 /// an explicit `--slots` occurrence that conflicts with `--no-slots`.
-pub fn env_fallback_endpoint_slots(value: &mut bool, slots_was_set: bool, no_slots_was_set: bool) {
+pub fn env_fallback_endpoint_slots(
+    value: &mut bool,
+    slots_was_set: bool,
+    no_slots_was_set: bool,
+    notices: &mut Vec<StartupNotice>,
+) {
     const KEY: &str = "LLAMA_ARG_ENDPOINT_SLOTS";
     if slots_was_set || no_slots_was_set {
         return;
@@ -1591,17 +1676,20 @@ pub fn env_fallback_endpoint_slots(value: &mut bool, slots_was_set: bool, no_slo
     if let Ok(raw) = std::env::var(KEY) {
         match parse_env_bool(&raw) {
             Some(parsed) => *value = parsed,
-            None => tracing::warn!(
-                "{KEY} has unparseable value {:?}; ignoring (expected on/off/true/false/1/0)",
-                raw
-            ),
+            None => notices.push(StartupNotice::warn(format!(
+                "{KEY} has unparseable value {raw:?}; ignoring (expected on/off/true/false/1/0)"
+            ))),
         }
     }
 }
 
 /// Apply `MLXCEL_ENABLE_SETTINGS_ENDPOINT` after clap parsing so deployments
 /// may use the common `1` / `0` spellings as well as `true` / `false`.
-pub fn env_fallback_settings_endpoint(value: &mut bool, cli_was_set: bool) {
+pub fn env_fallback_settings_endpoint(
+    value: &mut bool,
+    cli_was_set: bool,
+    notices: &mut Vec<StartupNotice>,
+) {
     const KEY: &str = "MLXCEL_ENABLE_SETTINGS_ENDPOINT";
     if cli_was_set {
         return;
@@ -1609,10 +1697,9 @@ pub fn env_fallback_settings_endpoint(value: &mut bool, cli_was_set: bool) {
     if let Ok(raw) = std::env::var(KEY) {
         match parse_env_bool(&raw) {
             Some(parsed) => *value = parsed,
-            None => tracing::warn!(
-                "{KEY} has unparseable value {:?}; ignoring (expected on/off/true/false/1/0)",
-                raw
-            ),
+            None => notices.push(StartupNotice::warn(format!(
+                "{KEY} has unparseable value {raw:?}; ignoring (expected on/off/true/false/1/0)"
+            ))),
         }
     }
 }
@@ -1657,6 +1744,7 @@ pub fn env_fallback_cors_credentials(
     value: &mut bool,
     enable_was_set: bool,
     disable_was_set: bool,
+    notices: &mut Vec<StartupNotice>,
 ) {
     const KEY: &str = "LLAMA_ARG_CORS_CREDENTIALS";
     if enable_was_set || disable_was_set {
@@ -1665,12 +1753,204 @@ pub fn env_fallback_cors_credentials(
     if let Ok(raw) = std::env::var(KEY) {
         match parse_env_bool(&raw) {
             Some(parsed) => *value = parsed,
-            None => tracing::warn!(
-                "{KEY} has unparseable value {:?}; ignoring (expected on/off/true/false/1/0)",
-                raw
-            ),
+            None => notices.push(StartupNotice::warn(format!(
+                "{KEY} has unparseable value {raw:?}; ignoring (expected on/off/true/false/1/0)"
+            ))),
         }
     }
+}
+
+/// The b10621 CORS origin variable, read by [`env_fallback_cors_origins`].
+const CORS_ORIGINS_ENV: &str = "LLAMA_ARG_CORS_ORIGINS";
+/// The mlxcel-native allow-list variable, read by
+/// [`env_fallback_allowed_origins`].
+const ALLOWED_ORIGINS_ENV: &str = "MLXCEL_ALLOWED_ORIGINS";
+
+/// Read one of the two CORS origin variables, treating an unset variable as
+/// absent and a value that is not UTF-8 as a startup error (clap's `env`
+/// binding refused it the same way).
+fn cors_origin_env(key: &'static str) -> anyhow::Result<Option<String>> {
+    match std::env::var(key) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("{key} is not valid UTF-8"),
+    }
+}
+
+/// Refuse a start where both CORS origin variables are set and neither flag
+/// picked a side, because the two rules are mutually exclusive and nothing
+/// says which one the operator meant.
+fn ensure_single_cors_origin_env() -> anyhow::Result<()> {
+    if std::env::var_os(CORS_ORIGINS_ENV).is_some()
+        && std::env::var_os(ALLOWED_ORIGINS_ENV).is_some()
+    {
+        anyhow::bail!(
+            "{CORS_ORIGINS_ENV} and {ALLOWED_ORIGINS_ENV} are both set, but the b10621 \
+             --cors-origins rule and the --allowed-origins allow-list are mutually exclusive; \
+             unset one of them"
+        );
+    }
+    Ok(())
+}
+
+/// Apply `LLAMA_ARG_CORS_ORIGINS` without making clap treat its env value as
+/// an explicit `--cors-origins` occurrence.
+///
+/// `--cors-origins` conflicts with `--allowed-origins`, and clap counts an
+/// env-sourced value as present when it checks conflicts, so a clap `env`
+/// binding turned `LLAMA_ARG_CORS_ORIGINS=... --allowed-origins ...` into a
+/// parse error for a combination the operator never typed (#2664). The
+/// variable is read here instead:
+///
+/// - `--cors-origins` on the command line wins and the variable is unused.
+/// - `--allowed-origins` on the command line wins over the variable, which is
+///   ignored; the returned notice names it.
+/// - With neither flag, the variable sets the origin rule, and a start that
+///   also sets `MLXCEL_ALLOWED_ORIGINS` fails naming both variables.
+///
+/// `cors_origins_was_set` and `allowed_origins_was_set` report whether each
+/// flag was on the command line ([`long_cli_flag_was_set`]).
+///
+/// Returns the warning to show when the variable was ignored. It is returned
+/// rather than logged because this runs before `start_server` installs the
+/// tracing subscriber, so a `tracing::warn!` here is written to nothing; the
+/// caller carries it in [`ServerStartupInput::startup_notices`] and
+/// `start_server` logs it once logging exists.
+///
+/// # Errors
+///
+/// Fails when both variables are set without either flag, or when the
+/// variable is not valid UTF-8.
+pub fn env_fallback_cors_origins(
+    value: &mut String,
+    cors_origins_was_set: bool,
+    allowed_origins_was_set: bool,
+) -> anyhow::Result<Option<StartupNotice>> {
+    if cors_origins_was_set {
+        return Ok(None);
+    }
+    if allowed_origins_was_set {
+        return Ok(ignored_cors_origin_env_notice(
+            CORS_ORIGINS_ENV,
+            "--allowed-origins",
+        ));
+    }
+    ensure_single_cors_origin_env()?;
+    if let Some(raw) = cors_origin_env(CORS_ORIGINS_ENV)? {
+        *value = raw;
+    }
+    Ok(None)
+}
+
+/// Apply `MLXCEL_ALLOWED_ORIGINS` without making clap treat its env value as
+/// an explicit `--allowed-origins` occurrence.
+///
+/// The mirror of [`env_fallback_cors_origins`] (#2664): `--allowed-origins`
+/// on the command line wins and the variable is unused, `--cors-origins` on
+/// the command line wins over the variable (ignored, with the returned notice
+/// naming it), and with neither flag the variable is split on `,` exactly as clap's
+/// `value_delimiter` split it, then validated at startup like the flag. A
+/// start that also sets `LLAMA_ARG_CORS_ORIGINS` fails naming both variables.
+///
+/// # Errors
+///
+/// Fails when both variables are set without either flag, or when the
+/// variable is not valid UTF-8.
+pub fn env_fallback_allowed_origins(
+    values: &mut Vec<String>,
+    allowed_origins_was_set: bool,
+    cors_origins_was_set: bool,
+) -> anyhow::Result<Option<StartupNotice>> {
+    if allowed_origins_was_set {
+        return Ok(None);
+    }
+    if cors_origins_was_set {
+        return Ok(ignored_cors_origin_env_notice(
+            ALLOWED_ORIGINS_ENV,
+            "--cors-origins",
+        ));
+    }
+    ensure_single_cors_origin_env()?;
+    if let Some(raw) = cors_origin_env(ALLOWED_ORIGINS_ENV)? {
+        *values = raw.split(',').map(str::to_string).collect();
+    }
+    Ok(None)
+}
+
+/// The startup warning for a CORS origin variable that lost to the other
+/// rule's flag, or `None` when the variable is unset.
+fn ignored_cors_origin_env_notice(key: &str, winning_flag: &str) -> Option<StartupNotice> {
+    std::env::var_os(key).map(|_| {
+        StartupNotice::warn(format!(
+            "{key} is ignored because {winning_flag} was given on the command line; the two \
+             CORS origin rules are mutually exclusive"
+        ))
+    })
+}
+
+/// Apply `LLAMA_ARG_MODELS_AUTOLOAD` without making clap treat its env value
+/// as an explicit `--models-autoload` occurrence.
+///
+/// clap registers an `overrides_with` partner as a direct conflict and counts
+/// an env-sourced value as present, while only a command-line occurrence
+/// removes the overridden half. With the variable bound through clap's `env`
+/// attribute, `LLAMA_ARG_MODELS_AUTOLOAD=<anything> --no-models-autoload`
+/// therefore failed to parse instead of letting the flag win. The variable is
+/// read here instead, through the same [`crate::cli::apply_boolish_pair_env`]
+/// as the other b10621 pairs ([`apply_bool_pair_env_bindings`]), and only when
+/// neither `--models-autoload` nor `--no-models-autoload` was on the command
+/// line.
+///
+/// # Errors
+///
+/// Names the variable and its value when the value is not one of clap's
+/// boolish spellings, as b10621 rejects an invalid pair value at startup
+/// (#2618).
+pub fn env_fallback_models_autoload(
+    value: &mut bool,
+    enable_was_set: bool,
+    disable_was_set: bool,
+) -> anyhow::Result<()> {
+    let mut resolved = enable_was_set.then_some(*value);
+    crate::cli::apply_boolish_pair_env("LLAMA_ARG_MODELS_AUTOLOAD", &mut resolved, disable_was_set)
+        .map_err(invalid_bool_pair_env)?;
+    if let Some(parsed) = resolved {
+        *value = parsed;
+    }
+    Ok(())
+}
+
+/// The startup error for a b10621 pair variable whose value is not boolish.
+fn invalid_bool_pair_env((var, raw): (&'static str, String)) -> anyhow::Error {
+    anyhow::anyhow!("{var} has an invalid boolean value {raw:?}")
+}
+
+/// Apply the `LLAMA_ARG_*` variables of the b10621 `--x` / `--no-x` pairs in
+/// the cache, context and slot groups (#2609).
+///
+/// `--cache-prompt`, `--cont-batching`, `--context-shift`,
+/// `--cache-idle-slots` and `--kv-unified` used to bind their variables through
+/// clap's `env` attribute. clap counts an env-sourced value as present and
+/// treats every `overrides_with` partner as a direct conflict, so
+/// `LLAMA_ARG_CONT_BATCHING=1 --no-cont-batching` failed to parse instead of
+/// letting the command line win. Each group now reads its variables here, only
+/// for a pair neither half of which was on the command line; see
+/// [`crate::cli::apply_boolish_pair_env`].
+///
+/// # Errors
+///
+/// Names the variable and its value when the value is not one of clap's
+/// boolish spellings, which is the value domain the clap binding accepted.
+pub fn apply_bool_pair_env_bindings(
+    cache: &mut crate::cli::cache_args::CacheCompatArgs,
+    context: &mut crate::cli::context_args::ContextCompatArgs,
+    slot: &mut crate::cli::slot_args::SlotCompatArgs,
+) -> anyhow::Result<()> {
+    cache
+        .apply_env_bindings()
+        .and_then(|()| context.apply_env_bindings())
+        .and_then(|()| slot.apply_env_bindings())
+        .map_err(invalid_bool_pair_env)
 }
 
 /// Apply the `MLXCEL_EMBEDDING_MODEL` env var fallback to `--embedding-model`.
@@ -1679,17 +1959,20 @@ pub fn env_fallback_cors_credentials(
 /// attribute; this layers the mlxcel-native alias on top with the same
 /// precedence rule as the other pairs: the CLI flag (or the `LLAMA_ARG_*`
 /// value clap resolved) wins, and a conflicting alias is logged and ignored.
-pub fn env_fallback_embedding_model(cli_value: &mut Option<String>) {
+pub fn env_fallback_embedding_model(
+    cli_value: &mut Option<String>,
+    notices: &mut Vec<StartupNotice>,
+) {
     const ALIAS: &str = "MLXCEL_EMBEDDING_MODEL";
     match std::env::var(ALIAS) {
         Ok(value) if !value.trim().is_empty() => {
             if cli_value.is_none() {
                 *cli_value = Some(value);
             } else {
-                tracing::info!(
+                notices.push(StartupNotice::info(format!(
                     "{ALIAS} env var is set but --embedding-model (or LLAMA_ARG_EMBEDDING_MODEL) \
                      takes precedence; ignoring {ALIAS}"
-                );
+                )));
             }
         }
         _ => {}
@@ -1701,17 +1984,20 @@ pub fn env_fallback_embedding_model(cli_value: &mut Option<String>) {
 /// Same precedence rule as [`env_fallback_embedding_model`]: `clap` reads
 /// `LLAMA_ARG_RERANKER_MODEL` through the flag's `env` attribute, the CLI flag
 /// (or that value) wins, and a conflicting alias is logged and ignored.
-pub fn env_fallback_reranker_model(cli_value: &mut Option<String>) {
+pub fn env_fallback_reranker_model(
+    cli_value: &mut Option<String>,
+    notices: &mut Vec<StartupNotice>,
+) {
     const ALIAS: &str = "MLXCEL_RERANKER_MODEL";
     match std::env::var(ALIAS) {
         Ok(value) if !value.trim().is_empty() => {
             if cli_value.is_none() {
                 *cli_value = Some(value);
             } else {
-                tracing::info!(
+                notices.push(StartupNotice::info(format!(
                     "{ALIAS} env var is set but --reranker-model (or LLAMA_ARG_RERANKER_MODEL) \
                      takes precedence; ignoring {ALIAS}"
-                );
+                )));
             }
         }
         _ => {}
@@ -1724,23 +2010,23 @@ pub fn env_fallback_reranker_model(cli_value: &mut Option<String>) {
 ///
 /// - If `args.lang_bias` is `None` and `LLAMA_ARG_LANG_BIAS` is set → fill from env.
 /// - If `args.lang_bias` is `Some` (CLI was used) and `LLAMA_ARG_LANG_BIAS` is also set →
-///   keep CLI value and log an INFO-level message acknowledging the override.
+///   keep CLI value and collect an INFO startup notice acknowledging the override.
 ///
 /// Only `LLAMA_ARG_LANG_BIAS` is handled here. Companion env vars
 /// (`LLAMA_ARG_LANG_BIAS_POLICY`, `LLAMA_ARG_LANG_BIAS_CONFIG`, etc.) are NOT
 /// added because the repo does not yet use `LLAMA_ARG_*` for any of those
 /// sibling flags. They are reserved for a follow-up when the convention is
 /// established.
-pub fn env_fallback_lang_bias(args: &mut LangBiasCliArgs) {
+pub fn env_fallback_lang_bias(args: &mut LangBiasCliArgs, notices: &mut Vec<StartupNotice>) {
     if args.lang_bias.is_none() {
         if let Ok(v) = std::env::var("LLAMA_ARG_LANG_BIAS") {
             args.lang_bias = Some(v);
         }
     } else if std::env::var_os("LLAMA_ARG_LANG_BIAS").is_some() {
-        tracing::info!(
+        notices.push(StartupNotice::info(
             "LLAMA_ARG_LANG_BIAS env var is set but --lang-bias CLI flag takes precedence; \
-             ignoring LLAMA_ARG_LANG_BIAS"
-        );
+             ignoring LLAMA_ARG_LANG_BIAS",
+        ));
     }
 }
 
@@ -1755,8 +2041,11 @@ pub fn env_fallback_lang_bias(args: &mut LangBiasCliArgs) {
 /// - If `args.include_byte_fragments == false` (CLI unset) and the env var is
 ///   set to a truthy value → flip the field to `true`.
 /// - If `args.include_byte_fragments == true` (CLI set) and the env var is
-///   also set → keep the CLI value and log an INFO-level message.
-pub fn env_fallback_lang_bias_include_byte_fragments(args: &mut LangBiasCliArgs) {
+///   also set → keep the CLI value and collect an INFO startup notice.
+pub fn env_fallback_lang_bias_include_byte_fragments(
+    args: &mut LangBiasCliArgs,
+    notices: &mut Vec<StartupNotice>,
+) {
     const KEY: &str = "LLAMA_ARG_LANG_BIAS_INCLUDE_BYTE_FRAGMENTS";
     if !args.include_byte_fragments {
         if let Ok(v) = std::env::var(KEY) {
@@ -1767,19 +2056,16 @@ pub fn env_fallback_lang_bias_include_byte_fragments(args: &mut LangBiasCliArgs)
                 Some(false) => {
                     // Explicitly false — no-op.
                 }
-                None => {
-                    tracing::warn!(
-                        "{KEY} env var has unparseable value {:?}; ignoring (expected true/false/1/0)",
-                        v
-                    );
-                }
+                None => notices.push(StartupNotice::warn(format!(
+                    "{KEY} env var has unparseable value {v:?}; ignoring (expected true/false/1/0)"
+                ))),
             }
         }
     } else if std::env::var_os(KEY).is_some() {
-        tracing::info!(
+        notices.push(StartupNotice::info(format!(
             "{KEY} env var is set but --lang-bias-include-byte-fragments CLI flag takes precedence; \
              ignoring {KEY}"
-        );
+        )));
     }
 }
 
@@ -1816,6 +2102,7 @@ pub fn resolve_compat_toggle(enabled: bool, disabled: bool) -> bool {
 fn apply_reasoning_template_kwargs(
     base: Option<crate::server::chat_template_kwargs::ChatTemplateKwargs>,
     from_flags: &[(String, Option<serde_json::Value>)],
+    notices: &mut Vec<StartupNotice>,
 ) -> Option<crate::server::chat_template_kwargs::ChatTemplateKwargs> {
     if from_flags.is_empty() {
         return base;
@@ -1828,11 +2115,11 @@ fn apply_reasoning_template_kwargs(
                 if let Some(existing) = existing.as_ref()
                     && existing != value
                 {
-                    tracing::warn!(
+                    notices.push(StartupNotice::warn(format!(
                         "--chat-template-kwargs sets {key}={existing} but a dedicated reasoning \
                          flag sets {key}={value}; the flag wins (llama-server deprecates setting \
                          {key} through --chat-template-kwargs)"
-                    );
+                    )));
                 }
                 merged.set(key, value.clone());
             }
@@ -1842,10 +2129,10 @@ fn apply_reasoning_template_kwargs(
                 // entry for it does not survive. A template testing
                 // `reasoning_effort is defined` must see it undefined.
                 if let Some(existing) = existing.as_ref() {
-                    tracing::warn!(
+                    notices.push(StartupNotice::warn(format!(
                         "--chat-template-kwargs sets {key}={existing} but --reasoning-effort \
                          default asks for the template's own default; the key is removed"
-                    );
+                    )));
                 }
                 merged.remove(key);
             }
@@ -1914,16 +2201,16 @@ pub(super) fn resolve_mirostat(value: i32) -> anyhow::Result<i32> {
 /// Clamp `--adaptive-decay` into b10621's `0.0..=0.99` domain (#1485), the
 /// clamp upstream's `llama_sampler_init_adaptive_p` applies at sampler init,
 /// with a startup warning when the operator's value was out of range.
-pub(super) fn sanitize_adaptive_decay(value: f32) -> f32 {
+pub(super) fn sanitize_adaptive_decay(value: f32, notices: &mut Vec<StartupNotice>) -> f32 {
     let clamped = if value.is_finite() {
         value.clamp(0.0, 0.99)
     } else {
         0.9
     };
     if clamped != value {
-        tracing::warn!(
+        notices.push(StartupNotice::warn(format!(
             "--adaptive-decay {value} is outside the valid range 0.0..=0.99; using {clamped}"
-        );
+        )));
     }
     clamped
 }
@@ -2034,10 +2321,22 @@ pub(super) fn build_prompt_cache_config(
 /// explicit value in the same `bool`, so startup code needs this lightweight
 /// argv check to preserve CLI-over-env precedence.
 pub fn long_cli_flag_was_set(name: &str) -> bool {
+    long_cli_flag_in(std::env::args_os(), name)
+}
+
+/// The matching rule behind [`long_cli_flag_was_set`], over an explicit
+/// argument list: `--name` on its own or the `--name=value` form. Exposed so
+/// tests that build their own argv apply exactly the rule the binaries use
+/// (#2697).
+pub fn long_cli_flag_in<I, S>(args: I, name: &str) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
     let flag = format!("--{name}");
     let with_value = format!("--{name}=");
-    std::env::args_os().any(|arg| {
-        let arg = arg.to_string_lossy();
+    args.into_iter().any(|arg| {
+        let arg = arg.as_ref().to_string_lossy();
         arg == flag || arg.starts_with(&with_value)
     })
 }
@@ -2062,24 +2361,27 @@ pub fn long_cli_flag_was_set(name: &str) -> bool {
 /// The `cli_was_set` parameter must be `true` when the binary's clap arg was
 /// explicitly provided (not the default), so that a default `true` from clap
 /// doesn't shadow an env var that says `false`.
-pub fn env_fallback_prompt_cache_enabled(enabled: &mut bool, cli_was_set: bool) {
+pub fn env_fallback_prompt_cache_enabled(
+    enabled: &mut bool,
+    cli_was_set: bool,
+    notices: &mut Vec<StartupNotice>,
+) {
     const MLXCEL_KEY: &str = "MLXCEL_PROMPT_CACHE_ENABLED";
 
     if cli_was_set {
         if std::env::var_os(MLXCEL_KEY).is_some() {
-            tracing::info!("{MLXCEL_KEY} is set but --prompt-cache-enabled takes precedence");
+            notices.push(StartupNotice::info(format!(
+                "{MLXCEL_KEY} is set but --prompt-cache-enabled takes precedence"
+            )));
         }
     } else if let Ok(raw) = std::env::var(MLXCEL_KEY) {
         match parse_env_bool(&raw) {
             Some(v) => {
                 *enabled = v;
             }
-            None => {
-                tracing::warn!(
-                    "{MLXCEL_KEY} has unparseable value {:?}; ignoring (expected true/false/1/0)",
-                    raw
-                );
-            }
+            None => notices.push(StartupNotice::warn(format!(
+                "{MLXCEL_KEY} has unparseable value {raw:?}; ignoring (expected true/false/1/0)"
+            ))),
         }
     }
 }
@@ -2087,43 +2389,52 @@ pub fn env_fallback_prompt_cache_enabled(enabled: &mut bool, cli_was_set: bool) 
 /// Apply `MLXCEL_PROMPT_CACHE_CAPACITY_BYTES` env var fallback.
 ///
 /// CLI flag beats env var. Unparseable env values are warn-logged and ignored.
-pub fn env_fallback_prompt_cache_capacity_bytes(value: &mut Option<usize>) {
+pub fn env_fallback_prompt_cache_capacity_bytes(
+    value: &mut Option<usize>,
+    notices: &mut Vec<StartupNotice>,
+) {
     apply_optional_usize_env_fallback(
         value,
         "MLXCEL_PROMPT_CACHE_CAPACITY_BYTES",
         "prompt-cache-capacity-bytes",
+        notices,
     );
 }
 
 /// Apply `MLXCEL_PROMPT_CACHE_MAX_ENTRIES` env var fallback.
 ///
 /// CLI flag beats env var. Unparseable env values are warn-logged and ignored.
-pub fn env_fallback_prompt_cache_max_entries(value: &mut Option<usize>) {
+pub fn env_fallback_prompt_cache_max_entries(
+    value: &mut Option<usize>,
+    notices: &mut Vec<StartupNotice>,
+) {
     apply_optional_usize_env_fallback(
         value,
         "MLXCEL_PROMPT_CACHE_MAX_ENTRIES",
         "prompt-cache-max-entries",
+        notices,
     );
 }
 
 /// Apply `MLXCEL_PROMPT_CACHE_TTL` env var fallback (value in seconds).
 ///
 /// CLI flag beats env var. Unparseable env values are warn-logged and ignored.
-pub fn env_fallback_prompt_cache_ttl(value: &mut Option<u64>) {
+pub fn env_fallback_prompt_cache_ttl(value: &mut Option<u64>, notices: &mut Vec<StartupNotice>) {
     const KEY: &str = "MLXCEL_PROMPT_CACHE_TTL";
     if value.is_some() {
         if std::env::var_os(KEY).is_some() {
-            tracing::info!("{KEY} env var is set but --prompt-cache-ttl CLI flag takes precedence");
+            notices.push(StartupNotice::info(format!(
+                "{KEY} env var is set but --prompt-cache-ttl CLI flag takes precedence"
+            )));
         }
         return;
     }
     if let Ok(raw) = std::env::var(KEY) {
         match raw.trim().parse::<u64>() {
             Ok(v) => *value = Some(v),
-            Err(_) => tracing::warn!(
-                "{KEY} has unparseable value {:?}; ignoring (expected unsigned integer seconds)",
-                raw
-            ),
+            Err(_) => notices.push(StartupNotice::warn(format!(
+                "{KEY} has unparseable value {raw:?}; ignoring (expected unsigned integer seconds)"
+            ))),
         }
     }
 }
@@ -2131,56 +2442,70 @@ pub fn env_fallback_prompt_cache_ttl(value: &mut Option<u64>) {
 /// Apply `MLXCEL_PROMPT_CACHE_MIN_PREFIX` env var fallback.
 ///
 /// CLI flag beats env var. Unparseable env values are warn-logged and ignored.
-pub fn env_fallback_prompt_cache_min_prefix(value: &mut Option<usize>) {
+pub fn env_fallback_prompt_cache_min_prefix(
+    value: &mut Option<usize>,
+    notices: &mut Vec<StartupNotice>,
+) {
     apply_optional_usize_env_fallback(
         value,
         "MLXCEL_PROMPT_CACHE_MIN_PREFIX",
         "prompt-cache-min-prefix",
+        notices,
     );
 }
 
 /// Apply `MLXCEL_PROMPT_CACHE_SNAPSHOT_CAPACITY_BYTES` env var fallback.
 ///
 /// CLI flag beats env var. Unparseable env values are warn-logged and ignored.
-pub fn env_fallback_prompt_cache_snapshot_capacity_bytes(value: &mut Option<usize>) {
+pub fn env_fallback_prompt_cache_snapshot_capacity_bytes(
+    value: &mut Option<usize>,
+    notices: &mut Vec<StartupNotice>,
+) {
     apply_optional_usize_env_fallback(
         value,
         "MLXCEL_PROMPT_CACHE_SNAPSHOT_CAPACITY_BYTES",
         "prompt-cache-snapshot-capacity-bytes",
+        notices,
     );
 }
 
 /// Apply `MLXCEL_PROMPT_CACHE_SNAPSHOT_MAX_ENTRIES` env var fallback.
 ///
 /// CLI flag beats env var. Unparseable env values are warn-logged and ignored.
-pub fn env_fallback_prompt_cache_snapshot_max_entries(value: &mut Option<usize>) {
+pub fn env_fallback_prompt_cache_snapshot_max_entries(
+    value: &mut Option<usize>,
+    notices: &mut Vec<StartupNotice>,
+) {
     apply_optional_usize_env_fallback(
         value,
         "MLXCEL_PROMPT_CACHE_SNAPSHOT_MAX_ENTRIES",
         "prompt-cache-snapshot-max-entries",
+        notices,
     );
 }
 
 /// Apply `MLXCEL_PROMPT_CACHE_SNAPSHOT_TTL` env var fallback (value in seconds).
 ///
 /// CLI flag beats env var. Unparseable env values are warn-logged and ignored.
-pub fn env_fallback_prompt_cache_snapshot_ttl(value: &mut Option<u64>) {
+pub fn env_fallback_prompt_cache_snapshot_ttl(
+    value: &mut Option<u64>,
+    notices: &mut Vec<StartupNotice>,
+) {
     const KEY: &str = "MLXCEL_PROMPT_CACHE_SNAPSHOT_TTL";
     if value.is_some() {
         if std::env::var_os(KEY).is_some() {
-            tracing::info!(
+            notices.push(StartupNotice::info(format!(
                 "{KEY} env var is set but --prompt-cache-snapshot-ttl CLI flag takes precedence"
-            );
+            )));
         }
         return;
     }
     if let Ok(raw) = std::env::var(KEY) {
         match raw.trim().parse::<u64>() {
             Ok(v) => *value = Some(v),
-            Err(_) => tracing::warn!(
-                "{KEY} has unparseable value {:?}; ignoring (expected unsigned integer seconds)",
-                raw
-            ),
+            Err(_) => notices.push(StartupNotice::warn(format!(
+                "{KEY} has unparseable value {raw:?}; ignoring (expected unsigned integer seconds)"
+            ))),
         }
     }
 }
@@ -2201,21 +2526,26 @@ pub fn env_fallback_prompt_cache_snapshot_ttl(value: &mut Option<u64>) {
 /// merely came from the compiled-in default must be reported as
 /// `cli_was_set = false` so the env var can still override it in either
 /// direction (the detection scans argv, not the default).
-pub fn env_fallback_apc_enabled(enabled: &mut bool, cli_was_set: bool) {
+pub fn env_fallback_apc_enabled(
+    enabled: &mut bool,
+    cli_was_set: bool,
+    notices: &mut Vec<StartupNotice>,
+) {
     const KEY: &str = "APC_ENABLED";
     if cli_was_set {
         if std::env::var_os(KEY).is_some() {
-            tracing::info!("{KEY} env var is set but --apc-enabled CLI flag takes precedence");
+            notices.push(StartupNotice::info(format!(
+                "{KEY} env var is set but --apc-enabled CLI flag takes precedence"
+            )));
         }
         return;
     }
     if let Ok(raw) = std::env::var(KEY) {
         match parse_env_bool(&raw) {
             Some(v) => *enabled = v,
-            None => tracing::warn!(
-                "{KEY} has unparseable value {:?}; ignoring (expected true/false/1/0)",
-                raw
-            ),
+            None => notices.push(StartupNotice::warn(format!(
+                "{KEY} has unparseable value {raw:?}; ignoring (expected true/false/1/0)"
+            ))),
         }
     }
 }
@@ -2223,42 +2553,49 @@ pub fn env_fallback_apc_enabled(enabled: &mut bool, cli_was_set: bool) {
 /// Apply `APC_BLOCK_SIZE` env var fallback to the raw `--apc-block-size` value.
 ///
 /// CLI flag beats env var. Unparseable env values are warn-logged and ignored.
-pub fn env_fallback_apc_block_size(value: &mut Option<usize>) {
-    apply_optional_usize_env_fallback(value, "APC_BLOCK_SIZE", "apc-block-size");
+pub fn env_fallback_apc_block_size(value: &mut Option<usize>, notices: &mut Vec<StartupNotice>) {
+    apply_optional_usize_env_fallback(value, "APC_BLOCK_SIZE", "apc-block-size", notices);
 }
 
 /// Apply `APC_NUM_BLOCKS` env var fallback to the raw `--apc-num-blocks` value.
 ///
 /// CLI flag beats env var. Unparseable env values are warn-logged and ignored.
-pub fn env_fallback_apc_num_blocks(value: &mut Option<usize>) {
-    apply_optional_usize_env_fallback(value, "APC_NUM_BLOCKS", "apc-num-blocks");
+pub fn env_fallback_apc_num_blocks(value: &mut Option<usize>, notices: &mut Vec<StartupNotice>) {
+    apply_optional_usize_env_fallback(value, "APC_NUM_BLOCKS", "apc-num-blocks", notices);
 }
 
 /// Apply `APC_HASH` env var fallback to the raw `--apc-hash` value.
 ///
 /// CLI flag beats env var. Empty / whitespace-only env values are skipped.
-pub fn env_fallback_apc_hash(value: &mut Option<String>) {
-    apply_optional_string_env_fallback(value, "APC_HASH", "apc-hash");
+pub fn env_fallback_apc_hash(value: &mut Option<String>, notices: &mut Vec<StartupNotice>) {
+    apply_optional_string_env_fallback(value, "APC_HASH", "apc-hash", notices);
 }
 
 /// Shared helper for `Option<usize>` env-var fallbacks.
 ///
 /// If `value` is `Some` (CLI was explicitly set) and the env var is present, an
-/// INFO log is emitted. If `value` is `None`, the env var is parsed and applied.
-fn apply_optional_usize_env_fallback(value: &mut Option<usize>, key: &str, flag_name: &str) {
+/// INFO startup notice is collected. If `value` is `None`, the env var is parsed
+/// and applied.
+fn apply_optional_usize_env_fallback(
+    value: &mut Option<usize>,
+    key: &str,
+    flag_name: &str,
+    notices: &mut Vec<StartupNotice>,
+) {
     if value.is_some() {
         if std::env::var_os(key).is_some() {
-            tracing::info!("{key} env var is set but --{flag_name} CLI flag takes precedence");
+            notices.push(StartupNotice::info(format!(
+                "{key} env var is set but --{flag_name} CLI flag takes precedence"
+            )));
         }
         return;
     }
     if let Ok(raw) = std::env::var(key) {
         match raw.trim().parse::<usize>() {
             Ok(v) => *value = Some(v),
-            Err(_) => tracing::warn!(
-                "{key} has unparseable value {:?}; ignoring (expected unsigned integer)",
-                raw
-            ),
+            Err(_) => notices.push(StartupNotice::warn(format!(
+                "{key} has unparseable value {raw:?}; ignoring (expected unsigned integer)"
+            ))),
         }
     }
 }

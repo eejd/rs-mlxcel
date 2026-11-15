@@ -139,6 +139,8 @@ export const startupSettingStrings = [
   { key: 'settings.startup.prefill_peers', en: 'Prefill peers', ko: '프리필 피어', test_id: 'settings-startup-prefill-peers' },
   { key: 'settings.startup.decode_peers', en: 'Decode peers', ko: '디코드 피어', test_id: 'settings-startup-decode-peers' },
   { key: 'settings.startup.serving_bind', en: 'Serving bind address', ko: '서빙 바인드 주소', test_id: 'settings-startup-serving-bind' },
+  { key: 'settings.startup.cluster_auth', en: 'Cluster authentication', ko: '클러스터 인증', test_id: 'settings-startup-cluster-auth' },
+  { key: 'settings.startup.cluster_auth.configured', en: 'Configured', ko: '설정됨', test_id: 'settings-startup-cluster-auth-configured' },
   { key: 'settings.startup.model_is_gemma4_family', en: 'Gemma 4 family model', ko: 'Gemma 4 계열 모델', test_id: 'settings-startup-model-is-gemma4-family' },
 ] as const;
 
@@ -158,6 +160,7 @@ export const startupValueStrings = [
   { key: 'settings.startup.embedding_serving_mode.values.any', en: 'All routes', ko: '모든 경로', test_id: 'settings-startup-embedding-serving-mode-values-any' },
   { key: 'settings.startup.embedding_serving_mode.values.embedding_only', en: 'Embeddings only', ko: '임베딩 전용', test_id: 'settings-startup-embedding-serving-mode-values-embedding-only' },
   { key: 'settings.startup.embedding_serving_mode.values.rerank_only', en: 'Reranking only', ko: '리랭킹 전용', test_id: 'settings-startup-embedding-serving-mode-values-rerank-only' },
+  { key: 'settings.startup.embedding_serving_mode.values.image_only', en: 'Image generation only', ko: '이미지 생성 전용', test_id: 'settings-startup-embedding-serving-mode-values-image-only' },
   { key: 'settings.startup.preemption_policy.values.longest-first', en: 'Most generated tokens first', ko: '가장 많이 생성한 요청부터', test_id: 'settings-startup-preemption-policy-values-longest-first' },
   { key: 'settings.startup.preemption_policy.values.lowest-priority', en: 'Lowest-priority request first', ko: '우선순위가 가장 낮은 요청부터', test_id: 'settings-startup-preemption-policy-values-lowest-priority' },
   { key: 'settings.startup.decode_storage_backend.values.auto', en: 'Automatic', ko: '자동', test_id: 'settings-startup-decode-storage-backend-values-auto' },

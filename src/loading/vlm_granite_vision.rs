@@ -96,13 +96,18 @@ pub(crate) fn load_granite_vision_vlm(model_path: &Path) -> Result<LoadedModel> 
     let text_args: models::granite::ModelArgs = serde_json::from_value(text_config_val)
         .map_err(|e| anyhow::anyhow!("Failed to parse Granite text config: {}", e))?;
 
-    let vision_config: vision::config::VisionConfig = serde_json::from_value(
-        full_config
-            .get("vision_config")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Missing vision_config in config.json"))?,
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to parse Granite vision config: {}", e))?;
+    let raw_vision_config = full_config
+        .get("vision_config")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Missing vision_config in config.json"))?;
+    let mut vision_config: vision::config::VisionConfig =
+        serde_json::from_value(raw_vision_config.clone())
+            .map_err(|e| anyhow::anyhow!("Failed to parse Granite vision config: {}", e))?;
+    // Granite Vision 3.x's SigLIP tower omits `hidden_act`; Hugging Face
+    // (`LlavaNext` + `SiglipVisionConfig`) evaluates `gelu_pytorch_tanh`.
+    // mlx-vlm's `FastGELUMLP` departs from it; this follows HF (#2548; erf
+    // before).
+    vision_config.default_missing_hidden_act_by_model_type(&raw_vision_config);
 
     let group_size = text_args.group_size();
     let bits = text_args.bits();
@@ -132,10 +137,16 @@ pub(crate) fn load_granite_vision_vlm(model_path: &Path) -> Result<LoadedModel> 
     )
     .map_err(|e| anyhow::anyhow!("Failed to load Granite projector: {}", e))?;
 
-    let image_newline = weights
-        .get("image_newline")
-        .map(|w| mlxcel_core::copy(w))
-        .ok_or_else(|| anyhow::anyhow!("Missing image_newline weight"))?;
+    if !weights.contains_key("image_newline") && !weights.contains_key("image_newline.scales") {
+        anyhow::bail!("Missing image_newline weight");
+    }
+    let image_newline = crate::vision::weights::load_dense_param(
+        &weights,
+        "image_newline",
+        &[text_args.hidden_size as i32],
+        Some((group_size, bits)),
+    )
+    .map_err(anyhow::Error::msg)?;
 
     let image_token_index = full_config
         .get("image_token_index")

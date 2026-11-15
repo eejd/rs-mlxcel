@@ -497,6 +497,11 @@ pub const DEFAULT_RERANK_BATCH_SIZE: usize = crate::rerank::DEFAULT_RERANK_BATCH
 /// with no chat model, and the body names the flag that turned them off, so an
 /// operator can tell "this deployment is embedding-only" from "the chat model
 /// failed to load".
+///
+/// [`EmbeddingServingMode::ImageOnly`] (#2825) generalizes the same gate to
+/// `--image-model` with no chat checkpoint. It is selected by that flag rather
+/// than by a restriction flag, but reusing the enum keeps `blocks_generation`
+/// as the single switch behind health, props and the model capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EmbeddingServingMode {
     /// No mode flag: every loaded worker serves its routes.
@@ -506,6 +511,13 @@ pub enum EmbeddingServingMode {
     EmbeddingOnly,
     /// `--reranking`: reranking routes only.
     RerankOnly,
+    /// `--image-model` with no model source: image generation only (#2825).
+    ///
+    /// Unlike the two flags above, this mode is selected by the side-model
+    /// flag itself rather than by a restriction flag, because the server has no
+    /// chat checkpoint at all. Generation and tokenizer routes answer the same
+    /// 501, naming `--image-model`, and `/health` waits on the image worker.
+    ImageOnly,
 }
 
 impl EmbeddingServingMode {
@@ -516,6 +528,7 @@ impl EmbeddingServingMode {
             Self::Any => None,
             Self::EmbeddingOnly => Some("--embeddings"),
             Self::RerankOnly => Some("--reranking"),
+            Self::ImageOnly => Some("--image-model"),
         }
     }
 
@@ -532,6 +545,7 @@ impl EmbeddingServingMode {
             Self::Any => "any",
             Self::EmbeddingOnly => "embedding_only",
             Self::RerankOnly => "rerank_only",
+            Self::ImageOnly => "image_only",
         }
     }
 }
@@ -838,7 +852,8 @@ pub struct ServerConfig {
     /// "use the per-kind default" — `4` for MTP, `16` for DFlash. See
     /// [`crate::cli::speculative_args::default_block_size_for_kind`].
     pub draft_block_size: Option<u32>,
-    /// `--prompt-lookup-max-batch`: under `--draft-kind prompt-lookup`, a
+    /// `--prompt-lookup-max-batch`: under `--draft-kind prompt-lookup` or a
+    /// full-model drafter, a
     /// sequence runs its own verify round only on ticks whose active decode
     /// batch has at most this many rows (#2255).
     pub prompt_lookup_max_batch: usize,
@@ -901,9 +916,11 @@ pub struct ServerConfig {
     pub enable_preemption: bool,
     /// Policy used to select the eviction victim.
     pub preemption_policy: PreemptionPolicy,
-    /// When true, disable the batch scheduler and use the legacy sequential
-    /// worker. Equivalent to `max_batch_size <= 1` for scheduling purposes
-    /// but makes the intent explicit and guarantees zero scheduler overhead.
+    /// When true, serve through the legacy sequential worker: the same
+    /// `BatchScheduler` at `max_batch_size=1` with chunked prefill and batched
+    /// prefill off (`spawn_legacy_model_worker`). It still runs the scheduler;
+    /// what it drops is the batching, and features only the batched worker
+    /// wires (prompt cache, speculative dispatch, multi-adapter LoRA).
     pub no_batch: bool,
     /// Maximum number of requests to batch together for prefill.
     ///
@@ -1108,6 +1125,11 @@ pub struct ServerConfig {
     /// on a non-hybrid node enables the live prefill/decode role loop; `None`
     /// keeps the standard single-node scheduler loop.
     pub serving_bind: Option<std::net::SocketAddr>,
+    /// Cluster authentication for the disaggregated role transports (#2655).
+    /// `Some` on every `PrefillOnly`, `DecodeOnly` and `Router` node (startup
+    /// fails closed without a secret); `None` on a `Hybrid` node, which binds
+    /// no role transport.
+    pub cluster_auth: Option<std::sync::Arc<crate::distributed::ClusterAuth>>,
     /// `--max-denoising-steps` (issue #217 phase 3). Serve-level override for
     /// the DiffusionGemma per-block denoising step cap; `None` keeps the
     /// checkpoint default. Only diffusion models read it.
@@ -1268,6 +1290,7 @@ impl Default for ServerConfig {
             prefill_peers: Vec::new(),
             decode_peers: Vec::new(),
             serving_bind: None,
+            cluster_auth: None,
             max_denoising_steps: None,
             diffusion_sampler: "entropy-bound".to_string(),
             diffusion_threshold: 0.9,

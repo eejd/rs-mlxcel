@@ -33,6 +33,7 @@
 
 use std::path::Path;
 
+use crate::server::StartupNotice;
 use clap::Args;
 use mlxcel_core::cache::KVCacheMode;
 use mlxcel_core::cache::turbo::resolve_kv_cache_mode_for_model;
@@ -146,7 +147,7 @@ impl TurboKvCacheArgs {
     /// process environment is left untouched, so any caller-set
     /// `MLXCEL_KV_BOUNDARY_V_LAYERS` continues to win).
     ///
-    /// SAFETY: this function calls `std::env::set_var`, which is
+    /// SAFETY: this function calls `set_native_var`, which is
     /// process-global and is not thread-safe with concurrent `getenv` from
     /// other threads (Rust 1.84 marks it `unsafe` for that reason). It MUST
     /// be invoked while:
@@ -173,7 +174,7 @@ impl TurboKvCacheArgs {
             // constant from mlxcel_core, eliminating any chance of
             // writing to the wrong key.
             unsafe {
-                std::env::set_var(
+                mlxcel_core::native_env::set_native_var(
                     mlxcel_core::cache::turbo::BOUNDARY_V_ENV,
                     boundary.to_string(),
                 );
@@ -185,6 +186,44 @@ impl TurboKvCacheArgs {
 // ── KV cache type split flags ────────────────────────────────────
 // (Comment kept in non-doc form for code-archeology only; the user-facing
 // help text intentionally omits closed-repo issue numbers.)
+
+/// The warning for a start that sets both the split `--cache-type-k` /
+/// `--cache-type-v` flags and the legacy `--kv-cache-mode`, where the split
+/// flags win. `None` when at most one of the two spellings was used.
+///
+/// [`resolve_kv_cache_mode`] does not log it: the server resolves the mode
+/// before a tracing subscriber exists and carries this line as a startup
+/// notice (#2697, #2722), and the other callers log it themselves.
+pub fn kv_cache_mode_precedence_notice(
+    cache_type_k: Option<&str>,
+    cache_type_v: Option<&str>,
+    kv_cache_mode_legacy: Option<&str>,
+) -> Option<String> {
+    let have_split = cache_type_k.is_some() || cache_type_v.is_some();
+    (have_split && kv_cache_mode_legacy.is_some()).then(|| {
+        "--cache-type-k/--cache-type-v and --kv-cache-mode are both set; \
+         --cache-type-k/--cache-type-v take precedence (use one or the other)"
+            .to_string()
+    })
+}
+
+/// Log [`kv_cache_mode_precedence_notice`] through `tracing` when it applies.
+///
+/// For the CLI entry points that resolve the KV cache mode after their
+/// subscriber exists (`generate`, `inspect`, the in-process CLI server). The
+/// server must not call this: it resolves the mode before a subscriber exists
+/// and carries the line as a startup notice instead (#2722).
+pub fn log_kv_cache_mode_precedence_notice(
+    cache_type_k: Option<&str>,
+    cache_type_v: Option<&str>,
+    kv_cache_mode_legacy: Option<&str>,
+) {
+    if let Some(notice) =
+        kv_cache_mode_precedence_notice(cache_type_k, cache_type_v, kv_cache_mode_legacy)
+    {
+        tracing::warn!("{notice}");
+    }
+}
 
 /// Supported K/V combinations and their corresponding `KVCacheMode`.
 ///
@@ -204,14 +243,6 @@ pub fn resolve_kv_cache_mode(
     kv_cache_mode_legacy: Option<&str>,
 ) -> Result<KVCacheMode, String> {
     let have_split = cache_type_k.is_some() || cache_type_v.is_some();
-    let have_legacy = kv_cache_mode_legacy.is_some();
-
-    if have_split && have_legacy {
-        tracing::warn!(
-            "--cache-type-k/--cache-type-v and --kv-cache-mode are both set; \
-             --cache-type-k/--cache-type-v take precedence (use one or the other)"
-        );
-    }
 
     if have_split {
         // Resolve each side, defaulting the unspecified side to fp16.
@@ -349,9 +380,10 @@ fn map_kv_modes_to_cache_mode(k: KVCacheMode, v: KVCacheMode) -> Result<KVCacheM
 ///
 /// Precedence: CLI flag beats env var. When the CLI flag was not provided
 /// (value is `None`) and the env var is set, the env var value is applied.
-/// When both are present, the CLI value is kept and an INFO log is emitted.
-pub fn env_fallback_cache_type_k(value: &mut Option<String>) {
-    apply_optional_string_env_fallback(value, "LLAMA_ARG_CACHE_TYPE_K", "cache-type-k");
+/// When both are present, the CLI value is kept and an INFO startup notice is
+/// collected.
+pub fn env_fallback_cache_type_k(value: &mut Option<String>, notices: &mut Vec<StartupNotice>) {
+    apply_optional_string_env_fallback(value, "LLAMA_ARG_CACHE_TYPE_K", "cache-type-k", notices);
 }
 
 /// Apply `LLAMA_ARG_CACHE_TYPE_V` env var fallback to the raw
@@ -359,17 +391,24 @@ pub fn env_fallback_cache_type_k(value: &mut Option<String>) {
 ///
 /// Precedence: CLI flag beats env var. When the CLI flag was not provided
 /// (value is `None`) and the env var is set, the env var value is applied.
-/// When both are present, the CLI value is kept and an INFO log is emitted.
-pub fn env_fallback_cache_type_v(value: &mut Option<String>) {
-    apply_optional_string_env_fallback(value, "LLAMA_ARG_CACHE_TYPE_V", "cache-type-v");
+/// When both are present, the CLI value is kept and an INFO startup notice is
+/// collected.
+pub fn env_fallback_cache_type_v(value: &mut Option<String>, notices: &mut Vec<StartupNotice>) {
+    apply_optional_string_env_fallback(value, "LLAMA_ARG_CACHE_TYPE_V", "cache-type-v", notices);
 }
 
 /// Shared helper: if `value` is `None` and the named env var is set, fill
 /// `value` from the env var. If `value` is `Some` (CLI was set) and the env
-/// var is also present and differs, log an INFO and keep the CLI value.
+/// var is also present and differs, collect an INFO startup notice and keep
+/// the CLI value.
 /// When `value` already equals the env var string (because clap's `env = "..."`
 /// injected it), no conflict log is emitted since there is no real conflict.
-fn apply_optional_string_env_fallback(value: &mut Option<String>, key: &str, flag_name: &str) {
+fn apply_optional_string_env_fallback(
+    value: &mut Option<String>,
+    key: &str,
+    flag_name: &str,
+    notices: &mut Vec<StartupNotice>,
+) {
     if value.is_some() {
         if let Ok(raw) = std::env::var(key) {
             let trimmed = raw.trim();
@@ -377,9 +416,9 @@ fn apply_optional_string_env_fallback(value: &mut Option<String>, key: &str, fla
             // clap injected the env var as the CLI value they are equal
             // and logging would be misleading.
             if value.as_deref() != Some(trimmed) {
-                tracing::info!(
+                notices.push(StartupNotice::info(format!(
                     "{key} env var is set but --{flag_name} CLI flag takes precedence; ignoring {key}"
-                );
+                )));
             }
         }
         return;

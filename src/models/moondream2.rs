@@ -31,13 +31,14 @@
 //! permutation, attention scores are invariant to it, so `fast_rope` with
 //! `traditional = false` (half-split in, half-split out) is exact.
 
-use mlxcel_core::generate::LanguageModel;
+use mlxcel_core::generate::{BatchedDecodeKind, LanguageModel, route_batched_decode};
 use mlxcel_core::layers::{KVCache, LayerNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(remote = "Self")]
 pub struct ModelArgs {
     #[serde(default = "default_model_type")]
     pub model_type: String,
@@ -70,6 +71,8 @@ pub struct ModelArgs {
     #[serde(default = "default_bos_token_id")]
     pub bos_token_id: i32,
 }
+
+mlxcel_core::impl_rope_lifting_deserialize!(ModelArgs);
 
 fn default_model_type() -> String {
     "moondream2".to_string()
@@ -238,6 +241,29 @@ impl Moondream2Attention {
     }
 }
 
+impl mlxcel_core::batched_decode::SplitAttention for Moondream2Attention {
+    fn split_shape(&self) -> mlxcel_core::batched_decode::SplitAttentionShape {
+        mlxcel_core::batched_decode::SplitAttentionShape {
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            scale: self.scale,
+        }
+    }
+
+    fn rope_batched(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        offsets: &[i32],
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        (
+            mlxcel_core::fast_rope_batched(q, self.rope_dims, false, self.rope_base, 1.0, offsets),
+            mlxcel_core::fast_rope_batched(k, self.rope_dims, false, self.rope_base, 1.0, offsets),
+        )
+    }
+}
+
 struct Moondream2Mlp {
     fc1: UnifiedLinear,
     fc2: UnifiedLinear,
@@ -263,8 +289,10 @@ impl Moondream2Mlp {
 
     fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         let hidden = self.fc1.forward(x);
-        // nn.GELU(approx="tanh")
-        let hidden = mlxcel_core::gelu_approx(&hidden);
+        // nn.GELU(approx="tanh"), as the remote code's `gelu_approx`
+        // (`F.gelu(approximate="tanh")`); evaluated in f32 as one compiled
+        // kernel (erf before #2548).
+        let hidden = mlxcel_core::utils::GeluActivation::TanhF32Compiled.apply(&hidden);
         self.fc2.forward(&hidden)
     }
 }
@@ -298,6 +326,37 @@ impl Moondream2Block {
         // Parallel residual on a single shared LayerNorm.
         let normed = self.ln.forward(x);
         let attn = self.attn.forward(&normed, cache, mask);
+        let mlp = self.mlp.forward(&normed);
+        let residual = mlxcel_core::add(x, &attn);
+        mlxcel_core::add(&residual, &mlp)
+    }
+
+    fn forward_batched(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut KVCache],
+        layer_idx: usize,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let normed = self.ln.forward(x);
+        let qkv = self.attn.qkv.forward(&normed);
+        let q_dim = self.attn.num_heads * self.attn.head_dim;
+        let kv_dim = self.attn.num_kv_heads * self.attn.head_dim;
+        let q = mlxcel_core::slice_last_dim(&qkv, 0, q_dim);
+        let k = mlxcel_core::slice_last_dim(&qkv, q_dim, q_dim + kv_dim);
+        let v = mlxcel_core::slice_last_dim(&qkv, q_dim + kv_dim, q_dim + 2 * kv_dim);
+        let seq_len = mlxcel_core::array_shape(&q)[1];
+        let metadata = crate::models::batched_decode_cache::uniform_layer_metadata(
+            caches,
+            seq_len,
+            0,
+            "Moondream2",
+            layer_idx,
+        );
+        let attn = mlxcel_core::batched_decode::forward_split_attention(
+            &self.attn, &q, &k, &v, caches, &metadata, mask,
+        );
+        let attn = self.attn.proj.forward(&attn);
         let mlp = self.mlp.forward(&normed);
         let residual = mlxcel_core::add(x, &attn);
         mlxcel_core::add(&residual, &mlp)
@@ -359,6 +418,25 @@ impl Moondream2Model {
         self.lm_head.forward(&hidden)
     }
 
+    fn forward_batched_impl(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let mut hidden = self.embed_tokens.forward(input_ids);
+        for layer_idx in 0..self.layers.len() {
+            let mut layer_caches = crate::models::batched_decode_cache::collect_layer_caches(
+                batch_caches,
+                "Moondream2",
+                layer_idx,
+            );
+            hidden =
+                self.layers[layer_idx].forward_batched(&hidden, &mut layer_caches, layer_idx, mask);
+        }
+        self.lm_head.forward(&self.post_ln.forward(&hidden))
+    }
+
     fn build_caches(&self) -> Vec<KVCache> {
         (0..self.layers.len()).map(|_| KVCache::new()).collect()
     }
@@ -373,6 +451,10 @@ impl Moondream2Model {
 }
 
 impl LanguageModel for Moondream2Model {
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
@@ -390,6 +472,17 @@ impl LanguageModel for Moondream2Model {
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         self.forward_impl(input_ids, input_embeddings, caches, mask)
+    }
+
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        route_batched_decode(self, input_ids, batch_caches, |caches| {
+            self.forward_batched_impl(input_ids, caches, mask)
+        })
     }
 
     fn embed_tokens(&self, input_ids: &MlxArray) -> Option<UniquePtr<MlxArray>> {

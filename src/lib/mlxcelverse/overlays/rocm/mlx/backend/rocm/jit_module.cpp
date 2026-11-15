@@ -2,14 +2,15 @@
 
 #include "mlx/backend/rocm/jit_module.h"
 #include "mlx/backend/rocm/device.h"
+#include "mlx/backend/rocm/runtime_dir.h"
 #include "mlx/backend/rocm/utils.h"
 #include "mlx/version.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <mutex>
 #include <shared_mutex>
@@ -18,11 +19,50 @@
 
 #include <fcntl.h>
 #include <hip/hiprtc.h>
+#ifdef _WIN32
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
+
+// Last: on Windows it brings in <windows.h>, whose macros must not reach the
+// headers above.
+#include "mlx/backend/rocm/hsaco_cache_dir.h"
 
 namespace mlx::core::rocm {
 
 namespace {
+
+#ifdef _WIN32
+constexpr const char* kNullDevice = "NUL";
+constexpr int kStderrFd = 2;
+inline int sys_dup(int fd) {
+  return _dup(fd);
+}
+inline int sys_dup2(int from, int to) {
+  return _dup2(from, to);
+}
+inline int sys_open_null() {
+  return _open(kNullDevice, _O_WRONLY);
+}
+inline int sys_close(int fd) {
+  return _close(fd);
+}
+#else
+constexpr int kStderrFd = STDERR_FILENO;
+inline int sys_dup(int fd) {
+  return dup(fd);
+}
+inline int sys_dup2(int from, int to) {
+  return dup2(from, to);
+}
+inline int sys_open_null() {
+  return open("/dev/null", O_WRONLY);
+}
+inline int sys_close(int fd) {
+  return close(fd);
+}
+#endif
 
 // RAII helper that silences stderr during hipRTC compilation.
 // AMD's comgr library (used by hipRTC) unconditionally writes preprocessed
@@ -31,16 +71,16 @@ namespace {
 // kernel is JIT-compiled.
 struct StderrSuppressor {
   StderrSuppressor() {
-    saved_fd_ = dup(STDERR_FILENO);
+    saved_fd_ = sys_dup(kStderrFd);
     if (saved_fd_ >= 0) {
-      int devnull = open("/dev/null", O_WRONLY);
+      int devnull = sys_open_null();
       if (devnull >= 0) {
-        dup2(devnull, STDERR_FILENO);
-        close(devnull);
+        sys_dup2(devnull, kStderrFd);
+        sys_close(devnull);
         active_ = true;
       } else {
-        // Could not open /dev/null — leave stderr alone.
-        close(saved_fd_);
+        // Could not open the null device — leave stderr alone.
+        sys_close(saved_fd_);
         saved_fd_ = -1;
       }
     }
@@ -51,8 +91,8 @@ struct StderrSuppressor {
   void restore() {
     if (active_) {
       fflush(stderr);
-      dup2(saved_fd_, STDERR_FILENO);
-      close(saved_fd_);
+      sys_dup2(saved_fd_, kStderrFd);
+      sys_close(saved_fd_);
       saved_fd_ = -1;
       active_ = false;
     }
@@ -111,30 +151,176 @@ void check_hiprtc_error(const char* name, hiprtcResult err) {
   }
 }
 
-// Return the location of the ROCm toolkit.
-const std::string& rocm_home() {
-  static std::string home = []() -> std::string {
-    const char* home = std::getenv("ROCM_HOME");
-    if (home) {
-      return home;
+// An empty variable counts as unset: "" would turn the hiprtc include flag
+// into "-I/include", the root of the current drive on Windows, where any local
+// user can plant hip/hip_runtime.h. Matches windows_rocm::resolve_rocm_root in
+// mlxcel-core's build script.
+const char* getenv_nonempty(const char* name) {
+  const char* value = std::getenv(name);
+  return (value && *value) ? value : nullptr;
+}
+
+// The include directory hiprtc compiles against, from the candidates in
+// order: ROCM_HOME and ROCM_PATH, each a ROCm root whose include/ is used
+// (explicit overrides); then the include/ of the ROCm runtime directory the
+// DLLs were loaded from when that directory is a runtime bundle
+// (`runtime_is_bundle`: MLXCEL_ROCM_RUNTIME_DIR or the executable's
+// directory, Windows, lablup/mlxcel#2606) and holds hip/hip_runtime.h; then
+// HIP_PATH (Windows), whose include/ is used, and which a bundle outranks
+// because the HIP SDK installer sets it machine-wide rather than per run
+// (lablup/mlxcel#2639); then the runtime directory's include/ when it is the
+// build-time SDK; then the build-time include directory if it still exists on
+// disk (Windows, lablup/mlxcel#2602); then /opt/rocm/include if it exists
+// (Linux). Pure, so the order reads in one place: callers pass the getenv
+// results (nullptr or "" is unset), the runtime include directory ("" if none
+// qualifies), whether the runtime directory is a bundle, the baked directory
+// (nullptr if none) and whether it and /opt/rocm exist. Returns "" when
+// nothing qualifies.
+std::string choose_rocm_include_dir(
+    const char* rocm_home,
+    const char* rocm_path,
+    const char* hip_path,
+    const std::string& runtime_include_dir,
+    bool runtime_is_bundle,
+    const char* baked_include_dir,
+    bool baked_include_dir_exists,
+    bool opt_rocm_exists) {
+  for (const char* root : {rocm_home, rocm_path}) {
+    if (root && *root) {
+      return std::string(root) + "/include";
     }
-    home = std::getenv("ROCM_PATH");
-    if (home) {
-      return home;
+  }
+  if (runtime_is_bundle && !runtime_include_dir.empty()) {
+    return runtime_include_dir;
+  }
+  if (hip_path && *hip_path) {
+    return std::string(hip_path) + "/include";
+  }
+  if (!runtime_include_dir.empty()) {
+    return runtime_include_dir;
+  }
+  if (baked_include_dir && *baked_include_dir && baked_include_dir_exists) {
+    return baked_include_dir;
+  }
+  if (opt_rocm_exists) {
+    return "/opt/rocm/include";
+  }
+  return "";
+}
+
+#if defined(_WIN32)
+// The HIP headers that belong to the ROCm runtime directory, as UTF-8 (the
+// encoding of the baked directory): <runtime dir>/include, or the include/
+// beside it, which is where both the SDK (bin/ and include/ under one root)
+// and the runtime bundle keep them. "" when neither holds hip/hip_runtime.h.
+std::string runtime_include_dir() {
+  const std::filesystem::path& runtime = rocm_runtime_dir();
+  if (runtime.empty()) {
+    return "";
+  }
+  for (const std::filesystem::path& include :
+       {runtime / "include", runtime.parent_path() / "include"}) {
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(
+            include / "hip" / "hip_runtime.h", ec)) {
+      // u8string() throws for a path that is not valid UTF-16 (an unpaired
+      // surrogate); fall through to the next candidate instead of letting
+      // the exception escape the JIT.
+      try {
+        auto utf8 = include.u8string(); // std::u8string from C++20
+        return std::string(utf8.begin(), utf8.end());
+      } catch (const std::exception&) {
+        return "";
+      }
     }
-#if defined(__linux__)
-    home = "/opt/rocm";
-    if (std::filesystem::exists(home)) {
-      return home;
-    }
+  }
+  return "";
+}
 #endif
-    throw std::runtime_error(
-        "Environment variable ROCM_HOME or ROCM_PATH is not set.");
+
+// Return the ROCm include directory for the hiprtc -I flag.
+const std::string& rocm_include_dir() {
+  static std::string dir = []() -> std::string {
+#if defined(_WIN32)
+    // Set by the HIP SDK installer.
+    const char* hip_path = getenv_nonempty("HIP_PATH");
+#else
+    const char* hip_path = nullptr;
+#endif
+#if defined(_WIN32)
+    // <runtime dir>/include when the chosen runtime directory ships the HIP
+    // headers, so a runtime bundle compiles against its own headers.
+    std::string runtime_include = runtime_include_dir();
+    RuntimeDirSource runtime_source = rocm_runtime_dir_source();
+    bool runtime_is_bundle = runtime_source == RuntimeDirSource::Env ||
+        runtime_source == RuntimeDirSource::ExeDir;
+#else
+    std::string runtime_include;
+    RuntimeDirSource runtime_source = RuntimeDirSource::None;
+    bool runtime_is_bundle = false;
+#endif
+#if defined(_WIN32) && defined(MLXCEL_ROCM_INCLUDE_DIR)
+    // <ROCM_PATH>/include of the SDK the binary was built against, so a
+    // binary started without ROCM_PATH still JIT-compiles.
+    const char* baked = MLXCEL_ROCM_INCLUDE_DIR;
+    bool baked_exists = std::filesystem::exists(baked);
+#else
+    const char* baked = nullptr;
+    bool baked_exists = false;
+#endif
+#if defined(__linux__)
+    bool opt_rocm_exists = std::filesystem::exists("/opt/rocm");
+#else
+    bool opt_rocm_exists = false;
+#endif
+    const char* rocm_home_env = getenv_nonempty("ROCM_HOME");
+    const char* rocm_path_env = getenv_nonempty("ROCM_PATH");
+    std::string chosen = choose_rocm_include_dir(
+        rocm_home_env,
+        rocm_path_env,
+        hip_path,
+        runtime_include,
+        runtime_is_bundle,
+        baked,
+        baked_exists,
+        opt_rocm_exists);
+    if (chosen.empty()) {
+      throw std::runtime_error(
+          "Environment variable ROCM_HOME or ROCM_PATH is not set.");
+    }
+    // One line when an environment variable and a runtime bundle offered
+    // different headers, naming both (always "" on Linux, where nothing is a
+    // bundle).
+    std::string notice = rocm_include_dir_notice(
+        rocm_home_env,
+        rocm_path_env,
+        hip_path,
+        runtime_include,
+        runtime_is_bundle,
+        runtime_dir_source_name(runtime_source),
+        chosen);
+    if (!notice.empty()) {
+      std::fprintf(stderr, "%s\n", notice.c_str());
+      std::fflush(stderr);
+    }
+    return chosen;
   }();
-  return home;
+  return dir;
 }
 
 std::string get_gpu_arch();
+
+// [mlxcel #2641] Say once per process that the disk cache is off and why, so a
+// user can see why every run compiles again and fix the directory. A refused
+// cache is a configuration problem, not progress noise.
+void report_hsaco_cache_disabled(const std::string& detail) {
+  static std::once_flag once;
+  std::call_once(once, [&]() {
+    std::fprintf(
+        stderr, "mlxcel: ROCm kernel disk cache disabled: %s\n", detail.c_str());
+    std::fflush(stderr);
+  });
+}
 
 // Get the cache directory for storing compiled results. The GPU arch is part of
 // the path so that, on a multi-GPU host (e.g. an integrated gfx1151 APU + a
@@ -154,23 +340,24 @@ const std::filesystem::path& hsaco_cache_dir() {
   if (auto it = by_arch.find(arch); it != by_arch.end()) {
     return it->second;
   }
-  std::filesystem::path cache;
-  if (auto c = std::getenv("MLX_HSACO_CACHE_DIR"); c) {
-    cache = std::filesystem::path(c) / arch;
-  } else {
-    cache = std::filesystem::temp_directory_path() / "mlx" / version() /
-        "hsaco" / arch;
+  // [mlxcel #2641] Per-user by default and refused unless every component is
+  // private: read_cached_hsaco loads what it finds here into the GPU. Upstream's
+  // shared <tmp>/mlx could be created first by another user, who could then
+  // plant kernels for everyone else. An empty path turns the cache off;
+  // compilation still works.
+  HsacoCacheDir cache = resolve_hsaco_cache_dir(
+      hsaco_cache_env_from_process(), version(), arch, cache_current_euid());
+  if (!cache.refusal.empty()) {
+    report_hsaco_cache_disabled(cache.refusal);
   }
-  if (!std::filesystem::exists(cache)) {
-    std::error_code error;
-    if (!std::filesystem::create_directories(cache, error)) {
-      cache = std::filesystem::path();
-    }
-  }
-  return by_arch.emplace(std::move(arch), std::move(cache)).first->second;
+  return by_arch.emplace(std::move(arch), std::move(cache.dir)).first->second;
 }
 
 // Get the path for HSACO file, splitting long names into nested directories.
+// [mlxcel #2641] Nothing below the cache directory is trust-checked, and it does
+// not have to be: JitModule passes safe_filename(module_name), which caps a name
+// at 200 characters, so with the 245 limit below the nesting branch is not reached
+// and every entry sits directly in the checked directory.
 // This mirrors the CUDA backend approach to handle long kernel names that
 // would otherwise exceed filesystem filename limits (typically 255 chars).
 std::filesystem::path get_hsaco_path(
@@ -207,46 +394,51 @@ bool read_cached_hsaco(
     return false;
   }
 
+  // [mlxcel #2641] Each entry must pass read_trusted_cache_entry, the .txt too:
+  // it picks the function each kernel name launches. An entry that cannot be
+  // used is a miss, as in the CUDA overlay (#2492), so the caller compiles and
+  // republishes it: an empty .hsaco, a missing or empty .txt, or a malformed
+  // .txt line, any of which would otherwise fail at load or launch on every run.
   if (expected_source) {
-    auto source_path = get_hsaco_path(cache_dir, module_name, ".hip");
-    std::ifstream source_file(source_path, std::ios::binary);
-    if (!source_file.good()) {
-      return false;
-    }
-    std::string cached_source(
-        (std::istreambuf_iterator<char>(source_file)),
-        std::istreambuf_iterator<char>());
-    if (cached_source != *expected_source) {
+    std::string cached_source;
+    if (!read_trusted_cache_entry(
+            get_hsaco_path(cache_dir, module_name, ".hip"), cached_source) ||
+        cached_source != *expected_source) {
       return false;
     }
   }
 
-  auto hsaco_path = get_hsaco_path(cache_dir, module_name, ".hsaco");
-  std::error_code error;
-  auto hsaco_size = std::filesystem::file_size(hsaco_path, error);
-  if (error) {
+  std::string kernel_map;
+  if (!read_trusted_cache_entry(
+          get_hsaco_path(cache_dir, module_name, ".hsaco"), hsaco) ||
+      hsaco.empty() ||
+      !read_trusted_cache_entry(
+          get_hsaco_path(cache_dir, module_name, ".txt"), kernel_map)) {
+    hsaco.clear();
     return false;
   }
-  std::ifstream hsaco_file(hsaco_path, std::ios::binary);
-  if (!hsaco_file.good()) {
-    return false;
-  }
-  hsaco.resize(hsaco_size);
-  hsaco_file.read(hsaco.data(), hsaco_size);
-
-  auto txt_path = get_hsaco_path(cache_dir, module_name, ".txt");
-  std::ifstream txt_file(txt_path, std::ios::binary);
+  std::istringstream lines(kernel_map);
   std::string line;
-  while (std::getline(txt_file, line)) {
+  bool valid = true;
+  while (std::getline(lines, line)) {
     auto tab = line.find('\t');
-    if (tab != std::string::npos) {
-      hsaco_kernels.emplace_back(line.substr(0, tab), line.substr(tab + 1));
+    if (tab == std::string::npos || tab == 0 || tab + 1 >= line.size()) {
+      valid = false;
+      break;
     }
+    hsaco_kernels.emplace_back(line.substr(0, tab), line.substr(tab + 1));
+  }
+  if (!valid || hsaco_kernels.empty()) {
+    hsaco.clear();
+    hsaco_kernels.clear();
+    return false;
   }
   return true;
 }
 
-// Write the |hsaco| and |hsaco_kernels| to |cache_dir| with |name|.
+// Write the |hsaco| and |hsaco_kernels| to |cache_dir| with |name|. Entries are
+// published atomically with mode 0600 ([mlxcel #2641]): the mangled names, then
+// the compiled code, then the source a later read compares against.
 void write_cached_hsaco(
     const std::filesystem::path& cache_dir,
     const std::string& module_name,
@@ -260,26 +452,28 @@ void write_cached_hsaco(
   auto hsaco_path = get_hsaco_path(cache_dir, module_name, ".hsaco");
 
   // Create parent directories if they don't exist (for long module names)
-  std::error_code error;
-  std::filesystem::create_directories(hsaco_path.parent_path(), error);
-  if (error) {
+  if (!make_private_directories(hsaco_path.parent_path())) {
     return;
   }
 
-  std::ofstream hsaco_file(hsaco_path, std::ios::binary);
-  if (!hsaco.empty()) {
-    hsaco_file.write(&hsaco.front(), hsaco.size());
-  }
-
-  auto txt_path = get_hsaco_path(cache_dir, module_name, ".txt");
-  std::ofstream txt_file(txt_path, std::ios::binary);
+  std::string kernel_map;
   for (const auto& [name, mangled] : hsaco_kernels) {
-    txt_file << name << "\t" << mangled << std::endl;
+    kernel_map += name;
+    kernel_map += '\t';
+    kernel_map += mangled;
+    kernel_map += '\n';
   }
-
-  auto source_path = get_hsaco_path(cache_dir, module_name, ".hip");
-  std::ofstream source_file(source_path);
-  source_file << source_code;
+  if (!publish_cache_entry(
+          get_hsaco_path(cache_dir, module_name, ".txt"),
+          kernel_map.data(),
+          kernel_map.size()) ||
+      !publish_cache_entry(hsaco_path, hsaco.data(), hsaco.size())) {
+    return;
+  }
+  publish_cache_entry(
+      get_hsaco_path(cache_dir, module_name, ".hip"),
+      source_code.data(),
+      source_code.size());
 }
 
 // Get GPU architecture string for the current device
@@ -331,7 +525,7 @@ void compile(
   arg_strings.push_back(arch_flag);
 
   // Add include paths
-  std::string rocm_include = "-I" + rocm_home() + "/include";
+  std::string rocm_include = "-I" + rocm_include_dir();
   arg_strings.push_back(rocm_include);
 
   for (const auto& arg : arg_strings) {

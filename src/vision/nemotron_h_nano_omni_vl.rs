@@ -440,6 +440,36 @@ impl NemotronHNanoOmniVlModel {
 }
 
 impl LanguageModel for NemotronHNanoOmniVlModel {
+    fn batched_decode_kind(&self) -> mlxcel_core::generate::BatchedDecodeKind {
+        self.text_model.batched_decode_kind()
+    }
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.text_model
+            .forward_batched(input_ids, batch_caches, mask)
+    }
+    fn forward_batched_with_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[mlxcel_core::cache::SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.text_model
+            .forward_batched_with_ids(input_ids, seq_ids, batch_caches, mask)
+    }
+    fn sync_sequence_storage(
+        &self,
+        seq_id: mlxcel_core::cache::SequenceId,
+        pool: &mut mlxcel_core::cache::CachePool,
+    ) -> Result<(), String> {
+        self.text_model.sync_sequence_storage(seq_id, pool)
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
@@ -565,6 +595,11 @@ impl LanguageModel for NemotronHNanoOmniVlModel {
 
     fn sequence_state_layout(&self) -> mlxcel_core::cache::SequenceStateLayout {
         self.text_model.sequence_state_layout()
+    }
+
+    /// The text model owns the KV caches; forward what it stores (#2790).
+    fn kv_cache_storage_modes(&self) -> Option<Vec<Option<mlxcel_core::cache::KVCacheMode>>> {
+        self.text_model.kv_cache_storage_modes()
     }
 
     fn supports_padded_prefill(&self) -> bool {

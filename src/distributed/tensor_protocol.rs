@@ -58,6 +58,21 @@ const MAX_NDIM: usize = 32;
 /// Prevents allocation of excessively large buffers from crafted headers.
 const MAX_METADATA_LEN: usize = 16 * 1024 * 1024;
 
+/// Maximum size in bytes of one decoded (decompressed) tensor payload (4 GiB).
+///
+/// Caps the buffer a receiver allocates for a compressed payload regardless of
+/// the shape a peer declares. It equals the u32 limit of the inner lz4_flex
+/// size prefix, so nothing that decompressed before this cap is rejected.
+/// Declared as `u64` because `1 << 32` does not fit a 32-bit `usize`; use
+/// [`max_decoded_tensor_bytes`] where a `usize` limit is needed.
+pub const MAX_DECODED_TENSOR_BYTES: u64 = 1 << 32;
+
+/// [`MAX_DECODED_TENSOR_BYTES`] as a `usize`, saturated to `usize::MAX` on a
+/// target whose address space is smaller than the cap.
+pub fn max_decoded_tensor_bytes() -> usize {
+    usize::try_from(MAX_DECODED_TENSOR_BYTES).unwrap_or(usize::MAX)
+}
+
 /// Minimum compression ratio (compressed / original) below which we apply
 /// LZ4. If compression yields a ratio above this threshold the data is sent
 /// uncompressed.
@@ -245,17 +260,23 @@ impl TensorHeader {
 
     /// Compute the total number of elements described by the shape.
     ///
-    /// Returns 0 for an empty (scalar) shape. Uses checked arithmetic
-    /// to avoid silent overflow on malicious inputs.
-    pub fn num_elements(&self) -> u64 {
-        if self.shape.is_empty() {
-            return 0;
-        }
-        self.shape
+    /// See [`Self::shape_num_elements`].
+    pub fn num_elements(&self) -> Result<u64> {
+        Self::shape_num_elements(&self.shape)
+    }
+
+    /// Total number of elements of a tensor with `shape`.
+    ///
+    /// An empty shape is a 1-element scalar, as in MLX (and as
+    /// `validate_raw_tensor` reads it at the end of the wire path). The shape
+    /// comes from a peer, so a product that overflows `u64` is an error rather
+    /// than a saturated count that a caller would size an allocation from.
+    pub fn shape_num_elements(shape: &[u64]) -> Result<u64> {
+        shape
             .iter()
             .copied()
             .try_fold(1u64, u64::checked_mul)
-            .unwrap_or(u64::MAX)
+            .with_context(|| format!("shape product overflow for {shape:?}"))
     }
 
     /// Encode the header into wire bytes (little-endian).

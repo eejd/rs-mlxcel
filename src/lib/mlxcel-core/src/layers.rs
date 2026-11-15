@@ -2006,7 +2006,8 @@ pub fn validate_quantization_mode_runnable(
 ///
 /// A line is due only for a block-float mode (affine is every backend's
 /// baseline) that the capability table marks `Native` on a backend where some
-/// mode is not native, which is ROCm today. There the same checkpoint could
+/// mode is not native, which no backend is today (ROCm was, for NVFP4, until
+/// lablup/mlxcel#2617). There the same checkpoint could
 /// have been converted or refused, so the log states which route it took, as
 /// the NVFP4 repack line in the binary crate's `models/sanitize.rs` does for
 /// the conversion route. Metal, CUDA and the CPU run every mode natively, have
@@ -2237,7 +2238,8 @@ const MAX_QUANT_GROUP_SIZE: i32 = 1 << 20;
 ///          [`QuantizedMultiLinear::from_weights`] (MLA `embed_q` /
 ///          `unembed_out`), BailingMoe weight validation, `kimi_linear`'s
 ///          private `MultiLinear` in the consuming crate, and `kimi_k3`'s
-///          expert-plane probe (`expert_quantization`)
+///          expert-plane probe (`expert_quantization`), plus the consuming
+///          crate's quantization-aware vision learned-parameter loaders
 pub fn infer_quantization_mode(has_biases: bool, group_size: i32, bits: i32) -> &'static str {
     if has_biases {
         "affine"
@@ -2470,7 +2472,8 @@ pub struct QuantizedTensorShapes<'a> {
 ///
 /// Used by: BailingMoe weight validation (token table, dense projections,
 ///          stacked experts) and the shared `validate_embedding_table` guard
-///          (BailingMoe, Gpt2, GptBigCode, GptNeoX, Mamba, Mamba2)
+///          (BailingMoe, Gpt2, GptBigCode, GptNeoX, Mamba, Mamba2), plus the
+///          consuming crate's quantized vision embedding/table loaders
 pub fn validate_quantized_packing(
     label: &str,
     shapes: &QuantizedTensorShapes<'_>,
@@ -3283,6 +3286,12 @@ impl FusedQKVLinear {
     /// Concatenates `{prefix}.q_proj`, `{prefix}.k_proj`, `{prefix}.v_proj`
     /// along axis 0 into a single `UnifiedLinear`.  Both quantized and
     /// non-quantized weight layouts are supported.
+    ///
+    /// The quantization mode is inferred from `q_proj` the way
+    /// [`UnifiedLinear::from_weights`] infers it for a single plane: affine
+    /// stores zero-point `biases`, so their absence means a block-float scheme
+    /// (issue #2444). Hardcoding `"affine"` made every bias-free plane solve
+    /// to a 1-bit affine layout and fail the load.
     pub fn from_weights_separate(
         weights: &crate::weights::WeightMap,
         prefix: &str,
@@ -3292,8 +3301,10 @@ impl FusedQKVLinear {
         n_kv_heads: i32,
         head_dim: i32,
     ) -> Result<Self, String> {
+        let has_biases = weights.contains_key(&format!("{prefix}.q_proj.biases"));
+        let mode = infer_quantization_mode(has_biases, group_size, bits);
         Self::from_weights_separate_with_mode(
-            weights, prefix, group_size, bits, n_heads, n_kv_heads, head_dim, "affine",
+            weights, prefix, group_size, bits, n_heads, n_kv_heads, head_dim, mode,
         )
     }
 
@@ -3367,6 +3378,49 @@ impl FusedQKVLinear {
             validate_quantization_params(group_size, bits)
                 .map_err(|e| format!("{q_prefix}: {e}"))?;
 
+            let plane_prefixes = [q_prefix.as_str(), k_prefix.as_str(), v_prefix.as_str()];
+
+            // A ModelOpt NVFP4 plane carries its per-tensor `weight_scale_2` as
+            // a `{plane}.global_scale` sidecar (repacked in `sanitize.rs`) that
+            // multiplies that plane's matmul output, and q/k/v each have their
+            // own. One concatenated plane has a single scalar slot, and the
+            // fused rope kernels take no scale at all, so such a layer keeps
+            // its planes separate: each `UnifiedLinear` applies its own scalar
+            // after the matmul and claims (and width-pins) its own runtime-LoRA
+            // terms (issue #2444). Like the mixed-width split below, each plane
+            // is built at its own reconciled layout.
+            if plane_prefixes
+                .iter()
+                .any(|p| weights.contains_key(&format!("{p}.global_scale")))
+            {
+                let layouts =
+                    reconciled_qkv_layouts(weights, plane_prefixes, group_size, bits, mode);
+                let plane = |index: usize| {
+                    let (plane_group_size, plane_bits) =
+                        layouts.map_or((group_size, bits), |l| (l[index].1, l[index].0));
+                    UnifiedLinear::from_weights_with_mode(
+                        weights,
+                        plane_prefixes[index],
+                        plane_group_size,
+                        plane_bits,
+                        mode,
+                    )
+                };
+                return Ok(Self {
+                    qkv_proj: QkvProjection::Split {
+                        q: plane(0)?,
+                        k: plane(1)?,
+                        v: plane(2)?,
+                    },
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    lora_q: Vec::new(),
+                    lora_k: Vec::new(),
+                    lora_v: Vec::new(),
+                });
+            }
+
             // A checkpoint whose three projections were quantized at different
             // layouts cannot be concatenated: the packed planes have different
             // widths and MLX's `concatenate` throws, which crosses the cxx
@@ -3384,7 +3438,6 @@ impl FusedQKVLinear {
             // that path owns the existing, more specific diagnostics for a
             // broken triple, and this check must not pre-empt them with a worse
             // message.
-            let plane_prefixes = [q_prefix.as_str(), k_prefix.as_str(), v_prefix.as_str()];
             if let Some(packed) = qkv_packed_widths(weights, plane_prefixes)
                 && !qkv_planes_are_fusable(&packed)
             {
@@ -3440,13 +3493,22 @@ impl FusedQKVLinear {
             }
 
             // Fused QKV concatenates along axis 0, so q/k/v must share bits; infer from q.
-            let effective_bits = if mode == "affine" {
-                let w_shape = ffi::array_shape(q_w);
-                let s_shape = ffi::array_shape(q_s);
-                infer_quantization_bits(&w_shape, &s_shape, group_size, bits)
-                    .map_err(|e| format!("{} (prefix: {})", e, q_prefix))?
+            // A block-float mode fixes `bits` and re-derives `group_size` from
+            // the shapes instead, as the single-plane loader does, and is
+            // refused here on a backend with no kernel for it, rather than
+            // storing a declared group size the packing does not have for an
+            // abort in `quantized_matmul` (issue #2444).
+            let w_shape = ffi::array_shape(q_w);
+            let s_shape = ffi::array_shape(q_s);
+            let (effective_bits, group_size) = if mode == "affine" {
+                let inferred = infer_quantization_bits(&w_shape, &s_shape, group_size, bits)
+                    .map_err(|e| format!("{} (prefix: {})", e, q_prefix))?;
+                (inferred, group_size)
             } else {
-                bits
+                let layout = reconcile_quantization_layout_logged(
+                    &w_shape, &s_shape, group_size, bits, mode, &q_prefix,
+                )?;
+                (layout.bits, layout.group_size)
             };
             let qkv_has_biases = [&q_prefix, &k_prefix, &v_prefix]
                 .iter()
@@ -3514,8 +3576,8 @@ impl FusedQKVLinear {
                 group_size,
                 bits: effective_bits,
                 mode: mode.to_string(),
-                // Fused QKV is never a native-NVFP4 global-scale target: the
-                // ModelOpt NVFP4 Gemma 4 checkpoints leave attention dense.
+                // A plane with a global scale returned split above, so the
+                // concatenated plane never has one to carry.
                 global_scale: None,
                 // Per-projection runtime-LoRA terms live on the enclosing
                 // FusedQKVLinear (lora_q/k/v), not on the concatenated plane.
@@ -6108,8 +6170,9 @@ pub fn paged_decode_attention_pooled(
 ///     KV heads internally, so no caller-side repeat_kv is needed.
 ///   - Softcap (Gemma 2/3): still handled by `compiled_softcap_sdpa*` until
 ///     upstream MLX grows a fused softcap variant.
-///   - Sliding window (Gemma 3, Ministral): still handled by passing an
-///     explicit pre-built mask from Rust model code.
+///   - Sliding window (Gemma 3, Ministral): an explicit pre-built mask from
+///     Rust model code when it reaches this entry; the unmasked over-window
+///     prefill goes through `crate::window_sdpa` instead (#2621).
 ///
 /// # Current behaviour
 ///
@@ -6157,12 +6220,14 @@ pub fn metal4_attention(
 /// GELU MLP forward for non-quantized (FP16/BF16) UnifiedLinear layers.
 ///
 /// When all three projections are non-quantized, calls the C++ path which
-/// runs matmul operations directly and fuses only the GELU activation via
-/// compiled element-wise kernels.
+/// runs matmul operations directly and fuses only the tanh GeGLU activation
+/// (`gelu_tanh(gate) * up`, the formula Gemma checkpoints declare as
+/// `gelu_pytorch_tanh`) via compiled element-wise kernels. It computed the erf
+/// GeGLU before #2548.
 ///
 /// Returns `None` if any projection is quantized (caller should use the quantized path).
 ///
-/// Used by: Gemma, Gemma4 and other GELU-gated FP models
+/// Used by: Gemma v1, Gemma4 dense MLP and the Gemma4 assistant drafter
 pub fn compiled_gelu_mlp_fp16(
     x: &MlxArray,
     gate_proj: &UnifiedLinear,
@@ -6802,11 +6867,9 @@ mod tests {
             }
             assert!(validate_quantization_mode_runnable("optiq", backend).is_ok());
         }
-        let err = validate_quantization_mode_runnable("nvfp4", GpuBackendKind::Rocm).unwrap_err();
-        assert!(
-            err.contains("affine"),
-            "the message must name the way out: {err}"
-        );
+        // Every mode is native on every backend since ROCm gained NVFP4
+        // kernels (lablup/mlxcel#2617), so the refusal arms above have no
+        // table entry to exercise until a backend without a kernel appears.
     }
 
     /// Issue #1808: the load log names the native route for a block-float
@@ -6835,10 +6898,10 @@ mod tests {
             }
             assert_eq!(native_quantization_route_line("optiq", backend), None);
         }
-        let rocm = native_quantization_route_line("mxfp4", GpuBackendKind::Rocm)
-            .expect("mxfp4 is native on ROCm, which also converts nvfp4");
-        assert!(rocm.contains("ROCm"), "{rocm}");
+        // ROCm runs every mode natively since lablup/mlxcel#2617 (NVFP4 was
+        // converted before), so it has no route to report either.
         for backend in [
+            GpuBackendKind::Rocm,
             GpuBackendKind::Metal,
             GpuBackendKind::Cuda,
             GpuBackendKind::None,
@@ -7845,6 +7908,150 @@ mod tests {
                 ffi::array_shape(&qw.weight).as_slice(),
                 &[16, MIXED_IN * bits / 32]
             );
+        }
+    }
+
+    /// A ModelOpt NVFP4 attention layer after the direct transcode: bias-free
+    /// nvfp4 q/k/v planes, each with its own per-tensor `weight_scale_2`
+    /// repacked as a `[1]` `{plane}.global_scale` sidecar (issue #2444). Those
+    /// scalars cannot share one concatenated plane, so the layer loads split
+    /// in mode nvfp4, and each plane computes `x @ dequantize(w).T * s`.
+    #[test]
+    fn modelopt_nvfp4_qkv_with_global_scales_loads_split() {
+        use crate::hardware::{QuantMode, QuantModeSupport, quant_mode_support};
+        const GROUP: i32 = 16;
+        let mut weights = crate::weights::WeightMap::new();
+        let planes = [("q", 8, 1, 0.5f32), ("k", 4, 2, 2.0), ("v", 4, 3, 3.25)];
+        for (name, out, seed, scale) in planes {
+            let prefix = format!("l.self_attn.{name}_proj");
+            let packed =
+                ffi::quantize_weights_with_mode(&mixed_dense_plane(out, seed), GROUP, 4, "nvfp4");
+            weights.insert(
+                format!("{prefix}.weight"),
+                ffi::quantized_weights_w(&packed),
+            );
+            weights.insert(
+                format!("{prefix}.scales"),
+                ffi::quantized_weights_scales(&packed),
+            );
+            weights.insert(
+                format!("{prefix}.global_scale"),
+                ffi::from_slice_f32(&[scale], &[1]),
+            );
+        }
+
+        let loaded =
+            FusedQKVLinear::from_weights_separate(&weights, "l.self_attn", GROUP, 4, 2, 1, 4);
+        if quant_mode_support(QuantMode::Nvfp4) != QuantModeSupport::Native {
+            let err = loaded.err().expect("NVFP4 must be refused on this backend");
+            assert!(err.contains("nvfp4"), "{err}");
+            return;
+        }
+        let fused = loaded.expect("ModelOpt NVFP4 q/k/v must load");
+        let QkvProjection::Split { q, k, v } = &fused.qkv_proj else {
+            panic!("per-plane global scales cannot share one fused plane");
+        };
+        for (name, plane) in [("q", q), ("k", k), ("v", v)] {
+            let UnifiedLinear::Quantized { weight, .. } = plane else {
+                panic!("{name}_proj must stay packed");
+            };
+            assert_eq!(weight.mode, "nvfp4", "{name}_proj mode");
+            assert_eq!((weight.bits, weight.group_size), (4, GROUP));
+            assert!(weight.global_scale.is_some(), "{name}_proj lost its scale");
+        }
+
+        let input: Vec<f32> = (0..MIXED_IN)
+            .map(|i| ((i % 9) as f32 - 4.0) * 0.07)
+            .collect();
+        let x = ffi::from_slice_f32(&input, &[1, 1, MIXED_IN]);
+        let (q_out, k_out, v_out) = fused.forward(&x);
+        for ((name, out, _, scale), actual) in planes.into_iter().zip([&q_out, &k_out, &v_out]) {
+            let prefix = format!("l.self_attn.{name}_proj");
+            // SAFETY: both arrays are borrowed from live map entries.
+            let dense = unsafe {
+                ffi::dequantize(
+                    weights.get(&format!("{prefix}.weight")).unwrap(),
+                    weights.get(&format!("{prefix}.scales")).unwrap(),
+                    std::ptr::null(),
+                    GROUP,
+                    4,
+                    "nvfp4",
+                )
+            };
+            let dense = ffi::astype(&dense, crate::dtype::FLOAT32);
+            ffi::eval(&dense);
+            let dense = crate::utils::array_to_vec_f32(&dense);
+            let expected: Vec<f32> = (0..out as usize)
+                .map(|o| {
+                    let row = &dense[o * MIXED_IN as usize..(o + 1) * MIXED_IN as usize];
+                    row.iter().zip(&input).map(|(w, x)| w * x).sum::<f32>() * scale
+                })
+                .collect();
+            let actual = ffi::astype(actual, crate::dtype::FLOAT32);
+            ffi::eval(&actual);
+            let actual = crate::utils::array_to_vec_f32(&actual);
+            assert_eq!(actual.len(), expected.len(), "{name} width");
+            let peak = expected.iter().fold(0f32, |m, v| m.max(v.abs()));
+            for (got, want) in actual.iter().zip(&expected) {
+                assert!(
+                    (got - want).abs() <= 1e-3 * peak.max(1.0),
+                    "{name}: got {got}, want {want} (scale {scale})"
+                );
+            }
+        }
+    }
+
+    /// Bias-free mxfp4 q/k/v without a global scale still fuse, but the fused
+    /// plane takes the group size the packing has (32) rather than the
+    /// declared 64, which `quantized_matmul` would abort on (issue #2444). The
+    /// fused forward equals the three planes loaded on their own.
+    #[test]
+    fn block_float_qkv_fuses_at_the_shape_derived_group_size() {
+        use crate::hardware::{QuantMode, QuantModeSupport, quant_mode_support};
+        let mut weights = crate::weights::WeightMap::new();
+        for (name, out, seed) in [("q", 8, 1), ("k", 4, 2), ("v", 4, 3)] {
+            let prefix = format!("l.self_attn.{name}_proj");
+            let packed =
+                ffi::quantize_weights_with_mode(&mixed_dense_plane(out, seed), 32, 4, "mxfp4");
+            weights.insert(
+                format!("{prefix}.weight"),
+                ffi::quantized_weights_w(&packed),
+            );
+            weights.insert(
+                format!("{prefix}.scales"),
+                ffi::quantized_weights_scales(&packed),
+            );
+        }
+        let loaded =
+            FusedQKVLinear::from_weights_separate(&weights, "l.self_attn", MIXED_GROUP, 4, 2, 1, 4);
+        if quant_mode_support(QuantMode::Mxfp4) != QuantModeSupport::Native {
+            let err = loaded.err().expect("mxfp4 must be refused on this backend");
+            assert!(err.contains("mxfp4"), "{err}");
+            return;
+        }
+        let fused = loaded.expect("bias-free mxfp4 q/k/v must load");
+        let qw = fused
+            .qkv_proj
+            .fused()
+            .and_then(UnifiedLinear::as_quantized_weight)
+            .expect("uniform mxfp4 planes stay fused and packed");
+        assert_eq!(qw.mode, "mxfp4");
+        assert_eq!((qw.bits, qw.group_size), (4, 32));
+
+        let x = probe_input(7, 0.03);
+        let (q_out, k_out, v_out) = fused.forward(&x);
+        for (name, actual) in [("q", &q_out), ("k", &k_out), ("v", &v_out)] {
+            let reference = UnifiedLinear::from_weights(
+                &weights,
+                &format!("l.self_attn.{name}_proj"),
+                MIXED_GROUP,
+                4,
+            )
+            .expect("plane loads standalone")
+            .forward(&x);
+            ffi::eval(&reference);
+            ffi::eval(actual);
+            assert_eq!(plane_max_abs_diff(&reference, actual), 0.0, "{name}");
         }
     }
 

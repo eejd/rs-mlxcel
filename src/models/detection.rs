@@ -712,6 +712,7 @@ pub fn model_type_has_native_video(model_type: ModelType) -> bool {
             | ModelType::Qwen3VLMoe
             | ModelType::Qwen35VLM
             | ModelType::Qwen35MoeVLM
+            | ModelType::Qwen4ExpVLM
     )
 }
 
@@ -822,6 +823,15 @@ pub(crate) fn detect_model_type_with_probes<P: ModelDetectionProbes + ?Sized>(
         return Ok(embedding);
     }
 
+    // A Diffusers-style image-generation checkpoint has component directories
+    // instead of a top-level `model_type`; say where it belongs rather than
+    // report a missing key.
+    if v["model_type"].is_null()
+        && let Some(redirect) = crate::imagegen::image_checkpoint_redirect_error(model_path)
+    {
+        return Err(redirect);
+    }
+
     let model_type_raw = v["model_type"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("model_type not found"))?;
@@ -829,6 +839,12 @@ pub(crate) fn detect_model_type_with_probes<P: ModelDetectionProbes + ?Sized>(
     // upstream casing (e.g. `NemotronH_Nano_Omni_Reasoning_V3`) match the
     // same arm as their canonical lowercase form.
     let model_type = model_type_raw.to_ascii_lowercase();
+
+    if crate::vision::dense::registry::is_dense_model_type(&model_type) {
+        return Err(anyhow::anyhow!(
+            "dense prediction checkpoint ({model_type_raw}): use `mlxcel predict`"
+        ));
+    }
 
     if matches!(model_type.as_str(), "inkling_mm_model" | "inkling")
         && probes.inkling_dir_is_mtp_only(model_path, v)?
@@ -887,6 +903,9 @@ pub(crate) fn detect_model_type_with_probes<P: ModelDetectionProbes + ?Sized>(
             ModelType::Qwen35Moe,
             ModelType::Qwen35MoeVLM,
         ),
+        // Qwen3.8-Flash-Next. Only the vision-language model exists; a prompt
+        // without images runs through the same wrapper.
+        "qwen4_exp" => Ok(ModelType::Qwen4ExpVLM),
         // mlx-vlm's text-only Qwen 3.5 exports (`mlx_vlm/models/qwen3_5_text`):
         // always the text model, so no VLM weight probe (#2384).
         "qwen3_5_text" => Ok(ModelType::Qwen35),
@@ -991,6 +1010,10 @@ pub(crate) fn detect_model_type_with_probes<P: ModelDetectionProbes + ?Sized>(
         "hunyuan_vl" => Ok(ModelType::HunyuanVLM),
         "hunyuan" => Ok(detect_hunyuan_model_type(v)),
         "mimo" => Ok(ModelType::MiMo),
+        // MiMo v2 Flash is a different family from MiMo v1: hybrid
+        // sliding/full attention, a sparse MoE decoder, and its own
+        // `mimo_v2_flash` model type.
+        "mimo_v2_flash" => Ok(ModelType::MiMoV2Flash),
         "bailing_moe" => Ok(ModelType::BailingMoe),
         "bailing_moe_linear" => Ok(ModelType::BailingMoeLinear),
         "afmoe" => Ok(ModelType::Afmoe),
@@ -1161,6 +1184,19 @@ pub(crate) fn detect_model_type_with_probes<P: ModelDetectionProbes + ?Sized>(
         "nemotron_parse" => Ok(ModelType::NemotronParseVLM),
         // Speech-to-text (encoder-decoder ASR).
         "whisper" => Ok(ModelType::Whisper),
+        // A token classifier, not a generator: `mlxcel tag` loads it through
+        // `token_classification::loader`. Not in `ENCODER_ONLY_MODEL_TYPES`,
+        // which would make embedding detection claim it with no family.
+        "openai_privacy_filter" => Err(anyhow::anyhow!(
+            "openai_privacy_filter is a token classifier; use `mlxcel tag` (checkpoint {})",
+            model_path.display()
+        )),
+        // A span extractor, not a generator: `mlxcel extract` loads it through
+        // `token_classification::loader`.
+        "gliner2" | "gliner2_5" => Err(anyhow::anyhow!(
+            "GLiNER2.5 is a span extractor; use `mlxcel extract` (checkpoint {})",
+            model_path.display()
+        )),
         _ => Err(anyhow::anyhow!(
             "Unsupported model type: {}",
             model_type_raw
@@ -1171,6 +1207,13 @@ pub(crate) fn detect_model_type_with_probes<P: ModelDetectionProbes + ?Sized>(
 /// Detect model type from config.json
 pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
     let config_path = model_path.join("config.json");
+    // Component checkpoints ship `model_index.json` and no top-level
+    // `config.json`, so the read below would fail with a bare "No such file".
+    if !config_path.exists()
+        && let Some(redirect) = crate::imagegen::image_checkpoint_redirect_error(model_path)
+    {
+        return Err(redirect);
+    }
     let config_str = std::fs::read_to_string(config_path)?;
     let config_str = sanitize_config_json(&config_str);
     let v: serde_json::Value = serde_json::from_str(&config_str)?;

@@ -193,6 +193,10 @@ impl LlmJpVlModel {
 // EOS ids come from the checkpoint rather than the backbone default, which
 // would be Llama-3's or Qwen3's and is wrong for both of these vocabularies.
 impl LanguageModel for LlmJpVlModel {
+    fn batched_decode_kind(&self) -> mlxcel_core::generate::BatchedDecodeKind {
+        self.text_model.batched_decode_kind()
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
@@ -284,6 +288,10 @@ impl LanguageModel for LlmJpVlModel {
 
     fn kv_cache_layer_modes(&self) -> Option<Vec<KVCacheMode>> {
         LanguageModel::kv_cache_layer_modes(&self.text_model)
+    }
+
+    fn kv_cache_storage_modes(&self) -> Option<Vec<Option<KVCacheMode>>> {
+        LanguageModel::kv_cache_storage_modes(&self.text_model)
     }
 
     fn num_layers(&self) -> usize {

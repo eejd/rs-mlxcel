@@ -1,0 +1,110 @@
+{
+  "schema_version": 2,
+  "runtime_acceptance": "Canonical unchanged Pipeline.generate reference; Rust acceptance is recorded separately",
+  "execution_api": "Pinned unchanged Pipeline.generate; only complete event is evaluated by upstream",
+  "historical_custom_stream_manifest": "historical-stream-full-reference-manifest.json",
+  "cases": {
+    "default": {
+      "receipt_file": "reference-default.json",
+      "receipt_sha256": "4160f230bd6ccb6c5764ff3f44a3cd09cc188630c756c668260a8a515fd285d8",
+      "resources_file": "reference-default-resources.json",
+      "resources_sha256": "9cd91815bc677c97f750ac813fb17423c5641e4e6bf23cddebf10ed985c7345b",
+      "child_exit": 0,
+      "wrapper_exit": 0,
+      "guard_exit": 0,
+      "files": {
+        "reference.safetensors": {
+          "sha256": "7c327b4352842d187db7178fbcc70522251dfc1be64fc735fe532966386c14ed",
+          "bytes": 22951992
+        },
+        "mesh.obj": {
+          "sha256": "ca53b4b2396e84d47fa01922cd5c61aab9c53831c7959f0754bb2b0e28566b27",
+          "bytes": 21310803
+        },
+        "gaussian.ply": {
+          "sha256": "05a8ffeee241be3a55a26729363dbbce2bb55706c7dc2003e2c51b758dbc0eda",
+          "bytes": 13724448
+        }
+      },
+      "options": {
+        "seed": 42,
+        "ss_steps": 25,
+        "slat_steps": 25,
+        "formats": [
+          "gaussian",
+          "mesh"
+        ],
+        "estimate_depth": true
+      },
+      "pointmap_conditioned": true,
+      "status_files": {
+        "child": {
+          "file": "reference-default-child.exit",
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "exit": 0
+        },
+        "wrapper": {
+          "file": "reference-default-wrapper.exit",
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "exit": 0
+        },
+        "guard": {
+          "file": "reference-default-guard.exit",
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "exit": 0
+        }
+      }
+    },
+    "rgba-dropout": {
+      "receipt_file": "reference-rgba-dropout.json",
+      "receipt_sha256": "1f08fdffb6d1425ae779bfffdba3c546de39aa74e35a004d6ed3d1cb2bca0dc6",
+      "resources_file": "reference-rgba-dropout-resources.json",
+      "resources_sha256": "d578703df798320fdd189e96908f2d82ee0db1276ac52334e171dd34e2087d83",
+      "child_exit": 0,
+      "wrapper_exit": 0,
+      "guard_exit": 0,
+      "files": {
+        "reference.safetensors": {
+          "sha256": "8d8cc32b5a5d0f223d6bce474e7f90ff4eff11cf6c28c58eeaacd230393eecaf",
+          "bytes": 21952184
+        },
+        "mesh.obj": {
+          "sha256": "f43edae5ec1273cbd331d91090f715c5180f20e9d43b08088390b0bdc45d0339",
+          "bytes": 21207383
+        },
+        "gaussian.ply": {
+          "sha256": "44ba1140ba20f29d3e3e45c6d9d15d8bd1d17f8f5f8bc3b079b5232ca0f4977e",
+          "bytes": 12605984
+        }
+      },
+      "options": {
+        "seed": 42,
+        "ss_steps": 25,
+        "slat_steps": 25,
+        "formats": [
+          "gaussian",
+          "mesh"
+        ],
+        "estimate_depth": false
+      },
+      "pointmap_conditioned": false,
+      "status_files": {
+        "child": {
+          "file": "reference-rgba-dropout-child.exit",
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "exit": 0
+        },
+        "wrapper": {
+          "file": "reference-rgba-dropout-wrapper.exit",
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "exit": 0
+        },
+        "guard": {
+          "file": "reference-rgba-dropout-guard.exit",
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "exit": 0
+        }
+      }
+    }
+  }
+}

@@ -29,6 +29,8 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 
+use crate::vision::weights::load_dense_param;
+
 fn default_layers() -> usize {
     27
 }
@@ -137,7 +139,10 @@ impl Block {
         let y = self.attn.forward(&self.norm1.forward(x));
         let x = mlxcel_core::add(x, &y);
         let y = self.fc1.forward(&self.norm2.forward(&x));
-        let y = mlxcel_core::gelu_approx(&y); // GELU tanh approximation
+        // Tanh GELU: DeepSeek-VL2's SigLIP ViT builds its MLP with
+        // `nn.GELU(approximate="tanh")` (`siglip_vit.py`), and mlx-vlm uses
+        // `approx="precise"`; f32, one compiled kernel (erf before #2548).
+        let y = mlxcel_core::utils::GeluActivation::TanhF32Compiled.apply(&y);
         let y = self.fc2.forward(&y);
         mlxcel_core::add(&x, &y)
     }
@@ -181,7 +186,17 @@ impl DeepSeekVl2VisionEncoder {
         let patch_b = get(weights, &format!("{prefix}.patch_embed.proj.bias"))?;
         let dtype = mlxcel_core::array_dtype(&patch_w);
         let patch_embed = Linear::new(patch_w, Some(patch_b));
-        let pos_embed = get(weights, &format!("{prefix}.pos_embed"))?;
+        let grid = config.image_size / config.patch_size;
+        let pos_key = format!("{prefix}.pos_embed");
+        if !weights.contains_key(&pos_key) {
+            return Err(format!("DeepSeek-VL2 vision weight missing: {pos_key}"));
+        }
+        let pos_embed = load_dense_param(
+            weights,
+            &pos_key,
+            &[1, grid * grid, config.width],
+            Some((gs, bits)),
+        )?;
 
         let mut blocks = Vec::with_capacity(config.layers);
         for i in 0..config.layers {

@@ -42,7 +42,7 @@
 
 use crate::models::dynamic_ntk_rope::DynamicNtkRope;
 use crate::models::rope_utils::RopeScalingSpec;
-use mlxcel_core::generate::LanguageModel;
+use mlxcel_core::generate::{BatchedDecodeKind, LanguageModel, route_batched_decode};
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
@@ -51,6 +51,7 @@ use std::path::Path;
 
 // Configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(remote = "Self")]
 pub struct ModelArgs {
     pub model_type: String,
     pub hidden_size: usize,
@@ -88,6 +89,8 @@ pub struct ModelArgs {
     #[serde(default)]
     pub quantization: Option<Quantization>,
 }
+
+mlxcel_core::impl_rope_lifting_deserialize!(ModelArgs);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Quantization {
@@ -257,6 +260,29 @@ impl Attention {
     }
 }
 
+impl mlxcel_core::batched_decode::SplitAttention for Attention {
+    fn split_shape(&self) -> mlxcel_core::batched_decode::SplitAttentionShape {
+        mlxcel_core::batched_decode::SplitAttentionShape {
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            scale: self.scale,
+        }
+    }
+
+    fn rope_batched(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        offsets: &[i32],
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        (
+            self.rope.apply_batched(q, offsets),
+            self.rope.apply_batched(k, offsets),
+        )
+    }
+}
+
 // MLP (SwiGLU).
 pub struct MLP {
     pub w1: UnifiedLinear, // gate_proj
@@ -314,6 +340,79 @@ impl TransformerBlock {
         mlxcel_core::add(&h, &ff_out)
     }
 
+    pub fn forward_batched(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut KVCache],
+        layer_idx: usize,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let normed = self.attention_norm.forward(x);
+        let qkv = self.attention.wqkv.forward(&normed);
+        let shape = mlxcel_core::array_shape(&qkv);
+        let batch = shape[0];
+        let seq_len = shape[1];
+        let groups = self.attention.num_heads / self.attention.num_kv_heads;
+        let qkv = mlxcel_core::reshape(
+            &qkv,
+            &[
+                batch,
+                seq_len,
+                self.attention.num_kv_heads,
+                2 + groups,
+                self.attention.head_dim,
+            ],
+        );
+        let q = mlxcel_core::utils::slice_axis(&qkv, 3, 0, groups);
+        let q = mlxcel_core::reshape(
+            &q,
+            &[
+                batch,
+                seq_len,
+                self.attention.num_heads * self.attention.head_dim,
+            ],
+        );
+        let k = mlxcel_core::utils::slice_axis(&qkv, 3, groups, groups + 1);
+        let k = mlxcel_core::reshape(
+            &k,
+            &[
+                batch,
+                seq_len,
+                self.attention.num_kv_heads * self.attention.head_dim,
+            ],
+        );
+        let v = mlxcel_core::utils::slice_axis(&qkv, 3, groups + 1, groups + 2);
+        let v = mlxcel_core::reshape(
+            &v,
+            &[
+                batch,
+                seq_len,
+                self.attention.num_kv_heads * self.attention.head_dim,
+            ],
+        );
+        let metadata = crate::models::batched_decode_cache::uniform_layer_metadata(
+            caches,
+            seq_len,
+            0,
+            "internlm2",
+            layer_idx,
+        );
+        let attn = mlxcel_core::batched_decode::forward_split_attention(
+            &self.attention,
+            &q,
+            &k,
+            &v,
+            caches,
+            &metadata,
+            mask,
+        );
+        let attn = self.attention.wo.forward(&attn);
+        let h = mlxcel_core::add(x, &attn);
+        let normed = self.ffn_norm.forward(&h);
+        let ff = self.feed_forward.forward(&normed);
+        mlxcel_core::add(&h, &ff)
+    }
+
     pub fn from_weights(
         weights: &WeightMap,
         args: &ModelArgs,
@@ -368,6 +467,29 @@ impl InternLM2Model {
         let h = self.norm.forward(&h);
 
         // LM head
+        if let Some(ref output) = self.output {
+            output.forward(&h)
+        } else {
+            self.tok_embeddings.as_linear(&h)
+        }
+    }
+
+    pub fn forward_batched_impl(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let mut h = self.tok_embeddings.forward(input_ids);
+        for layer_idx in 0..self.layers.len() {
+            let mut layer_caches = crate::models::batched_decode_cache::collect_layer_caches(
+                batch_caches,
+                "InternLM2",
+                layer_idx,
+            );
+            h = self.layers[layer_idx].forward_batched(&h, &mut layer_caches, layer_idx, mask);
+        }
+        let h = self.norm.forward(&h);
         if let Some(ref output) = self.output {
             output.forward(&h)
         } else {
@@ -446,6 +568,10 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
 
 // LanguageModel trait implementation.
 impl LanguageModel for InternLM2Model {
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
@@ -465,6 +591,17 @@ impl LanguageModel for InternLM2Model {
 
     fn eos_token_ids(&self) -> Vec<i32> {
         vec![2] // Default EOS token
+    }
+
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        route_batched_decode(self, input_ids, batch_caches, |caches| {
+            self.forward_batched_impl(input_ids, caches, mask)
+        })
     }
 }
 

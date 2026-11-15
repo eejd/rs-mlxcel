@@ -24,6 +24,8 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 
+use crate::vision::weights::load_dense_param;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Moondream3VisionConfig {
     #[serde(default = "default_enc_dim")]
@@ -206,7 +208,10 @@ impl Moondream3VisionMlp {
 
     fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         let hidden = self.fc1.forward(x);
-        let hidden = mlxcel_core::gelu_approx(&hidden);
+        // Tanh GELU (mlx-vlm `TanhGELUMLP`, remote code `gelu_approx` =
+        // `F.gelu(approximate="tanh")`); f32, one compiled kernel (erf before
+        // #2548).
+        let hidden = mlxcel_core::utils::GeluActivation::TanhF32Compiled.apply(&hidden);
         self.fc2.forward(&hidden)
     }
 }
@@ -254,6 +259,47 @@ pub struct Moondream3VisionModel {
     config: Moondream3VisionConfig,
 }
 
+fn load_position_embedding(
+    weights: &WeightMap,
+    config: &Moondream3VisionConfig,
+    group_size: i32,
+    bits: i32,
+) -> Result<UniquePtr<MlxArray>, String> {
+    const KEY: &str = "vision.pos_emb";
+    if config.enc_patch_size == 0 || !config.crop_size.is_multiple_of(config.enc_patch_size) {
+        return Err(format!(
+            "{KEY} crop size {} must be divisible by non-zero patch size {}",
+            config.crop_size, config.enc_patch_size
+        ));
+    }
+    let grid = config.crop_size / config.enc_patch_size;
+    let rows = grid
+        .checked_mul(grid)
+        .and_then(|rows| i32::try_from(rows).ok())
+        .ok_or_else(|| format!("{KEY} position count for grid {grid}x{grid} exceeds i32"))?;
+    let dim = i32::try_from(config.enc_dim)
+        .map_err(|_| format!("{KEY} hidden size {} exceeds i32", config.enc_dim))?;
+    let stored = weights
+        .get(KEY)
+        .ok_or_else(|| format!("Missing weight: {KEY}"))?;
+    let stored_shape = mlxcel_core::array_shape(stored);
+    let expected_shape = match stored_shape.as_slice() {
+        [stored_rows, _] if *stored_rows == rows => vec![rows, dim],
+        [1, stored_rows, _] if *stored_rows == rows => vec![1, rows, dim],
+        _ => {
+            return Err(format!(
+                "{KEY} shape mismatch: expected [{rows}, {dim}] or [1, {rows}, {dim}], got {stored_shape:?}"
+            ));
+        }
+    };
+    let position = load_dense_param(weights, KEY, &expected_shape, Some((group_size, bits)))?;
+    if expected_shape.len() == 2 {
+        Ok(mlxcel_core::expand_dims(&position, 0))
+    } else {
+        Ok(position)
+    }
+}
+
 impl Moondream3VisionModel {
     pub fn from_weights(
         weights: &WeightMap,
@@ -271,7 +317,7 @@ impl Moondream3VisionModel {
         let (group_size, bits) = (config.quant_group_size, config.quant_bits);
         Ok(Self {
             patch_emb: UnifiedLinear::from_weights(weights, "vision.patch_emb", group_size, bits)?,
-            pos_emb: get_weight_copy(weights, "vision.pos_emb")?,
+            pos_emb: load_position_embedding(weights, config, group_size, bits)?,
             blocks,
             post_ln: load_layer_norm(weights, "vision.post_ln", 1e-5)?,
             proj_fc1: UnifiedLinear::from_weights(
@@ -357,7 +403,8 @@ impl Moondream3VisionModel {
         let merged = mlxcel_core::reshape(&merged, &[1, enc_n * enc_n, dim * 2]);
 
         let projected = self.proj_fc1.forward(&merged);
-        let projected = mlxcel_core::gelu_approx(&projected);
+        // Projection MLP: the same tanh GELU (#2548; erf before).
+        let projected = mlxcel_core::utils::GeluActivation::TanhF32Compiled.apply(&projected);
         self.proj_fc2.forward(&projected)
     }
 
@@ -491,3 +538,7 @@ fn load_layer_norm(weights: &WeightMap, prefix: &str, eps: f32) -> Result<LayerN
         .map(|value| mlxcel_core::copy(value));
     Ok(LayerNorm::new(weight, bias, eps))
 }
+
+#[cfg(test)]
+#[path = "moondream3_tests.rs"]
+mod tests;

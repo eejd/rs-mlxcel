@@ -16,7 +16,9 @@
 //
 // It does NOTHING for default / `xla-backend` builds, so Apple-Silicon, CUDA, and
 // CI builds are unaffected. Under the `rocm` feature it adds the ROCm library
-// directory as an rpath (see `main`). Only under the `xla-iree` feature (real
+// directory as an rpath (Linux) or the ROCm delay-load link arguments (Windows
+// MSVC), and under `cuda` on Windows MSVC it adds the CUDA delay-load link
+// arguments (see `main`). Only under the `xla-iree` feature (real
 // OpenXLA execution, issue #449 Phase 3) does it emit the IREE *runtime* link
 // recipe.
 //
@@ -34,11 +36,55 @@ use std::path::PathBuf;
 #[path = "src/lib/mlxcel-core/build_support/rocm_rpath.rs"]
 mod rocm_rpath;
 
+// Only the delay-load half is used here; mlxcel-core's build script uses the
+// CMake and import-library fields as well.
+#[allow(dead_code)]
+#[path = "src/lib/mlxcel-core/build_support/windows_cuda.rs"]
+mod windows_cuda;
+
+// The ROCm counterpart (#2602); likewise only its delay-load half is used,
+// so its re-export of `cmake_path` is unused here too.
+#[allow(dead_code, unused_imports)]
+#[path = "src/lib/mlxcel-core/build_support/windows_rocm.rs"]
+mod windows_rocm;
+
 fn main() {
     // ROCm (`rocm` feature, #1802): mlxcel-core links the ROCm shared libraries,
     // but its rpath link arg does not reach this crate's binaries for the reason
     // given above, so this crate emits its own.
     rocm_rpath::emit();
+
+    // CUDA on Windows MSVC (#58): mlxcel-core links the CUDA import libraries
+    // and compiles MLX's delay-load hook, but `/DELAYLOAD` is a link arg and
+    // does not reach this crate's binaries for the same reason, so this crate
+    // emits its own. A no-op off Windows.
+    if env::var_os("CARGO_FEATURE_CUDA").is_some()
+        && let Some(layout) = windows_cuda::layout_from_env()
+    {
+        windows_cuda::emit_delayload_link_args(&layout);
+    }
+
+    // ROCm on Windows MSVC (#2602): the same reasoning for the ROCm DLLs,
+    // which the overlay's delay-load hook resolves from the SDK bin directory
+    // recorded at build time. A no-op off Windows, so Linux keeps its rpath.
+    if env::var_os("CARGO_FEATURE_ROCM").is_some()
+        && let Some(layout) = windows_rocm::layout_from_env()
+    {
+        windows_rocm::emit_delayload_link_args(&layout);
+    }
+
+    // The loader resolves a binary's static imports (openblas.dll, MSVCP140.dll,
+    // VCRUNTIME140.dll) before any code runs, so SetDllDirectoryW in the overlays'
+    // delayload.cpp comes too late for them, and the default search reaches the
+    // current directory. 0xA00 is LOAD_LIBRARY_SEARCH_APPLICATION_DIR |
+    // LOAD_LIBRARY_SEARCH_SYSTEM32 (#2641). OpenBLAS is copied beside every
+    // binary (`link_windows_openblas` in mlxcel-core's build script). A link arg
+    // does not cross crates, so mlxcel-core and this crate each emit it.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        println!("cargo:rustc-link-arg=/DEPENDENTLOADFLAG:0xA00");
+    }
 
     println!("cargo:rerun-if-env-changed=IREE_DIST");
     println!("cargo:rerun-if-env-changed=IREE_CUDA_HOME");

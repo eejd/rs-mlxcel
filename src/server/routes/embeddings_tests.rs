@@ -100,6 +100,10 @@ impl EmbeddingModelProvider for NonFiniteEmbeddingProvider {
     fn max_length(&self) -> usize {
         32
     }
+
+    fn shutdown_and_wait(&self, _timeout: std::time::Duration) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 fn stub_provider(multi_vector: bool, batch_size: usize) -> Arc<dyn EmbeddingModelProvider> {
@@ -591,3 +595,6 @@ async fn the_native_route_honors_embd_normalize_too() {
     let l1: f32 = values.iter().map(|v| v.abs()).sum();
     assert!((l1 - 1.0).abs() < 1e-4, "L1 norm is {l1}: {body}");
 }
+
+#[path = "embeddings_media_url_tests.rs"]
+mod media_url;

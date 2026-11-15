@@ -25,19 +25,18 @@
 //! - `LayerNorm` with bias (`layer_norm_epsilon`), not RMSNorm.
 //! - One fused `c_attn` projection that is split three ways on the last axis
 //!   into Q, K and V. Multi-head attention: `n_kv_heads == n_head`.
-//! - Simple MLP `c_proj(gelu_approx(c_fc(x)))` with an intermediate width of
-//!   `4 * n_embd`. `mlxcel_core::utils::gelu_approx` is the erf-based exact
-//!   GELU in this tree despite its name (see its own doc comment), not the
-//!   tanh approximation that upstream's `nn.gelu_approx` evaluates for the
-//!   checkpoint's `gelu_new` activation; the erf/tanh difference is under
-//!   1e-3 and produces identical generated tokens.
+//! - Simple MLP `c_proj(gelu(c_fc(x)))` with an intermediate width of
+//!   `4 * n_embd`. The GELU is the tanh form the checkpoint's
+//!   `activation_function = gelu_new` and upstream's `nn.gelu_approx` compute,
+//!   evaluated in f32 as one compiled kernel (it was erf before #2548).
 //! - Tied output head: logits come from `wte.as_linear`, there is no separate
 //!   `lm_head` tensor in the checkpoint.
 //!
 //! Two checkpoint-layout traps are handled at load time, see [`Gpt2Layout`]
 //! and [`strip_causal_mask_buffers`].
 
-use mlxcel_core::generate::LanguageModel;
+use mlxcel_core::batched_decode::{SplitAttention, SplitAttentionShape, forward_split_attention};
+use mlxcel_core::generate::{BatchedDecodeKind, LanguageModel, route_batched_decode};
 use mlxcel_core::layers::{KVCache, LayerNorm, Linear, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
@@ -566,7 +565,26 @@ impl Attention {
     }
 }
 
-// MLP (erf-based exact GELU via `gelu_approx`, no gate/up pattern).
+impl SplitAttention for Attention {
+    fn split_shape(&self) -> SplitAttentionShape {
+        SplitAttentionShape {
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_heads,
+            head_dim: self.head_dim,
+            scale: self.scale,
+        }
+    }
+    fn rope_batched(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        _offsets: &[i32],
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        (mlxcel_core::copy(q), mlxcel_core::copy(k))
+    }
+}
+
+// MLP (tanh GELU for `gelu_new`, no gate/up pattern).
 
 pub struct MLP {
     pub c_fc: UnifiedLinear,
@@ -576,7 +594,7 @@ pub struct MLP {
 impl MLP {
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         let h = self.c_fc.forward(x);
-        let h = mlxcel_core::utils::gelu_approx(&h);
+        let h = mlxcel_core::utils::GeluActivation::TanhF32Compiled.apply(&h);
         self.c_proj.forward(&h)
     }
 
@@ -635,6 +653,28 @@ impl TransformerBlock {
         let normed = self.ln_2.forward(&h);
         let mlp_out = self.mlp.forward(&normed);
         mlxcel_core::add(&h, &mlp_out)
+    }
+
+    pub fn forward_batched(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut KVCache],
+        layer_idx: usize,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let normed = self.ln_1.forward(x);
+        let qkv = self.attn.c_attn.forward(&normed);
+        let d = self.attn.num_heads * self.attn.head_dim;
+        let q = mlxcel_core::slice_last_dim(&qkv, 0, d);
+        let k = mlxcel_core::slice_last_dim(&qkv, d, 2 * d);
+        let v = mlxcel_core::slice_last_dim(&qkv, 2 * d, 3 * d);
+        let seq_len = mlxcel_core::array_shape(&q)[1];
+        let metadata = crate::models::batched_decode_cache::uniform_layer_metadata(
+            caches, seq_len, 0, "GPT-2", layer_idx,
+        );
+        let attn = forward_split_attention(&self.attn, &q, &k, &v, caches, &metadata, mask);
+        let h = mlxcel_core::add(x, &self.attn.c_proj.forward(&attn));
+        mlxcel_core::add(&h, &self.mlp.forward(&self.ln_2.forward(&h)))
     }
 
     pub fn from_weights(
@@ -739,6 +779,36 @@ impl Gpt2Model {
 
         // Tied output head.
         self.wte.as_linear(&h)
+    }
+
+    pub fn forward_batched_impl(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(input_ids);
+        let batch = shape[0] as usize;
+        let seq_len = *shape.last().unwrap_or(&0);
+        let mut positions = Vec::with_capacity(batch * seq_len as usize);
+        for caches in batch_caches.iter() {
+            let offset = caches.first().map(|cache| cache.offset).unwrap_or(0);
+            positions.extend(position_ids(offset, seq_len, self.n_positions));
+        }
+        let position_index = mlxcel_core::from_slice_i32(&positions, &[batch as i32, seq_len]);
+        let mut h = mlxcel_core::add(
+            &self.wte.forward(input_ids),
+            &self.wpe.forward(&position_index),
+        );
+        for layer_idx in 0..self.h.len() {
+            let mut caches = crate::models::batched_decode_cache::collect_layer_caches(
+                batch_caches,
+                "GPT-2",
+                layer_idx,
+            );
+            h = self.h[layer_idx].forward_batched(&h, &mut caches, layer_idx, mask);
+        }
+        self.wte.as_linear(&self.ln_f.forward(&h))
     }
 
     pub fn make_caches(&self) -> Vec<KVCache> {
@@ -970,6 +1040,20 @@ impl LanguageModel for Gpt2Model {
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         Gpt2Model::forward(self, input_ids, caches, mask)
+    }
+
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
+    }
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        route_batched_decode(self, input_ids, batch_caches, |caches| {
+            self.forward_batched_impl(input_ids, caches, mask)
+        })
     }
 
     fn make_caches(&self) -> Vec<KVCache> {

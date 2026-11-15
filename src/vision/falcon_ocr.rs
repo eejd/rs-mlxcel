@@ -96,6 +96,12 @@ impl FalconOcrVlModel {
     pub fn bind_state_to_sequence(&self, seq_id: SequenceId) {
         self.text_model.state.bind_to_sequence(seq_id);
     }
+
+    /// Drop the pending prefill state without binding it (admission abort,
+    /// issue #2625).
+    pub fn clear_pending_state(&self) {
+        self.text_model.state.clear_fallback();
+    }
 }
 
 /// Tokens that must never be sampled during decode.
@@ -189,6 +195,7 @@ impl LanguageModel for FalconOcrVlModel {
     }
 
     fn supports_batching(&self) -> bool {
+        // The OCR text tower keeps a single prompt mask and temporal-position vector.
         false
     }
 

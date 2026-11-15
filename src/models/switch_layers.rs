@@ -80,6 +80,16 @@ use mlxcel_core::{MlxArray, UniquePtr, dtype};
 /// in-situ probe (fused rerun determinism + gather_qmm reference + f32 ground
 /// truth) for future corruption triage.
 ///
+/// On CUDA the kernel pair is an `mx.fast.cuda_kernel`, NVRTC-compiled at its
+/// first launch, which is the first decode step. Upstream MLX never wrote
+/// custom kernels to the disk cache, so every process paid that compile (about
+/// 1.2 s on GB10) inside its decode time, and granite-4.0-h read 20% slower at
+/// `mlxcel generate -n 256` with the kernel than without it although the
+/// kernel is faster per token. The `jit_module.cpp` overlay caches custom
+/// kernels since issue #2492; see
+/// `docs/benchmark_results/fused-moe-jit-cache-gb10-2026-10-22.md` before
+/// reading a short-run CUDA A/B of this gate as a per-token result.
+///
 /// This only chooses whether to *attempt* the kernel. Callers still fall back to
 /// `gather_qmm` automatically for any config the kernel does not support
 /// (non-affine, unsupported bit widths, mismatched gate/up bits, prefill).
@@ -104,6 +114,24 @@ pub fn fused_moe_enabled() -> bool {
         // backend without the ports it selects the same SwitchGLU path
         // `MLXCEL_FUSED_MOE=0` selects.
         && mlxcel_core::fused_moe_kernels_available()
+}
+
+/// Whether [`SwitchGLU::forward`] tries the gate/up kernel for this batch.
+///
+/// Batched decode on M1 Ultra loses about 10% to it against `gather_qmm`:
+/// Qwen3-30B-A3B 4-bit is 94.2 vs 104.1 tok/s at B=2 and 115.3 vs 124.5 at B=4,
+/// and Mixtral 8x7B 4-bit is 34.3 vs 41.1 at B=4 (#2587). The M3 Ultra numbers
+/// in `docs/benchmark_results/switch-gate-up-batch-m3ultra-2026-10-21.md` keep
+/// it on where it was measured. M2 shares M1's narrow quantized paths and is
+/// declined with it, as is an unenumerated generation, on the rule
+/// [`AppleSiliconGen::wide_quantized_projections`] documents.
+///
+/// [`AppleSiliconGen::wide_quantized_projections`]: mlxcel_core::hardware::AppleSiliconGen::wide_quantized_projections
+pub(crate) fn switch_gate_up_preferred_in_forward(
+    tokens: i32,
+    silicon_gen: mlxcel_core::hardware::AppleSiliconGen,
+) -> bool {
+    tokens == 1 || silicon_gen.wide_quantized_projections()
 }
 
 /// Pure decision behind [`fused_moe_enabled`], split out so it can be unit-tested
@@ -149,10 +177,22 @@ const FUSED_MOE_MAX_DFF_METAL: i32 = 4096;
 /// `docs/benchmark_results/fused-moe-decode-kernel-design.md`.
 const FUSED_MOE_MAX_DFF_CUDA: i32 = 8192;
 
+/// ROCm default for the same bound. On gfx1151, Mixtral-8x7B (Dff 14336) decodes
+/// at 24.9 tok/s through the fused kernels and 8.2 through `gather_qmm`. No wider
+/// expert has been measured, so the bound stops at that shape.
+const FUSED_MOE_MAX_DFF_ROCM: i32 = 14336;
+
+/// The default bound of a non-Metal build, whose fused kernels are its GPU port.
+const FUSED_MOE_MAX_DFF_GPU_PORT: i32 = if cfg!(feature = "rocm") {
+    FUSED_MOE_MAX_DFF_ROCM
+} else {
+    FUSED_MOE_MAX_DFF_CUDA
+};
+
 /// Resolve the fused-MoE Dff upper bound. An explicit positive
 /// `MLXCEL_FUSED_MOE_MAX_DFF` wins on both backends; otherwise the default is
 /// backend-specific (Metal keeps the conservative 4096, CUDA uses the higher
-/// measured crossover). Split out as a pure function so the backend-aware
+/// measured crossover, ROCm its own measured width). Split out as a pure function so the backend-aware
 /// default is unit-testable without mutating process-global env or querying the
 /// live device; `metal_available` mirrors `mlx::core::metal::is_available()`.
 ///
@@ -181,7 +221,7 @@ pub(crate) fn fused_moe_max_dff_from(env: Option<&str>, metal_available: bool) -
         .unwrap_or(if metal_available {
             FUSED_MOE_MAX_DFF_METAL
         } else {
-            FUSED_MOE_MAX_DFF_CUDA
+            FUSED_MOE_MAX_DFF_GPU_PORT
         })
 }
 
@@ -941,10 +981,35 @@ pub(crate) const NATIVE_GLOBAL_SCALE_LEAF: &str = "native_global_scale";
 /// Reads the top-level and `text_config` `quantization` and
 /// `quantization_config` objects (mlx-lm writes both, identical).
 ///
-/// Used by: `load_text_weights` (`src/models/sanitize.rs`)
+/// Used by: `load_text_weights` and `sanitize_gemma4_nvfp4_weights`
+/// (`src/models/sanitize.rs`), and `resolve_and_sanitize_gemma4_unified_weights`
+/// (`src/loading/vlm_gemma_unified.rs`)
 pub(crate) fn apply_native_global_scale_flags(
     weights: &mut WeightMap,
     config: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    resolve_native_global_scale_flags(weights, config, false)
+}
+
+/// [`apply_native_global_scale_flags`] for a map that may hold only part of
+/// the checkpoint (issue #2444): a flagged path with neither its `.weight` nor
+/// its `.global_scale` in the map was filtered out and is skipped rather than
+/// reported as an incomplete export. A flagged path whose `.weight` is present
+/// without the scale still fails the load.
+///
+/// Used by: `finish_vlm_weights_common` (`src/loading/vlm.rs`), the tail of
+/// both the full and the filtered VLM weight loaders
+pub(crate) fn apply_native_global_scale_flags_to_subset(
+    weights: &mut WeightMap,
+    config: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    resolve_native_global_scale_flags(weights, config, true)
+}
+
+fn resolve_native_global_scale_flags(
+    weights: &mut WeightMap,
+    config: Option<&serde_json::Value>,
+    subset: bool,
 ) -> Result<(), String> {
     let suffix = format!(".{NATIVE_GLOBAL_SCALE_LEAF}");
     if let Some(key) = weights.keys().find(|k| k.ends_with(&suffix)) {
@@ -977,6 +1042,12 @@ pub(crate) fn apply_native_global_scale_flags(
         }
     }
     for path in flagged {
+        if subset
+            && !weights.contains_key(&format!("{path}.global_scale"))
+            && !weights.contains_key(&format!("{path}.weight"))
+        {
+            continue;
+        }
         let Some(scale) = weights.remove(&format!("{path}.global_scale")) else {
             return Err(format!(
                 "config.json declares \"global_scale\": true on the quantization entry for \
@@ -1018,15 +1089,18 @@ fn validate_native_global_scale(
     }
     let backend = mlxcel_core::hardware::gpu_backend_kind();
     let gpu = mlxcel_core::default_device_is_gpu();
+    // ROCm's GatherQMM applies the per-expert scale since lablup/mlxcel#2617.
     let supported = matches!(
         backend,
-        mlxcel_core::hardware::GpuBackendKind::Metal | mlxcel_core::hardware::GpuBackendKind::Cuda
+        mlxcel_core::hardware::GpuBackendKind::Metal
+            | mlxcel_core::hardware::GpuBackendKind::Cuda
+            | mlxcel_core::hardware::GpuBackendKind::Rocm
     );
     if !gpu || !supported {
         let device = if gpu { "GPU" } else { "CPU" };
         return Err(format!(
-            "{prefix}: per-expert NVFP4 global_scale planes run only on the Metal and CUDA GPU \
-             backends, and this process runs on the {} backend ({device} stream); MLX's \
+            "{prefix}: per-expert NVFP4 global_scale planes run only on the Metal, CUDA and ROCm \
+             GPU backends, and this process runs on the {} backend ({device} stream); MLX's \
              gather_qmm refuses the tensor scale elsewhere",
             backend.display_name()
         ));
@@ -1541,6 +1615,22 @@ impl SwitchGLU {
             let activated = self.activate(&x_gate, &x_up);
             let output = self.down_proj.forward(&activated, &rhs, true);
             scatter_unsort(&output, &inv_order, &indices_shape)
+        } else if let Some(activated) = switch_gate_up_preferred_in_forward(
+            n_tokens,
+            mlxcel_core::hardware::get_hardware().silicon_gen,
+        )
+        .then(|| self.forward_switch_gate_up_kernel(x, indices))
+        .flatten()
+        {
+            // The kernel's activated output is `[tokens, top_k, dff]`; the
+            // down projection's indexed path consumes the gather layout's
+            // `[tokens, top_k, 1, dff]`, so one ExpandDims bridges the shapes
+            // and the down projection picks the expert rows itself.
+            let activated = mlxcel_core::expand_dims(&activated, -2);
+            let output = self
+                .down_proj
+                .forward_indexed(&activated, None, indices, false);
+            mlxcel_core::squeeze_axis(&output, -2)
         } else {
             let gi = prepare_gather_indices(&x_exp, indices);
             let lhs = gi.lhs.as_deref();
@@ -1552,6 +1642,48 @@ impl SwitchGLU {
                 .forward_indexed(&activated, None, &gi.rhs, false);
             mlxcel_core::squeeze_axis(&output, -2)
         }
+    }
+
+    /// LLaDA-Image's `TextMoE` routed experts, on the expert-sorted gather
+    /// path at every token count: `x` is `[N, D]`, `indices` the flattened
+    /// `[N * k]` expert ids (row-major over tokens, `k` per token) and
+    /// `scores` their `[N * k]` f32 routing weights. The weights multiply the
+    /// SwiGLU activation in f32 BEFORE the down projection, and the result is
+    /// rounded back to `x`'s dtype, as the checkpoint's fused MoE does. Returns
+    /// the `[N * k, D]` expert outputs in the input order, unsummed.
+    ///
+    /// Used by: Llada2Moe (`Llada2Numerics::LladaImage`, issue #2346)
+    pub(crate) fn forward_prescaled_down(
+        &self,
+        x: &MlxArray,
+        indices: &MlxArray,
+        scores: &MlxArray,
+        top_k: i32,
+    ) -> UniquePtr<MlxArray> {
+        let order = mlxcel_core::argsort(indices, -1);
+        let selected = mlxcel_core::take(indices, &order, 0);
+        let k = mlxcel_core::astype(
+            &mlxcel_core::from_slice_i32(&[top_k], &[1]),
+            mlxcel_core::array_dtype(&order),
+        );
+        let token = mlxcel_core::floor_divide(&order, &k);
+        let routed = mlxcel_core::expand_dims(&mlxcel_core::take(x, &token, 0), 1);
+        let gate = self.gate_proj.forward(&routed, &selected, true);
+        let up = self.up_proj.forward(&routed, &selected, true);
+        let activated = mlxcel_core::multiply(&mlxcel_core::silu(&gate), &up);
+        let weights =
+            mlxcel_core::expand_dims_multi(&mlxcel_core::take(scores, &order, 0), &[-2, -1]);
+        // Explicit f32: the CUDA build of mlxcel's MLX would otherwise compute
+        // a bf16 x f32 product in bf16.
+        let weighted = mlxcel_core::multiply(
+            &mlxcel_core::astype(&activated, dtype::FLOAT32),
+            &mlxcel_core::astype(&weights, dtype::FLOAT32),
+        );
+        let weighted = mlxcel_core::astype(&weighted, mlxcel_core::array_dtype(x));
+        let output = self.down_proj.forward(&weighted, &selected, true);
+        let output = mlxcel_core::take(&output, &mlxcel_core::argsort(&order, -1), 0);
+        let hidden = *mlxcel_core::array_shape(&output).last().unwrap_or(&0);
+        mlxcel_core::reshape(&output, &[-1, hidden])
     }
 
     /// Run selected experts with optional per-expert gate and output scales.
@@ -1599,6 +1731,163 @@ impl SwitchGLU {
             output = mlxcel_core::multiply(&output, &selected);
         }
         mlxcel_core::squeeze_axis(&output, -2)
+    }
+
+    /// Selected experts' gate/up projections and activation, without the down
+    /// projection: `act(gate(x), up(x))` per expert id, `[tokens, k, dff]`.
+    ///
+    /// Partial of [`Self::forward`] for callers that consume the activated
+    /// intermediate directly. Inkling's decode down-combine kernel folds the
+    /// weighted expert sum into the down projection, so the `[n, k, out]`
+    /// expert output never exists there (issue #2479).
+    pub(crate) fn forward_activated(
+        &self,
+        x: &MlxArray,
+        indices: &MlxArray,
+    ) -> UniquePtr<MlxArray> {
+        let indices_shape = mlxcel_core::array_shape(indices);
+        let total = indices_shape[0] * indices_shape[1];
+        let do_sort = total >= 64;
+        let x_exp = mlxcel_core::expand_dims_multi(x, &[-3, -2]);
+        if do_sort {
+            let (sorted_x, sorted_idx, inv_order) = gather_sort(&x_exp, indices);
+            let rhs = mlxcel_core::astype(&sorted_idx, dtype::UINT32);
+            let x_gate = self.gate_proj.forward(&sorted_x, &rhs, true);
+            let x_up = self.up_proj.forward(&sorted_x, &rhs, true);
+            let activated = self.activate(&x_gate, &x_up);
+            scatter_unsort(&activated, &inv_order, &indices_shape)
+        } else if let Some(activated) = self.forward_switch_gate_up_kernel(x, indices) {
+            activated
+        } else {
+            let gi = prepare_gather_indices(&x_exp, indices);
+            let lhs = gi.lhs.as_deref();
+            let x_gate = self.gate_proj.forward_indexed(&x_exp, lhs, &gi.rhs, false);
+            let x_up = self.up_proj.forward_indexed(&x_exp, lhs, &gi.rhs, false);
+            let activated = self.activate(&x_gate, &x_up);
+            mlxcel_core::squeeze_axis(&activated, -2)
+        }
+    }
+
+    /// Borrowed quantized parts of the down projection, for callers that drive
+    /// a custom kernel over it (Inkling's decode down-combine kernel).
+    pub fn down_quantized_parts(&self) -> Option<QuantizedSwitchLinearRef<'_>> {
+        self.down_proj.quantized_parts()
+    }
+
+    /// Selected gate/up projection for affine q4 experts at decode as one
+    /// Metal kernel, with the configured activation applied on its output.
+    ///
+    /// The routed down-projection side of the fused decode path is already a
+    /// dequant+combine dispatch (issue #2479); the gate/up pair next to it
+    /// still runs two indexed gather_qmm dispatches whose per-expert vector
+    /// mode streams the same packed weights at a fraction of the device's
+    /// practical bandwidth. This kernel is its analogue: one threadgroup per
+    /// (8 output rows, route) reads both planes' packed q4 with the scale and
+    /// zero-point in-kernel, so the per-token weight AsType and the gather
+    /// never run. The reference is mlx-vlm's
+    /// `short_block_affine4_switch_gate_up`, whose gate is generic (any
+    /// affine 4-bit quantized switch MoE at decode shapes), so it lives here
+    /// in the shared [`SwitchGLU`] rather than a model crate. Wired into both
+    /// [`Self::forward_activated`] (inkling's decode) and [`Self::forward`]
+    /// (the other MoE families' multi-token decode), each ahead of its gather
+    /// path.
+    ///
+    /// Returns `None` when any condition fails and the caller stays on the
+    /// gather path: non-affine or block-float planes, bits other than 4,
+    /// missing zero points, scales or zero points outside the activation
+    /// dtype (the mixed-dtype gather cliff in reverse), reduction geometry
+    /// the kernel's per-lane indexing cannot hold, or the activation kill
+    /// switch. Deliberately not `expect`: a decline is the contract.
+    fn forward_switch_gate_up_kernel(
+        &self,
+        x: &MlxArray,
+        indices: &MlxArray,
+    ) -> Option<UniquePtr<MlxArray>> {
+        if !fused_moe_enabled() || !mlxcel_core::metal_is_available() {
+            return None;
+        }
+        // The kernel reads the routes flattened against x's token rows and
+        // searches adjacent positions for the route pairing.
+        let indices_shape = mlxcel_core::array_shape(indices);
+        if indices_shape.len() != 2 {
+            return None;
+        }
+        let tokens = indices_shape[0];
+        let top_k = indices_shape[1];
+        if !(1..=8).contains(&tokens) || !(1..=8).contains(&top_k) {
+            return None;
+        }
+        if mlxcel_core::array_dtype(indices) != dtype::UINT32 {
+            return None;
+        }
+        let x_shape = mlxcel_core::array_shape(x);
+        if x_shape.len() != 2 || x_shape[0] != tokens {
+            return None;
+        }
+        let x_dtype = mlxcel_core::array_dtype(x);
+        if x_dtype != dtype::BFLOAT16 && x_dtype != dtype::FLOAT16 {
+            return None;
+        }
+        let gate = self.gate_proj.quantized_parts()?;
+        let up = self.up_proj.quantized_parts()?;
+        if gate.mode != "affine" || up.mode != "affine" {
+            return None;
+        }
+        if gate.bits != 4 || up.bits != 4 || gate.group_size != up.group_size {
+            return None;
+        }
+        if gate.group_size <= 0 || gate.group_size % 16 != 0 || 512 % gate.group_size != 0 {
+            return None;
+        }
+        let gate_shape = mlxcel_core::array_shape(gate.weight.as_ref().unwrap());
+        let up_shape = mlxcel_core::array_shape(up.weight.as_ref().unwrap());
+        if gate_shape != up_shape || gate_shape.len() != 3 {
+            return None;
+        }
+        let k_size = up_shape[2] * 8;
+        let n_size = up_shape[1];
+        if k_size <= 0
+            || n_size <= 0
+            || k_size != x_shape[1]
+            || k_size % 512 != 0
+            || n_size % 8 != 0
+        {
+            return None;
+        }
+        if mlxcel_core::array_dtype(up.scales.as_ref().unwrap()) != x_dtype
+            || mlxcel_core::array_dtype(up.biases.as_ref().unwrap()) != x_dtype
+            || mlxcel_core::array_dtype(gate.scales.as_ref().unwrap()) != x_dtype
+            || mlxcel_core::array_dtype(gate.biases.as_ref().unwrap()) != x_dtype
+        {
+            return None;
+        }
+        let sidecar_shape = vec![up_shape[0], n_size, k_size / gate.group_size];
+        for plane in [&gate, &up] {
+            if mlxcel_core::array_dtype(plane.weight.as_ref()?) != dtype::UINT32
+                || mlxcel_core::array_shape(plane.scales.as_ref()?) != sidecar_shape
+                || mlxcel_core::array_shape(plane.biases.as_ref()?) != sidecar_shape
+            {
+                return None;
+            }
+        }
+        let mut up_out = mlxcel_core::UniquePtr::null();
+        let mut gate_out = mlxcel_core::UniquePtr::null();
+        mlxcel_core::moe_switch_gate_up_kernel(
+            x,
+            indices,
+            up.weight.as_ref().unwrap(),
+            up.scales.as_ref().unwrap(),
+            up.biases.as_ref().unwrap(),
+            gate.weight.as_ref().unwrap(),
+            gate.scales.as_ref().unwrap(),
+            gate.biases.as_ref().unwrap(),
+            top_k,
+            gate.group_size,
+            &mut up_out,
+            &mut gate_out,
+        )
+        .ok()?;
+        Some(self.activate(gate_out.as_ref().unwrap(), up_out.as_ref().unwrap()))
     }
 
     /// Single-token decode via the fused MoE expert Metal kernel (#268, step 2b).
@@ -1662,7 +1951,8 @@ impl SwitchGLU {
         // Large experts: gather_qmm already saturates the GPU, so the two-kernel
         // fused path's all-cores advantage disappears and its extra dispatch +
         // global-memory activation staging becomes a net loss. The break-even is
-        // backend-dependent (Metal ~4096, CUDA ~8192; see FUSED_MOE_MAX_DFF_*),
+        // backend-dependent (Metal ~4096, CUDA ~8192, ROCm above 14336; see
+        // FUSED_MOE_MAX_DFF_*),
         // so the default follows the live backend and the env var overrides both.
         // Decline above the bound so the caller falls back to gather_qmm.
         let max_dff = fused_moe_max_dff_from(
@@ -1930,7 +2220,7 @@ pub(crate) fn scatter_unsort(
 /// Used by: BailingMoe, DeepSeek, DeepSeekV3, DeepSeekV32, ExaOneMoe,
 ///          Ernie4_5Moe, GLM4Moe, GLM4MoeLite, GptOss, HunyuanMoe, Jamba,
 ///          KimiK3, KimiLinear, Laguna, MiniMax, Mistral4, Mixtral, Moondream3,
-///          OLMoE, PhiMoE, Qwen2Moe, Qwen3Moe, Qwen3Next, Qwen3VLMoe,
+///          OLMoE, PhiMoE, Qwen2Moe, Qwen3Moe, Qwen3Next, Qwen3VLMoe, Qwen4Exp,
 ///          SolarOpen, Step3p5
 ///
 /// The old `nkh,nk->nh` einsum contraction promotes the combine to float32
@@ -2134,6 +2424,37 @@ pub fn group_mask_scores(scores: &MlxArray, n_group: i32, topk_group: i32) -> Un
     mlxcel_core::reshape(&grouped, &[n, n_experts])
 }
 
+/// Load an MLX-native NVFP4 expert plane where the running backend can run it.
+///
+/// Where NVFP4 is native (Metal, CUDA, and ROCm since lablup/mlxcel#2617)
+/// this returns the layer and fails the test with `what` if the load failed.
+/// On a backend whose capability table marks the mode `ConvertTo(Affine)`,
+/// as ROCm's did from lablup/mlxcel#1806 until then, only ModelOpt
+/// checkpoints are converted at load and an MLX-native plane is refused by
+/// design. There this asserts that the refusal names the plane and the mode,
+/// prints the skip, and returns `None`, so the caller stops before the parts
+/// of the test that need the loaded layer.
+#[cfg(test)]
+pub(crate) fn expect_native_nvfp4_load<T>(
+    loaded: Result<T, String>,
+    prefix: &str,
+    what: &str,
+) -> Option<T> {
+    use mlxcel_core::hardware::{QuantMode, QuantModeSupport, quant_mode_support};
+    if quant_mode_support(QuantMode::Nvfp4) == QuantModeSupport::Native {
+        return Some(loaded.unwrap_or_else(|e| panic!("{what}: {e}")));
+    }
+    let Err(err) = loaded else {
+        panic!("{what}: an NVFP4 plane must be refused on a backend without a native NVFP4 kernel");
+    };
+    assert!(err.contains(prefix) && err.contains("nvfp4"), "{err}");
+    eprintln!(
+        "skipping the rest of `{what}`: this backend has no native NVFP4 kernel and refuses \
+         MLX-native NVFP4 planes at load (lablup/mlxcel#1806)"
+    );
+    None
+}
+
 /// An NVFP4 expert plane (group 16, 4-bit, no zero points): 3 experts, out
 /// 4, in 64, so 8 packed words and 4 groups per row. Loader-only fixture;
 /// no kernel runs on it.
@@ -2222,8 +2543,33 @@ mod gather_index_tests;
 mod global_scale_tests;
 
 #[cfg(test)]
+#[path = "switch_layers_sorted_gather_test_support.rs"]
+mod sorted_gather_test_support;
+
+#[cfg(test)]
+#[path = "switch_layers_sorted_gather_history_tests.rs"]
+mod sorted_gather_history_tests;
+
+#[cfg(test)]
+#[path = "switch_layers_sorted_gather_layout_tests.rs"]
+mod sorted_gather_layout_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hold MLX's process-wide default device stable while a Metal-only test
+    /// checks availability and runs its graph. Parallel libtest workers can
+    /// otherwise observe a temporary CPU guard from an unrelated test and
+    /// either skip this test or make the kernel decline midway through it.
+    fn metal_kernel_or_skip() -> Option<mlxcel_core::streams::DefaultDeviceLock> {
+        let device = mlxcel_core::streams::lock_default_device();
+        if !mlxcel_core::metal_is_available() {
+            eprintln!("no Metal backend; the switch_gate_up kernel is Metal, skipping");
+            return None;
+        }
+        Some(device)
+    }
 
     /// 1-bit expert stacks would reach MLX's `gather_qmm`, which has no 1-bit
     /// kernel; they are refused at load with the prefix named (issue #1370).
@@ -2368,11 +2714,28 @@ mod tests {
     }
 
     #[test]
+    fn switch_gate_up_in_forward_is_batched_only_on_wide_generations() {
+        use mlxcel_core::hardware::AppleSiliconGen as Gen;
+        for silicon_gen in [Gen::M1, Gen::M2, Gen::M3, Gen::M4, Gen::M5, Gen::Unknown] {
+            assert!(switch_gate_up_preferred_in_forward(1, silicon_gen));
+        }
+        for silicon_gen in [Gen::M1, Gen::M2, Gen::Unknown] {
+            assert!(!switch_gate_up_preferred_in_forward(2, silicon_gen));
+        }
+        for silicon_gen in [Gen::M3, Gen::M4, Gen::M5] {
+            assert!(switch_gate_up_preferred_in_forward(2, silicon_gen));
+        }
+    }
+
+    #[test]
     fn fused_moe_max_dff_default_is_backend_aware_and_env_overrides() {
         // Unset: Metal keeps the conservative 4096; CUDA (no Metal) uses the
         // higher measured GB10 crossover (#626).
         assert_eq!(fused_moe_max_dff_from(None, true), FUSED_MOE_MAX_DFF_METAL);
-        assert_eq!(fused_moe_max_dff_from(None, false), FUSED_MOE_MAX_DFF_CUDA);
+        assert_eq!(
+            fused_moe_max_dff_from(None, false),
+            FUSED_MOE_MAX_DFF_GPU_PORT
+        );
         // The CUDA default must exceed Metal's, which is the whole point of #626.
         const { assert!(FUSED_MOE_MAX_DFF_CUDA > FUSED_MOE_MAX_DFF_METAL) };
         // An explicit positive value overrides the default on both backends.
@@ -2388,7 +2751,7 @@ mod tests {
             );
             assert_eq!(
                 fused_moe_max_dff_from(Some(bad), false),
-                FUSED_MOE_MAX_DFF_CUDA
+                FUSED_MOE_MAX_DFF_GPU_PORT
             );
         }
     }
@@ -2406,12 +2769,13 @@ mod tests {
         assert!(!declines(FUSED_MOE_MAX_DFF_METAL, None, true));
         assert!(declines(FUSED_MOE_MAX_DFF_METAL + 1, None, true));
 
-        // CUDA default 8192: phi-3.5-moe (Dff 6400) and llama-4-scout (Dff 8192)
-        // dispatch, mixtral (Dff 14336) declines.
+        // CUDA default 8192 (ROCm 14336): phi-3.5-moe (Dff 6400) and llama-4-scout
+        // (Dff 8192) dispatch.
         assert!(!declines(6400, None, false));
-        assert!(!declines(FUSED_MOE_MAX_DFF_CUDA, None, false));
-        assert!(declines(FUSED_MOE_MAX_DFF_CUDA + 1, None, false));
-        assert!(declines(14336, None, false));
+        assert!(!declines(FUSED_MOE_MAX_DFF_GPU_PORT, None, false));
+        assert!(declines(FUSED_MOE_MAX_DFF_GPU_PORT + 1, None, false));
+        // Mixtral (Dff 14336) takes the fused path on ROCm alone.
+        assert_eq!(declines(14336, None, false), !cfg!(feature = "rocm"));
 
         // Metal keeps 4096, so the same mid-size experts decline there.
         assert!(declines(6400, None, true));
@@ -2474,6 +2838,283 @@ mod tests {
         assert!(
             glu.forward_fused_kernel(&x, &indices, &scores).is_none(),
             "a non-affine plane must stay on gather_qmm"
+        );
+    }
+
+    #[test]
+    fn switch_gate_up_kernel_refuses_a_backend_without_a_port() {
+        if mlxcel_core::metal_is_available() {
+            return;
+        }
+        let dummy = mlxcel_core::from_slice_f32(&[0.0], &[1]);
+        let mut up = mlxcel_core::UniquePtr::null();
+        let mut gate = mlxcel_core::UniquePtr::null();
+        let error = mlxcel_core::moe_switch_gate_up_kernel(
+            &dummy, &dummy, &dummy, &dummy, &dummy, &dummy, &dummy, &dummy, 1, 64, &mut up,
+            &mut gate,
+        )
+        .expect_err("missing Metal port must return an error across FFI");
+        assert!(error.to_string().contains("moe_switch_gate_up_kernel"));
+        assert!(up.is_null() && gate.is_null());
+    }
+
+    /// Affine 4-bit `switch_mlp` fixture for the switch gate/up kernel tests:
+    /// three stacked planes under `model.layers.0.mlp.switch_mlp`, bf16-valued
+    /// dense quantized with per-group affine zero points. `out`/`input` are
+    /// the gate and up planes' geometry; the down plane mirrors them.
+    fn affine_switch_glu_fixture(experts: i32, out: i32, input: i32, group: i32) -> SwitchGLU {
+        let prefix = "model.layers.0.mlp.switch_mlp";
+        let mut weights = WeightMap::new();
+        for (leaf, o, i) in [
+            ("gate_proj", out, input),
+            ("up_proj", out, input),
+            ("down_proj", input, out),
+        ] {
+            let (mut w, mut s, mut b) = (Vec::new(), Vec::new(), Vec::new());
+            for e in 0..experts {
+                let n = (o * i) as usize;
+                let data: Vec<f32> = (0..n)
+                    .map(|j| ((j as i32 * 7 + e * 3) % 17) as f32 * 0.04 - 0.3)
+                    .collect();
+                let dense = mlxcel_core::astype(
+                    &mlxcel_core::from_slice_f32(&data, &[o, i]),
+                    dtype::BFLOAT16,
+                );
+                let q = mlxcel_core::quantize_weights_with_mode(&dense, group, 4, "affine");
+                assert!(
+                    mlxcel_core::quantized_weights_has_biases(&q),
+                    "affine must produce zero points"
+                );
+                w.push(mlxcel_core::quantized_weights_w(&q));
+                s.push(mlxcel_core::quantized_weights_scales(&q));
+                b.push(mlxcel_core::quantized_weights_biases(&q));
+            }
+            weights.insert(
+                format!("{prefix}.{leaf}.weight"),
+                mlxcel_core::stack_owned(&w, 0),
+            );
+            weights.insert(
+                format!("{prefix}.{leaf}.scales"),
+                mlxcel_core::stack_owned(&s, 0),
+            );
+            weights.insert(
+                format!("{prefix}.{leaf}.biases"),
+                mlxcel_core::stack_owned(&b, 0),
+            );
+        }
+        SwitchGLU::from_weights_with_mode(&weights, prefix, group, 4, "affine")
+            .expect("an honest affine expert plane must load")
+    }
+
+    #[test]
+    fn switch_gate_up_kernel_matches_the_gather_path() {
+        // The kernel is Metal; skip on a CPU-only build (CI has no GPU
+        // backend, so the gathers below would not run there either).
+        let Some(_device) = metal_kernel_or_skip() else {
+            return;
+        };
+        // k_size % 512 == 0 and n_size % 8 == 0 are the kernel's reduction
+        // gate, so the fixture hides 512 and 256.
+        let (experts, hidden, dff, group) = (4i32, 512i32, 256i32, 64i32);
+        let glu = affine_switch_glu_fixture(experts, dff, hidden, group);
+
+        for (tokens, ids) in [
+            (1i32, vec![0i32, 2]),
+            // Adjacent tokens sharing expert 0: the route pairing computes
+            // token 1's row from token 0's threadgroup and skips its own.
+            (3, vec![0, 2, 0, 3, 1, 2]),
+        ] {
+            let x: Vec<f32> = (0..(tokens * hidden) as usize)
+                .map(|i| ((i % 23) as f32 - 11.0) * 0.05)
+                .collect();
+            let x = mlxcel_core::astype(
+                &mlxcel_core::from_slice_f32(&x, &[tokens, hidden]),
+                dtype::BFLOAT16,
+            );
+            let indices = mlxcel_core::astype(
+                &mlxcel_core::from_slice_i32(&ids, &[tokens, 2]),
+                dtype::UINT32,
+            );
+
+            // The gather path the kernel replaces, built by hand so the
+            // comparison does not depend on the kill switch.
+            let x_exp = mlxcel_core::expand_dims_multi(&x, &[-3, -2]);
+            let gi = prepare_gather_indices(&x_exp, &indices);
+            let lhs = gi.lhs.as_deref();
+            let x_gate = glu.gate_proj.forward_indexed(&x_exp, lhs, &gi.rhs, false);
+            let x_up = glu.up_proj.forward_indexed(&x_exp, lhs, &gi.rhs, false);
+            let expected = mlxcel_core::squeeze_axis(&glu.activate(&x_gate, &x_up), -2);
+
+            let output = glu
+                .forward_switch_gate_up_kernel(&x, &indices)
+                .expect("supported fixture must use the Metal kernel");
+            assert_eq!(
+                mlxcel_core::array_shape(&output),
+                vec![tokens, 2, dff],
+                "tokens {tokens}: the kernel path must return [tokens, k, dff]"
+            );
+            assert!(
+                mlxcel_core::item_bool(&mlxcel_core::allclose(&output, &expected, 1e-2, 1e-2)),
+                "tokens {tokens}: the kernel path must match the gather path"
+            );
+        }
+    }
+
+    #[test]
+    fn switch_gate_up_kernel_matches_the_gather_path_with_down() {
+        // The kernel is Metal; skip on a CPU-only build (CI has no GPU
+        // backend, so the gathers below would not run there either).
+        let Some(_device) = metal_kernel_or_skip() else {
+            return;
+        };
+        let (experts, hidden, dff, group) = (4i32, 512i32, 256i32, 64i32);
+        let glu = affine_switch_glu_fixture(experts, dff, hidden, group);
+
+        for (tokens, ids) in [
+            (1i32, vec![0i32, 2]),
+            // Adjacent tokens sharing expert 0: the route pairing computes
+            // token 1's row from token 0's threadgroup and skips its own.
+            (3, vec![0, 2, 0, 3, 1, 2]),
+        ] {
+            let x: Vec<f32> = (0..(tokens * hidden) as usize)
+                .map(|i| ((i % 23) as f32 - 11.0) * 0.05)
+                .collect();
+            let x = mlxcel_core::astype(
+                &mlxcel_core::from_slice_f32(&x, &[tokens, hidden]),
+                dtype::BFLOAT16,
+            );
+            let indices = mlxcel_core::astype(
+                &mlxcel_core::from_slice_i32(&ids, &[tokens, 2]),
+                dtype::UINT32,
+            );
+
+            // The full gather path `forward` replaces, built by hand so the
+            // comparison does not depend on the kill switch: gate/up, the
+            // activation, then the down projection on the gather layout.
+            let x_exp = mlxcel_core::expand_dims_multi(&x, &[-3, -2]);
+            let gi = prepare_gather_indices(&x_exp, &indices);
+            let lhs = gi.lhs.as_deref();
+            let x_gate = glu.gate_proj.forward_indexed(&x_exp, lhs, &gi.rhs, false);
+            let x_up = glu.up_proj.forward_indexed(&x_exp, lhs, &gi.rhs, false);
+            let activated = glu.activate(&x_gate, &x_up);
+            let expected = mlxcel_core::squeeze_axis(
+                &glu.down_proj
+                    .forward_indexed(&activated, None, &gi.rhs, false),
+                -2,
+            );
+
+            assert!(glu.forward_switch_gate_up_kernel(&x, &indices).is_some());
+            let output = glu.forward(&x, &indices);
+            assert_eq!(
+                mlxcel_core::array_shape(&output),
+                vec![tokens, 2, hidden],
+                "tokens {tokens}: the kernel path must return [tokens, k, hidden]"
+            );
+            assert!(
+                mlxcel_core::item_bool(&mlxcel_core::allclose(&output, &expected, 1e-2, 1e-2)),
+                "tokens {tokens}: the kernel path must match the gather path"
+            );
+        }
+    }
+
+    /// Directory of a real OLMoE checkpoint: `MLXCEL_TEST_OLMOE_DIR`, else the
+    /// mlxcel store copy of `mlx-community/OLMoE-1B-7B-0125-Instruct-4bit`.
+    fn real_olmoe_checkpoint() -> Option<std::path::PathBuf> {
+        let dir = std::env::var_os("MLXCEL_TEST_OLMOE_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| {
+                    std::path::PathBuf::from(h)
+                        .join(".cache/mlxcel/models/mlx-community/OLMoE-1B-7B-0125-Instruct-4bit")
+                })
+            })?;
+        dir.join("config.json").exists().then_some(dir)
+    }
+
+    /// On a real (quantized) checkpoint the kernel branch of `forward` must
+    /// fire and match the hand-built gather path, so the wire-in's live
+    /// coverage holds beyond the synthetic fixture. OLMoE-1B-7B-0125-4bit:
+    /// 64 experts, top_k 8, affine q4 group 64, hidden 2048, dff 1024, f16
+    /// planes whose scales and biases share the activation dtype.
+    #[test]
+    #[ignore = "needs an OLMoE checkpoint (mlx-community/OLMoE-1B-7B-0125-Instruct-4bit or MLXCEL_TEST_OLMOE_DIR)"]
+    fn switch_gate_up_kernel_matches_the_gather_path_on_a_real_olmoe() {
+        // The kernel is Metal; skip on a CPU-only build.
+        let Some(_device) = metal_kernel_or_skip() else {
+            return;
+        };
+        let Some(dir) = real_olmoe_checkpoint() else {
+            eprintln!("skipping: no OLMoE checkpoint found");
+            return;
+        };
+        let (model, _) = crate::models::olmoe::OlmoeModel::load(&dir).unwrap();
+        // One layer's experts drive both paths on the same real planes.
+        let glu = &model.layers[0].mlp.experts;
+
+        // Real activations as the input: the embedding forward of a token
+        // batch, flattened to decode's [tokens, hidden]. The checkpoint is
+        // f16 throughout, so the activation keeps the planes' scales dtype.
+        let ids = mlxcel_core::from_slice_i32(&[9707, 11, 1879, 0, 358, 1079, 264], &[1, 7]);
+        let hidden_states = model.embed_tokens.forward(&ids);
+        let hidden = mlxcel_core::array_shape(&hidden_states)[2];
+        let tokens = 7i32;
+        let x = mlxcel_core::reshape(&hidden_states, &[tokens, hidden]);
+
+        // Deterministic top_k=8 routes with repeats and adjacent pairs.
+        let top_k = 8i32;
+        let mut routes = Vec::new();
+        for t in 0..tokens {
+            for j in 0..top_k {
+                routes.push((t * 9 + j * 5) % 64);
+            }
+        }
+        let indices = mlxcel_core::astype(
+            &mlxcel_core::from_slice_i32(&routes, &[tokens, top_k]),
+            dtype::UINT32,
+        );
+
+        // The kernel branch must actually fire: a silent decline would
+        // compare gather against gather and validate nothing.
+        let activated = glu
+            .forward_switch_gate_up_kernel(&x, &indices)
+            .expect("the kernel gate must accept an affine q4 OLMoE plane at decode shapes");
+
+        // The gather path the wire-in replaces, built by hand.
+        let x_exp = mlxcel_core::expand_dims_multi(&x, &[-3, -2]);
+        let gi = prepare_gather_indices(&x_exp, &indices);
+        let lhs = gi.lhs.as_deref();
+        let x_gate = glu.gate_proj.forward_indexed(&x_exp, lhs, &gi.rhs, false);
+        let x_up = glu.up_proj.forward_indexed(&x_exp, lhs, &gi.rhs, false);
+        let expected_activated = mlxcel_core::squeeze_axis(&glu.activate(&x_gate, &x_up), -2);
+        assert!(
+            mlxcel_core::item_bool(&mlxcel_core::allclose(
+                &activated,
+                &expected_activated,
+                1e-2,
+                1e-2
+            )),
+            "the kernel activation must match the gather path on the real planes"
+        );
+
+        // The full `forward` (kernel gate/up + indexed down) against the full
+        // hand-built gather path, at tokens*top_k = 56, just under the sorted
+        // threshold.
+        let output = glu.forward(&x, &indices);
+        let down = glu.down_proj.forward_indexed(
+            &mlxcel_core::expand_dims(&expected_activated, -2),
+            None,
+            &gi.rhs,
+            false,
+        );
+        let expected = mlxcel_core::squeeze_axis(&down, -2);
+        assert_eq!(
+            mlxcel_core::array_shape(&output),
+            mlxcel_core::array_shape(&expected),
+            "forward must return the gather path's shape"
+        );
+        assert!(
+            mlxcel_core::item_bool(&mlxcel_core::allclose(&output, &expected, 1e-2, 1e-2)),
+            "forward's kernel path must match the gather path on the real planes"
         );
     }
 

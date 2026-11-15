@@ -44,7 +44,7 @@ use crate::server::types::request::Tool;
 /// Shared by [`strip_thinking`], which removes them, and
 /// [`thinking_marker_pair`], which reports which one a generation used, so the
 /// two cannot disagree about what delimits a thinking block.
-const THINKING_MARKER_PAIRS: [(&str, &str); 4] = [
+pub(super) const THINKING_MARKER_PAIRS: [(&str, &str); 5] = [
     ("<think>", "</think>"),
     ("<|content_thinking|>", "<|end_message|>"),
     ("<|channel>", "<channel|>"),
@@ -52,6 +52,8 @@ const THINKING_MARKER_PAIRS: [(&str, &str); 4] = [
     // generation prompt ends with the open tag, so the model emits only the
     // close.
     ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
+    // Kimi-VL-Thinking (#2464): `◁think▷...◁/think▷` ahead of the answer.
+    ("◁think▷", "◁/think▷"),
 ];
 
 fn has_inkling_primed_boundary(text: &str) -> bool {
@@ -121,6 +123,21 @@ fn clean_content_markers(text: &str) -> String {
     // the streaming `CHAT_DELIMITERS` table suppresses for the same markers
     // (#1743 security review).
     let text = formats::strip_kimi_k3_tools_block(&text);
+    // Hermes: a `<tool_call>` block that reached this pass was not parsed into
+    // a call (no-tools request, unknown function, malformed or unclosed JSON).
+    // The streaming filter suppresses it in every one of those cases, so the
+    // non-streamed content drops it too instead of echoing call syntax (#2394,
+    // the #1743 rule).
+    // MiniMax M3: a namespaced block `try_minimax_m3` did not turn into a call
+    // (no-tools request, unknown function). Dropped before the Hermes pass,
+    // which would otherwise keep the `]<]minimax[>[` token in front of the
+    // embedded `<tool_call>` as content (#2464).
+    let text = strip_blocks(&text, MINIMAX_M3_TOOL_OPEN, MINIMAX_M3_TOOL_CLOSE);
+    let text = strip_hermes_tool_blocks(&text);
+    // Llama 3.x: a `<|python_tag|>` call `try_llama3` did not parse (no-tools
+    // request, unknown function, malformed JSON), dropped for the same reason
+    // as the Hermes block above (#2470).
+    let text = strip_python_tag_blocks(&text);
     text.replace("<turn|>", "")
         .replace("<|turn>", "")
         .replace("<|think|>", "")
@@ -139,8 +156,72 @@ fn clean_content_markers(text: &str) -> String {
         .replace("<|open|>response<|sep|>", "")
         .replace("<|close|>response<|sep|>", "")
         .replace("<|close|>message<|sep|>", "")
+        // Answer wrappers (#2394): Aya Vision `<|START_RESPONSE|>` /
+        // `<|END_RESPONSE|>`, GLM-4.xV `<|begin_of_box|>` / `<|end_of_box|>`.
+        // Mirrors the `Strip` rows in the streaming `CHAT_DELIMITERS`.
+        .replace("<|START_RESPONSE|>", "")
+        .replace("<|END_RESPONSE|>", "")
+        .replace("<|begin_of_box|>", "")
+        .replace("<|end_of_box|>", "")
         .trim()
         .to_string()
+}
+
+/// Strip GLM-4.1V-Thinking's `<answer>` / `</answer>` wrapper from cleaned
+/// content (#2394), the non-streamed counterpart of
+/// [`StreamFilter::with_answer_wrapper`](super::stream_filter::StreamFilter::with_answer_wrapper).
+///
+/// Not part of [`clean_structural_tokens`]: for every other model the tags are
+/// ordinary text a prompt may ask for, so callers apply this only when
+/// [`super::answer_wrapper_enabled`] holds for the loaded tokenizer.
+#[must_use]
+pub fn strip_answer_wrapper(content: &str) -> String {
+    let markers = super::stream_filter::ANSWER_WRAPPER;
+    if !markers.iter().any(|marker| content.contains(marker)) {
+        return content.to_string();
+    }
+    let mut out = content.to_string();
+    for marker in markers {
+        out = out.replace(marker, "");
+    }
+    out.trim().to_string()
+}
+
+/// MiniMax M3's namespaced tool-call block tags; the streaming
+/// `CHAT_DELIMITERS` table carries the same two rows.
+const MINIMAX_M3_TOOL_OPEN: &str = "]<]minimax[>[<tool_call>";
+const MINIMAX_M3_TOOL_CLOSE: &str = "]<]minimax[>[</tool_call>";
+
+/// Drop every `open...close` block, and an unclosed one through the end of the
+/// text, plus any stray `close`.
+fn strip_blocks(text: &str, open: &str, close: &str) -> String {
+    if !text.contains(open) && !text.contains(close) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(open) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + open.len()..];
+        rest = match after.find(close) {
+            Some(end) => &after[end + close.len()..],
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out.replace(close, "")
+}
+
+/// Drop every Hermes `<tool_call>...</tool_call>` block, and an unclosed one
+/// through the end of the text, plus any stray close tag.
+fn strip_hermes_tool_blocks(text: &str) -> String {
+    strip_blocks(text, "<tool_call>", "</tool_call>")
+}
+
+/// Drop every Llama 3.x `<|python_tag|>` call through its `<|eom_id|>` close,
+/// or through the end of the text when unclosed, plus any stray close.
+fn strip_python_tag_blocks(text: &str) -> String {
+    strip_blocks(text, "<|python_tag|>", "<|eom_id|>")
 }
 
 /// Strip all known structural tokens (thinking blocks and stray turn/think
@@ -154,7 +235,13 @@ fn clean_content_markers(text: &str) -> String {
 /// no tools are present in the request.
 // Used by: routes/chat (non-streaming path)
 pub fn clean_structural_tokens(raw: &str) -> String {
+    // Harmony (gpt-oss) owns its whole channel stream, exactly as on the
+    // tool-call path in `parse_tool_calls`; without this the `analysis`
+    // channel and its markup reached a no-tools `message.content` (#2394).
     let without_thinking = strip_thinking(raw);
+    if let Some(result) = formats::try_harmony(without_thinking.trim()) {
+        return result.content;
+    }
     let (content, _) = atem::split_muse_channels(&without_thinking);
     clean_content_markers(&content)
 }
@@ -445,25 +532,26 @@ fn filter_by_tools(calls: Vec<ParsedToolCall>, tools: &[Tool]) -> Vec<ParsedTool
     calls
         .into_iter()
         .filter_map(|mut c| {
-            if tool_names.contains(c.name.as_str()) {
-                // Bare name matches directly.
-                Some(c)
-            } else if let Some(dot_pos) = c.name.find('.') {
-                // Strip the leading namespace segment (e.g. `functions.`) and
-                // retry. Only normalise when the result actually matches a
-                // registered tool; otherwise drop the call as before.
-                let stripped = c.name[dot_pos + 1..].to_string();
-                if tool_names.contains(stripped.as_str()) {
-                    c.name = stripped;
-                    Some(c)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+            c.name = resolve_tool_name(&c.name, &tool_names)?.to_string();
+            Some(c)
         })
         .collect()
+}
+
+/// The name [`filter_by_tools`] keeps a call under, or `None` when it drops
+/// the call. A bare name that matches a registered tool is kept; otherwise
+/// the leading namespace segment (e.g. `functions.`) is stripped and the rest
+/// kept when it matches. Shared with the incremental streamer (#2396) so a
+/// streamed call carries the name the final parse reports.
+pub(super) fn resolve_tool_name<'a>(
+    name: &'a str,
+    tool_names: &std::collections::HashSet<&str>,
+) -> Option<&'a str> {
+    if tool_names.contains(name) {
+        return Some(name);
+    }
+    let (_, stripped) = name.split_once('.')?;
+    tool_names.contains(stripped).then_some(stripped)
 }
 
 /// Generate a unique tool call ID in the format `call_` + random alphanumeric.
@@ -476,6 +564,21 @@ pub fn generate_tool_call_id() -> String {
 mod tests {
     use super::*;
     use crate::server::types::request::{FunctionDefinition, Tool};
+
+    #[test]
+    fn strip_hermes_blocks_drops_closed_unclosed_and_stray_tags() {
+        assert_eq!(strip_hermes_tool_blocks("plain text"), "plain text");
+        assert_eq!(
+            strip_hermes_tool_blocks("a<tool_call>{}</tool_call>b"),
+            "ab"
+        );
+        assert_eq!(strip_hermes_tool_blocks("a<tool_call>{\"x\":"), "a");
+        assert_eq!(strip_hermes_tool_blocks("a</tool_call>b"), "ab");
+        assert_eq!(
+            strip_hermes_tool_blocks("</tool_call>x<tool_call>{}</tool_call>y"),
+            "xy"
+        );
+    }
 
     fn make_tool(name: &str) -> Tool {
         Tool {

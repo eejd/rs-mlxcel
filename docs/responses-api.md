@@ -16,6 +16,8 @@ Implementation source map:
 | `src/server/responses_store.rs` | In-memory response store. |
 | `src/server/conversation_store.rs` | In-memory conversation transcript store. |
 | `src/server/routes/responses.rs` | Route handlers. |
+| `src/server/responses_compaction.rs` | Compaction capsule, replay, selection and summarization core. |
+| `src/server/routes/responses_compact.rs` | `POST /v1/responses/compact` handler. |
 
 ## Implemented endpoints
 
@@ -24,16 +26,17 @@ Implementation source map:
 | POST | `/v1/responses` | Create a response, either non-streaming or streaming. |
 | GET | `/v1/responses/{id}` | Retrieve a stored response. |
 | DELETE | `/v1/responses/{id}` | Delete a stored response. |
-| POST | `/v1/responses/{id}/cancel` | Best-effort cancellation / cancellation marking. |
+| POST | `/v1/responses/{id}/cancel` | Best-effort cancellation of an in-flight streaming response. Stored (finished) responses return `400 invalid_request_error` without changing the saved result. |
+| POST | `/v1/responses/compact` | Summarize older turns into a `compaction` item; see [Conversation compaction](#conversation-compaction). |
+| POST | `/v1/responses/input_tokens` | Count the prompt tokens a body would prefill; see `docs/llama-server-compat.md`. |
 
 Aliases without `/v1` are also mounted for the same implemented routes:
-`/responses`, `/responses/{id}`, and `/responses/{id}/cancel`.
+`/responses`, `/responses/{id}`, `/responses/{id}/cancel`,
+`/responses/compact`, and `/responses/input_tokens`.
 
-The following OpenAI-style surfaces are **not mounted** in this implementation:
+The following OpenAI-style surface is **not mounted** in this implementation:
 
 - `GET /v1/responses/{id}/input_items`
-- `POST /v1/responses/compact`
-- `POST /v1/responses/input_tokens`
 
 ## Quickstart
 
@@ -86,6 +89,7 @@ with client.responses.stream(
 | `background` | rejected when `true` | Async polling is not implemented. |
 | `truncation` | only `disabled` | Other values, including `auto`, return 400. |
 | `service_tier` | accepted | Echoed/ignored; no scheduling tier is implemented. |
+| `context_management` | supported subset | `[{"type":"compaction","compact_threshold":N}]` enables automatic compaction; see [Automatic compaction](#automatic-compaction). `[]` or `null` disables it. |
 
 ## Input items
 
@@ -99,9 +103,12 @@ Phase 1 supports these typed items:
   {"type":"function_call", "call_id":"call_abc", "name":"f", "arguments":"{}"},
   {"type":"function_call_output", "call_id":"call_abc", "output":"ok"},
   {"type":"function_call_output", "call_id":"call_img", "output":[{"type":"input_text", "text":"captured"}, {"type":"input_image", "image_url":"data:image/png;base64,..."}]},
-  {"type":"reasoning", "content":[{"type":"reasoning_text", "text":"..."}]}
+  {"type":"reasoning", "content":[{"type":"reasoning_text", "text":"..."}]},
+  {"type":"compaction", "id":"cmp_...", "encrypted_content":"..."}
 ]
 ```
+
+A `compaction` item is the capsule `POST /v1/responses/compact` returns; see [Conversation compaction](#conversation-compaction) for how it replays.
 
 `developer` role is treated like `system`. Reasoning input items are accepted and forwarded: the text content is buffered and attached to the parallel `reasoning` field of the following assistant turn. Chat templates that render `message.get('reasoning')` (such as Gemma 4) receive it there. The `preserve_thinking` kwarg controls whether the field survives the rolling-checkpoint strip: `false` (the default, unless the prompt cache is on) drops prior-turn reasoning along with any inline `<think>` blocks; `true` retains it.
 
@@ -198,9 +205,14 @@ Phase 1 emits events such as:
 - `response.reasoning_text.delta`
 - `response.reasoning_text.done`
 - `response.completed`
+- `mlx.compaction.started`, `mlx.compaction.completed` (MLX extension, only after an automatic compaction; see [Automatic compaction](#automatic-compaction))
 - failure/incomplete/error events on error paths
 
 Reasoning streams as `response.reasoning_text.delta` events inside a `reasoning` output item, ahead of the message item, and never as `output_text`. This holds when the chat template primes an open thinking block (for example a generation prompt ending in `<think>\n`), where the model writes only the close marker: the stream starts inside the reasoning item, as the non-streaming split does.
+
+Harmony (GPT-OSS) replies surface their `analysis` channel as the same `reasoning` output item, with or without tool calls, and `usage.output_tokens_details.reasoning_tokens` is the token count of that reasoning text, identical for streaming and non-streaming requests. Multiple analysis or `<think>` segments are accumulated through the same streaming filter in both response modes, without parser-added separators or dropped later segments. It is 0 when the reply has no reasoning.
+
+Function calls stream while they are generated for the formats `/v1/chat/completions` streams incrementally (Hermes / Qwen JSON, Mistral `[ARGS]` and JSON list, Llama 3 JSON, Qwen3-Coder XML; see `docs/server-features.md`). Once a call's name is complete, any open reasoning or message item is closed and a `function_call` item is added with `status: "in_progress"` and empty `arguments`; `response.function_call_arguments.delta` events then carry the argument fragments. After generation, `response.function_call_arguments.done` and `response.output_item.done` carry the authoritative parsed arguments, and the call keeps its streamed `call_id` in the completed response. For a streamed request that parses tool calls, `response.completed` (and the copy stored for `previous_response_id`) is built from the items the stream sent: same item ids and `output_index` order, each message segment as its own `message` item (prose before and after a call are two items), function calls with their streamed `fc_` id, `call_id` and parsed arguments, and `output_text` as the concatenation of the message segments. If the streamer panics on a fragment, it is contained and the remaining arguments arrive from the final parse. Non-streaming responses are unchanged. For Hermes, Granite, Mistral and Llama 3, object `arguments` are the model's raw JSON text, not a re-serialization. A streamed call that the final parse does not confirm is logged at `warn` with the response id and closed as `incomplete`; the parsed calls are then emitted as separate items. Other formats emit each call as one `output_item.added`, one argument delta, `.done`, and `output_item.done` after generation, as before.
 
 ## Response and conversation stores
 
@@ -227,6 +239,190 @@ disabled, requests using `conversation` return an error.
 - `conversation` loads and appends to an in-memory transcript by id.
 - The two fields are mutually exclusive.
 - `instructions` from the referenced prior response are not carried over.
+- A `compaction` item anywhere in the combined history (stored input, stored
+  output, or the new input) is expanded after the history is assembled. A
+  response whose history held a capsule stores its instructions, that capsule
+  and everything after it as its input, so later `previous_response_id` hops
+  keep replaying the summary. An automatically compacted response stores its
+  instructions as input and the capsule as its first output item, which
+  replays the same way.
+
+## Conversation compaction
+
+`POST /v1/responses/compact` (alias `/responses/compact`) replaces older turns
+with a model-written summary so a long agent session fits the context window
+again. It is non-streaming and stores nothing.
+
+Request body: `model`, `input` (string or item array), and optionally
+`instructions`, `tools`, `max_output_tokens` (summary budget, default 1024,
+1 to 16384) and `keep_tokens` (budget of the turns kept verbatim, default 1/16
+of the per-slot context window, at most 8192). Sampling fields are accepted
+as on `/v1/responses`. `stream: true`, `previous_response_id` and
+`conversation` return 400: send the full history in `input`.
+
+```jsonc
+{
+  "id": "resp_...",
+  "object": "response.compaction",
+  "created_at": 1760000000,
+  "model": "...",
+  "output": [
+    {"type":"message", "role":"system", "content":"..."},
+    {"type":"message", "role":"user", "content":"latest question"},
+    {"type":"compaction", "id":"cmp_...", "encrypted_content":"eyJ2IjoxLC..."}
+  ],
+  "usage": {"input_tokens": 1830, "output_tokens": 212, "total_tokens": 2042, ...}
+}
+```
+
+`output` holds the system and developer messages, the retained turns, and
+exactly one `compaction` item. Version 1 also stores retained turns inside the
+capsule, so the returned body can be larger than the original media payload.
+The server rejects output that cannot fit its replay request limit; leave
+additional room for new items. `usage` counts the one summary generation.
+Continue the session by sending `[...output, <new items>]` to `/v1/responses`.
+The request-level `instructions` applies to the compaction pass; resend it on
+continuation if needed, or put persistent instructions in system/developer
+input messages.
+The retained turns appear in `output` and again inside the capsule, so that
+body carries them twice. A client may send only the system and developer
+messages plus the `compaction` item, followed by its new items, for the same
+replay at a smaller body size.
+
+**Selection.** System and developer messages are always kept in their roles.
+The latest user message is always kept. The newest whole turns that fit
+`keep_tokens` are kept; the newest turn is kept even when it alone exceeds the
+budget. The budget is measured on the rendered kept context, so it also counts
+the system and developer messages, `instructions` and template overhead. When
+those alone exceed `keep_tokens`, no earlier turn fits and only the newest turn
+(plus the latest user message) is kept. The history is split only before a
+user message or right after the
+output that closes the last open function call, so a `function_call` is never
+separated from its `function_call_output`. A history that ends in a call
+without an output keeps that whole tool group. Everything before the split is
+summarized.
+
+**Summarization.** The summarized prefix (with the system and developer
+messages and `instructions`) is rendered through the model's chat template with
+a fixed handoff instruction appended as a user turn, and one generation runs on
+the same worker path as `/v1/responses`, at temperature 0, with thinking off
+and without tools. Token counts use the `/v1/responses/input_tokens` path.
+Successfully fetched image URLs are cached per compaction and reused for every
+count and for the summary prompt. Media capability and image-count checks run
+before prefetch; failed reads are left to the ordinary renderer for its error. A body with media is still counted on the
+worker, so each count takes a worker slot as `/v1/responses/input_tokens` does.
+
+**Failures.** None of these replaces any context:
+
+| Condition | Status | Error |
+|-----------|--------|-------|
+| Input longer than one context window (multi-pass summarization is not implemented) | 400 | `type: exceed_context_size_error`, `code: context_length_exceeded` |
+| Summary prompt plus `max_output_tokens` exceeds the window | 400 | same |
+| Summarized context is not shorter than the input | 400 | same |
+| Compacted output exceeds the request body limit on replay | 400 | `invalid_request_error`; reduce retained media or `keep_tokens` |
+| No safe split before the latest turn | 400 | `invalid_request_error` |
+| Summary empty or stopped at `max_output_tokens` | 502 | `server_error` |
+
+The error type matches the server's existing context-overflow error; the code
+is OpenAI's, so either kind of client recognizes it.
+
+**Capsule.** `encrypted_content` is base64url (no padding) of
+`{"v":1,"summary":"...","retained":[<input items>]}`. Despite the OpenAI field
+name it is not encrypted, by design: the client already holds the conversation
+it summarizes, so confidentiality adds nothing, and an encryption or HMAC key
+would not survive a server restart without new key storage. A capsule is
+therefore treated as client data. It is bounded by the request body limit,
+its retained items pass the same parser and validation as any `input` item,
+and a capsule that nests another capsule is refused. A capsule that does not
+decode, or whose `v` is not 1, returns 400 `invalid_request_error`.
+
+**Replay.** When `input` (or chained history) contains a `compaction` item,
+everything before the newest one is dropped except system and developer
+messages (exact resent duplicates are kept once), and the capsule's summary (as an assistant message) and retained
+items take its place, followed by the items after it. This applies to
+`/v1/responses`, `/v1/responses/input_tokens`, and `/v1/responses/compact`
+itself, so compacting an already compacted session folds the previous summary
+into the new one.
+
+Known limits:
+
+- The split may summarize the most recent completed tool group away; upstream mlx-vlm always keeps that group verbatim.
+- The summary replays as an assistant turn directly after the system and developer messages, so a chat template that requires the first non-system turn to be a user turn (Gemma, older Mistral) can reject the replayed prompt; upstream mlx-vlm uses the same ordering.
+
+### Automatic compaction
+
+A `/v1/responses` request (also `/responses`) opts in with:
+
+```json
+{"context_management": [{"type": "compaction", "compact_threshold": 24000}]}
+```
+
+Before generation the server counts the rendered input on the
+`/v1/responses/input_tokens` path. The input is the full history: chained
+`previous_response_id` or `conversation` items plus `input`, with any capsule
+already expanded. When the count reaches `compact_threshold`, or leaves no room
+for output in the context window, the history is compacted exactly as
+`POST /v1/responses/compact` does (same selection, default `keep_tokens` and
+failures), and generation runs on the compacted context. The summary budget is
+1/16 of the context window, between 128 and 1024 tokens. Unused
+`max_output_tokens` does not count toward the threshold. Compaction never runs
+during generation.
+
+The response `output` then starts with the `compaction` item, followed by the
+generated items. `usage` counts the final generation only, not the summary
+pass. A stored response keeps the system and developer messages as its input
+and the capsule as its first output item, so a `previous_response_id`
+continuation replays the summary and the retained turns, and compacts again
+only when that continuation reaches the threshold. A `conversation` transcript
+appends the new input and the output, capsule included, and replays the same
+way. A client that resends its history can append the output normally, or keep
+only the newest `compaction` item and everything after it.
+
+For every request that carries `context_management`, compacted or not,
+generation is capped at the smaller of the output limit (`max_output_tokens`
+or the server default) and the context left after the prompt. A reply that
+stops at that cap, or at `max_output_tokens`, returns `status: "incomplete"`
+with `incomplete_details: {"reason": "max_output_tokens"}`, no `completed_at`,
+and the cut-off message item marked `status: "incomplete"` (streaming ends with
+`response.incomplete`). A limited reasoning budget above the capped limit is
+lowered to one token below it, so the forced end of thinking still leaves room
+for visible output. A server with no free slot answers 503 before any count.
+Requests without `context_management` are unchanged:
+no extra count, no cap, and a `length` stop still reports `completed`.
+
+A streamed request that was compacted sends two MLX extension events after
+`response.in_progress` and before the compaction item's
+`response.output_item.added` (at `output_index` 0; generated items follow from
+index 1, and `response.completed` lists the same items):
+
+```text
+event: mlx.compaction.started
+data: {"type":"mlx.compaction.started","sequence_number":2,"response_id":"resp_...","input_tokens":5786}
+
+event: mlx.compaction.completed
+data: {"type":"mlx.compaction.completed","sequence_number":3,"response_id":"resp_...","input_tokens_before":5786,"input_tokens_after":854}
+```
+
+The counts describe the rendered input before and after compaction. Compaction
+finishes before the stream opens, so both events arrive together after it;
+they carry the counts, not live progress. No compaction means no events.
+
+**Failures.** A compaction failure returns the same HTTP error as
+`POST /v1/responses/compact` (see the table above) before any output is
+generated, for streaming requests too, since the stream has not opened yet:
+for example 400 `exceed_context_size_error` with code
+`context_length_exceeded` for a history over one window or a summary that does
+not shorten it. Nothing is generated from a context that would overflow. When
+the history has no safe split (a single turn, or one unfinished tool group),
+the request proceeds uncompacted if the input still leaves room for output, as
+upstream mlx-vlm does, and fails with `context_length_exceeded` otherwise. A
+malformed `context_management` (not an array, more than one entry, a `type`
+other than `compaction`, or a `compact_threshold` that is not an integer from
+1 to 100000000) returns 400 `invalid_request_error`.
+
+Not implemented: automatic compaction on `/v1/chat/completions` and
+`/v1/messages`, the Codex `compaction_trigger` input item, and multi-pass
+summarization of a history longer than one window.
 
 ## Tool choice enforcement
 
@@ -257,6 +453,10 @@ tool list only, and a forced choice that ends without a call is logged at
 `warn`. A tool schema the grammar engine cannot express falls back to that same
 instruction-only path instead of failing the request.
 
+A `call_id` the model emitted with the call is passed through to the
+`function_call` item (and its streaming events). The server mints a `call_`
+id only when the model gave none.
+
 A forced `tool_choice` cannot be combined with `text.format` of type
 `json_schema`: the two constraints would each claim the whole generation, so
 the request returns 400.
@@ -274,8 +474,6 @@ Notable gaps:
 
 - no background job mode;
 - no input-items pagination endpoint;
-- no server-side compaction endpoint;
-- no token-count endpoint;
 - no built-in tools or MCP connector execution;
 - no disk-persisted response store;
 - no `input_file` ingestion or `file_id` resolution through an uploads store.

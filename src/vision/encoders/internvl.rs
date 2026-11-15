@@ -46,9 +46,12 @@
 
 use super::{VisionEncoder, VisionEncoderOutput};
 use mlxcel_core::layers::{LayerNorm, Linear};
+use mlxcel_core::utils::GeluActivation;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
+
+use crate::vision::weights::load_dense_param;
 
 /// InternViT vision encoder configuration (parsed from `vision_config`).
 #[derive(Debug, Clone, Deserialize)]
@@ -207,9 +210,14 @@ impl VisionMLP {
 
     fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         let h = self.fc1.forward(x);
-        // GELU(approx="precise") in the Python reference; `gelu_approx` is
-        // mlxcel's tanh-free precise GELU (matches the SigLIP encoder).
-        let h = mlxcel_core::gelu_approx(&h);
+        // Exact erf GELU, deliberately. The checkpoint declares
+        // `vision_config.hidden_act = "gelu"`, which Hugging Face's InternViT
+        // (`ACT2FN[config.hidden_act]`) evaluates as erf. mlx-vlm's
+        // `internvl_chat` port uses `nn.GELU(approx="precise")`, which in MLX is
+        // the tanh approximation, so it departs from the trained activation
+        // here; on internvl3-1b the two move logits by under 0.04 and change no
+        // decided token (#2423, docs/benchmark_results/gelu-erf-vs-tanh-2026-10-23.md).
+        let h = GeluActivation::Erf.apply(&h);
         self.fc2.forward(&h)
     }
 }
@@ -280,6 +288,8 @@ impl VisionEmbeddings {
         weights: &WeightMap,
         config: &InternVitConfig,
         prefix: &str,
+        group_size: i32,
+        bits: i32,
     ) -> Result<Self, String> {
         let weight_key = format!("{prefix}.patch_embedding.weight");
         let mut patch_weight = weights
@@ -303,14 +313,22 @@ impl VisionEmbeddings {
             .get(&format!("{prefix}.patch_embedding.bias"))
             .map(|b| mlxcel_core::copy(b));
 
-        let class_embedding = weights
-            .get(&format!("{prefix}.class_embedding"))
-            .map(|w| mlxcel_core::copy(w))
-            .ok_or_else(|| format!("Weight not found: {prefix}.class_embedding"))?;
-        let position_embedding = weights
-            .get(&format!("{prefix}.position_embedding"))
-            .map(|w| mlxcel_core::copy(w))
-            .ok_or_else(|| format!("Weight not found: {prefix}.position_embedding"))?;
+        let class_embedding = load_dense_param(
+            weights,
+            &format!("{prefix}.class_embedding"),
+            &[1, 1, config.hidden_size as i32],
+            Some((group_size, bits)),
+        )?;
+        let position_embedding = load_dense_param(
+            weights,
+            &format!("{prefix}.position_embedding"),
+            &[
+                1,
+                (config.num_patches() + 1) as i32,
+                config.hidden_size as i32,
+            ],
+            Some((group_size, bits)),
+        )?;
 
         Ok(Self {
             patch_weight,
@@ -373,9 +391,16 @@ impl InternVitVisionModel {
         weights: &WeightMap,
         config: &InternVitConfig,
         prefix: &str,
+        group_size: i32,
+        bits: i32,
     ) -> Result<Self, String> {
-        let embeddings =
-            VisionEmbeddings::from_weights(weights, config, &format!("{prefix}.embeddings"))?;
+        let embeddings = VisionEmbeddings::from_weights(
+            weights,
+            config,
+            &format!("{prefix}.embeddings"),
+            group_size,
+            bits,
+        )?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {

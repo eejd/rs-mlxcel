@@ -97,8 +97,9 @@ impl BatchScheduler {
             // new id. Take the entry out *before* the release so we can
             // rebind it under the freshly allocated id below.
             //
-            // For non-Qwen-VL models / text-only requests this returns
-            // an empty snapshot and the rebind is a no-op.
+            // For models without per-sequence MRoPE state this returns an
+            // empty snapshot and the rebind is a no-op; text-only requests
+            // on MRoPE models carry their empty entry across.
             let mrope_snapshot = self.engine.model().take_qwen_vl_mrope_entry(victim.seq_id);
 
             // same lifecycle invariant for Gemma 4 E2B/E4B
@@ -121,6 +122,14 @@ impl BatchScheduler {
                 .engine
                 .model()
                 .take_gemma3n_per_layer_inputs_entry(victim.seq_id);
+
+            // Same for Llama 3.2 Vision image state (#2567): the vision
+            // tower ran once at enqueue time, and the re-prefill attends to
+            // the same cross-attention states under the new id.
+            let mllama_snapshot = self
+                .engine
+                .model()
+                .take_mllama_image_state_entry(victim.seq_id);
 
             // Drop the victim's prompt-cache context. Preemption reallocates
             // the sequence under a fresh `SequenceId` below, and the context
@@ -160,7 +169,7 @@ impl BatchScheduler {
             victim.merged_eos.clear();
             // The drafter's context is the discarded decode's; the re-prefill
             // primes a fresh one (#2255).
-            victim.prompt_lookup = None;
+            victim.token_only = None;
 
             // Allocate a fresh cache slot
             match self.allocate_sequence_state() {
@@ -184,6 +193,10 @@ impl BatchScheduler {
                     self.engine
                         .model()
                         .install_gemma3n_per_layer_inputs_entry(new_id, pli3n_snapshot);
+                    // Same for the Mllama image state (#2567).
+                    self.engine
+                        .model()
+                        .install_mllama_image_state_entry(new_id, mllama_snapshot);
                     if let Err(err) = victim.state.transition_to(SequenceState::Queued) {
                         tracing::error!("Eviction state transition error: {err}");
                         self.release_sequence_caches(new_id);
@@ -203,6 +216,7 @@ impl BatchScheduler {
                     // consumer.
                     drop(mrope_snapshot);
                     drop(pli_snapshot);
+                    drop(mllama_snapshot);
                     return true; // Slot is still freed
                 }
             }
@@ -484,6 +498,32 @@ impl BatchScheduler {
         seq.state = SequenceState::Finished(FinishReason::Error(err.to_string()));
     }
 
+    /// Finish every row of a step whose forward failed (#2727) with the
+    /// model's client-safe `msg`. The stage's own error is already in the
+    /// server log; the request sees exactly `msg`.
+    pub(super) fn fail_forward_rows(&mut self, seq_ids: &[SequenceId], msg: &str) {
+        tracing::warn!(
+            rows = seq_ids.len(),
+            error = msg,
+            "decode forward failed; failing its rows"
+        );
+        for &seq_id in seq_ids {
+            self.fail_sequence_with_message(seq_id, msg);
+        }
+    }
+
+    /// Answer `seq_id` with `msg` verbatim and finish it with that error.
+    /// Like [`Self::fail_desynchronized_sequence`] this overrides a finish
+    /// already recorded this tick, so nothing is donated to the prompt
+    /// cache from a state the failed forward never wrote.
+    pub(super) fn fail_sequence_with_message(&mut self, seq_id: SequenceId, msg: &str) {
+        let Some(seq) = self.active_batch.get_mut(seq_id) else {
+            return;
+        };
+        let _ = seq.response_tx.send(GenerateEvent::Error(msg.to_string()));
+        seq.state = SequenceState::Finished(FinishReason::Error(msg.to_string()));
+    }
+
     /// `seq_ids` without the ids a failed teardown just finished.
     fn without_failed(seq_ids: &[SequenceId], failed: &[SequenceId]) -> Vec<SequenceId> {
         seq_ids
@@ -594,7 +634,18 @@ impl BatchScheduler {
                     tokens,
                 })
             }
-            Err(mlxcel_core::engine::EngineError::Eval(msg)) => {
+            Err(EngineError::Forward(msg)) => {
+                // #2727: the model's forward failed before it appended
+                // anything, so there is nothing to unwind. The synchronous
+                // step this tick falls back to runs the forward once more and
+                // fails the rows with the model's message when it fails again.
+                tracing::warn!(
+                    error = %msg,
+                    "lookahead prime forward failed; decoding this tick synchronously"
+                );
+                None
+            }
+            Err(EngineError::Eval(msg)) => {
                 // #822: the forward already appended one speculative KV
                 // position per sequence before the async schedule threw.
                 // Record the throw and unwind that append before bailing;
@@ -904,6 +955,11 @@ impl BatchScheduler {
                 self.finish_rows_state(&out.rows);
                 self.apply_row_outcomes(&out.rows);
             }
+            // #2727: the model reported the forward failed before any row's
+            // state advanced (a remote stage error or timeout). Every row of
+            // the step is answered with the model's client-safe message and
+            // finished with an error, so none decodes on or donates state.
+            Err(EngineError::Forward(msg)) => self.fail_forward_rows(seq_ids, &msg),
             Err(err) => tracing::error!("{err} during decode"),
         }
     }
@@ -1120,7 +1176,7 @@ impl BatchScheduler {
                 // Classic decode reports no acceptance block (#1314); a
                 // prompt-lookup row reports its verify rounds (#2255).
                 let speculative = seq
-                    .prompt_lookup
+                    .token_only
                     .as_ref()
                     .and_then(|row| row.speculative_stats());
                 let result = seq.take_generation_result(&self.tokenizer, cached, speculative);

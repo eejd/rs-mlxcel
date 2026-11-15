@@ -94,6 +94,8 @@ pub enum ResponsesTranslateError {
     MaxOutputTokensInvalid,
     #[error("{0}")]
     InvalidInputPart(String),
+    #[error("invalid compaction item: {0}")]
+    InvalidCompaction(String),
 }
 
 /// Inbound translation result. Carries the synthetic
@@ -105,6 +107,10 @@ pub struct TranslatedRequest {
     pub canonical_input_items: Vec<ResponseInputItem>,
     pub effective_store: bool,
     pub conversation_id: Option<String>,
+    /// The full rendered history as input items (chained history plus
+    /// `input`, capsule expanded). Kept only for a request that carries
+    /// `context_management`, which automatic compaction reads (issue #2397).
+    pub resolved_items: Option<Vec<ResponseInputItem>>,
 }
 
 /// Flatten a Responses-API request into the chat-completions shape.
@@ -176,9 +182,19 @@ pub fn responses_request_to_chat(
 
     // Append the current request's input items.
     let current_items = request.input.clone().into_items();
-    let canonical_input_items = current_items.clone();
+    let mut canonical_input_items = current_items.clone();
     let mut all_items = prior_items;
     all_items.extend(current_items);
+    if let Some(compacted) =
+        crate::server::responses_compaction::canonical_compaction_input(&all_items)
+    {
+        canonical_input_items = compacted;
+    }
+    // Expand the newest compaction capsule (issue #2397). It runs on the
+    // concatenated history because a chained request carries its capsule in
+    // the stored input, not in the current one.
+    let all_items = crate::server::responses_compaction::resolve_compaction(all_items)
+        .map_err(ResponsesTranslateError::InvalidCompaction)?;
 
     // Build the chat-completion messages. Instructions go in as a
     // leading system message so the existing template renderer treats
@@ -255,12 +271,14 @@ pub fn responses_request_to_chat(
 
     let effective_store = request.store.unwrap_or(true);
     let conversation_id = request.conversation.as_ref().map(|c| c.id().to_string());
+    let resolved_items = request.context_management.is_some().then_some(all_items);
 
     Ok(TranslatedRequest {
         chat_request,
         canonical_input_items,
         effective_store,
         conversation_id,
+        resolved_items,
     })
 }
 
@@ -521,6 +539,11 @@ fn input_items_to_messages(items: &[ResponseInputItem]) -> Result<Vec<Message>, 
                 // next turn boundary is dropped.
                 pending_reasoning = None;
             }
+            ResponseInputItem::Compaction { .. } => {
+                // `responses_request_to_chat` expands every capsule before
+                // lowering; one reaching here would silently lose context.
+                return Err("compaction item was not expanded before rendering".to_string());
+            }
             ResponseInputItem::Reasoning { content } => {
                 // Buffer the reasoning text and attach it to the following
                 // assistant turn (issue #362) so templates that render
@@ -603,6 +626,11 @@ fn output_to_input_items(output: &ResponseOutputItem) -> Vec<ResponseInputItem> 
         // Reasoning output items are not replayed — the model can
         // regenerate reasoning when prompted again.
         ResponseOutputItem::Reasoning(_) => vec![],
+        // A capsule replays as the input item it was minted from, so a
+        // chained request expands it like a client-sent one.
+        ResponseOutputItem::Compaction(c) => vec![ResponseInputItem::Compaction {
+            encrypted_content: c.encrypted_content.clone(),
+        }],
     }
 }
 
@@ -660,7 +688,10 @@ pub fn build_response_object(ctx: OutboundContext<'_>) -> ResponseObject {
             output.push(ResponseOutputItem::FunctionCall(
                 ResponseFunctionCallOutput {
                     id: format!("fc_{}", short_uuid()),
-                    call_id: format!("call_{}", short_uuid()),
+                    call_id: call
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| format!("call_{}", short_uuid())),
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
                     status: ResponseItemStatus::Completed,
@@ -814,6 +845,7 @@ mod tests {
             safety_identifier: None,
             background: None,
             service_tier: None,
+            context_management: None,
             sampling: SamplingParams::default(),
         }
     }

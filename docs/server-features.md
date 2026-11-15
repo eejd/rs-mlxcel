@@ -47,7 +47,7 @@ route discovery depend on the checkpoint.
 
 | Surface | Main routes | Notes |
 | --- | --- | --- |
-| OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/models` | Responses also supports retrieve, delete, and cancel by id. |
+| OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/responses/compact`, `/v1/embeddings`, `/v1/models` | Responses also supports retrieve, delete, and cancel by id, and conversation compaction (explicit, or automatic through `context_management`). |
 | Anthropic | `/v1/messages`, `/v1/messages/count_tokens` | Uses the loaded chat template and the shared token accounting path. |
 | Retrieval | `/v1/rerank`, `/v1/reranking` | Cohere/Jina-compatible reranking surface. |
 | Audio | `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/translations` | Kokoro TTS, audio-capable chat models, and Whisper are described in [`audio-api.md`](audio-api.md). |
@@ -60,6 +60,19 @@ Most non-`/v1` convenience aliases remain available. Two aliases are important
 migration exceptions: `/completions` and `/embeddings` now return the native
 `llama-server` schemas. Clients expecting OpenAI objects must use
 `/v1/completions` and `/v1/embeddings`.
+
+`POST /v1/completions` accepts `prompt` as a string or an array containing
+exactly one string. For example, `"prompt": ["Hello"]` is handled identically
+to `"prompt": "Hello"`, in both streaming and non-streaming requests. Empty
+arrays and arrays containing multiple prompts return HTTP 400 with an
+`invalid_request_error` JSON body; send one prompt per request. Token-ID
+arrays and other JSON types are not supported. An empty string remains a
+valid request for unconditional generation; a non-empty, whitespace-only
+string is rejected. This policy is shared by the single-node HTTP server,
+the disaggregated HTTP router, and `InProcessServer::complete`, including
+direct Rust calls. Validation happens before dispatch or streaming setup.
+Prompt batching, token-ID input, and multiple choices (`n > 1`) remain
+separate follow-up work.
 
 The checked-in b10621 manifest under `compat/llama-server/b10621/` is the
 authoritative compatibility inventory. It classifies every pinned option,
@@ -275,6 +288,18 @@ dialects such as Qwen3-Coder and GLM, Kimi K2, pythonic) get the instruction and
 the narrowed tool list only, and a forced choice that ends without a call is
 logged at `warn` with the format name.
 
+Llama 3.x `<|python_tag|>` calls are held back from streamed `content` as they are from the non-streamed reply, whether the call is a JSON object or closed by `<|eom_id|>`. A `<|python_tag|>` block that does not hold a JSON tool call is dropped from `content` in both modes; text before the tag is kept.
+
+Tool-call ids: when the model emits an id with the call (for example the
+`id` field of a Mistral `[TOOL_CALLS]` entry), the response returns it as
+`tool_calls[].id`. When the model gives none, the server mints a `call_` id.
+
+**Streamed tool-call arguments.** With `stream: true`, `/v1/chat/completions` sends a call's `arguments` as they are generated instead of in one chunk at the end, for Hermes / Qwen JSON (`<tool_call>{...}</tool_call>`), Mistral (`[TOOL_CALLS]name[ARGS]{...}` and the `[TOOL_CALLS] [{...}]` list), Llama 3 JSON (bare or after `<|python_tag|>`), and Qwen3-Coder XML (`<function=...><parameter=...>`). The first chunk of a call carries `index`, `id` and `function.name` once the name is complete (bare Llama 3 JSON also waits for its `parameters` / `arguments` member, Qwen3-Coder for the first body character after the name); later chunks carry `function.arguments` fragments. Concatenating a call's fragments gives exactly the final `arguments` string. For the JSON formats that string is the model's own object text (the non-streamed reply returns the same text), and a string-encoded `arguments` value arrives decoded in one fragment. For Qwen3-Coder it is compact JSON with keys in generation order: a parameter the tool schema types as `string` streams as escaped fragments, any other value is sent once its `</parameter>` arrives. Other formats keep the single end-of-stream chunk.
+
+The end-of-generation parse stays authoritative. A call is streamed only after its name passes the declared-tool filter, and a named `tool_choice` keeps the other calls off the stream entirely (they keep their `index` slot, as before). Text inside a thinking block is never streamed. The id in the first chunk is the call's id for the rest of the stream: a model-supplied Mistral list `id` is used only when it precedes `name` (validated and de-duplicated as in the non-streamed parse), otherwise the server mints one at the first chunk and a later model id is ignored. When the final parse disagrees with what was streamed (a different call count, name, or arguments), the server logs a `warn` with the request id, sends no further fragment for that call, and emits the parsed call in one shot, under a new `index` when the streamed call already used its slot. `finish_reason` still follows the parsed calls.
+
+For Hermes (and Granite, which parses through it), Mistral and Llama 3, an object-valued `arguments` is the model's raw JSON text everywhere, streamed or not, not a re-serialization: key order, spacing and number forms are kept. This is a change from earlier releases, which re-serialized the parsed object. Clients should parse `arguments` as JSON and not compare it byte for byte with a canonical form. The streamer never panics the request: a scanner panic is caught, that fragment is dropped, the newest call's sent text is rolled back to what the client received, streaming stops for the rest of the reply, and the end-of-generation parse sends the unsent remainder in one chunk.
+
 Tool schemas that the grammar engine cannot express fall back to that same
 instruction-only path rather than failing the request: the compile failure is
 logged at `warn` and generation runs unconstrained. Only a `response_format`
@@ -284,7 +309,8 @@ schema, which the client asked for explicitly, turns a compile failure into a
 A forced `tool_choice` cannot be combined with a `response_format` schema (400).
 The Anthropic `tool_choice` values `{"type": "any"}` and
 `{"type": "tool", "name": "f"}` map to `required` and the named form, so the
-same rules apply on `/v1/messages`.
+same rules apply on `/v1/messages`. A `{"type": "tool"}` without a `name`, or a
+`type` other than `auto`, `any`, `none` and `tool`, is rejected with 400.
 
 ## Observability, persistence, and resumable streams
 
@@ -305,7 +331,18 @@ client disconnect continues to cancel generation normally.
 `--sleep-idle-seconds N` frees the model worker and prompt cache after the idle
 window. Health and inspection routes remain available while sleeping; the next
 inference request reloads the model and performs its own prefill. Negative
-values disable sleep, which is the default.
+values disable sleep, which is the default. A shutdown request that arrives
+while the worker is sleeping exits it without reloading the model, so process
+exit does not wait for a load it will never use.
+
+On exit, the server joins its chat model worker and every side worker (audio,
+embedding, image, rerank and realtime) before `main` returns, because a thread
+that frees MLX arrays after the C runtime's static destructors run aborts a CPU
+build with `pure virtual method called`. The join is bounded by a 120 s
+`WORKER_EXIT_TIMEOUT` (150 s for the router's pool drain). Model load has no
+cancellation point, so a worker that is still loading when the deadline
+expires keeps running: the server logs that the worker is still running and
+that a CPU build may abort at exit, rather than reporting a clean exit.
 
 ## Live settings
 
@@ -356,6 +393,14 @@ The default CORS mode follows b10621 and is permissive. Use
 when migrating an existing llama-server command. TLS is enabled by supplying
 both `--ssl-cert-file` and `--ssl-key-file`. A `--host` ending in `.sock` starts
 a Unix-domain-socket listener, and `--api-prefix` nests all routes below a path.
+
+The public set is matched literally against the request path as the client sent
+it, prefix included. With `--api-prefix /llama` and keys enabled,
+`/llama/health` and `/llama/v1/health` are therefore not public and need a
+bearer key, which matches llama-server b10621. The unprefixed `/health` is still
+treated as public but is not mounted, so it answers 404. Health probes that
+cannot send a key (for example a load balancer) should not be pointed at a
+prefixed server with keys enabled. Startup logs a warning when both are set.
 
 With `AIP_MODE=PREDICTION`, the server also honors the Vertex AI custom-container
 `AIP_HTTP_PORT`, `AIP_HEALTH_ROUTE`, and `AIP_PREDICT_ROUTE` variables. See

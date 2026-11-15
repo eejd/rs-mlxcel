@@ -1,71 +1,213 @@
 {
   "budgets": {
-    "embedded_asset_bytes": 888342,
+    "embedded_asset_bytes": 1683367,
     "embedded_asset_limit_bytes": 5242880,
-    "initial_js_gzip_bytes": 188847,
-    "initial_js_gzip_limit_bytes": 204800,
-    "total_js_gzip_bytes": 189458,
+    "initial_js_gzip_bytes": 237532,
+    "initial_js_gzip_limit_bytes": 262144,
+    "total_js_gzip_bytes": 353057,
     "total_js_gzip_limit_bytes": 716800
   },
   "files": [
     {
-      "bytes": 951,
-      "gzip_bytes": 611,
-      "path": "assets/code-highlight-BAAcRsuc.js",
-      "sha256": "a0912b5f97a2d53bdd111a22a64f4e54baf7a98782d2f89b6897d205a6ed7bd4"
+      "bytes": 33062,
+      "gzip_bytes": 10820,
+      "path": "assets/BottomSheet-DbOFY-yD.js",
+      "sha256": "bc5b6ee7d8ff4111e117d30c1c43415e2582c139a067c7d7ad7247575443c96c"
     },
     {
-      "bytes": 731347,
-      "gzip_bytes": 187858,
-      "path": "assets/index-01S1553r.js",
-      "sha256": "dcb14ee20992bad82d7de1867241b7c4a70459b56580a64799d75fe49a237418"
+      "bytes": 8454,
+      "gzip_bytes": 3379,
+      "path": "assets/ItemSwipeLayer-Nm6HO4EL.js",
+      "sha256": "e0474d93e0bba69a74f165398145ffad6187cb2f8dde9f12bee30cec54dd60db"
     },
     {
-      "bytes": 138092,
-      "gzip_bytes": 21927,
-      "path": "assets/index-B8XA_0O-.css",
-      "sha256": "26f4c4f85c6611bb19cec62d8bb9361d26e92b26c887cf50e9297e2202e211dc"
+      "bytes": 477,
+      "gzip_bytes": 296,
+      "path": "assets/MenuBottomSheet-CCSrKOdN.js",
+      "sha256": "a8e37de5df042aeab22cf9c789a40892f2f3e565b1f36fc5020ac8b025471a62"
     },
     {
-      "bytes": 503,
-      "gzip_bytes": 305,
+      "bytes": 231,
+      "gzip_bytes": 192,
+      "path": "assets/ProgressBarMarkTooltip-DdnVFmtm.js",
+      "sha256": "64ff0657e61f79d7b62771c67073d4c3aee99ca4f6eee47dbee0dc37610f5897"
+    },
+    {
+      "bytes": 25647,
+      "gzip_bytes": 8470,
+      "path": "assets/Tooltip-CJ7RdAlI.js",
+      "sha256": "1b6e63e759d4d42fef0748f89b4c521e7596bc1e72285780e4912b105972ce16"
+    },
+    {
+      "bytes": 15250,
+      "gzip_bytes": 4623,
+      "path": "assets/activity-S_KpVND-.js",
+      "sha256": "e4d98ac2171560bcdc53cc9dc337523b96807ca8d8d894049769ca9fc86150d5"
+    },
+    {
+      "bytes": 45422,
+      "gzip_bytes": 14362,
+      "path": "assets/chat-B_xwGV8F.js",
+      "sha256": "77fc9fd9f6db9c88cc4bdf7e25860368977a517ff889d1558ba667b4d572e88d"
+    },
+    {
+      "bytes": 957,
+      "gzip_bytes": 618,
+      "path": "assets/code-highlight-DPnWnFeT.js",
+      "sha256": "0c73c47b901a7db231ea76114a83bc8f2526e431eda95bdb2442152ba6e2481d"
+    },
+    {
+      "bytes": 38183,
+      "gzip_bytes": 9221,
+      "path": "assets/common-i18n-ko-C2ci3gEl.js",
+      "sha256": "df9c426be5a56f804a22edc2c0767922d07c22a3bb7c63279f908327607945e4"
+    },
+    {
+      "bytes": 658,
+      "gzip_bytes": 448,
+      "path": "assets/format-C5iCj9a_.js",
+      "sha256": "492fa0bbb09bd6756de03db281f3c6d3db64c978b9c3fecae45a10911e6fd245"
+    },
+    {
+      "bytes": 3099,
+      "gzip_bytes": 1344,
+      "path": "assets/format-CP4Qtweh.js",
+      "sha256": "98bc0b03e800e03d80ecaab0a0dc3070d4842ea322b616c3dc3f839ad16103f8"
+    },
+    {
+      "bytes": 6715,
+      "gzip_bytes": 1777,
+      "path": "assets/gallery-BnDxSmtR.js",
+      "sha256": "1718c9873e75bdf978f60570cd383c1e7c2ec9cb0e42cc9aa238629457e16f57"
+    },
+    {
+      "bytes": 341976,
+      "gzip_bytes": 52517,
+      "path": "assets/index-BcCqLp8u.css",
+      "sha256": "7b85987c103ca5b735b6d3ec8fa617fcdec797c98b6eb5a9c06a264f71061a30"
+    },
+    {
+      "bytes": 851814,
+      "gzip_bytes": 219452,
+      "path": "assets/index-CaiEcLWh.js",
+      "sha256": "1191366842f38016e3b554062d901595d27f7f4ad039214fc8c96a1e513887bd"
+    },
+    {
+      "bytes": 8911,
+      "gzip_bytes": 3401,
+      "path": "assets/jsx-runtime-Wy9s6hX0.js",
+      "sha256": "bcb9f6586cd973c2fb2faa4a2d38d4b06660e2fe2806aaa0de1c39306ff0f69a"
+    },
+    {
+      "bytes": 5567,
+      "gzip_bytes": 2007,
+      "path": "assets/load-action-DjAGVDf_.js",
+      "sha256": "e310a22f4ef80db210a7c01a8594b5f3efa71b19182ab47871567e6c1ba9cb7a"
+    },
+    {
+      "bytes": 2969,
+      "gzip_bytes": 1309,
+      "path": "assets/load-profiles-DZB82Wpx.js",
+      "sha256": "ab5b304d51b61404cb163aed8cd4ea66e6c9174d2fda6b051d74dee777f10bb7"
+    },
+    {
+      "bytes": 4612,
+      "gzip_bytes": 1244,
+      "path": "assets/primitives-Bo7WZ0Dj.css",
+      "sha256": "63b7fc023bbc1f5d9387dd0316bffb883a3f492c5eb63198cbe1c85d968e0084"
+    },
+    {
+      "bytes": 151163,
+      "gzip_bytes": 49698,
+      "path": "assets/primitives-Ci3QedEZ.js",
+      "sha256": "0e2511bc1535f8afe84fb8ec99ab30e4d29ee436c41e65091114e868630fbfe3"
+    },
+    {
+      "bytes": 21397,
+      "gzip_bytes": 6330,
+      "path": "assets/screen-DJlKLjZw.js",
+      "sha256": "f28ee3ceb9489269524de7e6bead1b86de1bc05f39083493a9536c5eeb2561b7"
+    },
+    {
+      "bytes": 2842,
+      "gzip_bytes": 1247,
+      "path": "assets/server-defaults-_jVXOQKJ.js",
+      "sha256": "d1f8417598464479307c5a53a41e426237fb6ebca4ecb6362e4bea2707b079f0"
+    },
+    {
+      "bytes": 29054,
+      "gzip_bytes": 7854,
+      "path": "assets/settings-screen-CW_5UjQq.js",
+      "sha256": "b4b1e32fe5fd9a692dc7d462ae41e89d690e34edb07da8ea9c64345ed0319727"
+    },
+    {
+      "bytes": 7207,
+      "gzip_bytes": 1951,
+      "path": "assets/themeProps-C8nYV8It.js",
+      "sha256": "96aa4cfb5c5335fe6b9acbc26827f5bf5f990ba6ae3d69f95676f733dc6b48e5"
+    },
+    {
+      "bytes": 12690,
+      "gzip_bytes": 3137,
+      "path": "assets/useLayerDismissal-Bwrv1KEx.js",
+      "sha256": "29d5276ff50b3e4d1c9bebbae5663dc5795a17f2fb18eb0aa2eb56479c868975"
+    },
+    {
+      "bytes": 29012,
+      "gzip_bytes": 680,
+      "path": "astryx-layer-slide-rules.css",
+      "sha256": "9e80e458526869e9f627092a676504d05e996571eff4794a3bd883e4c1c98d8e"
+    },
+    {
+      "bytes": 1203,
+      "gzip_bytes": 550,
       "path": "index.html",
-      "sha256": "9198c7f1d31fc8924850baf721cb9ea03eafa78b087293f4717652b6bfe496d5"
+      "sha256": "bab4c9a3ea41cfa4ed945b85fcce2f2634720116d6f17d02b84cd4b6e0a3c365"
     },
     {
-      "bytes": 2129,
-      "gzip_bytes": 989,
+      "bytes": 88,
+      "gzip_bytes": 88,
+      "path": "layer-order.css",
+      "sha256": "facf486c00c08d866031ba8d280b5cb390cc608a6b0ac85d1f4d5c095aa3e01d"
+    },
+    {
+      "bytes": 2476,
+      "gzip_bytes": 1121,
       "path": "theme-bootstrap.js",
-      "sha256": "731929d04a3407095caf1e6ee8cf6c6c1c8ddc31e592b45931322e94a9352b49"
+      "sha256": "c79443e2236c300c9ab852aa0366a5a3661839b21f40b3d5cd112d0a8c77ab91"
     },
     {
-      "bytes": 13233,
-      "gzip_bytes": 4828,
+      "bytes": 25601,
+      "gzip_bytes": 7028,
       "path": "third-party-licenses.txt",
-      "sha256": "98527167553e5b383153c3ea4301d9cf53b391877abaf2cae8c19a7a71bef7e0"
+      "sha256": "53469dfd5cef5c83223b8ea3e06ad54e1164ec14ff074f9c1c6e7f2453d09e74"
     }
   ],
   "node_version": "v26.5.1",
-  "package_manager": "pnpm@11.18.0",
+  "package_manager": "pnpm@12.16.1",
   "packages": {
-    "@axe-core/playwright": "4.10.2",
+    "@astryxdesign/lab": "0.7.0-canary.97a0d31",
+    "@axe-core/playwright": "4.14.0",
     "@eslint/js": "10.0.1",
-    "@lablup/ui-common": "0.1.0-alpha.19",
-    "@playwright/test": "1.63.0",
-    "@types/node": "22.20.2",
+    "@lablup/ui-common": "0.2.0-alpha.19",
+    "@lablup/ui-common-cli": "0.2.0-alpha.19",
+    "@playwright/test": "1.64.1",
+    "@stylexjs/stylex": "0.19.1",
+    "@types/node": "26.6.6",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
-    "@vitejs/plugin-react": "6.1.1",
-    "eslint": "10.10.0",
-    "jsdom": "30.0.1",
-    "react": "19.3.0",
-    "react-dom": "19.3.0",
-    "typescript": "5.9.3",
-    "typescript-eslint": "8.70.0",
-    "vite": "8.3.0",
-    "vitest": "5.0.0"
+    "@vitejs/plugin-react": "6.1.2",
+    "eslint": "10.14.0",
+    "jsdom": "30.1.3",
+    "lucide-react": "1.66.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.1",
+    "vite": "8.3.5",
+    "vitest": "5.0.5"
   },
-  "pnpm_version": "11.18.0",
+  "pnpm_version": "12.16.1",
   "schema_version": 1,
-  "source_digest_sha256": "37d43011dbb311ae846411ac79abd0742370b2fd52e73c55913640e3822a380e"
+  "source_digest_sha256": "7892fca5a9545aa117aaeafe0626fcd1b36e2bb10efa6abe1d412e3aaa8e5656"
 }

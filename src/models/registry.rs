@@ -26,6 +26,8 @@ pub enum Runtime {
     Asr,
     Tts,
     Detect,
+    Predict,
+    ImageGenerate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -45,6 +47,11 @@ pub enum OutputKind {
     Scores,
     Audio,
     Boxes,
+    DenseMap,
+    Mesh,
+    Keypoints,
+    Masks,
+    Image,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -87,8 +94,37 @@ pub struct FamilyCapabilities {
 #[derive(Debug, Serialize)]
 pub struct ArchitectureRegistry {
     pub mlxcel_version: &'static str,
+    /// Complete schema vocabulary, including capabilities whose model rows
+    /// have not landed yet.
+    pub runtime_kinds: &'static [Runtime],
+    pub output_kinds: &'static [OutputKind],
     pub families: Vec<ArchitectureFamily>,
 }
+
+const ALL_RUNTIMES: &[Runtime] = &[
+    Runtime::Generate,
+    Runtime::Serve,
+    Runtime::Embed,
+    Runtime::Rerank,
+    Runtime::Asr,
+    Runtime::Tts,
+    Runtime::Detect,
+    Runtime::Predict,
+    Runtime::ImageGenerate,
+];
+
+const ALL_OUTPUT_KINDS: &[OutputKind] = &[
+    OutputKind::Tokens,
+    OutputKind::Embeddings,
+    OutputKind::Scores,
+    OutputKind::Audio,
+    OutputKind::Boxes,
+    OutputKind::DenseMap,
+    OutputKind::Mesh,
+    OutputKind::Keypoints,
+    OutputKind::Masks,
+    OutputKind::Image,
+];
 
 #[derive(Debug, Serialize)]
 pub struct ArchitectureFamily {
@@ -139,11 +175,14 @@ const RERANK: &[Runtime] = &[Runtime::Rerank];
 const ASR: &[Runtime] = &[Runtime::Asr];
 const TTS: &[Runtime] = &[Runtime::Tts];
 const DETECT: &[Runtime] = &[Runtime::Detect];
+const PREDICT: &[Runtime] = &[Runtime::Predict];
+const IMAGE_GENERATE: &[Runtime] = &[Runtime::ImageGenerate];
 
 const TEXT: &[Modality] = &[Modality::Text];
 const IMAGE: &[Modality] = &[Modality::Image];
 const AUDIO: &[Modality] = &[Modality::Audio];
 const TEXT_IMAGE: &[Modality] = &[Modality::Text, Modality::Image];
+const IMAGE_VIDEO: &[Modality] = &[Modality::Image, Modality::Video];
 const TEXT_IMAGE_VIDEO: &[Modality] = &[Modality::Text, Modality::Image, Modality::Video];
 const TEXT_IMAGE_VIDEO_AUDIO: &[Modality] = &[
     Modality::Text,
@@ -182,8 +221,8 @@ struct StandaloneArchitectureFamily {
     kv_modes: &'static [KvMode],
 }
 
-const STANDALONE_ARCHITECTURE_FAMILIES: &[StandaloneArchitectureFamily] =
-    &[StandaloneArchitectureFamily {
+const STANDALONE_ARCHITECTURE_FAMILIES: &[StandaloneArchitectureFamily] = &[
+    StandaloneArchitectureFamily {
         id: "rt_detr_v2",
         display_name: "RT-DETRv2",
         category: "detection",
@@ -201,7 +240,376 @@ const STANDALONE_ARCHITECTURE_FAMILIES: &[StandaloneArchitectureFamily] =
         pipeline_parallel: false,
         drafters: NO_DRAFTERS,
         kv_modes: KV_FP16,
-    }];
+    },
+    StandaloneArchitectureFamily {
+        id: "pp_doclayout_v3",
+        display_name: "PP-DocLayoutV3",
+        category: "detection",
+        model_types: &["pp_doclayout_v3"],
+        aliases: EMPTY_KEYS,
+        runtimes: DETECT,
+        modalities_in: IMAGE,
+        output: OutputKind::Boxes,
+        backends: BackendSupport {
+            metal: BackendStatus::Supported,
+            cuda: BackendStatus::Supported,
+            rocm: ROCM_FIRST_PASS,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+    StandaloneArchitectureFamily {
+        id: "rf-detr",
+        display_name: "RF-DETR",
+        category: "detection",
+        model_types: &["rf-detr"],
+        aliases: &["rfdetr"],
+        runtimes: DETECT,
+        modalities_in: IMAGE,
+        output: OutputKind::Boxes,
+        backends: BackendSupport {
+            metal: BackendStatus::Partial,
+            cuda: BackendStatus::Partial,
+            rocm: BackendStatus::Supported,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+    StandaloneArchitectureFamily {
+        id: "dinov2",
+        display_name: "DINOv2",
+        category: "vision encoder",
+        model_types: &["dinov2", "dinov2_with_registers"],
+        aliases: EMPTY_KEYS,
+        runtimes: PREDICT,
+        modalities_in: IMAGE,
+        output: OutputKind::Embeddings,
+        backends: BackendSupport {
+            metal: BackendStatus::Supported,
+            cuda: BackendStatus::Supported,
+            rocm: ROCM_FIRST_PASS,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+    StandaloneArchitectureFamily {
+        id: "sam3d_body",
+        display_name: "SAM 3D Body",
+        category: "dense_prediction",
+        model_types: &["sam3d_body"],
+        aliases: EMPTY_KEYS,
+        runtimes: PREDICT,
+        modalities_in: IMAGE,
+        output: OutputKind::Mesh,
+        backends: BackendSupport {
+            metal: BackendStatus::Supported,
+            cuda: BackendStatus::Supported,
+            rocm: ROCM_FIRST_PASS,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+    StandaloneArchitectureFamily {
+        id: "sam3d_objects",
+        display_name: "SAM 3D Objects",
+        category: "dense_prediction",
+        model_types: &["sam3d_objects"],
+        aliases: EMPTY_KEYS,
+        runtimes: PREDICT,
+        modalities_in: IMAGE,
+        output: OutputKind::Mesh,
+        backends: BackendSupport {
+            metal: BackendStatus::Supported,
+            cuda: BackendStatus::Supported,
+            rocm: ROCM_FIRST_PASS,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+    StandaloneArchitectureFamily {
+        id: "moge3",
+        display_name: "MoGe3",
+        category: "dense_prediction",
+        model_types: &["moge3"],
+        aliases: EMPTY_KEYS,
+        runtimes: PREDICT,
+        modalities_in: IMAGE,
+        output: OutputKind::DenseMap,
+        backends: BackendSupport {
+            metal: BackendStatus::Supported,
+            cuda: BackendStatus::Supported,
+            rocm: ROCM_FIRST_PASS,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+    StandaloneArchitectureFamily {
+        id: "sapiens2",
+        display_name: "Sapiens2",
+        category: "dense_prediction",
+        model_types: &["sapiens2"],
+        aliases: EMPTY_KEYS,
+        runtimes: PREDICT,
+        modalities_in: IMAGE,
+        output: OutputKind::DenseMap,
+        backends: BackendSupport {
+            metal: BackendStatus::Supported,
+            cuda: BackendStatus::Supported,
+            rocm: ROCM_FIRST_PASS,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+    StandaloneArchitectureFamily {
+        id: "video_depth_anything",
+        display_name: "Video Depth Anything",
+        category: "dense_prediction",
+        model_types: &["video_depth_anything"],
+        aliases: EMPTY_KEYS,
+        runtimes: PREDICT,
+        modalities_in: IMAGE_VIDEO,
+        output: OutputKind::DenseMap,
+        backends: BackendSupport {
+            metal: BackendStatus::Supported,
+            cuda: BackendStatus::Supported,
+            rocm: ROCM_FIRST_PASS,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+    StandaloneArchitectureFamily {
+        id: "sam3",
+        display_name: "SAM 3",
+        category: "segmentation",
+        model_types: &["sam3_video", "sam3"],
+        aliases: EMPTY_KEYS,
+        runtimes: PREDICT,
+        modalities_in: TEXT_IMAGE_VIDEO,
+        output: OutputKind::Masks,
+        backends: BackendSupport {
+            metal: BackendStatus::Supported,
+            cuda: BackendStatus::Supported,
+            rocm: ROCM_FIRST_PASS,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+    StandaloneArchitectureFamily {
+        id: "sam3_1",
+        display_name: "SAM 3.1",
+        category: "segmentation",
+        model_types: &["sam3.1_video", "sam3.1"],
+        aliases: &["sam31"],
+        runtimes: PREDICT,
+        modalities_in: TEXT_IMAGE_VIDEO,
+        output: OutputKind::Masks,
+        backends: BackendSupport {
+            metal: BackendStatus::Supported,
+            cuda: BackendStatus::Supported,
+            rocm: ROCM_FIRST_PASS,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+    StandaloneArchitectureFamily {
+        id: "flux2",
+        display_name: "FLUX.2 Klein",
+        category: "image generation",
+        model_types: &["flux2"],
+        aliases: EMPTY_KEYS,
+        runtimes: IMAGE_GENERATE,
+        modalities_in: TEXT_IMAGE,
+        output: OutputKind::Image,
+        backends: BackendSupport {
+            metal: BackendStatus::Partial,
+            cuda: BackendStatus::Supported,
+            rocm: ROCM_FIRST_PASS,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+    StandaloneArchitectureFamily {
+        id: "z_image",
+        display_name: "Z-Image",
+        category: "image generation",
+        model_types: &["z_image"],
+        aliases: &["z-image", "z-image-turbo"],
+        runtimes: IMAGE_GENERATE,
+        modalities_in: TEXT_IMAGE,
+        output: OutputKind::Image,
+        backends: BackendSupport {
+            metal: BackendStatus::Supported,
+            cuda: BackendStatus::Supported,
+            rocm: ROCM_FIRST_PASS,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+    StandaloneArchitectureFamily {
+        id: "bonsai",
+        display_name: "Prism Bonsai (ternary FLUX.2 Klein)",
+        category: "image generation",
+        model_types: &["bonsai"],
+        aliases: EMPTY_KEYS,
+        runtimes: IMAGE_GENERATE,
+        modalities_in: TEXT,
+        output: OutputKind::Image,
+        backends: BackendSupport {
+            metal: BackendStatus::Partial,
+            cuda: BackendStatus::Supported,
+            rocm: ROCM_FIRST_PASS,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+    StandaloneArchitectureFamily {
+        id: "ernie_image",
+        display_name: "ERNIE-Image",
+        category: "image generation",
+        model_types: &["ernie_image"],
+        aliases: &["ernie-image", "ernie-image-turbo"],
+        runtimes: IMAGE_GENERATE,
+        modalities_in: TEXT_IMAGE,
+        output: OutputKind::Image,
+        backends: BackendSupport {
+            metal: BackendStatus::Partial,
+            cuda: BackendStatus::Supported,
+            rocm: ROCM_FIRST_PASS,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+    StandaloneArchitectureFamily {
+        id: "mage_flow",
+        display_name: "Mage-Flow",
+        category: "image generation",
+        model_types: &["mage_flow"],
+        aliases: &[
+            "mage-flow",
+            "mage-flow-base",
+            "mage-flow-turbo",
+            "mage-flow-edit",
+            "mage-flow-edit-base",
+            "mage-flow-edit-turbo",
+        ],
+        runtimes: IMAGE_GENERATE,
+        modalities_in: TEXT_IMAGE,
+        output: OutputKind::Image,
+        backends: BackendSupport {
+            metal: BackendStatus::Partial,
+            cuda: BackendStatus::Supported,
+            rocm: ROCM_FIRST_PASS,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+    StandaloneArchitectureFamily {
+        id: "qwen_image",
+        display_name: "Qwen-Image",
+        category: "image generation",
+        model_types: &["qwen_image"],
+        aliases: &["qwen-image", "qwen-image-2.1"],
+        runtimes: IMAGE_GENERATE,
+        modalities_in: TEXT_IMAGE,
+        output: OutputKind::Image,
+        backends: BackendSupport {
+            metal: BackendStatus::Partial,
+            cuda: BackendStatus::Supported,
+            rocm: ROCM_FIRST_PASS,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+    StandaloneArchitectureFamily {
+        id: "ideogram4",
+        display_name: "Ideogram 4",
+        category: "image generation",
+        model_types: &["ideogram4"],
+        aliases: &["ideogram-4", "ideogram-4-fp8"],
+        runtimes: IMAGE_GENERATE,
+        modalities_in: TEXT,
+        output: OutputKind::Image,
+        backends: BackendSupport {
+            metal: BackendStatus::Partial,
+            cuda: BackendStatus::Supported,
+            rocm: ROCM_FIRST_PASS,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+    StandaloneArchitectureFamily {
+        id: "ming_image",
+        display_name: "Ming-Image",
+        category: "image generation",
+        model_types: &["ming_image"],
+        aliases: &["ming-image", "ming-image-0.1-design"],
+        runtimes: IMAGE_GENERATE,
+        modalities_in: TEXT,
+        output: OutputKind::Image,
+        backends: BackendSupport {
+            metal: BackendStatus::Partial,
+            cuda: BackendStatus::Supported,
+            rocm: ROCM_FIRST_PASS,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+    StandaloneArchitectureFamily {
+        id: "llada_image",
+        display_name: "LLaDA-Image",
+        category: "image generation",
+        model_types: &["llada_image"],
+        aliases: &["llada-image", "llada-image-turbo"],
+        runtimes: IMAGE_GENERATE,
+        modalities_in: TEXT_IMAGE,
+        output: OutputKind::Image,
+        backends: BackendSupport {
+            metal: BackendStatus::Partial,
+            cuda: BackendStatus::Supported,
+            rocm: ROCM_FIRST_PASS,
+        },
+        tensor_parallel: false,
+        pipeline_parallel: false,
+        drafters: NO_DRAFTERS,
+        kv_modes: KV_FP16,
+    },
+];
 
 const TENSOR_PARALLEL_MODEL_TYPES: &[ModelType] = &[
     ModelType::Llama,
@@ -258,6 +666,7 @@ impl ModelType {
             ModelType::Qwen35VLM => "qwen3_5_vlm",
             ModelType::Qwen35Moe => "qwen3_5_moe",
             ModelType::Qwen35MoeVLM => "qwen3_5_moe_vlm",
+            ModelType::Qwen4ExpVLM => "qwen4_exp_vlm",
             ModelType::Gemma => "gemma",
             ModelType::Gemma2 => "gemma2",
             ModelType::Gemma3 => "gemma3",
@@ -354,6 +763,7 @@ impl ModelType {
             ModelType::HunyuanMoe => "hunyuan_moe",
             ModelType::HunyuanV1Dense => "hunyuan_v1_dense",
             ModelType::MiMo => "mimo",
+            ModelType::MiMoV2Flash => "mimo_v2_flash",
             ModelType::BailingMoe => "bailing_moe",
             ModelType::BailingMoeLinear => "bailing_moe_linear",
             ModelType::Afmoe => "afmoe",
@@ -592,7 +1002,8 @@ impl ModelType {
             | ModelType::PhiMoe
             | ModelType::Phixtral
             | ModelType::Step3p5
-            | ModelType::MiMo => "moe",
+            | ModelType::MiMo
+            | ModelType::MiMoV2Flash => "moe",
             _ => {
                 let family = self.family();
                 if matches!(
@@ -673,6 +1084,8 @@ pub fn build_architecture_registry(mlxcel_version: &'static str) -> Architecture
 
     ArchitectureRegistry {
         mlxcel_version,
+        runtime_kinds: ALL_RUNTIMES,
+        output_kinds: ALL_OUTPUT_KINDS,
         families,
     }
 }
@@ -690,6 +1103,7 @@ fn model_type_keys(model_type: ModelType) -> &'static [&'static str] {
         ModelType::Qwen3Next => &["qwen3_next", "qwen3next"],
         ModelType::Qwen35 | ModelType::Qwen35VLM => &["qwen3_5", "qwen3_5_text"],
         ModelType::Qwen35Moe | ModelType::Qwen35MoeVLM => &["qwen3_5_moe", "qwen3_5_moe_text"],
+        ModelType::Qwen4ExpVLM => &["qwen4_exp"],
         ModelType::Qwen2Moe => &["qwen2_moe"],
         ModelType::Gemma => &["gemma"],
         ModelType::Gemma2 => &["gemma2"],
@@ -739,6 +1153,7 @@ fn model_type_keys(model_type: ModelType) -> &'static [&'static str] {
         ModelType::HunyuanVLM => &["hunyuan_vl"],
         ModelType::HunyuanMoe => &["hunyuan"],
         ModelType::MiMo => &["mimo"],
+        ModelType::MiMoV2Flash => &["mimo_v2_flash"],
         ModelType::BailingMoe => &["bailing_moe"],
         ModelType::BailingMoeLinear => &["bailing_moe_linear"],
         ModelType::Afmoe => &["afmoe"],
@@ -880,7 +1295,8 @@ fn modalities_for(model_type: ModelType) -> &'static [Modality] {
         | ModelType::Qwen3VL
         | ModelType::Qwen3VLMoe
         | ModelType::Qwen35VLM
-        | ModelType::Qwen35MoeVLM => TEXT_IMAGE_VIDEO,
+        | ModelType::Qwen35MoeVLM
+        | ModelType::Qwen4ExpVLM => TEXT_IMAGE_VIDEO,
         _ if is_vlm_registry_type(model_type) => TEXT_IMAGE,
         _ => TEXT,
     }
@@ -952,6 +1368,15 @@ fn supports_turbo_kv(model_type: ModelType) -> bool {
             | ModelType::StableLM
             | ModelType::SmolLM3
             | ModelType::Ministral3
+            // Model-owned cache families whose layer tables honor the
+            // requested KV mode since #2776.
+            | ModelType::ExaOne4
+            | ModelType::GptOss
+            | ModelType::Step3p5
+            | ModelType::Step3p7
+            | ModelType::Mellum
+            | ModelType::Laguna
+            | ModelType::NemotronNAS
     )
 }
 
@@ -1100,25 +1525,194 @@ mod tests {
     }
 
     #[test]
-    fn standalone_detection_family_reports_detect_only_capabilities() {
-        let rt_detr = build_architecture_registry("test")
+    fn standalone_detection_families_report_detect_only_capabilities() {
+        let registry = build_architecture_registry("test");
+        for (id, display_name, model_type) in [
+            ("rt_detr_v2", "RT-DETRv2", "rt_detr_v2"),
+            ("pp_doclayout_v3", "PP-DocLayoutV3", "pp_doclayout_v3"),
+            ("rf-detr", "RF-DETR", "rf-detr"),
+        ] {
+            let family = registry
+                .families
+                .iter()
+                .find(|family| family.id == id)
+                .unwrap();
+
+            assert_eq!(family.display_name, display_name);
+            assert_eq!(family.category, "detection");
+            assert_eq!(family.model_types, [model_type]);
+            assert_eq!(family.runtimes, DETECT);
+            assert!(!family.runtimes.contains(&Runtime::Generate));
+            assert!(!family.runtimes.contains(&Runtime::Serve));
+            assert_eq!(family.modalities_in, IMAGE);
+            assert_eq!(family.output, OutputKind::Boxes);
+            assert!(!family.tensor_parallel);
+            assert!(!family.pipeline_parallel);
+            assert_eq!(family.drafters, NO_DRAFTERS);
+            assert_eq!(family.kv_modes, KV_FP16);
+        }
+    }
+
+    #[test]
+    fn standalone_dinov2_family_reports_feature_capabilities() {
+        let dinov2 = build_architecture_registry("test")
             .families
             .into_iter()
-            .find(|family| family.id == "rt_detr_v2")
+            .find(|family| family.id == "dinov2")
             .unwrap();
 
-        assert_eq!(rt_detr.display_name, "RT-DETRv2");
-        assert_eq!(rt_detr.category, "detection");
-        assert_eq!(rt_detr.model_types, ["rt_detr_v2"]);
-        assert_eq!(rt_detr.runtimes, DETECT);
-        assert!(!rt_detr.runtimes.contains(&Runtime::Generate));
-        assert!(!rt_detr.runtimes.contains(&Runtime::Serve));
-        assert_eq!(rt_detr.modalities_in, IMAGE);
-        assert_eq!(rt_detr.output, OutputKind::Boxes);
-        assert!(!rt_detr.tensor_parallel);
-        assert!(!rt_detr.pipeline_parallel);
-        assert_eq!(rt_detr.drafters, NO_DRAFTERS);
-        assert_eq!(rt_detr.kv_modes, KV_FP16);
+        assert_eq!(dinov2.display_name, "DINOv2");
+        assert_eq!(dinov2.category, "vision encoder");
+        assert_eq!(dinov2.model_types, ["dinov2", "dinov2_with_registers"]);
+        assert_eq!(dinov2.runtimes, PREDICT);
+        assert_eq!(dinov2.modalities_in, IMAGE);
+        assert_eq!(dinov2.output, OutputKind::Embeddings);
+        assert!(!dinov2.tensor_parallel);
+        assert!(!dinov2.pipeline_parallel);
+        assert_eq!(dinov2.drafters, NO_DRAFTERS);
+        assert_eq!(dinov2.kv_modes, KV_FP16);
+    }
+
+    #[test]
+    fn video_depth_anything_reports_image_video_depth_capabilities() {
+        let vda = build_architecture_registry("test")
+            .families
+            .into_iter()
+            .find(|family| family.id == "video_depth_anything")
+            .unwrap();
+        assert_eq!(vda.display_name, "Video Depth Anything");
+        assert_eq!(vda.category, "dense_prediction");
+        assert_eq!(vda.model_types, ["video_depth_anything"]);
+        assert_eq!(vda.runtimes, PREDICT);
+        assert_eq!(vda.modalities_in, IMAGE_VIDEO);
+        assert_eq!(vda.output, OutputKind::DenseMap);
+        assert!(!vda.tensor_parallel);
+        assert!(!vda.pipeline_parallel);
+    }
+
+    #[test]
+    fn sam3_reports_promptable_mask_capabilities() {
+        let sam3 = build_architecture_registry("test")
+            .families
+            .into_iter()
+            .find(|family| family.id == "sam3")
+            .unwrap();
+
+        assert_eq!(sam3.display_name, "SAM 3");
+        assert_eq!(sam3.category, "segmentation");
+        assert_eq!(sam3.model_types, ["sam3_video", "sam3"]);
+        assert_eq!(sam3.runtimes, PREDICT);
+        assert_eq!(sam3.modalities_in, TEXT_IMAGE_VIDEO);
+        assert_eq!(sam3.output, OutputKind::Masks);
+        assert!(!sam3.tensor_parallel);
+        assert!(!sam3.pipeline_parallel);
+    }
+
+    #[test]
+    fn sam31_reports_multiplex_mask_capabilities() {
+        let sam31 = build_architecture_registry("test")
+            .families
+            .into_iter()
+            .find(|family| family.id == "sam3_1")
+            .unwrap();
+
+        assert_eq!(sam31.display_name, "SAM 3.1");
+        assert_eq!(sam31.category, "segmentation");
+        assert_eq!(sam31.model_types, ["sam3.1_video", "sam3.1"]);
+        assert_eq!(sam31.aliases, ["sam31"]);
+        assert_eq!(sam31.runtimes, PREDICT);
+        assert_eq!(sam31.modalities_in, TEXT_IMAGE_VIDEO);
+        assert_eq!(sam31.output, OutputKind::Masks);
+        assert!(!sam31.tensor_parallel);
+        assert!(!sam31.pipeline_parallel);
+    }
+
+    #[test]
+    fn mage_flow_lists_all_six_variants_as_aliases() {
+        let mage_flow = build_architecture_registry("test")
+            .families
+            .into_iter()
+            .find(|family| family.id == "mage_flow")
+            .unwrap();
+
+        assert_eq!(mage_flow.model_types, ["mage_flow"]);
+        assert_eq!(
+            mage_flow.aliases,
+            [
+                "mage-flow",
+                "mage-flow-base",
+                "mage-flow-turbo",
+                "mage-flow-edit",
+                "mage-flow-edit-base",
+                "mage-flow-edit-turbo",
+            ]
+        );
+    }
+
+    #[test]
+    fn qwen_image_is_an_image_generation_family() {
+        let qwen_image = build_architecture_registry("test")
+            .families
+            .into_iter()
+            .find(|family| family.id == "qwen_image")
+            .unwrap();
+
+        assert_eq!(qwen_image.category, "image generation");
+        assert_eq!(qwen_image.model_types, ["qwen_image"]);
+        assert_eq!(qwen_image.aliases, ["qwen-image", "qwen-image-2.1"]);
+        assert_eq!(qwen_image.output, OutputKind::Image);
+    }
+
+    #[test]
+    fn ming_image_is_an_image_generation_family() {
+        let ming = build_architecture_registry("test")
+            .families
+            .into_iter()
+            .find(|family| family.id == "ming_image")
+            .unwrap();
+
+        assert_eq!(ming.category, "image generation");
+        assert_eq!(ming.model_types, ["ming_image"]);
+        assert_eq!(ming.runtimes, IMAGE_GENERATE);
+        assert_eq!(ming.output, OutputKind::Image);
+    }
+
+    #[test]
+    fn image_generation_runtime_and_output_kind_are_stable_json_values() {
+        // `mlxcel arch --json` serializes these enums verbatim; the spellings
+        // are what downstream site builds key on, so pin them. A family that
+        // lists `ImageGenerate` / `Image` appears in the snapshot with them.
+        assert_eq!(
+            serde_json::to_value(Runtime::ImageGenerate).unwrap(),
+            "image_generate"
+        );
+        assert_eq!(serde_json::to_value(OutputKind::Image).unwrap(), "image");
+    }
+
+    #[test]
+    fn no_registered_family_claims_image_generation_before_a_model_ports_it() {
+        // The runtime issue ships the foundation with an empty family table;
+        // each model issue adds its row to the standalone family table and to
+        // `imagegen::FAMILIES` together. A row in only one of the two would
+        // advertise a family `mlxcel generate-image` cannot run.
+        let advertised: Vec<_> = build_architecture_registry("test")
+            .families
+            .into_iter()
+            .filter(|family| family.runtimes.contains(&Runtime::ImageGenerate))
+            .map(|family| family.id)
+            .collect();
+        let runnable: Vec<_> = crate::imagegen::FAMILIES.iter().map(|f| f.name).collect();
+        assert_eq!(
+            advertised.len(),
+            runnable.len(),
+            "{advertised:?} vs {runnable:?}"
+        );
+        for id in advertised {
+            assert!(
+                runnable.contains(&id),
+                "{id} is advertised but not runnable"
+            );
+        }
     }
 
     #[test]
@@ -1197,6 +1791,32 @@ mod tests {
                 family(model_type).kv_modes,
                 KV_FP16,
                 "{model_type:?} should not advertise quantized KV cache modes"
+            );
+        }
+    }
+
+    #[test]
+    fn model_owned_kv_families_advertise_quantized_modes() {
+        for model_type in [
+            ModelType::ExaOne4,
+            ModelType::GptOss,
+            ModelType::Step3p5,
+            ModelType::Step3p7,
+            ModelType::Mellum,
+            ModelType::Laguna,
+            ModelType::NemotronNAS,
+        ] {
+            assert_eq!(
+                family(model_type).kv_modes,
+                KV_TURBO,
+                "{model_type:?} honors --kv-cache-mode in its model-owned caches"
+            );
+        }
+        for model_type in [ModelType::LongcatFlash, ModelType::LongcatFlashNgram] {
+            assert_eq!(
+                family(model_type).kv_modes,
+                KV_FP16,
+                "{model_type:?} must stay FP16 only"
             );
         }
     }

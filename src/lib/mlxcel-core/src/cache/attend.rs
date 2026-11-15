@@ -140,14 +140,21 @@ impl RotatingKVCache {
     /// `update_and_fetch` directly. No host sync and no allocation beyond the
     /// shape reads.
     ///
-    /// A multi-token unmasked step whose returned window fits the ring is a
-    /// prefill whose mask would be plain causal and takes the causal helper;
-    /// anything else runs the masked or unmasked SDPA with the ring's
-    /// `max_size` as the window hint (what Gemma 3 passed as `window_size`,
-    /// read only by the Metal 4 kernel).
+    /// A multi-token unmasked step is a causal prefill over the ring's
+    /// window, which this entry carries explicitly as `max_size`: while the
+    /// returned keys fit the window the mask would be plain causal and the
+    /// causal helper runs maskless; once they outgrow it the helper's
+    /// over-window branch applies the window band, through MLX's native
+    /// `window_size` entry on eligible Metal shapes or the full-width
+    /// windowed mask elsewhere (issue #2621). Before #2621 an unmasked
+    /// over-window multi-token step ran unmasked attention, so every caller
+    /// built the window mask itself; Gemma 3 now leaves it to this entry
+    /// where the native route is planned. A caller-built mask (padding or
+    /// any other extra semantics) still runs the masked SDPA with the ring's
+    /// `max_size` as the window hint.
     ///
-    /// Used by: `models::gemma3::Cache::attend` (sliding layers),
-    /// [`attend_batched_rows`].
+    /// Used by: `models::gemma3::Cache::attend` (sliding layers), Gemma 3's
+    /// `CacheInterface for RotatingKVCache`, [`attend_batched_rows`].
     pub fn attend(
         &mut self,
         q: &MlxArray,
@@ -159,8 +166,13 @@ impl RotatingKVCache {
         let q_len = query_len(q);
         let (cache_k, cache_v) = self.update_and_fetch(new_keys, new_values);
         let k_len = ffi::array_shape(&cache_k)[2];
-        if mask.is_none() && q_len > 1 && k_len <= self.max_size {
-            return crate::causal_attention(q, &cache_k, &cache_v, scale, 0.0, 0);
+        if mask.is_none() && q_len > 1 {
+            let window = if k_len <= self.max_size {
+                0
+            } else {
+                self.max_size
+            };
+            return crate::causal_attention(q, &cache_k, &cache_v, scale, 0.0, window);
         }
         crate::layers::attention(q, &cache_k, &cache_v, scale, mask, 0.0, self.max_size)
     }
@@ -325,8 +337,8 @@ impl KVCache {
 /// goes through [`KVCache::attend`] per sequence, so a row decodes the same way
 /// whether it was scheduled alone or in a batch.
 ///
-/// Used by: `models::qwen3::Attention::forward_split_attention`,
-/// `models::llama3::Attention::forward_split_attention`.
+/// Used by: [`crate::batched_decode::forward_split_attention`] and specialized
+/// model-owned cache paths.
 pub fn attend_batched(
     q_batched: &MlxArray,
     k_batched: &MlxArray,
@@ -356,8 +368,10 @@ pub fn attend_batched(
 /// This is the batched route for every storage that has no whole-batch
 /// launch: the model-owned enums of Gemma 3 and Llama 4, and the dense or
 /// declined batches [`attend_batched`] hands over. Same shapes and mask
-/// convention as [`attend_batched`]. One slice per row and one concat per
-/// extra row, which is what the per-row loops it replaced did.
+/// convention as [`attend_batched`].
+///
+/// The row results are joined with one n-ary concatenation so evaluation does
+/// not repeatedly copy growing intermediates as the batch gets wider.
 ///
 /// Used by: [`attend_batched`], `models::gemma3::Attention::forward_batched_decode`,
 /// `models::llama4::CxxAttention::forward_batched_decode_rows`.
@@ -383,12 +397,8 @@ pub fn attend_batched_rows<C: KvAttention>(
         });
         outputs.push(cache.attend(&q_b, k_b, v_b, scale, mask_b.as_deref()));
     }
-    let mut outputs = outputs.into_iter();
-    let mut result = outputs.next().expect("a non-empty batch has a first row");
-    for out in outputs {
-        result = crate::concatenate(&result, &out, 0);
-    }
-    result
+    let refs: Vec<_> = outputs.iter().map(|output| &**output).collect();
+    crate::concatenate_many(&refs, 0)
 }
 
 /// Query length of a `[B, H, L, D]` tensor (a shape read, no sync).

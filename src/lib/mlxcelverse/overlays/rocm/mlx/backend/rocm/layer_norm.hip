@@ -10,9 +10,18 @@
 
 #include <hip/hip_runtime.h>
 
+#include <climits>
+#include <string>
+
 namespace mlx::core {
 
 namespace rocm {
+
+// The 64-bit row of this block under row_grid().
+static __device__ inline int64_t row_grid_index() {
+  return static_cast<int64_t>(blockIdx.x) +
+      static_cast<int64_t>(blockIdx.y) * gridDim.x;
+}
 
 // Warp reduce for sum
 __device__ float warp_reduce_sum_f(float val) {
@@ -45,8 +54,12 @@ __global__ void layer_norm_kernel(
     float eps,
     int32_t axis_size,
     int64_t w_stride,
-    int64_t b_stride) {
-  size_t row = blockIdx.x;
+    int64_t b_stride,
+    int64_t n_rows) {
+  int64_t row = row_grid_index();
+  if (row >= n_rows) {
+    return;
+  }
   
   x += row * axis_size;
   out += row * axis_size;
@@ -83,6 +96,8 @@ __global__ void layer_norm_kernel(
   }
   __syncthreads();
   float mean = shared_sum[0] / axis_size;
+  // All waves must read the mean before shared_sum is reused for variance.
+  __syncthreads();
 
   // Compute variance
   float var_sum = 0;
@@ -138,8 +153,12 @@ __global__ void layer_norm_vjp_kernel(
     T* gw,
     float eps,
     int32_t axis_size,
-    int64_t w_stride) {
-  size_t row = blockIdx.x;
+    int64_t w_stride,
+    int64_t n_rows) {
+  int64_t row = row_grid_index();
+  if (row >= n_rows) {
+    return;
+  }
   
   x += row * axis_size;
   g += row * axis_size;
@@ -242,6 +261,42 @@ __global__ void layer_norm_vjp_kernel(
   }
 }
 
+// One block per row, split over grid x and y (lablup/mlxcel#2619, the ROCm side
+// of ml-explore/mlx#4717). HIP refuses gridDim.x * blockDim.x >= 2^32, so grid x
+// stops at UINT32_MAX / block_dim and the remaining rows spill into y; below
+// that cap the grid is dim3(n_rows) as before. Kernels recover the row with
+// row_grid_index() and return when it is >= n_rows.
+static inline dim3 row_grid(int64_t n_rows, int block_dim) {
+  const int64_t max_blocks_x = static_cast<int64_t>(UINT32_MAX) / block_dim;
+  int64_t grid_x = std::max<int64_t>(1, std::min(n_rows, max_blocks_x));
+  int64_t grid_y = (n_rows + grid_x - 1) / grid_x;
+  return dim3(static_cast<uint32_t>(grid_x), static_cast<uint32_t>(grid_y), 1);
+}
+
+// lablup/mlxcel#2633: the VJP shapes gw_temp and the column-reduce plans with
+// 32-bit dimensions (Shape holds int32), so it cannot reduce more than INT_MAX
+// rows. Say so instead of wrapping the row count.
+static inline void check_vjp_rows(const char* name, int64_t n_rows) {
+  if (n_rows > static_cast<int64_t>(INT_MAX)) {
+    throw std::invalid_argument(
+        std::string("[") + name + "] " + std::to_string(n_rows) +
+        " rows exceed INT_MAX, the most rows the weight and bias gradient "
+        "reductions take");
+  }
+}
+
+// lablup/mlxcel#2633: the gradient of a weight or bias over zero rows is zero.
+static inline void fill_zeros(
+    array& out, rocm::CommandEncoder& encoder, const Stream& s) {
+  if (out.size() == 0) {
+    out.set_data(mlx::core::rocm::malloc_async(0, encoder));
+    return;
+  }
+  array zero(0, out.dtype());
+  encoder.add_temporary(zero);
+  fill_gpu(zero, out, s);
+}
+
 } // namespace rocm
 
 namespace fast {
@@ -286,8 +341,13 @@ void LayerNorm::eval_gpu(
   const array& w = inputs[1];
   const array& b = inputs[2];
 
+  // Zero rows (lablup/mlxcel#2633): row_grid(0) is not a valid launch.
+  if (out.size() == 0) {
+    return;
+  }
+
   int32_t axis_size = x.shape().back();
-  int32_t n_rows = x.data_size() / axis_size;
+  int64_t n_rows = x.data_size() / axis_size;
   int64_t w_stride = (w.ndim() == 1) ? w.strides()[0] : 0;
   int64_t b_stride = (b.ndim() == 1) ? b.strides()[0] : 0;
 
@@ -303,23 +363,23 @@ void LayerNorm::eval_gpu(
     case float32:
       encoder.add_kernel_node(
           &rocm::layer_norm_kernel<float, BLOCK_DIM, N_READS>,
-          dim3(n_rows), dim3(BLOCK_DIM), 0,
+          rocm::row_grid(n_rows, BLOCK_DIM), dim3(BLOCK_DIM), 0,
           gpu_ptr<float>(x), gpu_ptr<float>(w), gpu_ptr<float>(b), gpu_ptr<float>(out),
-          eps_, axis_size, w_stride, b_stride);
+          eps_, axis_size, w_stride, b_stride, n_rows);
       break;
     case float16:
       encoder.add_kernel_node(
           &rocm::layer_norm_kernel<__half, BLOCK_DIM, N_READS>,
-          dim3(n_rows), dim3(BLOCK_DIM), 0,
+          rocm::row_grid(n_rows, BLOCK_DIM), dim3(BLOCK_DIM), 0,
           gpu_ptr<__half>(x), gpu_ptr<__half>(w), gpu_ptr<__half>(b), gpu_ptr<__half>(out),
-          eps_, axis_size, w_stride, b_stride);
+          eps_, axis_size, w_stride, b_stride, n_rows);
       break;
     case bfloat16:
       encoder.add_kernel_node(
           &rocm::layer_norm_kernel<hip_bfloat16, BLOCK_DIM, N_READS>,
-          dim3(n_rows), dim3(BLOCK_DIM), 0,
+          rocm::row_grid(n_rows, BLOCK_DIM), dim3(BLOCK_DIM), 0,
           gpu_ptr<hip_bfloat16>(x), gpu_ptr<hip_bfloat16>(w), gpu_ptr<hip_bfloat16>(b), gpu_ptr<hip_bfloat16>(out),
-          eps_, axis_size, w_stride, b_stride);
+          eps_, axis_size, w_stride, b_stride, n_rows);
       break;
     default:
       throw std::runtime_error("Unsupported type for layer_norm");
@@ -331,6 +391,16 @@ void LayerNormVJP::eval_gpu(
     std::vector<array>& outputs) {
   auto& s = stream();
   auto& encoder = rocm::get_command_encoder(s);
+
+  // Before any copy: a gradient reduction past INT_MAX rows cannot be planned.
+  if (inputs[0].size() > 0) {
+    int64_t rows = inputs[0].size() / inputs[0].shape().back();
+    bool reduces = inputs[1].ndim() != 0 ||
+        (outputs[2].ndim() == 1 && outputs[2].size() == inputs[0].shape().back());
+    if (reduces) {
+      rocm::check_vjp_rows("LayerNormVJP", rows);
+    }
+  }
 
   // Ensure row contiguity
   auto check_input = [&s](const array& x, bool& copied) {
@@ -374,12 +444,28 @@ void LayerNormVJP::eval_gpu(
   }
 
   int32_t axis_size = x.shape().back();
-  int32_t n_rows = x.data_size() / axis_size;
+
+  // The gradient for b in case we had a b
+  bool has_gb = (gb.ndim() == 1 && gb.size() == axis_size);
+
+  // Zero rows (lablup/mlxcel#2633): gx is empty and the weight and bias
+  // gradients are sums over no rows.
+  if (x.size() == 0) {
+    if (has_w) {
+      rocm::fill_zeros(gw, encoder, s);
+    }
+    if (has_gb) {
+      rocm::fill_zeros(gb, encoder, s);
+    }
+    return;
+  }
+
+  int64_t n_rows = x.data_size() / axis_size;
   int64_t w_stride = (w.ndim() == 1) ? w.strides()[0] : 0;
 
   // Allocate a temporary to store the gradients for w
   array gw_temp =
-      (has_w) ? array({n_rows, x.shape().back()}, gw.dtype(), nullptr, {}) : w;
+      (has_w) ? array({static_cast<int>(n_rows), x.shape().back()}, gw.dtype(), nullptr, {}) : w;
   bool g_in_gw = false;
   if (has_w) {
     if (!g_in_gx && donate_g) {
@@ -391,13 +477,21 @@ void LayerNormVJP::eval_gpu(
     }
   }
 
-  // The gradient for b in case we had a b
-  bool has_gb = (gb.ndim() == 1 && gb.size() == axis_size);
+  // The gradient for b: the sum of g over every row (lablup/mlxcel#2632, as
+  // in the CUDA backend). It is reduced before the VJP kernel is enqueued,
+  // because that kernel overwrites a g donated into gx or gw_temp. g is viewed
+  // as [n_rows, axis_size] so that the column reduce runs over every leading
+  // axis of an N-D cotangent.
   if (has_gb) {
-    // Sum reduction over rows for gb
-    gb.set_data(mlx::core::rocm::malloc_async(gb.nbytes(), encoder));
-    // TODO: Implement proper column reduction for gb
-    // For now, we'll compute it in the kernel or use a simple reduction
+    array g_rows({static_cast<int>(n_rows), axis_size}, g.dtype(), nullptr, {});
+    g_rows.copy_shared_buffer(
+        g, {static_cast<int64_t>(axis_size), 1}, g.flags(), g.data_size());
+    ReductionPlan plan(
+        ReductionOpType::ContiguousStridedReduce, {static_cast<int>(n_rows)}, {axis_size});
+    col_reduce(encoder, g_rows, gb, Reduce::ReduceType::Sum, {0}, plan);
+  }
+  if ((g_in_gx || g_in_gw) && has_gb) {
+    encoder.set_input_array(gb);
   }
 
   encoder.set_input_array(x);
@@ -414,26 +508,26 @@ void LayerNormVJP::eval_gpu(
       case float32:
         encoder.add_kernel_node(
             &rocm::layer_norm_vjp_kernel<float, true, BLOCK_DIM, N_READS>,
-            dim3(n_rows), dim3(BLOCK_DIM), 0,
+            rocm::row_grid(n_rows, BLOCK_DIM), dim3(BLOCK_DIM), 0,
             gpu_ptr<float>(x), gpu_ptr<float>(w), gpu_ptr<float>(g),
             gpu_ptr<float>(gx), gpu_ptr<float>(gw_temp),
-            eps_, axis_size, w_stride);
+            eps_, axis_size, w_stride, n_rows);
         break;
       case float16:
         encoder.add_kernel_node(
             &rocm::layer_norm_vjp_kernel<__half, true, BLOCK_DIM, N_READS>,
-            dim3(n_rows), dim3(BLOCK_DIM), 0,
+            rocm::row_grid(n_rows, BLOCK_DIM), dim3(BLOCK_DIM), 0,
             gpu_ptr<__half>(x), gpu_ptr<__half>(w), gpu_ptr<__half>(g),
             gpu_ptr<__half>(gx), gpu_ptr<__half>(gw_temp),
-            eps_, axis_size, w_stride);
+            eps_, axis_size, w_stride, n_rows);
         break;
       case bfloat16:
         encoder.add_kernel_node(
             &rocm::layer_norm_vjp_kernel<hip_bfloat16, true, BLOCK_DIM, N_READS>,
-            dim3(n_rows), dim3(BLOCK_DIM), 0,
+            rocm::row_grid(n_rows, BLOCK_DIM), dim3(BLOCK_DIM), 0,
             gpu_ptr<hip_bfloat16>(x), gpu_ptr<hip_bfloat16>(w), gpu_ptr<hip_bfloat16>(g),
             gpu_ptr<hip_bfloat16>(gx), gpu_ptr<hip_bfloat16>(gw_temp),
-            eps_, axis_size, w_stride);
+            eps_, axis_size, w_stride, n_rows);
         break;
       default:
         throw std::runtime_error("Unsupported type for layer_norm_vjp");
@@ -444,30 +538,30 @@ void LayerNormVJP::eval_gpu(
         float* gw_null = nullptr;
         encoder.add_kernel_node(
             &rocm::layer_norm_vjp_kernel<float, false, BLOCK_DIM, N_READS>,
-            dim3(n_rows), dim3(BLOCK_DIM), 0,
+            rocm::row_grid(n_rows, BLOCK_DIM), dim3(BLOCK_DIM), 0,
             gpu_ptr<float>(x), gpu_ptr<float>(w), gpu_ptr<float>(g),
             gpu_ptr<float>(gx), gw_null,
-            eps_, axis_size, w_stride);
+            eps_, axis_size, w_stride, n_rows);
         break;
       }
       case float16: {
         __half* gw_null = nullptr;
         encoder.add_kernel_node(
             &rocm::layer_norm_vjp_kernel<__half, false, BLOCK_DIM, N_READS>,
-            dim3(n_rows), dim3(BLOCK_DIM), 0,
+            rocm::row_grid(n_rows, BLOCK_DIM), dim3(BLOCK_DIM), 0,
             gpu_ptr<__half>(x), gpu_ptr<__half>(w), gpu_ptr<__half>(g),
             gpu_ptr<__half>(gx), gw_null,
-            eps_, axis_size, w_stride);
+            eps_, axis_size, w_stride, n_rows);
         break;
       }
       case bfloat16: {
         hip_bfloat16* gw_null = nullptr;
         encoder.add_kernel_node(
             &rocm::layer_norm_vjp_kernel<hip_bfloat16, false, BLOCK_DIM, N_READS>,
-            dim3(n_rows), dim3(BLOCK_DIM), 0,
+            rocm::row_grid(n_rows, BLOCK_DIM), dim3(BLOCK_DIM), 0,
             gpu_ptr<hip_bfloat16>(x), gpu_ptr<hip_bfloat16>(w), gpu_ptr<hip_bfloat16>(g),
             gpu_ptr<hip_bfloat16>(gx), gw_null,
-            eps_, axis_size, w_stride);
+            eps_, axis_size, w_stride, n_rows);
         break;
       }
       default:
@@ -478,7 +572,7 @@ void LayerNormVJP::eval_gpu(
   // Reduce gw_temp to gw if we have weights
   if (has_w) {
     ReductionPlan plan(
-        ReductionOpType::ContiguousStridedReduce, {n_rows}, {axis_size});
+        ReductionOpType::ContiguousStridedReduce, {static_cast<int>(n_rows)}, {axis_size});
     col_reduce(encoder, gw_temp, gw, Reduce::ReduceType::Sum, {0}, plan);
   }
 }

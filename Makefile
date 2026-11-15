@@ -88,8 +88,23 @@ BIN_SERVER := mlxcel-server
 # Default model path for examples (override with MODEL=path)
 MODEL ?= ./models/default
 
-# Default prompt for examples
-PROMPT ?= "Hello, world!"
+# Single-quote $(1) for the shell so a recipe passes it as one argument with no
+# expansion: $, `, \ and " stay literal, and an embedded ' becomes '\''.
+shell_quote = '$(subst ','\'',$(1))'
+
+# A model path as the run/serve/example recipes pass it: shell-quoted, so a path
+# with spaces stays one argument, with a leading ~/ expanded here first because
+# the shell leaves ~ inside quotes alone (and zsh passes MODEL=~/... to make
+# unexpanded). The *_ARG variables read their source with $(value ...) so make
+# does not expand a $ in it either (PROMPT='It costs $5' stays intact).
+model_arg = $(call shell_quote,$(patsubst ~/%,$(HOME)/%,$(1)))
+MODEL_ARG = $(call model_arg,$(value MODEL))
+DRAFT_MODEL_ARG = $(call model_arg,$(value DRAFT_MODEL))
+
+# Default prompt for examples (override with PROMPT="your prompt"). The recipes
+# pass it shell-quoted, so keep quotes out of the value itself.
+PROMPT ?= Hello, world!
+PROMPT_ARG = $(call shell_quote,$(value PROMPT))
 
 # Optional test-name filter forwarded to `cargo test` by the test-fast targets
 # below, e.g. `make test-fast-cuda FILTER=server::chat_request` (issue #809).
@@ -149,7 +164,7 @@ help: ## Show this help message
 	@grep -E '^[a-zA-Z0-9_.-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(clean|fmt|install)' | grep -v '^bench' | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(CYAN)%-20s$(RESET) %s\n", $$1, $$2}'
 	@echo ""
 	@echo "$(BOLD)Maintenance Targets:$(RESET)"
-	@grep -E '^[a-zA-Z0-9_.-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '^(update|tree|outdated|verify-versions|verify-kernel-dtype-keys|verify-binary-assets|bump-version):' | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(CYAN)%-20s$(RESET) %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_.-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '^(update|tree|outdated|verify-versions|verify-kernel-dtype-keys|verify-env-var-docs|verify-binary-assets|verify-windows-paths|bump-version):' | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(CYAN)%-20s$(RESET) %s\n", $$1, $$2}'
 	@echo ""
 	@echo "$(BOLD)Variables:$(RESET)"
 	@echo "  $(CYAN)MODEL$(RESET)    Path to model directory (default: ./models/default)"
@@ -165,6 +180,7 @@ help: ## Show this help message
 	@echo "  make test                            # Run all tests"
 	@echo "  make verify                          # macOS merge gate (fmt + clippy + test)"
 	@echo "  make verify-test-cuda                # Linux/NVIDIA merge gate (workspace, single threaded)"
+	@echo "  make verify-test-cuda-qmm-determinism # CUDA quantized-prefill determinism on a real checkpoint"
 	@echo "  make test-fast-cuda FILTER=server::chat_request  # Fast filtered test-fast-profile run"
 	@echo ""
 
@@ -404,12 +420,12 @@ run: run-generate ## Alias for run-generate
 .PHONY: run-generate
 run-generate: build-cli ## Run text generation
 	@echo "$(CYAN)Generating text...$(RESET)"
-	$(CARGO) run --bin $(BIN_CLI) -- generate -m $(MODEL) -p $(PROMPT)
+	$(CARGO) run --bin $(BIN_CLI) -- generate -m $(MODEL_ARG) -p $(PROMPT_ARG)
 
 .PHONY: run-generate-release
 run-generate-release: release-cli ## Run text generation (release mode)
 	@echo "$(CYAN)Generating text (release)...$(RESET)"
-	./target/release/$(BIN_CLI) generate -m $(MODEL) -p $(PROMPT)
+	./target/release/$(BIN_CLI) generate -m $(MODEL_ARG) -p $(PROMPT_ARG)
 
 .PHONY: run-list
 run-list: build-cli ## List supported models
@@ -418,12 +434,12 @@ run-list: build-cli ## List supported models
 .PHONY: serve
 serve: build-server ## Start the HTTP server
 	@echo "$(CYAN)Starting server on $(HOST):$(PORT)...$(RESET)"
-	$(CARGO) run --bin $(BIN_SERVER) -- --model $(MODEL) --host $(HOST) --port $(PORT)
+	$(CARGO) run --bin $(BIN_SERVER) -- --model $(MODEL_ARG) --host $(HOST) --port $(PORT)
 
 .PHONY: serve-release
 serve-release: release-server ## Start the HTTP server (release mode)
 	@echo "$(CYAN)Starting server on $(HOST):$(PORT) (release)...$(RESET)"
-	./target/release/$(BIN_SERVER) --model $(MODEL) --host $(HOST) --port $(PORT)
+	./target/release/$(BIN_SERVER) --model $(MODEL_ARG) --host $(HOST) --port $(PORT)
 
 # ============================================================================
 # Help & Documentation Targets
@@ -793,6 +809,26 @@ verify-test-cuda: ## CUDA gate: cargo test --workspace --profile test-fast --fea
 	@echo "$(CYAN)[verify] test (workspace, test-fast profile, features=cuda, single threaded)...$(RESET)"
 	$(CARGO) test --workspace --profile test-fast --features cuda --no-fail-fast -- --test-threads=1
 
+# `verify-test-cuda-qmm-determinism` is the real-checkpoint half of
+# `tests/cuda_qmm_determinism.rs`, the bitwise temp-0 prefill + decode gate
+# for the quantized matmul kernels (#910). Its checkpoint was missing on every
+# host and a missing checkpoint was a silent return, so for as long as the test
+# existed it reported `ok` without running (#1558). The model test is
+# `#[ignore]` now, which means `verify-test-cuda` reports it as `ignored` (that
+# gate passes no `--include-ignored`); the checkpoint-free kernel tests in the
+# same file still run there. This target runs all of the file's tests,
+# ignored ones included, and sets MLXCEL_REQUIRE_MODELS=1, so a checkpoint that
+# resolves nowhere fails instead of skipping. It sets MLX_ENABLE_TF32=0 itself
+# because the `ctor` pin described above lives in the lib crates' `cfg(test)`
+# builds and is absent from integration test binaries like this one. On a host that
+# serializes GPU work behind `gpu-lock`, build with `--no-run` first and run
+# the test binary under the lock rather than this target (see the test file).
+.PHONY: verify-test-cuda-qmm-determinism
+verify-test-cuda-qmm-determinism: ## CUDA gate: bitwise-repeatable quantized prefill on a real 4-bit checkpoint, fails if the checkpoint is missing (issue #1558)
+	@echo "$(CYAN)[verify] cuda_qmm_determinism (real checkpoint required, single threaded)...$(RESET)"
+	MLXCEL_REQUIRE_MODELS=1 MLX_ENABLE_TF32=0 $(CARGO) test --profile test-fast --features cuda \
+		--test cuda_qmm_determinism -- --include-ignored --test-threads=1
+
 .PHONY: verify-test-rocm
 verify-test-rocm: ## ROCm gate (experimental): cargo test --workspace --profile test-fast --features rocm --no-fail-fast -- --test-threads=1 (issue #1809)
 	@echo "$(CYAN)[verify] test (workspace, test-fast profile, features=rocm, single threaded)...$(RESET)"
@@ -821,7 +857,7 @@ verify-rocm-smoke: ## ROCm smoke: build, link and generate on the GPU, asserting
 # "does a real forward pass still run on this device" answer even while the
 # suite is red.
 .PHONY: verify-rocm
-verify-rocm: verify-versions verify-kernel-dtype-keys verify-kernel-port-dispatch verify-llama-compat verify-rocm-overlay verify-python-tooling verify-fmt verify-clippy-rocm verify-rocm-smoke verify-test-rocm ## Run the ROCm gate locally on an AMD host (issue #1811)
+verify-rocm: verify-versions verify-kernel-dtype-keys verify-env-var-docs verify-kernel-port-dispatch verify-llama-compat verify-rocm-overlay verify-python-tooling verify-fmt verify-clippy-rocm verify-rocm-smoke verify-test-rocm ## Run the ROCm gate locally on an AMD host (issue #1811)
 	@echo "$(GREEN)[verify-rocm] OK$(RESET)"
 
 # The gate for a shared gfx1151 host (issue #2244). Build everything the gate
@@ -854,6 +890,18 @@ verify-kernel-dtype-keys: ## Assert every CUDA and HIP JIT kernel launch keys it
 	@echo "$(CYAN)[verify] kernel dtype cache keys...$(RESET)"
 	@python3 scripts/ci/check_kernel_dtype_keys.py
 	@bash scripts/ci/check_kernel_dtype_keys_test.sh
+
+# Every MLXCEL_* string literal under src/**/*.rs must appear on
+# docs/environment-variables.md or carry a reasoned ALLOWLIST entry in the
+# script (issue #1140). tests/test_check_env_var_docs.py is its negative
+# coverage: synthetic trees with a new undocumented call site, a deleted row,
+# and stale allowlist entries, each of which must fail. That suite also runs in
+# `verify-python-tooling`; it is repeated here so this target is complete alone.
+.PHONY: verify-env-var-docs
+verify-env-var-docs: ## Assert every MLXCEL_* name in src is documented in docs/environment-variables.md or allowlisted (issue #1140)
+	@echo "$(CYAN)[verify] MLXCEL_* environment variable docs...$(RESET)"
+	@python3 scripts/ci/check_env_var_docs.py
+	@python3 -m unittest tests/test_check_env_var_docs.py
 
 # check_kernel_port_dispatch_test.sh is the negative coverage for the ROCm
 # wavefront rules (#2147): it marks a shuffle-based table any-wave, adds a
@@ -892,12 +940,36 @@ verify-rocm-overlay: ## Assert the ROCm overlay records agree with the MLX pin a
 	@python3 scripts/mlxcelverse/rocm_overlay.py records
 	@bash scripts/mlxcelverse/rocm_overlay_test.sh
 	@bash scripts/mlxcelverse/allocator_ownership_test.sh
+	@bash scripts/mlxcelverse/rocm_runtime_dir_test.sh
+	@bash scripts/mlxcelverse/rocm_hsaco_cache_test.sh
+
+# Host half of the Windows CUDA runtime bundle (issue #2640): the runtime
+# directory choice, the plain-name preload check and the NVRTC header order of
+# the CUDA overlay's runtime_dir.h, compiled with the host C++ compiler (CXX)
+# on any OS. The packaging script's unit tests run in verify-python-tooling;
+# the Windows NVIDIA run itself is manual (docs/installation.md).
+.PHONY: verify-cuda-runtime-dir
+verify-cuda-runtime-dir: ## Test the Windows CUDA runtime directory choice on the host (issue #2640)
+	@echo "$(CYAN)[verify] Windows CUDA runtime directory...$(RESET)"
+	@bash scripts/mlxcelverse/cuda_runtime_dir_test.sh
 
 .PHONY: verify-binary-assets
 verify-binary-assets: ## Assert every tracked binary file is declared with a size budget
 	@echo "$(CYAN)[verify] tracked binary assets...$(RESET)"
 	@python3 scripts/ci/check_binary_assets.py
 	@bash scripts/ci/check_binary_assets_test.sh
+
+.PHONY: verify-benchmark-raw-logs
+verify-benchmark-raw-logs: ## Assert benchmark data holds no uncited raw logs
+	@echo "$(CYAN)[verify] benchmark raw logs...$(RESET)"
+	@python3 scripts/ci/check_benchmark_raw_logs.py
+	@bash scripts/ci/check_benchmark_raw_logs_test.sh
+
+.PHONY: verify-windows-paths
+verify-windows-paths: ## Assert no tracked path is a Windows device name such as AUX (issue #2531)
+	@echo "$(CYAN)[verify] Windows device-name paths...$(RESET)"
+	@python3 scripts/ci/check_windows_reserved_paths.py
+	@bash scripts/ci/check_windows_reserved_paths_test.sh
 
 # Offline structural half of the llama-server b10621 compatibility gate
 # (issue #1443, epic #1431): validates the checked-in manifest under
@@ -927,11 +999,13 @@ verify-webui-bundle: ## Rebuild the bundled WebUI twice and compare it with chec
 	@$(WEBUI_BUNDLE_PY) scripts/webui/build_bundle.py --verify
 
 .PHONY: verify-webui-frontend
-verify-webui-frontend: ## Run WebUI lint, typecheck, theme-selector gate, unit tests, Chromium layout/accessibility gate, and multi-engine browser smoke (issue #1848)
+verify-webui-frontend: ## Run WebUI lint, typecheck, theme-selector, built-theme and agent-block gates, unit tests, Chromium layout/accessibility gate, and multi-engine browser smoke (issue #1848)
 	@echo "$(CYAN)[verify] WebUI frontend lint/type/unit/browser matrix...$(RESET)"
 	@pnpm --dir webui run typecheck
 	@pnpm --dir webui run lint
 	@pnpm --dir webui run check:theme-selectors
+	@pnpm --dir webui run check:themes
+	@pnpm --dir webui run check:agents
 	@pnpm --dir webui run unit
 	@pnpm --dir webui run browser
 	@pnpm --dir webui run browser:all
@@ -959,6 +1033,7 @@ verify-webui-helper-tests: ## Run pure-Python WebUI verifier helper tests; no se
 	@$(WEBUI_BUNDLE_PY) scripts/webui/verify_generated_key_helper_tests.py
 	@$(WEBUI_BUNDLE_PY) scripts/webui/measure_startup_tests.py
 	@$(WEBUI_BUNDLE_PY) scripts/webui/verify_single_model_tests.py
+	@$(WEBUI_BUNDLE_PY) scripts/webui/activity_performance_verdict_tests.py
 	@$(WEBUI_BUNDLE_PY) scripts/webui/verify_activity_performance_tests.py
 	@$(WEBUI_BUNDLE_PY) scripts/webui/summarize_activity_evidence_tests.py
 	@$(WEBUI_BUNDLE_PY) scripts/webui/activity_gate_host_tests.py
@@ -1039,7 +1114,7 @@ bump-version: ## Release: set every version-tracking crate to VERSION and sync C
 	@$(MAKE) --no-print-directory verify-versions
 
 .PHONY: verify
-verify: verify-versions verify-kernel-dtype-keys verify-kernel-port-dispatch verify-llama-compat verify-rocm-overlay verify-python-tooling verify-fmt verify-clippy verify-test ## Run the full CI-faithful gate locally (recommended before push)
+verify: verify-versions verify-kernel-dtype-keys verify-env-var-docs verify-kernel-port-dispatch verify-llama-compat verify-rocm-overlay verify-cuda-runtime-dir verify-python-tooling verify-fmt verify-clippy verify-test ## Run the full CI-faithful gate locally (recommended before push)
 	@echo "$(GREEN)[verify] OK: matches the nightly-verify GitHub Actions job$(RESET)"
 
 .PHONY: verify-clean
@@ -1055,26 +1130,26 @@ verify-clean: ## Run `verify` after a `cargo clean` (use when clippy's cache may
 .PHONY: example-greedy
 example-greedy: build-cli ## Example: greedy decoding
 	@echo "$(BOLD)Example: Greedy Decoding (temp=0)$(RESET)"
-	$(CARGO) run --bin $(BIN_CLI) -- generate -m $(MODEL) -p $(PROMPT) --temp 0
+	$(CARGO) run --bin $(BIN_CLI) -- generate -m $(MODEL_ARG) -p $(PROMPT_ARG) --temp 0
 
 .PHONY: example-creative
 example-creative: build-cli ## Example: creative sampling
 	@echo "$(BOLD)Example: Creative Sampling$(RESET)"
-	$(CARGO) run --bin $(BIN_CLI) -- generate -m $(MODEL) -p $(PROMPT) \
+	$(CARGO) run --bin $(BIN_CLI) -- generate -m $(MODEL_ARG) -p $(PROMPT_ARG) \
 		--temp 0.8 --top-p 0.95 --top-k 40
 
 .PHONY: example-dry
 example-dry: build-cli ## Example: DRY penalty
 	@echo "$(BOLD)Example: DRY Penalty (prevents repetition)$(RESET)"
-	$(CARGO) run --bin $(BIN_CLI) -- generate -m $(MODEL) -p $(PROMPT) \
+	$(CARGO) run --bin $(BIN_CLI) -- generate -m $(MODEL_ARG) -p $(PROMPT_ARG) \
 		--temp 0.7 --dry-multiplier 1.0 --dry-base 1.75
 
 .PHONY: example-speculative
 example-speculative: build-cli ## Example: speculative decoding
 	@echo "$(BOLD)Example: Speculative Decoding$(RESET)"
-	@echo "Requires DRAFT_MODEL variable"
-	$(CARGO) run --bin $(BIN_CLI) -- generate -m $(MODEL) -p $(PROMPT) \
-		--draft-model $(DRAFT_MODEL) --num-draft-tokens 4
+	@echo "Requires DRAFT_MODEL variable (an MTP drafter for MODEL)"
+	$(CARGO) run --bin $(BIN_CLI) -- generate -m $(MODEL_ARG) -p $(PROMPT_ARG) \
+		--draft-model $(DRAFT_MODEL_ARG) --draft-kind mtp --draft-block-size 4
 
 # ============================================================================
 # Aliases

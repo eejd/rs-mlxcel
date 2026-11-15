@@ -22,11 +22,12 @@
 //! `TcpStream` and leaves no seam to wrap the I/O in.
 //!
 //! Socket options follow upstream `server_http_context::start`: `SO_REUSEADDR`
-//! is always set, `SO_REUSEPORT` only with `--reuse-port`, and a `--host`
-//! ending in `.sock` binds an `AF_UNIX` socket instead.
+//! is set everywhere except Windows, `SO_REUSEPORT` only with `--reuse-port`,
+//! and a `--host` ending in `.sock` binds an `AF_UNIX` socket instead.
 
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,7 +37,9 @@ use axum::Router;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
 use tower::Service;
@@ -89,24 +92,40 @@ pub(crate) async fn serve(
                     path.display()
                 );
             }
-            let listener = bind_unix(path)?;
-            announce(&format!("unix://{}", path.display()));
-            accept_unix(listener, app, options.timeouts).await
+            #[cfg(unix)]
+            {
+                let listener = bind_unix(path)?;
+                announce(&format!("unix://{}", path.display()));
+                accept_unix(listener, app, options.timeouts).await
+            }
+            // tokio has no Unix domain socket listener off Unix (#58).
+            #[cfg(not(unix))]
+            {
+                let _ = (app, announce);
+                bail!(
+                    "--host {} names a Unix domain socket, which this platform does not support; listen on TCP instead",
+                    path.display()
+                )
+            }
         }
     }
 }
 
 /// Bind a TCP listener, applying the b10621 socket options.
 ///
-/// `SO_REUSEADDR` is unconditional, matching upstream's `set_socket_options`
-/// callback; `SO_REUSEPORT` is applied only for `--reuse-port` and, where the
-/// platform lacks it, produces the same warning upstream emits rather than a
-/// startup failure.
+/// `SO_REUSEADDR` is set everywhere except Windows, matching upstream's
+/// `set_socket_options` callback on Unix. On Windows it would let any other
+/// socket that also sets it bind the same live port and receive our
+/// connections, and Windows rebinds past TIME_WAIT without it, so it is left
+/// unset there as std, mio and tokio do. `SO_REUSEPORT` is applied only for
+/// `--reuse-port` and, where the platform lacks it, produces the same warning
+/// upstream emits rather than a startup failure.
 fn bind_tcp(host: &str, port: u16, reuse_port: bool) -> Result<TcpListener> {
     let addr = resolve_socket_addr(host, port)?;
     let domain = socket2::Domain::for_address(addr);
     let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
         .with_context(|| format!("failed to create a TCP socket for {addr}"))?;
+    #[cfg(not(windows))]
     socket
         .set_reuse_address(true)
         .with_context(|| format!("failed to set SO_REUSEADDR on the listener for {addr}"))?;
@@ -158,6 +177,7 @@ fn resolve_socket_addr(host: &str, port: u16) -> Result<SocketAddr> {
 }
 
 /// Bind a Unix domain socket, clearing a stale path first.
+#[cfg(unix)]
 fn bind_unix(path: &Path) -> Result<UnixListener> {
     if path.exists() {
         std::fs::remove_file(path)
@@ -213,6 +233,7 @@ async fn accept_tcp(listener: TcpListener, app: Router, options: ServeOptions) -
     }
 }
 
+#[cfg(unix)]
 async fn accept_unix(listener: UnixListener, app: Router, timeouts: HttpTimeouts) -> Result<()> {
     loop {
         let stream = match listener.accept().await {

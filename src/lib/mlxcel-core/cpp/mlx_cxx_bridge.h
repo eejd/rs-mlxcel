@@ -59,14 +59,13 @@ struct MlxStream {
 // `mlx::core::stream_from_thread_local_stream`. Holding the same handle
 // across threads gives every thread its own dedicated MLX stream
 // without any explicit coordination between them. Used by
-// `mlxcel-core` to back the generation stream of `BatchScheduler`,
-// the engine's raw-completion client, and `SpeculativeGenerator` (upstream MLX commit `728fab1` in mlx-vlm PR #1050).
+// `mlxcel-core` to back the generation stream of `BatchScheduler`
+// and the engine's raw-completion client (upstream MLX commit `728fab1` in mlx-vlm PR #1050).
 struct MlxThreadLocalStream {
     mlx::core::ThreadLocalStream inner;
 
     explicit MlxThreadLocalStream(mlx::core::ThreadLocalStream s) : inner(s) {}
 };
-
 
 // Stream functions.
 std::unique_ptr<MlxStream> default_stream();
@@ -217,6 +216,7 @@ std::unique_ptr<MlxArray> from_bytes_f16(rust::Slice<const uint8_t> data, rust::
 
 // Array property accessors.
 rust::Vec<int32_t> array_shape(const MlxArray& arr);
+rust::Vec<int64_t> array_strides(const MlxArray& arr);
 int32_t array_dtype(const MlxArray& arr);
 size_t array_size(const MlxArray& arr);
 size_t array_ndim(const MlxArray& arr);
@@ -253,9 +253,12 @@ rust::Vec<uint8_t> array_evaluated_bytes(const MlxArray& arr);
 // synthetic backend error. The error outlives the returned event.
 std::unique_ptr<MlxArray> array_with_failed_event_for_test();
 
-// Test-only (issue #1792), in mlx_cxx_compile_probe.cpp. Run fixed graph
-// `graph` on (a, b) eagerly (mode 0), compiled (1) or compiled shapeless (2),
-// and return the evaluated output.
+// Test-only (issues #1792, #2333), in mlx_cxx_compile_probe.cpp. Run fixed
+// graph `graph` on (a, b) eagerly (mode 0), compiled (1) or compiled
+// shapeless (2), and return the evaluated output. Graphs 0-6 cover
+// comparisons, isnan / isinf, the min-p filter and mixed bf16/f32
+// arithmetic; graphs 7-10 take real / imag of the complex64 a + i*b, built
+// in the graph (7, 8) or passed in as an eagerly built input (9, 10).
 std::unique_ptr<MlxArray> compile_dtype_probe_for_test(
     int32_t graph,
     const MlxArray& a,
@@ -331,6 +334,8 @@ std::unique_ptr<MlxArray> sum_all(const MlxArray& a);
 std::unique_ptr<MlxArray> sum_axis(const MlxArray& a, int32_t axis, bool keepdims);
 std::unique_ptr<MlxArray> mean_all(const MlxArray& a);
 std::unique_ptr<MlxArray> mean_axis(const MlxArray& a, int32_t axis, bool keepdims);
+std::unique_ptr<MlxArray> mean_axis_native_dtype(const MlxArray& a, int32_t axis, bool keepdims);
+std::unique_ptr<MlxArray> sum_axis_native_dtype(const MlxArray& a, int32_t axis, bool keepdims);
 std::unique_ptr<MlxArray> max_all(const MlxArray& a);
 std::unique_ptr<MlxArray> max_axis(const MlxArray& a, int32_t axis, bool keepdims);
 std::unique_ptr<MlxArray> min_all(const MlxArray& a);
@@ -415,9 +420,6 @@ std::unique_ptr<MlxArray> layer_norm(const MlxArray& x, const MlxArray& weight,
 
 // Concatenate arrays along axis
 std::unique_ptr<MlxArray> concatenate(rust::Slice<const MlxArray* const> arrays, int32_t axis);
-
-// Split array into multiple parts
-rust::Vec<std::unique_ptr<MlxArray>> split(const MlxArray& a, int32_t num_splits, int32_t axis);
 
 // Slice array with start, stop, step
 std::unique_ptr<MlxArray> slice(const MlxArray& a,
@@ -563,24 +565,34 @@ std::unique_ptr<MlxArray> swiglu_mlp_forward(
 // One-shot report for MLXCEL_SHAPELESS_COMPILE_AUDIT=1. Each audited compile
 // site is compared against its eager graph on first-use and warmed calls.
 rust::String shapeless_compile_audit_report();
+bool native_env_read(rust::Str name, rust::Vec<uint8_t>& value);
+int32_t mlx_env_get_var_int(rust::Str name, int32_t default_value);
 
 // Compiled relu_squared: square(maximum(x, 0)) — single fused kernel
 std::unique_ptr<MlxArray> compiled_relu_squared(const MlxArray& x);
 
 // Compiled silu: x * sigmoid(x) — single fused kernel
+// Qwen4-Exp hyper-connection pointwise graphs, matching mlx-vlm compilation.
+std::unique_ptr<MlxArray> qwen4_hyper_activate(const MlxArray& x, int32_t count);
+std::unique_ptr<MlxArray> qwen4_hyper_gate(const MlxArray& x, int32_t count);
+std::unique_ptr<MlxArray> qwen4_hyper_mix(const MlxArray& projected, const MlxArray& normed);
+std::unique_ptr<MlxArray> qwen4_hyper_inject(const MlxArray& branch, const MlxArray& weights, const MlxArray& hyper);
+std::unique_ptr<MlxArray> compiled_scaled_rms_norm(const MlxArray& x, const MlxArray& scale, float eps);
 std::unique_ptr<MlxArray> compiled_silu(const MlxArray& x);
 
-// Compiled gelu: x * 0.5 * (1 + erf(x / sqrt(2))) — single fused kernel
-// Used by: StarCoder2 and other precise GELU-based models
-std::unique_ptr<MlxArray> compiled_gelu(const MlxArray& x);
-
-// Compiled gelu_approx: erf-based GELU (x * 0.5 * (1 + erf(x / sqrt(2)))) — fused kernel
-// Uses erf instead of tanh for numerical stability with bf16 inputs.
-// Used by: legacy/tests
+// Compiled gelu_approx: despite the name, exact erf GELU
+// (x * 0.5 * (1 + erf(x / sqrt(2)))), MLX `nn.gelu`, not MLX's tanh
+// `nn.gelu_approx`; use `gelu_tanh` for that (#2423).
+// Used by: tests only
 std::unique_ptr<MlxArray> compiled_gelu_approx(const MlxArray& x);
 
+// Compiled tanh GELU evaluated in f32 and cast back, one fused kernel; may
+// differ from the eager `gelu_tanh_f32` by f32 rounding (FMA contraction).
+// Used by: Rust `GeluActivation::TanhF32Compiled` (#2423)
+std::unique_ptr<MlxArray> compiled_gelu_tanh_f32(const MlxArray& x);
+
 // Compiled gelu_topk: sparse GELU with dynamic threshold — single fused kernel
-// gelu_approx(max(0, x - (mean + std * multiplier)))
+// gelu_tanh(max(0, x - (mean + std * multiplier))) in the input dtype (#2548)
 // Used by: Gemma3n MLP layers with activation_sparsity > 0
 std::unique_ptr<MlxArray> compiled_gelu_topk(
     const MlxArray& x,
@@ -787,9 +799,9 @@ std::unique_ptr<MlxArray> compiled_swiglu_mlp_forward_fp16(
 );
 
 // Compiled GELU MLP forward for non-quantized (FP16/BF16) weights:
-//   down_proj(gelu(gate_proj(x)) * up_proj(x))
-// Fuses gate_proj + gelu + up_proj + multiply + down_proj into compiled graph.
-// Used by: Gemma, Gemma4 and other GELU-gated FP models
+//   down_proj(gelu_tanh(gate_proj(x)) * up_proj(x))
+// Runs the matmuls eagerly and the tanh GeGLU as one compiled kernel (#2548).
+// Used by: Gemma v1, Gemma4 dense MLP and the Gemma4 assistant drafter
 std::unique_ptr<MlxArray> compiled_gelu_mlp_forward_fp16(
     const MlxArray& x,
     const MlxArray& gate_weight,
@@ -885,10 +897,16 @@ std::unique_ptr<MlxArray> not_equal(const MlxArray& a, const MlxArray& b);
 std::unique_ptr<MlxArray> silu(const MlxArray& a);
 std::unique_ptr<MlxArray> gelu(const MlxArray& a);
 std::unique_ptr<MlxArray> gelu_approx(const MlxArray& a);
+std::unique_ptr<MlxArray> gelu_tanh(const MlxArray& a);
+std::unique_ptr<MlxArray> gelu_tanh_f32(const MlxArray& a);
 std::unique_ptr<MlxArray> relu(const MlxArray& a);
 std::unique_ptr<MlxArray> leaky_relu(const MlxArray& a, float negative_slope);
 
 // Sorting and searching.
+std::unique_ptr<MlxArray> searchsorted(
+    const MlxArray& sorted_sequence,
+    const MlxArray& values,
+    bool right);
 std::unique_ptr<MlxArray> argsort(const MlxArray& a, int32_t axis);
 std::unique_ptr<MlxArray> argpartition(const MlxArray& a, int32_t kth, int32_t axis);
 std::unique_ptr<MlxArray> argmin(const MlxArray& a, int32_t axis, bool keepdims);
@@ -1063,6 +1081,27 @@ std::unique_ptr<MlxArray> compiled_proportional_rope(
     int32_t offset
 );
 
+// Compiled packed 2D RoPE used by Sapiens2. This mirrors the model's
+// shape-specialized Python `@mx.compile` window, including float32 rotation
+// and the reversed pair-axis view.
+std::unique_ptr<MlxArray> compiled_sapiens2_rope(
+    const MlxArray& x,
+    const MlxArray& sin,
+    const MlxArray& cos
+);
+
+// SAM 3D Objects compile boundaries, with checked floating dtype/shape contracts.
+std::unique_ptr<MlxArray> compiled_objects_modulate(
+    const MlxArray& x, const MlxArray& scale, const MlxArray& shift);
+std::unique_ptr<MlxArray> compiled_objects_gated_residual(
+    const MlxArray& x, const MlxArray& h, const MlxArray& gate);
+std::unique_ptr<MlxArray> compiled_objects_gelu(const MlxArray& x);
+std::unique_ptr<MlxArray> compiled_objects_gelu_tanh(const MlxArray& x);
+std::unique_ptr<MlxArray> compiled_objects_focal_shift(const MlxArray& uv, const MlxArray& xyz);
+std::unique_ptr<MlxArray> objects_focal_shift_states_for_test(const MlxArray& uv, const MlxArray& xyz);
+std::unique_ptr<MlxArray> compiled_objects_head_norm(
+    const MlxArray& x, const MlxArray& gamma);
+
 // Compiled Gemma 4 Q-path with proportional RoPE. Folds
 // `reshape → fast::rms_norm → transpose → full-head ProportionalRoPE`
 // into one compile window so MLX sees a single fused subgraph instead of
@@ -1122,6 +1161,31 @@ std::unique_ptr<MlxArray> fast_layer_norm(
     float eps
 );
 
+// Test-only (issue #2619): the gradient of `fast::rms_norm(x, weight, eps)`
+// with respect to input `wrt` (0 = x, 1 = weight) under cotangent `cotan`,
+// through `mlx::core::vjp`, so the backend's RMSNormVJP primitive runs.
+std::unique_ptr<MlxArray> fast_rms_norm_vjp_for_test(
+    const MlxArray& x,
+    const MlxArray& weight,
+    const MlxArray& cotan,
+    float eps,
+    int32_t wrt
+);
+
+// Test-only (issue #2619): the gradient of `fast::layer_norm(x, weight, bias,
+// eps)` with respect to input `wrt` (0 = x, 1 = weight, 2 = bias) under
+// cotangent `cotan`, through `mlx::core::vjp` (the LayerNormVJP primitive).
+// A null `weight` (issue #2632) normalizes without one; `wrt` 1 is then an
+// error.
+std::unique_ptr<MlxArray> fast_layer_norm_vjp_for_test(
+    const MlxArray& x,
+    const MlxArray* weight,  // nullable
+    const MlxArray& bias,
+    const MlxArray& cotan,
+    float eps,
+    int32_t wrt
+);
+
 // Dtype code of the dtype SDPA over q, k and v attends in, `result_type(q, k, v)`
 // under this backend's promotion table (see `sdpa_attention_dtype_for_inputs`).
 int32_t sdpa_attention_dtype(const MlxArray& q, const MlxArray& k, const MlxArray& v);
@@ -1135,8 +1199,8 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention(
     const MlxArray* mask  // nullable
 );
 
-// Fast SDPA with optional sinks (per-head attention bias for first position)
-// Used by: GptOss
+// Fast SDPA with optional attention sinks: an extra per-head logit added to the softmax denominator, with no value row
+// Used by: GptOss, Laguna, DeepSeekV4, FalconOcr, OpenAIPrivacyFilter
 std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_with_sinks(
     const MlxArray& q,
     const MlxArray& k,
@@ -1434,6 +1498,22 @@ int32_t rocm_device_warp_size();
 // them: hits, misses, inserts, evictions, bypasses, entries, bytes, in that
 // order. Seven zeros off ROCm.
 rust::Vec<uint64_t> rocm_dequant_cache_stats();
+
+// Counters of the Windows ROCm host shadows (lablup/mlxcel#2643), as
+// `mlx::core::rocm::host_shadow_stats()` returns them: pinned bytes the live
+// shadows hold, device-to-host copies into a shadow, host-to-device flushes
+// of a dirty shadow, in that order. Three zeros off ROCm; on Linux ROCm only
+// stream-ordered pool buffers are counted.
+rust::Vec<uint64_t> rocm_host_shadow_stats();
+
+// Test-only (lablup/mlxcel#2643): element `index` of an evaluated,
+// row-contiguous float32 array through the bridge's read-only host path (the
+// one `item_*` and the byte readers use), and a write of one element through
+// `array::data<T>()`, the mutable path every CPU writer in MLX takes. Both
+// throw for another dtype, a non-contiguous array or an index past the end.
+float host_read_f32_for_test(const MlxArray& arr, size_t index);
+void host_write_f32_for_test(const MlxArray& arr, size_t index, float value);
+
 void set_rocm_port_warp_size_for_tests(int32_t warp_size);
 
 // Test-only (lablup/mlxcel#1804): a lazy array whose evaluation fails on the
@@ -1467,7 +1547,6 @@ std::unique_ptr<MlxArray> rocm_jit_key_probe(const MlxArray& input, bool f16_out
 // Takes a 1-d float32 input of 1 to 1024 elements and a non-negative variant.
 // Throws on backends other than ROCm.
 std::unique_ptr<MlxArray> rocm_jit_race_probe_array(const MlxArray& input, int32_t variant);
-
 
 // True when this backend has a BitLinear kernel port: Metal, CUDA or ROCm
 // (issues #1803, #1862). Read from the kernel's port table, so on a wave64
@@ -2089,6 +2168,66 @@ void compiled_moe_gate(
     std::unique_ptr<MlxArray>& scores_out
 );
 
+// Whole post-matmul Inkling MoE routing chain as one Metal kernel (issue
+// #2479): sigmoid + correction bias + top-k + logsigmoid/logsumexp softmax +
+// scaling, emitting the shared-expert weights pre-broadcast over the
+// expert-major dense intermediate. Matches mlx-vlm inkling_moe_route.
+// Declared `-> Result<()>` in the bridge so cxx catches the launcher's
+// no-port refusal (issues #1885, #1801) and any thrown MLX exception at the
+// FFI boundary instead of aborting.
+void inkling_moe_route_kernel(
+    const MlxArray& logits,        // [tokens, n_routed + n_shared]
+    const MlxArray& corr,          // [n_routed] float32
+    const MlxArray& wscale,        // [1] float32 = route_scale * global_scale
+    int32_t n_routed,
+    int32_t n_shared,
+    int32_t top_k,
+    int32_t intermediate,
+    std::unique_ptr<MlxArray>& indices_out,  // [tokens, top_k] uint32
+    std::unique_ptr<MlxArray>& weights_out,  // [tokens, top_k]
+    std::unique_ptr<MlxArray>& gamma_out     // [tokens, n_shared * intermediate]
+);
+
+// Weighted routed-expert down-projection for decode as one Metal kernel
+// (issue #2479): in-kernel q4/g64 row dequant with the top-k weighted expert
+// sum folded in, so the [N, K, out] intermediate never exists. The caller's
+// gate pins bits=4, group_size=64, affine with biases, and in_dims 2048.
+// Matches mlx-vlm inkling_moe_down_combine.
+// Declared `-> Result<()>` in the bridge so cxx catches the launcher's
+// no-port refusal (issues #1885, #1801) and any thrown MLX exception at the
+// FFI boundary instead of aborting.
+void inkling_moe_down_combine_kernel(
+    const MlxArray& act,           // [tokens * top_k, in_dims] contiguous
+    const MlxArray& wq,            // [experts, out_dims, in_dims/8] uint32
+    const MlxArray& sc,            // [experts, out_dims, groups]
+    const MlxArray& bi,            // [experts, out_dims, groups]
+    const MlxArray& idx,           // [tokens, top_k] uint32
+    const MlxArray& wk,            // [tokens, top_k]
+    int32_t top_k,
+    std::unique_ptr<MlxArray>& out  // [tokens, out_dims]
+);
+
+// Selected gate/up projection for affine q4 switch experts as one Metal
+// kernel: in-kernel q4/g64 dequant over both planes' packed weights, so the
+// two indexed gather_qmm dispatches never run. The caller's gate pins
+// bits=4, affine with biases, equal plane shapes, scales/biases in the
+// activation dtype, and k_size % 512 == 0 / n_size % 8 == 0. Matches
+// mlx-vlm short_block_affine4_switch_gate_up.
+void moe_switch_gate_up_kernel(
+    const MlxArray& x,             // [tokens, k_size] contiguous
+    const MlxArray& idx,           // [tokens, top_k] uint32 contiguous
+    const MlxArray& up_w,          // [experts, n_size, k_size/8] uint32
+    const MlxArray& up_scales,     // [experts, n_size, groups] x dtype
+    const MlxArray& up_biases,     // [experts, n_size, groups] x dtype
+    const MlxArray& gate_w,        // same shape as up_w
+    const MlxArray& gate_scales,
+    const MlxArray& gate_biases,
+    int32_t top_k,
+    int32_t group_size,
+    std::unique_ptr<MlxArray>& up_out,   // [tokens, top_k, n_size]
+    std::unique_ptr<MlxArray>& gate_out  // [tokens, top_k, n_size]
+);
+
 // Fused Mamba2 mixer forward for single-token decode.
 // Replaces ~23 FFI calls with a single C++ function call.
 // Used by: NemotronH (and any other model with quantized Mamba2Mixer).
@@ -2140,6 +2279,25 @@ void metal_stop_capture();
 // Replaces ops-based gated_delta_step with a fused Metal shader using SIMD reductions.
 // Used by: Qwen3.5, Qwen3Next, KimiLinear
 void metal_gated_delta_forward(
+    const MlxArray& q,       // [B, T, Hk, Dk]
+    const MlxArray& k,       // [B, T, Hk, Dk]
+    const MlxArray& v,       // [B, T, Hv, Dv]
+    const MlxArray& g,       // [B, T, Hv] or [B, T, Hv, Dk]
+    const MlxArray& beta,    // [B, T, Hv]
+    const MlxArray& state,   // [B, Hv, Dv, Dk]
+    const MlxArray* mask,    // nullable: [B, T]
+    std::unique_ptr<MlxArray>& output,      // [B, T, Hv, Dv]
+    std::unique_ptr<MlxArray>& new_state    // [B, Hv, Dv, Dk]
+);
+
+std::unique_ptr<MlxArray> qwen4_mrope_apply(
+    const MlxArray& x, const MlxArray& positions, const MlxArray& frequencies, const MlxArray& selector);
+
+std::unique_ptr<MlxArray> qwen4_qsa_attention(
+    const MlxArray& q, const MlxArray& k, const MlxArray& v,
+    const MlxArray& blocks, const MlxArray& ends, float scale, int32_t block_size);
+
+void metal_gated_delta_forward_precise(
     const MlxArray& q,       // [B, T, Hk, Dk]
     const MlxArray& k,       // [B, T, Hk, Dk]
     const MlxArray& v,       // [B, T, Hv, Dv]
@@ -2379,6 +2537,38 @@ std::unique_ptr<MlxArray> fused_metal4_attention(
     float softcap,
     int32_t window_size,
     bool use_metal4
+);
+
+// Native sliding-window causal SDPA (issue #2621): upstream MLX's
+// `window_size` argument with `mask_mode = "causal"`, so a multi-query
+// prefill over a sliding window needs no explicit mask array. Queries are the
+// suffix of the keys; query row `r` sees key `c` iff `c <= r && r - c < W`.
+// `window_size` must be positive. Implementation in
+// `cpp/mlx_cxx_window_sdpa.cpp`; the only caller is `src/window_sdpa.rs`.
+std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_causal_window(
+    const MlxArray& q,
+    const MlxArray& k,
+    const MlxArray& v,
+    float scale,
+    int32_t window_size
+);
+
+// MLX's own verdict (`ScaledDotProductAttention::use_fallback`) on whether an
+// SDPA over these `[B, H, L, D]` shapes and dtypes runs a fused kernel or the
+// graph fallback. Probed over lazily built arrays, so nothing is evaluated;
+// `window_sdpa.rs` memoizes the verdict because building them is not free.
+// Never throws: a probe failure answers false. Metal only; false on every
+// other backend.
+bool sdpa_uses_fused_kernel(
+    rust::Slice<const int32_t> q_shape,
+    rust::Slice<const int32_t> k_shape,
+    rust::Slice<const int32_t> v_shape,
+    int32_t q_dtype,
+    int32_t k_dtype,
+    int32_t v_dtype,
+    bool has_arr_mask,
+    bool do_causal,
+    int32_t window_size
 );
 
 // Fused Sparse-V SDPA Metal kernel launcher.
@@ -2622,6 +2812,22 @@ std::unique_ptr<MlxArray> array_handle_clone(const MlxArray& a);
 
 // Whether two handles refer to the same MLX array node.
 bool array_same_handle(const MlxArray& a, const MlxArray& b);
+
+// A weak reference to an MLX array node (#1564): it does not keep the node or
+// its buffer alive. The pointee is `mlx::core::array::ArrayDesc`, private to
+// MLX, so it is held type-erased.
+struct MlxWeakArray {
+    std::weak_ptr<void> desc;
+};
+
+// A weak reference to `a`'s node.
+std::unique_ptr<MlxWeakArray> array_weak_ref(const MlxArray& a);
+
+// A handle to the node if something still holds it, null otherwise.
+std::unique_ptr<MlxArray> array_weak_upgrade(const MlxWeakArray& w);
+
+// CUDA weight-upload counters of `Load::eval_gpu` (#1564); false without CUDA.
+bool weight_load_transfer_stats(rust::Slice<uint64_t> out);
 
 std::unique_ptr<MlxArray> inplace_slice_write(
     const MlxArray& dst,

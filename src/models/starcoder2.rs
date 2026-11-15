@@ -19,7 +19,7 @@
 //! - GELU activation instead of SiLU
 //! - Attention/MLP bias enabled
 
-use mlxcel_core::generate::LanguageModel;
+use mlxcel_core::generate::{BatchedDecodeKind, LanguageModel, route_batched_decode};
 use mlxcel_core::layers::{FusedQKVLinear, KVCache, LayerNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
@@ -28,6 +28,7 @@ use std::path::Path;
 
 // Config.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(remote = "Self")]
 pub struct StarCoder2Config {
     pub model_type: String,
     pub hidden_size: usize,
@@ -44,6 +45,8 @@ pub struct StarCoder2Config {
     #[serde(default)]
     pub quantization: Option<QuantizationConfig>,
 }
+
+mlxcel_core::impl_rope_lifting_deserialize!(StarCoder2Config);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct QuantizationConfig {
@@ -176,6 +179,29 @@ impl StarCoder2Attention {
     }
 }
 
+impl mlxcel_core::batched_decode::SplitAttention for StarCoder2Attention {
+    fn split_shape(&self) -> mlxcel_core::batched_decode::SplitAttentionShape {
+        mlxcel_core::batched_decode::SplitAttentionShape {
+            num_heads: self.n_heads,
+            num_kv_heads: self.n_kv_heads,
+            head_dim: self.head_dim,
+            scale: self.scale,
+        }
+    }
+
+    fn rope_batched(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        offsets: &[i32],
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        (
+            mlxcel_core::fast_rope_batched(q, self.head_dim, false, self.rope_base, 1.0, offsets),
+            mlxcel_core::fast_rope_batched(k, self.head_dim, false, self.rope_base, 1.0, offsets),
+        )
+    }
+}
+
 // MLP.
 pub struct StarCoder2MLP {
     pub c_fc: UnifiedLinear,
@@ -209,8 +235,12 @@ impl StarCoder2MLP {
 
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         let x = self.c_fc.forward(x);
-        // Use compiled GELU for kernel fusion (matches Python's gelu activation)
-        let x = mlxcel_core::compiled_gelu(&x);
+        // StarCoder2 checkpoints declare `hidden_act = gelu_pytorch_tanh` (also
+        // the `Starcoder2Config` default), so this is the tanh GELU, evaluated
+        // in f32 as one compiled kernel. mlx-lm uses erf (`nn.gelu`) and this
+        // path did too before #2548; the OpenXLA StarCoder2 graph, proven
+        // token-exact against the Hugging Face oracle, was already tanh.
+        let x = mlxcel_core::utils::GeluActivation::TanhF32Compiled.apply(&x);
         self.c_proj.forward(&x)
     }
 }
@@ -273,6 +303,39 @@ impl StarCoder2TransformerBlock {
         let mlp_out = self.mlp.forward(&normed);
         mlxcel_core::add(&h, &mlp_out)
     }
+
+    pub fn forward_batched(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut KVCache],
+        layer_idx: usize,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let normed = self.input_layernorm.forward(x);
+        let (q, k, v) = self.self_attn.qkv_proj.forward(&normed);
+        let seq_len = mlxcel_core::array_shape(&q)[1];
+        let metadata = crate::models::batched_decode_cache::uniform_layer_metadata(
+            caches,
+            seq_len,
+            0,
+            "StarCoder2",
+            layer_idx,
+        );
+        let attn = mlxcel_core::batched_decode::forward_split_attention(
+            &self.self_attn,
+            &q,
+            &k,
+            &v,
+            caches,
+            &metadata,
+            mask,
+        );
+        let attn = self.self_attn.o_proj.forward(&attn);
+        let h = mlxcel_core::add(x, &attn);
+        let normed = self.post_attention_layernorm.forward(&h);
+        let mlp = self.mlp.forward(&normed);
+        mlxcel_core::add(&h, &mlp)
+    }
 }
 
 // Model.
@@ -302,6 +365,29 @@ impl StarCoder2Model {
         let h = self.norm.forward(&h);
 
         // LM head
+        if let Some(lm_head) = &self.lm_head {
+            lm_head.forward(&h)
+        } else {
+            self.embed_tokens.as_linear(&h)
+        }
+    }
+
+    pub fn forward_batched_impl(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let mut h = self.embed_tokens.forward(input_ids);
+        for layer_idx in 0..self.layers.len() {
+            let mut layer_caches = crate::models::batched_decode_cache::collect_layer_caches(
+                batch_caches,
+                "StarCoder2",
+                layer_idx,
+            );
+            h = self.layers[layer_idx].forward_batched(&h, &mut layer_caches, layer_idx, mask);
+        }
+        let h = self.norm.forward(&h);
         if let Some(lm_head) = &self.lm_head {
             lm_head.forward(&h)
         } else {
@@ -382,6 +468,10 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
 
 // LanguageModel trait implementation.
 impl LanguageModel for StarCoder2Model {
+    fn batched_decode_kind(&self) -> BatchedDecodeKind {
+        BatchedDecodeKind::Native
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
@@ -402,5 +492,16 @@ impl LanguageModel for StarCoder2Model {
     fn eos_token_ids(&self) -> Vec<i32> {
         // StarCoder2 EOS token
         vec![0] // <|endoftext|>
+    }
+
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        route_batched_decode(self, input_ids, batch_caches, |caches| {
+            self.forward_batched_impl(input_ids, caches, mask)
+        })
     }
 }

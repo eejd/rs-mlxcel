@@ -137,6 +137,10 @@ impl MuseGlimmerVlmModel {
 }
 
 impl LanguageModel for MuseGlimmerVlmModel {
+    fn batched_decode_kind(&self) -> mlxcel_core::generate::BatchedDecodeKind {
+        self.text.batched_decode_kind()
+    }
+
     fn num_layers(&self) -> usize {
         LanguageModel::num_layers(&self.text)
     }
@@ -204,6 +208,11 @@ impl LanguageModel for MuseGlimmerVlmModel {
 
     fn sequence_state_layout(&self) -> SequenceStateLayout {
         LanguageModel::sequence_state_layout(&self.text)
+    }
+
+    /// The text model owns the KV caches; forward what it stores (#2790).
+    fn kv_cache_storage_modes(&self) -> Option<Vec<Option<mlxcel_core::cache::KVCacheMode>>> {
+        LanguageModel::kv_cache_storage_modes(&self.text)
     }
 
     fn supports_batching(&self) -> bool {

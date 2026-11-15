@@ -23,21 +23,29 @@ use anyhow::Context;
 use mlxcel::cli::ggml_compat_args::read_model_layer_count;
 use mlxcel::cli::speculative_args::{env_fallback_draft_block_size, env_fallback_draft_kind};
 use mlxcel::cli::turbo_args::resolve_kv_cache_mode;
-use mlxcel::downloader::{ModelSourceOptions, resolve_model_source_with_options, set_offline_mode};
-use mlxcel::memory_estimate::{QuantHint, estimate_total_memory, format_bytes, format_estimate};
-use mlxcel::server::{LlamaModelSourceArgs, resolve_llama_model_source, superseded_model_notice};
+use mlxcel::downloader::{
+    ModelSourceOptions, resolve_draft_model_source, resolve_model_source_with_options,
+    set_offline_mode,
+};
+use mlxcel::memory_estimate::{
+    QuantHint, SERVE_PREFLIGHT_REMEDIATION, enforce_preflight, estimate_total_memory,
+    format_estimate,
+};
 use mlxcel::server::{
-    ServerStartupInput, env_fallback_apc_block_size, env_fallback_apc_enabled,
-    env_fallback_apc_hash, env_fallback_apc_num_blocks, env_fallback_api_key_files,
-    env_fallback_api_keys, env_fallback_batch_size, env_fallback_cache_type_k,
-    env_fallback_cache_type_v, env_fallback_chat_template_kwargs, env_fallback_cors_credentials,
-    env_fallback_draft_model, env_fallback_embedding_model, env_fallback_endpoint_slots,
-    env_fallback_kv_bits, env_fallback_kv_group_size, env_fallback_kv_quant_scheme,
-    env_fallback_kv_skip_last_layer, env_fallback_lang_bias,
-    env_fallback_lang_bias_include_byte_fragments, env_fallback_log_file, env_fallback_offline,
-    env_fallback_prompt_cache_capacity_bytes, env_fallback_prompt_cache_enabled,
-    env_fallback_prompt_cache_max_entries, env_fallback_prompt_cache_min_prefix,
-    env_fallback_prompt_cache_snapshot_capacity_bytes,
+    LlamaModelSourceArgs, StartupNotice, resolve_llama_model_source, superseded_model_notice,
+};
+use mlxcel::server::{
+    ServerStartupInput, env_fallback_allowed_origins, env_fallback_apc_block_size,
+    env_fallback_apc_enabled, env_fallback_apc_hash, env_fallback_apc_num_blocks,
+    env_fallback_api_key_files, env_fallback_api_keys, env_fallback_batch_size,
+    env_fallback_cache_type_k, env_fallback_cache_type_v, env_fallback_chat_template_kwargs,
+    env_fallback_cors_credentials, env_fallback_cors_origins, env_fallback_draft_model,
+    env_fallback_embedding_model, env_fallback_endpoint_slots, env_fallback_kv_bits,
+    env_fallback_kv_group_size, env_fallback_kv_quant_scheme, env_fallback_kv_skip_last_layer,
+    env_fallback_lang_bias, env_fallback_lang_bias_include_byte_fragments, env_fallback_log_file,
+    env_fallback_models_autoload, env_fallback_offline, env_fallback_prompt_cache_capacity_bytes,
+    env_fallback_prompt_cache_enabled, env_fallback_prompt_cache_max_entries,
+    env_fallback_prompt_cache_min_prefix, env_fallback_prompt_cache_snapshot_capacity_bytes,
     env_fallback_prompt_cache_snapshot_max_entries, env_fallback_prompt_cache_snapshot_ttl,
     env_fallback_prompt_cache_ttl, env_fallback_reasoning_budget, env_fallback_reranker_model,
     env_fallback_settings_endpoint, env_fallback_ubatch_size, long_cli_flag_was_set,
@@ -62,7 +70,60 @@ pub(crate) fn run_serve(args: crate::ServeArgs) -> anyhow::Result<()> {
 }
 
 async fn run_serve_async(mut args: crate::ServeArgs) -> anyhow::Result<()> {
-    env_fallback_settings_endpoint(&mut args.settings, long_cli_flag_was_set("settings"));
+    // Native Windows is single-node only (#58): refuse distributed flags
+    // before the model reference is resolved (and possibly downloaded).
+    mlxcel::server::ServerDistributedFlags {
+        pp_auto: args.pp_auto.is_some(),
+        pp_peer: args.pp_peer,
+        distributed_config: args.distributed_config.is_some(),
+        node_role: args.node_role.is_some(),
+        peers: !args.peers.is_empty(),
+        prefill_peers: !args.prefill_peers.is_empty(),
+        decode_peers: !args.decode_peers.is_empty(),
+        serving_bind: args.serving_bind.is_some(),
+        pp_layers: args.pp_layers.is_some(),
+        tp_size: args.tp_size,
+    }
+    .ensure_supported()?;
+    env_fallback_settings_endpoint(
+        &mut args.settings,
+        long_cli_flag_was_set("settings"),
+        &mut args.startup_notices,
+    );
+    // `--cors-origins` and `--allowed-origins` conflict, so their variables
+    // are read after parsing rather than through clap's `env` attribute,
+    // which counted an env value as a conflicting occurrence (#2664).
+    // Applied before the model reference is resolved so a conflicting pair of
+    // variables fails in under a second.
+    let cors_origins_was_set = long_cli_flag_was_set("cors-origins");
+    let allowed_origins_was_set = long_cli_flag_was_set("allowed-origins");
+    // The notice for an overridden variable is logged by `start_server`
+    // once the subscriber exists; a warning here would reach nothing.
+    args.startup_notices.extend(env_fallback_cors_origins(
+        &mut args.cors_origins,
+        cors_origins_was_set,
+        allowed_origins_was_set,
+    )?);
+    args.startup_notices.extend(env_fallback_allowed_origins(
+        &mut args.allowed_origins,
+        allowed_origins_was_set,
+        cors_origins_was_set,
+    )?);
+    // The b10621 on/off flag pairs whose `LLAMA_ARG_*` variables are read
+    // at runtime rather than through clap's `env` attribute (#2609). Applied
+    // here, ahead of the memory preflight (which reads `--kv-unified`) and the
+    // Web UI router override of `--models-autoload`, so both see the
+    // environment exactly as clap's binding used to deliver it.
+    env_fallback_models_autoload(
+        &mut args.models_autoload,
+        long_cli_flag_was_set("models-autoload"),
+        long_cli_flag_was_set("no-models-autoload"),
+    )?;
+    mlxcel::server::apply_bool_pair_env_bindings(
+        &mut args.cache_compat,
+        &mut args.context_compat,
+        &mut args.slot_compat,
+    )?;
     // Resolve the model reference into a concrete directory (epic #92, issue
     // #94) before the memory preflight or the server reads it. An existing
     // path is used verbatim (byte-identical to the pre-#94 local-path
@@ -131,9 +192,12 @@ async fn run_serve_async(mut args: crate::ServeArgs) -> anyhow::Result<()> {
         .resolved_spec_type()
         .map_err(|rejection| anyhow::anyhow!("{rejection}"))?;
     if spec_type.disable_speculation && args.draft_model.is_some() {
-        tracing::warn!(
-            "--spec-type none disables speculative decoding (b10621 semantics); ignoring the configured draft model"
-        );
+        // Collected rather than logged: no subscriber exists yet (#2697).
+        args.startup_notices.push(StartupNotice::warn(
+            "--spec-type none disables speculative decoding (b10621 semantics); ignoring the \
+             configured draft model"
+                .to_string(),
+        ));
         args.draft_model = None;
     }
     // `none` disables prompt lookup as well (#2255): it needs no draft model,
@@ -141,9 +205,11 @@ async fn run_serve_async(mut args: crate::ServeArgs) -> anyhow::Result<()> {
     if spec_type.disable_speculation
         && args.speculative.draft_kind.as_deref() == Some("prompt-lookup")
     {
-        tracing::warn!(
-            "--spec-type none disables speculative decoding (b10621 semantics); ignoring --draft-kind prompt-lookup"
-        );
+        args.startup_notices.push(StartupNotice::warn(
+            "--spec-type none disables speculative decoding (b10621 semantics); ignoring \
+             --draft-kind prompt-lookup"
+                .to_string(),
+        ));
         args.speculative.draft_kind = None;
     }
     if let Some(kind) = spec_type.draft_kind {
@@ -205,6 +271,8 @@ async fn run_serve_async(mut args: crate::ServeArgs) -> anyhow::Result<()> {
     mlxcel::server::configure_private_media_urls(
         mlxcel::server::private_media_urls_allowed_from_env(),
     );
+    mlxcel::server::configure_media_nat64_prefixes_from_env()
+        .map_err(|message| anyhow::anyhow!("{message}"))?;
 
     // b10621 chat-template / reasoning / parsing options (issue #1447):
     // classified before the model reference resolves, like the GGML group, so
@@ -256,6 +324,11 @@ async fn run_serve_async(mut args: crate::ServeArgs) -> anyhow::Result<()> {
     if webui_enabled && router_mode {
         args.models_autoload = false;
     }
+    // #2825: `--image-model` with no model source serves image generation
+    // alone. `build_startup_input` names any conflicting flag after folding in
+    // the environment aliases; here the decision only needs to skip the chat
+    // checkpoint resolution and the memory preflight below.
+    let image_only = args.image_model.is_some() && !has_model_source;
     // The #1438 migration guard, raised BEFORE model resolution so the old
     // store-root combination fails in milliseconds instead of after a
     // multi-gigabyte download. `into_startup_config` re-checks it for
@@ -268,6 +341,9 @@ async fn run_serve_async(mut args: crate::ServeArgs) -> anyhow::Result<()> {
              variable; to start the router, drop the model argument"
         );
     }
+    if image_only {
+        return start_server(build_startup_input(args)?.into_startup_config()?).await;
+    }
     if router_mode {
         return start_server(build_startup_input(args)?.into_startup_config()?).await;
     }
@@ -279,7 +355,12 @@ async fn run_serve_async(mut args: crate::ServeArgs) -> anyhow::Result<()> {
         docker_repo: args.docker_repo.clone(),
     })?;
     if let Some(superseded) = source.superseded_model.as_deref() {
-        tracing::info!("{}", superseded_model_notice(&source.reference, superseded));
+        // Collected rather than logged: no subscriber exists yet (#2722).
+        args.startup_notices
+            .push(StartupNotice::info(superseded_model_notice(
+                &source.reference,
+                superseded,
+            )));
     }
     let model_path = resolve_model_source_with_options(
         &source.reference,
@@ -356,26 +437,7 @@ fn run_serve_memory_preflight(
     let banner = format_estimate(model_path, &estimate);
     println!("{banner}");
 
-    if !estimate.fits {
-        if args.force_memory {
-            eprintln!(
-                "WARNING: --estimate-memory preflight says this load is over budget by {}. \
-                 Continuing because --force was set.",
-                format_bytes(estimate.overflow_bytes()),
-            );
-        } else {
-            return Err(anyhow::anyhow!(
-                "--estimate-memory: total {} exceeds available {} by {}. \
-                 Pass --force (or --no-memory-check) to override, or rerun with \
-                 a smaller --ctx-size, smaller --max-batch-size, or a smaller model.",
-                format_bytes(estimate.total_bytes),
-                format_bytes(estimate.available_bytes),
-                format_bytes(estimate.overflow_bytes()),
-            ));
-        }
-    }
-
-    Ok(())
+    enforce_preflight(&estimate, args.force_memory, SERVE_PREFLIGHT_REMEDIATION)
 }
 
 fn serve_preflight_ctx_len(args: &crate::ServeArgs) -> u64 {
@@ -430,50 +492,81 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
     // Axis B (B7): apply `LLAMA_ARG_LANG_BIAS` env-var fallback
     // before resolving, so env-supplied values flow through the same
     // validation path as CLI flags. CLI flag wins on conflict.
-    env_fallback_lang_bias(&mut args.lang_bias);
+    env_fallback_lang_bias(&mut args.lang_bias, &mut args.startup_notices);
     // env-var fallback for the byte-fragment opt-in flag.
-    env_fallback_lang_bias_include_byte_fragments(&mut args.lang_bias);
+    env_fallback_lang_bias_include_byte_fragments(&mut args.lang_bias, &mut args.startup_notices);
     // env-var fallback for the thinking-budget default.
     env_fallback_reasoning_budget(
         &mut args.reasoning_budget,
         long_cli_flag_was_set("reasoning-budget"),
+        &mut args.startup_notices,
     );
     // env-var fallback for the chat-template kwargs default.
-    env_fallback_chat_template_kwargs(&mut args.chat_template_kwargs);
+    env_fallback_chat_template_kwargs(&mut args.chat_template_kwargs, &mut args.startup_notices);
     // env-var fallbacks for prompt-cache knobs.
     env_fallback_prompt_cache_enabled(
         &mut args.prompt_cache_enabled,
         long_cli_flag_was_set("prompt-cache-enabled"),
+        &mut args.startup_notices,
     );
-    env_fallback_prompt_cache_capacity_bytes(&mut args.prompt_cache_capacity_bytes);
-    env_fallback_prompt_cache_max_entries(&mut args.prompt_cache_max_entries);
-    env_fallback_prompt_cache_ttl(&mut args.prompt_cache_ttl);
-    env_fallback_prompt_cache_min_prefix(&mut args.prompt_cache_min_prefix);
+    env_fallback_prompt_cache_capacity_bytes(
+        &mut args.prompt_cache_capacity_bytes,
+        &mut args.startup_notices,
+    );
+    env_fallback_prompt_cache_max_entries(
+        &mut args.prompt_cache_max_entries,
+        &mut args.startup_notices,
+    );
+    env_fallback_prompt_cache_ttl(&mut args.prompt_cache_ttl, &mut args.startup_notices);
+    env_fallback_prompt_cache_min_prefix(
+        &mut args.prompt_cache_min_prefix,
+        &mut args.startup_notices,
+    );
     env_fallback_prompt_cache_snapshot_capacity_bytes(
         &mut args.prompt_cache_snapshot_capacity_bytes,
+        &mut args.startup_notices,
     );
-    env_fallback_prompt_cache_snapshot_max_entries(&mut args.prompt_cache_snapshot_max_entries);
-    env_fallback_prompt_cache_snapshot_ttl(&mut args.prompt_cache_snapshot_ttl);
+    env_fallback_prompt_cache_snapshot_max_entries(
+        &mut args.prompt_cache_snapshot_max_entries,
+        &mut args.startup_notices,
+    );
+    env_fallback_prompt_cache_snapshot_ttl(
+        &mut args.prompt_cache_snapshot_ttl,
+        &mut args.startup_notices,
+    );
     // env-var fallbacks for the APC knobs.
-    env_fallback_apc_enabled(&mut args.apc_enabled, long_cli_flag_was_set("apc-enabled"));
-    env_fallback_apc_block_size(&mut args.apc_block_size);
-    env_fallback_apc_num_blocks(&mut args.apc_num_blocks);
-    env_fallback_apc_hash(&mut args.apc_hash);
+    env_fallback_apc_enabled(
+        &mut args.apc_enabled,
+        long_cli_flag_was_set("apc-enabled"),
+        &mut args.startup_notices,
+    );
+    env_fallback_apc_block_size(&mut args.apc_block_size, &mut args.startup_notices);
+    env_fallback_apc_num_blocks(&mut args.apc_num_blocks, &mut args.startup_notices);
+    env_fallback_apc_hash(&mut args.apc_hash, &mut args.startup_notices);
     // Env-var fallbacks for KV cache type split flags.
     // The clap `env = "..."` attribute already reads these env vars; the
     // explicit calls below maintain the warn-on-conflict pattern used by
     // other LLAMA_ARG_* pairs.
-    env_fallback_cache_type_k(&mut args.turbo.cache_type_k);
-    env_fallback_cache_type_v(&mut args.turbo.cache_type_v);
+    env_fallback_cache_type_k(&mut args.turbo.cache_type_k, &mut args.startup_notices);
+    env_fallback_cache_type_v(&mut args.turbo.cache_type_v, &mut args.startup_notices);
     // env-var fallbacks for the continuous-batching KV
     // quantization knobs. The flags themselves live in
     // `mlxcel::cli::batch_quant_args::BatchKvQuantArgs` (flattened on
     // `ServeArgs`); these helpers honor the warn-on-CLI-conflict pattern
     // shared with the other LLAMA_ARG_* env vars.
-    env_fallback_kv_bits(&mut args.batch_quant.kv_bits);
-    env_fallback_kv_group_size(&mut args.batch_quant.kv_group_size);
-    env_fallback_kv_quant_scheme(&mut args.batch_quant.kv_quant_scheme);
-    env_fallback_kv_skip_last_layer(&mut args.batch_quant.kv_skip_last_layer);
+    env_fallback_kv_bits(&mut args.batch_quant.kv_bits, &mut args.startup_notices);
+    env_fallback_kv_group_size(
+        &mut args.batch_quant.kv_group_size,
+        &mut args.startup_notices,
+    );
+    env_fallback_kv_quant_scheme(
+        &mut args.batch_quant.kv_quant_scheme,
+        &mut args.startup_notices,
+    );
+    env_fallback_kv_skip_last_layer(
+        &mut args.batch_quant.kv_skip_last_layer,
+        &mut args.startup_notices,
+    );
 
     // env-var fallbacks for the speculative-decoding selector
     // flags. `clap` already reads `LLAMA_ARG_DRAFT_KIND` /
@@ -481,23 +574,28 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
     // the helpers below layer the mlxcel-native `MLXCEL_DRAFT_KIND` /
     // `MLXCEL_DRAFT_BLOCK_SIZE` aliases on top with the same warn-on-conflict
     // pattern shared with the other `MLXCEL_*` / `LLAMA_ARG_*` pairs.
-    env_fallback_draft_kind(&mut args.speculative.draft_kind);
-    env_fallback_draft_block_size(&mut args.speculative.draft_block_size);
+    env_fallback_draft_kind(&mut args.speculative.draft_kind, &mut args.startup_notices);
+    env_fallback_draft_block_size(
+        &mut args.speculative.draft_block_size,
+        &mut args.startup_notices,
+    );
     mlxcel::cli::speculative_args::env_fallback_draft_max(
         &mut args.draft_max,
         mlxcel::server::long_cli_flag_was_set("draft-max")
             || mlxcel::server::long_cli_flag_was_set("draft")
             || mlxcel::server::long_cli_flag_was_set("spec-draft-n-max")
             || mlxcel::server::long_cli_flag_was_set("draft-n"),
+        &mut args.startup_notices,
     );
-    env_fallback_draft_model(&mut args.draft_model);
-    env_fallback_batch_size(&mut args.batch_size);
-    env_fallback_ubatch_size(&mut args.ubatch_size);
-    env_fallback_log_file(&mut args.log_file);
+    env_fallback_draft_model(&mut args.draft_model, &mut args.startup_notices);
+    env_fallback_batch_size(&mut args.batch_size, &mut args.startup_notices);
+    env_fallback_ubatch_size(&mut args.ubatch_size, &mut args.startup_notices);
+    env_fallback_log_file(&mut args.log_file, &mut args.startup_notices);
     env_fallback_endpoint_slots(
         &mut args.slots,
         long_cli_flag_was_set("slots"),
         long_cli_flag_was_set("no-slots"),
+        &mut args.startup_notices,
     );
     env_fallback_api_keys(&mut args.api_key);
     env_fallback_api_key_files(&mut args.api_key_file);
@@ -505,6 +603,7 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         &mut args.cors_credentials,
         long_cli_flag_was_set("cors-credentials"),
         long_cli_flag_was_set("no-cors-credentials"),
+        &mut args.startup_notices,
     );
     args.ui_compat
         .apply_env_bindings()
@@ -524,7 +623,48 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
 
     // `--embedding-model` accepts the same path-or-repo-id shapes as `-m`
     // and resolves through the same store lookup / auto-download.
-    env_fallback_embedding_model(&mut args.embedding_model);
+    env_fallback_embedding_model(&mut args.embedding_model, &mut args.startup_notices);
+    // `--reranker-model` accepts the same path-or-repo-id shapes as `-m`.
+    // Both aliases are folded in before the image-only decision below so the
+    // environment forms conflict with `--image-model` exactly as the flags do.
+    env_fallback_reranker_model(&mut args.reranker_model, &mut args.startup_notices);
+
+    // #2825: `--image-model` with no model source serves image generation
+    // alone, so a router selector or a flag naming another workload fails here,
+    // before the image checkpoint is resolved (and possibly downloaded).
+    let has_model_source = args.model.is_some()
+        || args.hf_repo.is_some()
+        || args.model_url.is_some()
+        || args.docker_repo.is_some()
+        || args.hf_file.is_some();
+    let image_only = {
+        let (embeddings, reranking) = if args.image_model.is_some() && !has_model_source {
+            let resolved = args
+                .embedding_compat
+                .resolve()
+                .map_err(|message| anyhow::anyhow!(message))?;
+            (
+                resolved.embedding_only && !resolved.rerank_only,
+                resolved.rerank_only,
+            )
+        } else {
+            (false, false)
+        };
+        mlxcel::server::resolve_image_only_mode(
+            args.image_model.is_some(),
+            has_model_source,
+            &[
+                ("--models-dir", args.models_dir.is_some()),
+                ("--models-preset", args.models_preset.is_some()),
+                ("--webui", webui_enabled),
+                ("--embedding-model", args.embedding_model.is_some()),
+                ("--reranker-model", args.reranker_model.is_some()),
+                ("--embeddings", embeddings),
+                ("--reranking", reranking),
+            ],
+        )?
+    };
+
     let embedding_model_path = args
         .embedding_model
         .as_deref()
@@ -542,8 +682,24 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         })
         .transpose()?;
 
-    // `--reranker-model` accepts the same path-or-repo-id shapes as `-m`.
-    env_fallback_reranker_model(&mut args.reranker_model);
+    // `--image-model` accepts the same path-or-repo-id shapes as `-m`.
+    let image_model_path = args
+        .image_model
+        .as_deref()
+        .map(|value| {
+            resolve_model_source_with_options(
+                std::path::Path::new(value),
+                ModelSourceOptions {
+                    models_dir: args.model_store_root.as_deref(),
+                    revision: args.revision.as_deref(),
+                    token: args.hf_token.as_deref(),
+                    offline: args.offline,
+                    cwd_models_dir: None,
+                },
+            )
+        })
+        .transpose()?;
+
     let reranker_model_path = args
         .reranker_model
         .as_deref()
@@ -561,6 +717,26 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         })
         .transpose()?;
 
+    // `--draft-model` accepts the same path-or-repo-id shapes as `-m`. The
+    // target's `--revision` is not applied to it.
+    let draft_model_path = args
+        .draft_model
+        .as_deref()
+        .map(|value| {
+            resolve_draft_model_source(
+                value,
+                ModelSourceOptions {
+                    models_dir: args.model_store_root.as_deref(),
+                    revision: None,
+                    token: args.hf_token.as_deref(),
+                    offline: args.offline,
+                    cwd_models_dir: None,
+                },
+            )
+            .with_context(|| format!("resolving --draft-model {}", value.display()))
+        })
+        .transpose()?;
+
     Ok(ServerStartupInput {
         chat_compat: args
             .chat_compat
@@ -569,14 +745,20 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         reasoning_alias_field: args.reasoning_alias_field,
         model_path: match args.model.clone() {
             Some(path) => path,
-            // Router/WebUI model-free mode: no startup checkpoint.
-            None if args.models_dir.is_some() || args.models_preset.is_some() || webui_enabled => {
+            // Router/WebUI model-free mode and the image-only mode (#2825)
+            // have no startup chat checkpoint.
+            None if image_only
+                || args.models_dir.is_some()
+                || args.models_preset.is_some()
+                || webui_enabled =>
+            {
                 std::path::PathBuf::new()
             }
             None => anyhow::bail!(
                 "--model/-m is required to start the server (set the \
                  LLAMA_ARG_MODEL environment variable, pass -m \
-                 <PATH_OR_REPO_ID>, or pass --hf-repo <owner>/<name>)"
+                 <PATH_OR_REPO_ID>, pass --hf-repo <owner>/<name>, or pass \
+                 --image-model <PATH_OR_REPO_ID> to serve image generation only)"
             ),
         },
         adapter_path: None,
@@ -614,11 +796,12 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         ssl_cert_file: args.ssl_cert_file,
         ssl_key_file: args.ssl_key_file,
         cors_origins: args.cors_origins,
+        startup_notices: args.startup_notices,
         cors_methods: args.cors_methods,
         cors_headers: args.cors_headers,
         cors_credentials: args.cors_credentials,
         no_cors_credentials: args._no_cors_credentials,
-        draft_model_path: args.draft_model,
+        draft_model_path,
         draft_max: args.draft_max,
         // forward the speculative-decoding selector flags
         // resolved above via env-var fallbacks. Reconciliation into a
@@ -632,6 +815,7 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         audio_queue_depth: args.audio_queue_depth,
         audio_request_timeout_secs: args.audio_request_timeout_secs,
         embedding_model_path,
+        image_model_path,
         embedding_batch_size: args.embedding_batch_size,
         embedding_max_length: args.embedding_max_length,
         embedding_queue_depth: args.embedding_queue_depth,
@@ -656,7 +840,10 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         slot_save_path: args.slot_save_path,
         router_models_dir: args.models_dir.clone(),
         models_max: args.models_max,
-        models_autoload: args.models_autoload,
+        models_autoload: mlxcel::server::resolve_compat_toggle(
+            args.models_autoload,
+            args._no_models_autoload,
+        ),
         models_preset: args.models_preset.clone(),
         tags: args.tags.clone(),
         model_store_root: args.model_store_root.clone(),
@@ -734,8 +921,10 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         cluster_name: args.cluster_name,
         cluster_peers: args.cluster_peers,
         cluster_discovery_port: args.cluster_discovery_port,
+        cluster_discovery_target: args.cluster_discovery_target,
         cluster_control_addr: args.cluster_control_addr,
         cluster_config_out: args.cluster_config_out,
+        cluster_secret_file: args.cluster_secret_file,
         dry_run: args.dry_run,
         tp_size: args.tp_size,
         tp_moe_mode: args.tp_moe_mode,

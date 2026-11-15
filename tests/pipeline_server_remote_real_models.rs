@@ -18,7 +18,7 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::repo_model_dir;
+use common::{repo_model_dir, test_cluster_auth};
 use mlxcel::SamplingConfig;
 use mlxcel::distributed::TransportBackend;
 use mlxcel::distributed::pipeline::{
@@ -27,7 +27,8 @@ use mlxcel::distributed::pipeline::{
 };
 use mlxcel::server::batch::{BatchObservability, RequestPriority};
 use mlxcel::server::{
-    BatchMetrics, ModelProvider, PipelineParallelRuntimeConfig, ServerConfig, ServerGenerateOptions,
+    BatchMetrics, ModelProvider, PipelineParallelRuntimeConfig, ServerConfig,
+    ServerGenerateOptions, WORKER_EXIT_TIMEOUT,
 };
 
 fn reserve_port() -> u16 {
@@ -86,6 +87,7 @@ fn assert_remote_coordinator_matches_dense_baseline(
     let num_layers = resolve_in_process_pipeline_num_layers(&model_dir).unwrap();
     let assignments = two_stage_assignments(num_layers, split_override.unwrap_or(num_layers / 2));
 
+    let auth = test_cluster_auth();
     let coordinator_addr = format!("127.0.0.1:{}", reserve_port());
     let stage0_addr = format!("127.0.0.1:{}", reserve_port());
     let stage1_addr = format!("127.0.0.1:{}", reserve_port());
@@ -96,8 +98,10 @@ fn assert_remote_coordinator_matches_dense_baseline(
         transport_backend: TransportBackend::Tcp,
         stage_assignment: assignments[1].clone(),
         num_stages: 2,
+        coordinator_peer: coordinator_addr.clone(),
         upstream_peer: Some(stage0_addr.clone()),
         downstream_peer: None,
+        auth: Arc::clone(&auth),
     })
     .unwrap();
     let stage0 = RemoteStageServiceHandle::spawn(RemoteStageServiceConfig {
@@ -106,8 +110,10 @@ fn assert_remote_coordinator_matches_dense_baseline(
         transport_backend: TransportBackend::Tcp,
         stage_assignment: assignments[0].clone(),
         num_stages: 2,
+        coordinator_peer: coordinator_addr.clone(),
         upstream_peer: None,
         downstream_peer: Some(stage1_addr.clone()),
+        auth: Arc::clone(&auth),
     })
     .unwrap();
 
@@ -129,6 +135,8 @@ fn assert_remote_coordinator_matches_dense_baseline(
                     transport_backend: TransportBackend::Tcp,
                     bind_address: coordinator_addr,
                     stage_timeout: Duration::from_secs(30),
+                    auth,
+                    vocab_size: None,
                 },
             )),
             ..ServerConfig::default()
@@ -176,6 +184,17 @@ fn assert_remote_coordinator_matches_dense_baseline(
         .generate(prompt.to_string(), options)
         .unwrap();
 
+    // Join both model workers before the stage services and before this
+    // function returns: dropping a provider only asks its worker to exit, and
+    // a test process that reaches `exit()` while the worker still frees the
+    // model aborts on the CPU backend (#2738). The coordinator goes first so
+    // its last stage round-trips complete while the stages are still up.
+    remote_provider
+        .shutdown_and_wait(WORKER_EXIT_TIMEOUT)
+        .expect("remote coordinator worker must exit");
+    dense_provider
+        .shutdown_and_wait(WORKER_EXIT_TIMEOUT)
+        .expect("dense worker must exit");
     drop(remote_provider);
     drop(dense_provider);
     stage0.shutdown().unwrap();

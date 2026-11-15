@@ -47,21 +47,100 @@ aggregate throughput scales with concurrency until the batch hits the compute
 roofline, while per-request decode rate falls proportionally. The defaults:
 
 - `--parallel 4`: admit a decode batch of up to 4. The worker clamps this to 1
-  for families that cannot batch (SSM / hybrid / mixed-cache, i.e. any model
-  where `supports_batching()` is false), so the default is safe for every
+  for families where `supports_batching()` is false, so the default is safe for every
   architecture. When an explicit split configuration is clamped this way, the
   worker restores the whole configured context as the one effective request
   window and publishes that post-load value to `/props`, `/slots`, and
   `/v1/models`.
+  The remaining clamps are the epic's class D exclusions: diffusion generation (`diffusion_gemma`, `llada2_moe`); document/encoder-decoder runtimes (`florence2`, `nemotron_parse`, Falcon OCR text/VLM and `unlimited_ocr`); the session-owned `nemotron_voicechat` speech pipeline; Phi4MM-VL's per-request LoRA selection; NemotronNAS and LongCat Flash/Flash Ngram, which keep one model-owned cache set (#2544; NemotronNAS allocates one cache per attention block rather than per `num_layers()`, so a batch-capable layout is a follow-up); and the loaded-model fallback of `TensorParallelGemma4Model`. The rank-sharded Gemma 4 path and `Gemma4UnifiedModel` already support batching and are not clamped. These exclusions have no batched-decode throughput claim in #2574.
   `supports_batching()` being true does not by itself mean a family runs one
-  forward per tick: only families that override `forward_batched()` (Llama 3,
-  Llama 4, Qwen 3, Qwen 3.5, Gemma 3, Helium, Muse Glimmer, and Qwen3-MoE
-  since #1616) do. Every other batching family runs the `LanguageModel`
-  default, which calls the single-sequence `forward()` once per row and
-  evaluates the B graphs together, so its aggregate scaling comes only from
-  overlapping independent single-token graphs. The 2026-09-04 M1 Ultra profile
+  forward per tick: families with a native decode path include Llama 3,
+  Llama 4, Qwen 3, Gemma 3, Gemma 3n text/VLM, Gemma 4 text/VLM/Unified,
+  Helium, Qwen3-MoE, Ministral 3, ExaOne 4, Mellum, Laguna, Step 3.5,
+  Step 3.7 VLM text decode, AFMoE (Trinity), DeepSeek V4, IQuestLoopCoder,
+  and Inkling text/VLM. The latter four model-owned families batch projections and
+  feed-forward operations while retaining sequence-local attention caches;
+  Inkling stacks convolution tails and DeepSeek V4 updates pooling per row.
+  AFMoE keeps its full-fused B=1 expert implementation per row when that
+  kernel is active, while unsupported or disabled configurations retain the
+  native whole-batch expert graph.
+  Other native families include
+  Apertus, Cohere, Cohere 2,
+  Ernie 4.5 dense, ExaOne, Gemma, Gemma 2, GLM-4, Granite, Hunyuan v1 dense,
+  GPT-2, GPT-BigCode, GPT-NeoX, GPT-OSS, InternLM 2/3, MiMo, MiniCPM, MiniMax-M3,
+  NanoChat, Nemotron, OLMo, OLMo 2/3, OpenELM, Phi, Phi-3, Phi-3-small,
+  StableLM, BitNet, Seed-OSS, SmolLM3, StarCoder2, and
+  TeleChat3, Mixtral, PhiMoE, Phixtral, Qwen2-MoE, OLMoE, DBRX, DeepSeek v1,
+  GLM-4 MoE, ERNIE 4.5 MoE, Hunyuan MoE, Bailing MoE, Dots1, MiniMax,
+  Klear, Solar Open, Exaone MoE, and Cohere 2 MoE, plus the MLA backbones
+  DeepSeek V2/V3/V3.2, MiniCPM3, Mistral 4,
+  GLM-4 MoE Lite, Youtu, and the Qwen2-VL/Qwen2.5-VL/Qwen3-VL/
+  Qwen3-VL-MoE/Qwen3-Omni text-decode paths. Qwen VL partitions identified
+  single-token rows into plain-RoPE and MRoPE groups while preserving row
+  order; prefill, missing sequence ids and stored-position rows retain exact
+  per-row dispatch. Qwen3 DeepStack state is keyed by sequence id (#2567): a
+  row that carries image features leaves the plain group, and decode never
+  injects, so no whole-batch fallback remains. GLM-4V (also used by GLM-OCR), GLM-4V
+  MoE, Hunyuan-VL, ERNIE-4.5-MoE-VL, PaddleOCR-VL, and Cohere Compass likewise
+  group identified decode rows by their plain/MRoPE position mode, execute one
+  decoder graph per group, and scatter logits back to scheduler order.
+  Distinct per-sequence deltas stay native; stored-position rows, prefill, and
+  missing sequence ids retain exact per-row dispatch. Compass preserves its
+  sliding/full attention split, and its DeepStack state is keyed by sequence
+  id as well (#2567). ERNIE decode always
+  uses the text expert bank; its image-token expert dispatch remains prefill
+  only. The tensor-parallel Llama, Qwen 3, Qwen 3.5,
+  Gemma 3, ERNIE 4.5, and
+  Hunyuan v1 dense runtimes also share one native decode graph across active
+  rows at each rank and layer. Phi-3V, Phi-4-SigLIP, Granite Vision,
+  DeepSeek-OCR, OCR-2, GLM MoE DSA, DeepSeek-VL2, Kimi-VL, MiniMax-M3-VL,
+  and Youtu-VL delegate text-only decode to their native text tower. Molmo,
+  Molmo 2, Molmo-Point, Moondream 2/3, and Jina VLM run their text
+  towers natively across active decode rows; their VLM wrappers delegate that
+  token-only path without entering the vision tower. DotsOCR and MiniCPM-o
+  likewise delegate to their already-native Qwen 2 and Qwen 3 towers. Mllama
+  keeps each request's image state (the cross-attention states and the
+  per-layer image K/V derived from them) under its sequence id (#2567): rows
+  without an image batch natively while their cross-attention layers are
+  identities, and rows with an image run one at a time over their own entry,
+  scattered back to scheduler order. Baichuan-M1 keys its per-layer K/V
+  convolution state by sequence id as well (#2567) and decodes per row through
+  the sequence-aware dispatch, so rows never share state, but it does not run
+  one fused graph over the batch. The conv state keeps a bounded history of
+  its recent appends (prefill tokens included, so the history stays
+  contiguous), which lets a pipelined decode lookahead be unwound exactly:
+  Baichuan-M1 keeps the pipelined lookahead and rewinds the conv state through
+  `rewind_decode_appends` alongside the KV trim. It has no padded prefill,
+  because a padding token would become the conv state's "last token" and the
+  scheduler's KV trim does not reach that state. Its conv state is not part of
+  the scheduler's KV slice
+  (`LanguageModel::kv_cache_captures_sequence_state()` is `false`), so it is
+  excluded from prompt-cache adopt and donate, from Automatic Prefix Caching,
+  and from the disaggregated KV handoff: a restored KV prefix would arrive
+  without the conv state of its last token.
+  GPT-OSS keeps its mixed full/sliding KV caches under each sequence id.
+  Its native decode batches projections, norms, experts, and the output head,
+  while attention runs per row to preserve learned sinks and independent
+  sliding-window offsets. It disables padded prefill because its rotating
+  state cannot trim padding. Prompt-cache reuse and decode lookahead remain
+  disabled for this model-owned state.
+  Mamba2, Mamba1/Falcon-Mamba, Jamba, LFM2/LFM2-MoE, RecurrentGemma, RWKV7, Nemotron-H, GraniteMoeHybrid, Falcon-H1, and PLaMo2 keep recurrent state under each sequence id and run native width-one decode across active rows (#2571, #2573). The existing recurrence runs once over stacked state, then each row receives an independent state copy; attention KV stays row-local, including RecurrentGemma's independently wrapped rotating windows. A batch mixing initialized and absent recurrent state falls back to identified per-row forwarding for that step, as do multi-token or masked calls. LFM2-VL and Nemotron-H Nano Omni delegate text decode and model-owned storage accounting to their towers. Granite 4 Vision keeps `supports_batching()` enabled but deliberately executes identified rows separately: on an Apple M3 Ultra, `mlx-community/granite-4.0-3b-vision-4bit` changed two of three free-form greedy outputs under native B=3 quantized decode, despite a 3/3 exact constrained smoke and an image-conditioned B=1 versus B=4 trace whose 4/64 top-1 changes were all low-margin (largest reference gap 0.125, zero decided-position changes). The per-row wrapper preserves the issue's exact solo-output requirement without disabling concurrent admission; the Granite text tower remains native. Padded-prefill, snapshot-reuse, and paged-attention eligibility are unchanged; growing attention KV lengths are synchronized into server paged accounting, while recurrent and stateless layers reserve no fictitious KV blocks.
+  Qwen3-Next, Qwen 3.5, Bailing MoE Linear, Kimi Linear, and Kimi K3 likewise run native single-token decode over stacked gated-delta, GLA, or KDA state while retaining sequence-local full-attention or MLA caches (#2572). Fresh/initialized mixtures and unsupported multi-token or masked calls keep the identified per-row path. Qwen 3.5 preserves its existing batched-prefill policy and resolves MRoPE positions per sequence; batches containing stored or multimodal positions keep full attention per row while the recurrent and feed-forward work remains batched. Qwen 3.5 VLM already delegates identified decode to its text tower, and Kimi K3 VLM now does the same.
+  Every other batching
+  family runs the
+  `LanguageModel` default, which calls the single-sequence `forward()` once per
+  row and evaluates the B graphs together, so its aggregate scaling comes only
+  from overlapping independent single-token graphs. The 2026-09-04 M1 Ultra
+  profile
   in `docs/benchmark_results/moe-batched-decode-m1ultra-2026-09-04.md` measured
   that fallback on `qwen3-30b-a3b-4bit` before the override landed.
+  MiniMax-M3 sparse attention keeps its extra index-key head in the cache, but
+  passes only the model's value heads to attention. This also corrects the
+  prior single-row path, where cache allocation padded values to the
+  index-augmented key-head count and could produce a K/V head-shape failure.
+  Batched decode projects index keys and queries once for the full batch, then
+  slices them by row after each row's cached prefill.
+  At startup the worker reports either `decode path: native batched forward` or `decode path: per-row fallback (aggregate decode throughput will not scale with --parallel)` for every batching-capable model. Qwen 4 Exp and Muse Glimmer currently report the fallback because their serving decode-width paths still dispatch identified rows sequentially; an anonymous-batch or batched-prefill override does not make serving decode native.
 - `--max-batch-prefill 4`: batch up to 4 pending prompts into one prefill pass.
   Only families that opt into `supports_batched_prefill()` (Llama 3, Qwen 3,
   Qwen 3.5, and aliases such as Qwen 2.5) use it; others fall back to sequential
@@ -70,8 +149,10 @@ roofline, while per-request decode rate falls proportionally. The defaults:
   retune). A repeated shared prefix (for example a long system prompt) is
   prefilled once and reused.
 
+Exaone MoE has an intentional historical B=1 exception: its former `LanguageModel` adapter discarded K/V on every call and copied back only an offset. The corrected path retains request history and matches the persistent `AnyKVCache` reference across the sliding window, so outputs may differ from that broken baseline even at one request (#2559).
+
 Escape hatches restore the previous single-client behavior: `--parallel 1`
-(single decode slot), `--no-batch` (legacy sequential worker, no scheduler),
+(single decode slot), `--no-batch` (legacy sequential worker: the same scheduler at `max_batch_size=1`),
 `--max-batch-prefill 1` (sequential prefill), and `--no-prompt-cache`.
 
 ### Token-exactness: `mlxcel run` and the server
@@ -92,7 +173,7 @@ same chat request under `MLXCEL_SDPA_DETERMINISTIC=1`, greedy output from
 `mlxcel run -p` and from the server is identical. `make engine-parity
 MODEL=<dir>` checks it with arm `e:run` (the settings `run -p --temp 0` builds)
 against arm `f:server` (the same request on the `mlxcel-server` default
-configuration, four slots, paged storage when the model supports it), prompt
+  configuration, four slots, paged storage when the model supports it), prompt
 cache off on both. On GB10 both pairs are identical for Qwen3-1.7B 4-bit and
 Llama-3.2-1B 4-bit. The same run compares the server at B=1, dense and paged,
 with the raw-completion client (arm `d:engine`, `mlxcel_core::engine::DirectEngine`)
@@ -122,13 +203,14 @@ On ROCm the invariant holds without `MLXCEL_SDPA_DETERMINISTIC` (the variable is
 > across the batch, so aggregate decode now scales with concurrency on CUDA
 > too: 40.4 / 68.5 / 74.2 tok/s at 1/2/4 clients on llama-3.1-8b-4bit on GB10
 > (vs 40.5 / 49.8 / 49.6 with the kill switch off). Scaling stays sublinear
-> versus Metal because attention KV reads still grow with B; the small-M
-> `qmm_sm80` tile shape (`M*B >= 8`) remains upstream MLX territory. For the
-> same reason, keep `--parallel` at 7 or below on CUDA (both server binaries
-> also accept `--n-parallel`): the multirow window covers 2-7 rows, and a full batch of 8+ decode
-> rows crosses into the under-tiled `qmm_sm80` shape, which measures worse
-> than per-row decode until the upstream small-M tile lands. The shipped
-> default of 4 sits comfortably inside the window. See
+> versus Metal because attention KV reads still grow with B. A decode batch
+> `[B, 1, K]` over a shared 2D weight also folds into rows (#2690): from 8 rows,
+> and on compute capability 12.1 from 5 rows of a weight of at least 2^24
+> elements, it runs one GEMM that reads the weight once. On an RTX Spark N1X that
+> lifts 8-client aggregate decode 1.2x to 3.2x across four models
+> (`docs/benchmark_results/cuda-qmm-fold-batch-n1x-2026-10-31.md`). The older
+> advice to keep `--parallel` at 7 or below predates the fold, and GB10 has not
+> been re-measured with it. See
 > `docs/benchmark_results/qmv-multirow-gb10-2026-07-11.md`. `--max-batch-prefill`
 > (large-M, tile-tuned, `docs/benchmark_results/qmm-sm121-tile-tuning-gb10-2026-07-10.md`)
 > and the prompt cache remain independent wins on CUDA.
@@ -429,7 +511,11 @@ The kernel is picked by the cache, not by the model forward
 behind that cache, and `cache::attend_batched` does the same for one layer of a
 batch. Qwen3, Llama 3 and the families that reuse their attention (Qwen2,
 Qwen2.5, Helium, the VLM text backbones) call these; DeepSeek V2's absorbed
-decode goes through `MlaLatentCache::attend`. The model-owned families hold
+decode goes through `MlaLatentCache::attend`. The latent MLA families keep
+their compressed latent and positional-key cache representation, batch the
+shared projections and MLPs, then update and attend through each request's
+ragged cache row. DeepSeek V3.2 and GLM MoE DSA likewise apply the DSA indexer
+selection independently to each row after the batched index projections. The model-owned families hold
 their per-sequence state in their own cache enums and attend through the same
 rule: Gemma 3's `Cache::attend` routes a global layer to `KVCache::attend` and
 a sliding layer to `RotatingKVCache::attend` (whose write path stays
@@ -528,7 +614,10 @@ Two knobs, neither normally needed:
   small. `0` pins the historical 32-block default.
 
 Recurrent and hybrid SSM / linear-attention families cannot safely reuse
-arbitrary KV blocks, so they keep the hybrid-SSM/APC exclusion. Families that
+arbitrary KV blocks, so they keep the hybrid-SSM/APC exclusion. Baichuan-M1 is
+a dense family that joins this exclusion (#2567): its K/V convolution state is
+model-owned per sequence and a restored KV prefix would not carry it, so the
+whole-prefix store, APC and the KV handoff all decline it. Families that
 opt into `supports_snapshot_reuse()` instead use a separate exact-prefix
 snapshot bucket: on a healthy finish the scheduler copies the model-owned
 state, and on the next turn it restores that state only when the stored token
@@ -744,6 +833,77 @@ and unwinds each, as `mlxcel generate --prompt-lookup` does before it decodes,
 so the first requests do not pay each width's first-use kernel cost
 mid-decode.
 
+### A full model as the drafter under continuous batching
+
+`--draft-model <ordinary model>` (auto-detected: a directory with no
+DFlash-family marker and no MTP `model_type`; or `--draft-kind full-model`,
+which b10621's `--spec-type draft-simple` maps onto) serves an ordinary smaller
+checkpoint as a token-only drafter on the same per-row tick as prompt lookup
+(#2757). The worker loads the drafter next to the target at startup, so a
+checkpoint that cannot load, or a target or drafter whose state a trim cannot
+roll back (#2495), fails startup rather than decoding plainly: chat routes
+report the worker as unavailable and `/health` never turns ready. The startup
+log reports the resident memory after the load. An eligible request gets a
+`DraftModelState` at prefill completion that records its prompt and holds no
+draft KV. Once gated in it catches the draft model up on the prompt, one chunk
+per tick, and every round after that costs `--draft-block-size` (default 4) draft
+forwards plus one verify forward on the target; a rejected block is trimmed from
+both. The drafter proposes its argmax
+and the target's own draw decides every position, so a sampled stream keeps the
+target's distribution. Temperature 0 follows the target's greedy choice at the
+token-only loop's bar, which is not byte-identity with plain decode: see
+[`docs/speculative-acceptance.md`](speculative-acceptance.md#offline-routing).
+
+**Batch widths.** Each row drafts and rolls back on its own caches, so no batched
+drafter is needed, but verification is per row and serial, not batched.
+`--prompt-lookup-max-batch` (default 2) decides how many concurrent rows verify. On a tick
+with more active rows than that, every row takes the plain batched step and gets
+no speculation at all, and resumes when the batch shrinks. So with the default
+a server at a steady B = 4 runs plain decode with the drafter loaded and idle.
+The flag can be raised to verify at wider batches; each extra row then adds its
+draft forwards and verify forward to every tick, which cost 35 to 68 percent of
+throughput at B = 4 and B = 8 in the measurement below. Rows above the gate hold no
+draft KV until they are first asked. Verify rounds also stay off under
+`--kv-unified`, and the drafter stays loaded there.
+
+**Catch-up.** A gated-in row that owes the draft model more than a steady tail
+(its prompt at first, or the tokens it missed while gated out) proposes nothing
+and decodes plainly while it catches up, and it proposes once it has caught up.
+A tick feeds at most one catch-up chunk, to the first row in the batch that owes
+one, whatever `--prompt-lookup-max-batch` is, so catching up costs live rows one
+chunk of draft forward per tick. Other rows that owe wait their turn and decode
+plainly. The chunk is the server's prefill chunk (`--prefill-chunk-size`, by
+default 2048 alone and 512 with other rows decoding), and `0`, which disables
+chunking for the target's prefill, takes those defaults here, since the draft has
+no prompt cache and a forward of the whole tail could not be interrupted. A row
+does not catch up unless its budget repays it: `max_tokens` left, capped by the
+context bound, must cover `ticks * (--draft-block-size + 2)`, one plain token and
+one full round per catch-up tick, so a request with a short budget decodes
+plainly and pays no draft forward at all. A row cancelled during catch-up feeds
+nothing further and leaves as any cancelled row does.
+
+Not served by this drafter, with the reason: `--no-batch` (the legacy sequential
+worker has no speculative dispatch and warns at startup); disaggregated
+`--node-role` rows adopted through a KV handoff (they carry no prefill for the
+drafter to record and decode plainly); requests with images, audio, video,
+structured output, logprobs or an extended sampler chain (eligibility is prompt
+lookup's, decoded plainly with a `debug` log). A vocabulary larger than the
+target's, or one either config leaves undeclared, is refused at startup, since a
+proposal past the target's embedding table cannot be verified and an undeclared
+pair cannot be checked. A row whose context passes `--max-kv-size` stops drafting
+and decodes plainly, since the draft caches have no `--context-shift` path. In
+router mode (`--models-dir`) each model's worker loads its own copy of the
+drafter. A finished request reports `draft_kind: "full-model"` in `timings`.
+
+**No speedup has been measured.** This drafter keeps the capability on the
+engine; do not expect it to raise throughput. On an idle M1 Ultra (Metal, 256
+tokens, temperature 0) Qwen3-8B 4-bit with a 0.6B 4-bit drafter fell from 93.5 to
+56.1 tok/s at B = 1, and Llama 3.1 8B bf16 with a 1B 4-bit drafter held at 40.3.
+Acceptance was 0.58 to 0.80, so a high acceptance rate did not repay the draft
+forwards. Llama's 34.1 against 25.8 at B = 2 is not counted as a gain, because
+plain B = 2 on that checkpoint is unexplainedly slower than plain B = 1. The full
+tables and the catch-up cost are in the pull request for #2757.
+
 ## Disaggregated serving
 
 Prefill is compute-bound and decode is memory-bound, so a deployment can run them
@@ -769,8 +929,10 @@ Networking flags:
 | Flag | Role | Purpose |
 |------|------|---------|
 | `--serving-bind <addr>` | prefill, decode, router | This node's own role-transport listener (`host:port`). |
-| `--decode-peers <addr,...>` | prefill, router | On a router, the decode pool it balances; on a prefill node, the static fallback used only when the router does not pick a decode target for a request. |
-| `--prefill-peers <addr,...>` | decode, router | On a router, the prefill pool it balances; on a decode node, the prefill node(s) it accepts handoffs from. |
+| `--decode-peers <addr,...>` | prefill, router | On a router, the decode pool it balances and the only decode addresses it accepts result frames from; on a prefill node, the static fallback used only when the router does not pick a decode target for a request. |
+| `--prefill-peers <addr,...>` | decode, router | On a router, the prefill pool it balances and the only prefill addresses it accepts result frames from; on a decode node, the prefill node(s) it accepts handoffs from. |
+
+On a router, each peer entry must be the address the node connects from: its `--serving-bind` address, with an unspecified bind IP (`0.0.0.0`, `::`) replaced by the IP the router sees the connection come from. A result frame from any other authenticated address is dropped with a `router: dropping result frame` warning and the request fails with the handoff timeout (see `docs/distributed.md`).
 
 ### Multi-node routing, load balancing, and failover
 
@@ -800,14 +962,33 @@ The router tracks node health and fails over without wedging:
 - A transport error when sending a request to a prefill node marks that node
   unreachable, re-routes its in-flight requests, and retries the request on a
   healthy node. When no prefill node is left, the request fails cleanly with an
-  error rather than hanging.
-- A background health monitor TCP-probes every peer's serving address on an
-  interval. A node that stops accepting connections is marked unreachable (so
-  routing skips it, including a dead decode node the router never sends to
-  directly), and a node that starts accepting again is restored to online.
+  error rather than hanging. A pooled connection to a node that has since exited
+  counts as such an error: before reusing an idle connection the transport
+  checks, without consuming any bytes, whether the peer closed it, and opens a
+  fresh connection instead, so the refused connect drives the failover rather
+  than a frame written into a dead socket (issue #2695). The router's transport
+  uses the pool's router profile (`PoolConfig::router()`: 2 reconnect attempts
+  from a 50 ms base delay, a 2 s connect timeout) instead of the default 5
+  attempts from 100 ms, so a refused connect fails over within about 150 ms
+  of backoff rather than after 3 s (issue #2712). A node that dies after
+  accepting a request still costs that request the full handoff timeout.
+- A background health monitor TCP-probes every peer's serving address, once
+  when the router starts and then every 3 s (2 s connect timeout). A node that
+  stops accepting connections is marked unreachable (so routing skips it,
+  including a dead decode node the router never sends to directly), and a node
+  that starts accepting again is restored to online.
 - Admission control runs before every dispatch: when the prefill queue is full
   or no prefill node is available, the router returns HTTP 503 instead of
-  attempting a dispatch that cannot succeed.
+  attempting a dispatch that cannot succeed. When no prefill node is available
+  and at least one prefill node is marked unreachable, the router first re-probes
+  the nodes marked unreachable
+  with a 500 ms connect timeout, restores any that accept, and admits the
+  request if one did (issue #2763). The re-probe is single-flight and runs at
+  most once per 250 ms router-wide: concurrent requests wait for the running
+  one and reuse its result, so a pool that is really down costs at most one
+  500 ms probe timeout per 250 ms window (a refused connect returns at once, a
+  host that silently drops packets takes the full timeout). A full queue is
+  refused without probing.
 
 `GET /router/stats` reports the per-node dispatch counts for both pools, the
 registered nodes with their current health status, and the routing-metrics
@@ -826,22 +1007,35 @@ serving-role entries).
 
 ### Example: three processes on localhost
 
+Every role process needs the shared cluster secret (issue #2655; see
+[cluster authentication](distributed.md#cluster-authentication) for the
+precedence of `--cluster-secret-file`, `MLXCEL_CLUSTER_SECRET_FILE`,
+`MLXCEL_CLUSTER_SECRET`, and the cluster TOML). A role started without one
+exits at startup naming every source.
+
 ```bash
+# One secret, shared by all three processes (copy it to every host in a
+# multi-host deployment).
+openssl rand -hex 32 > cluster.secret && chmod 600 cluster.secret
+
 # Decode node: receives KV handoffs on :8304.
 mlxcel-server -m models/<ckpt> --port 8302 \
     --parallel 2 --max-batch-size 2 --decode-storage-backend paged \
-    --node-role decode --serving-bind 127.0.0.1:8304
+    --node-role decode --serving-bind 127.0.0.1:8304 \
+    --cluster-secret-file cluster.secret
 
 # Prefill node: prefills, hands off to the decode node.
 mlxcel-server -m models/<ckpt> --port 8301 \
     --parallel 2 --max-batch-size 2 --decode-storage-backend paged \
     --node-role prefill --serving-bind 127.0.0.1:8305 \
-    --decode-peers 127.0.0.1:8304
+    --decode-peers 127.0.0.1:8304 \
+    --cluster-secret-file cluster.secret
 
 # Router: model-free HTTP front on :8300.
 mlxcel-server -m models/<ckpt> --port 8300 \
     --node-role router --serving-bind 127.0.0.1:8306 \
-    --prefill-peers 127.0.0.1:8305 --decode-peers 127.0.0.1:8304
+    --prefill-peers 127.0.0.1:8305 --decode-peers 127.0.0.1:8304 \
+    --cluster-secret-file cluster.secret
 
 # Client talks only to the router.
 curl http://127.0.0.1:8300/v1/chat/completions \
@@ -852,7 +1046,8 @@ curl http://127.0.0.1:8300/v1/chat/completions \
 ### Scope and limitations
 
 - Pool-backed Fp16 families only (the dense-natural backends such as qwen3 and
-  llama3). Model-owned-state families and recurrent/hybrid SSM models are
+  llama3). Model-owned-state families, recurrent/hybrid SSM models and
+  Baichuan-M1 (conv state outside the KV slice, #2567) are
   excluded from the paged handoff; the exact-prefix snapshot cache described
   above is a single-node prompt-cache optimization and is not serialized across
   disaggregated prefill/decode roles.
@@ -862,8 +1057,21 @@ curl http://127.0.0.1:8300/v1/chat/completions \
 - `stop` sequences are not forwarded to the worker nodes by the router. This is a pre-existing limitation shared with the chat path.
 - `completion_tokens` in the usage block uses the worker's authoritative generated-token count carried over the disaggregated wire protocol (issue #387), so it is exact for both byte-level BPE tokenizers (Qwen, Llama) and byte-fallback tokenizers (Gemma `<0xXX>` byte sequences), and `finish_reason` matches single-node. A node that predates the wire field (a mixed-version cluster) falls back to counting emitted detokenized text pieces, which can under-count for byte-fallback tokenizers and flip `finish_reason` between `"length"` and `"stop"`.
 - `/v1/chat/completions` reports the same `usage` shape as `/v1/completions` (`prompt_tokens`, `completion_tokens`, `total_tokens`): the non-streaming response always carries it, and the streaming response sends it as a trailing chunk with empty `choices` when the request sets `stream_options.include_usage`, matching single-node (issue #398).
+- On both routes, `usage.prompt_tokens_details` follows the single-node rule, applied to the worker that served the request: present when that prefill node has its prompt cache enabled (the default) and absent when it is disabled. The prefill node reports its setting on the first-token result frame; a prefill node that predates the report leaves the decision to the router's own prompt-cache flag (issues #2695, #2715). Its `cached_tokens` is always `0`, which is exact: the handoff prefill does not use a prompt cache.
+- The non-streaming `/v1/chat/completions` reply is shaped with the same helper as the single-node no-tools reply, so `content` and `reasoning_content` match single node byte for byte (for example, a SentencePiece leading space is trimmed on both). Streamed deltas are not shaped on either path (issue #2715).
+- Decode nodes stop on the checkpoint's configured EOS (`config.json`) as well as the model's built-in EOS ids, like single node, so a checkpoint whose EOS only `config.json` declares (MiniCPM-2B in llama format) stops at `</s>` instead of running to `max_tokens` (issue #2695).
 - The router stream filter suppresses model-specific structural markers (`<think>`, tool-call delimiters) and routes thinking content to `reasoning_content` plus the default identical `reasoning` alias, matching the single-node Chat Completions path; `--reasoning-alias-field none` suppresses the duplicate. Tool-call parsing is not yet supported on the router path: only `content` and the configured reasoning fields are emitted.
 - Co-locating the roles on one machine adds transport hops without the scaling
   benefit of separate prefill and decode hardware, so a single-machine setup is
   for validation. The throughput case for disaggregation is separate prefill and
   decode pools under load.
+
+### Mixed full/sliding cache families
+
+Ministral 3, ExaOne 4, Mellum, Laguna, and Step 3.5 keep separate model-owned
+caches for each sequence. Their single-token decode shares projections, norms,
+feed-forward blocks and the LM head across rows; attention uses each row's own
+KV history and position. Step 3.7 VLM delegates text decode and embedding-prefill
+sequence ownership to Step 3.5. These families no longer clamp `--parallel` to 1.
+They disable padded prefill because their rotating caches do not implement pad
+trimming. Laguna's independent DFlash caches are unchanged.

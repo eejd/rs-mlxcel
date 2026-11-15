@@ -1,0 +1,448 @@
+// Copyright 2025-2026 Lablup Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Single dedicated-thread worker for the image-generation model.
+//!
+//! MLX work is thread-affine (see [`super::embedding_worker`] for the full
+//! argument): the thread that builds the model must be the thread that runs it.
+//! [`ImageWorker`] owns that thread. It installs a thread-local default stream,
+//! builds the model on itself, and serves commands from a bounded channel one
+//! at a time. A diffusion run holds the GPU for seconds, so there is no
+//! batching: requests are serialized.
+//!
+//! Admission and timeout follow the embedding worker: a bounded `SyncSender`
+//! with `try_send` (a full queue is [`ImageError::QueueFull`]), a per-request
+//! reply timeout ([`ImageError::Timeout`]), and `catch_unwind` around every
+//! generation so one bad request cannot kill the worker for the rest of the
+//! process.
+
+use std::path::Path;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use mlxcel_core::streams::{
+    install_thread_local_default_stream, new_thread_local_generation_stream,
+    synchronize_thread_local_stream,
+};
+
+use crate::imagegen::InvalidImageRequest;
+use crate::imagegen::registry::{FAMILIES, ImageFamily, load_image_model_from};
+use crate::imagegen::run::{run_request, validate_request};
+use crate::imagegen::{
+    GeneratedImage, ImageGenerationModel, ImageRequest, ImageSamplingDefaults, ImageTask,
+};
+use crate::server::image_model::{ImageError, ImageModelProvider};
+use crate::server::model_provider::{
+    WorkerExitObserver, enqueue_shutdown_command, observe_worker_exit, wait_for_worker_exit,
+};
+
+/// Default bound on queued requests (one more is running).
+pub const DEFAULT_IMAGE_QUEUE_DEPTH: usize = 8;
+
+/// Default per-request reply timeout. Diffusion at high step counts is slow, so
+/// this is far above the embedding and audio defaults.
+pub const DEFAULT_IMAGE_REQUEST_TIMEOUT_SECS: u64 = 900;
+
+/// Reported when a request cannot reach the worker thread because it has
+/// already exited.
+const WORKER_GONE: &str = "image worker thread is no longer running";
+
+/// Static facts about the loaded model, sent back once the worker is ready.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ImageWorkerInfo {
+    pub family: &'static str,
+    /// [`ImageGenerationModel::variant`] of the loaded model.
+    pub variant: Option<&'static str>,
+    pub supports_generate: bool,
+    pub supports_edit: bool,
+    pub generate_defaults: ImageSamplingDefaults,
+    pub edit_defaults: ImageSamplingDefaults,
+    pub size_multiple: u32,
+    /// [`ImageGenerationModel::default_edit_size`] of the loaded model.
+    pub default_edit_size: fn(u32, u32) -> (u32, u32),
+}
+
+type Reply = mpsc::Sender<Result<Vec<GeneratedImage>, ImageError>>;
+
+enum ImageCommand {
+    Generate {
+        request: Box<ImageRequest>,
+        deadline: Instant,
+        respond: Reply,
+    },
+    Shutdown,
+}
+
+/// Owns the dedicated thread that builds and runs one image model.
+#[derive(Debug)]
+pub(crate) struct ImageWorker {
+    /// Bounded command channel; the `Mutex` makes the handle `Sync` and is held
+    /// only for the enqueue, never across generation.
+    sender: Mutex<mpsc::SyncSender<ImageCommand>>,
+    request_timeout: Duration,
+    info: ImageWorkerInfo,
+    /// Watcher thread handle; joining it waits for the worker to free the model.
+    handle: Option<JoinHandle<()>>,
+    /// Signalled once the worker thread has returned and dropped the model.
+    worker_exit: Arc<WorkerExitObserver>,
+}
+
+impl ImageWorker {
+    /// Spawn the worker thread and block until the model has been built.
+    ///
+    /// `loader` runs on the worker thread so every array it creates belongs to
+    /// that thread's MLX context. `queue_depth` is clamped to at least one and a
+    /// zero `request_timeout` falls back to the default.
+    pub(crate) fn spawn<L>(
+        thread_name: &str,
+        queue_depth: usize,
+        request_timeout: Duration,
+        loader: L,
+    ) -> anyhow::Result<Self>
+    where
+        L: FnOnce() -> anyhow::Result<Box<dyn ImageGenerationModel>> + Send + 'static,
+    {
+        let capacity = queue_depth.max(1);
+        let request_timeout = if request_timeout == Duration::ZERO {
+            Duration::from_secs(DEFAULT_IMAGE_REQUEST_TIMEOUT_SECS)
+        } else {
+            request_timeout
+        };
+        let (command_tx, command_rx) = mpsc::sync_channel::<ImageCommand>(capacity);
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<ImageWorkerInfo, String>>();
+
+        let handle = thread::Builder::new()
+            .name(thread_name.to_string())
+            .spawn(move || worker_loop(loader, command_rx, ready_tx))
+            .map_err(|e| anyhow::anyhow!("failed to spawn image worker thread: {e}"))?;
+
+        match ready_rx.recv() {
+            Ok(Ok(info)) => {
+                let (handle, worker_exit) = observe_worker_exit(handle);
+                Ok(Self {
+                    sender: Mutex::new(command_tx),
+                    request_timeout,
+                    info,
+                    handle: Some(handle),
+                    worker_exit,
+                })
+            }
+            Ok(Err(message)) => {
+                let _ = handle.join();
+                Err(anyhow::anyhow!(
+                    "image worker failed to load model: {message}"
+                ))
+            }
+            Err(_) => {
+                let _ = handle.join();
+                Err(anyhow::anyhow!(
+                    "image worker thread exited before reporting readiness"
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn info(&self) -> ImageWorkerInfo {
+        self.info
+    }
+
+    /// Ask the worker to exit and wait until it has released the model.
+    ///
+    /// Used by the process exit path before `main` returns (#2745), so the
+    /// model's MLX arrays are freed on the worker thread first. Idempotent;
+    /// `Err` names the timeout or carries the panic message.
+    pub(crate) fn shutdown_and_wait(&self, timeout: Duration) -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
+        let _ = enqueue_shutdown_command(&self.sender, ImageCommand::Shutdown, timeout);
+        let remaining = timeout.saturating_sub(started.elapsed());
+        wait_for_worker_exit(&self.worker_exit, remaining, "image model worker")
+    }
+
+    pub(crate) fn generate(
+        &self,
+        request: ImageRequest,
+    ) -> Result<Vec<GeneratedImage>, ImageError> {
+        let (respond, reply) = mpsc::channel();
+        self.dispatch(ImageCommand::Generate {
+            request: Box::new(request),
+            deadline: Instant::now() + self.request_timeout,
+            respond,
+        })?;
+        match reply.recv_timeout(self.request_timeout) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ImageError::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(ImageError::Internal(WORKER_GONE.to_string()))
+            }
+        }
+    }
+
+    /// Enqueue without blocking; a full queue is load-shed with
+    /// [`ImageError::QueueFull`].
+    fn dispatch(&self, command: ImageCommand) -> Result<(), ImageError> {
+        let sender = self
+            .sender
+            .lock()
+            .map_err(|_| ImageError::Internal("image worker channel poisoned".to_string()))?;
+        match sender.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err(ImageError::QueueFull),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                Err(ImageError::Internal(WORKER_GONE.to_string()))
+            }
+        }
+    }
+}
+
+impl Drop for ImageWorker {
+    fn drop(&mut self) {
+        // Blocking `send` on purpose: the worker keeps draining, so a slot
+        // frees and the shutdown lands after the queued work.
+        if let Ok(sender) = self.sender.lock() {
+            let _ = sender.send(ImageCommand::Shutdown);
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn worker_loop<L>(
+    loader: L,
+    commands: mpsc::Receiver<ImageCommand>,
+    ready: mpsc::Sender<Result<ImageWorkerInfo, String>>,
+) where
+    L: FnOnce() -> anyhow::Result<Box<dyn ImageGenerationModel>>,
+{
+    let stream = new_thread_local_generation_stream();
+    install_thread_local_default_stream(stream.as_ref());
+
+    let model = match loader() {
+        Ok(model) => model,
+        Err(err) => {
+            let _ = ready.send(Err(format!("{err:#}")));
+            return;
+        }
+    };
+    let info = ImageWorkerInfo {
+        family: model.family(),
+        variant: model.variant(),
+        supports_generate: model.supports(ImageTask::Generate),
+        supports_edit: model.supports(ImageTask::Edit),
+        generate_defaults: model.defaults(ImageTask::Generate),
+        edit_defaults: model.defaults(ImageTask::Edit),
+        size_multiple: model.size_multiple(),
+        default_edit_size: model.default_edit_size(),
+    };
+    if ready.send(Ok(info)).is_err() {
+        return;
+    }
+    drop(ready);
+
+    // One command at a time under a panic boundary, then synchronize the
+    // stream so dispatch and synchronization stay paired on this thread.
+    // `AssertUnwindSafe` is sound for the reason given in the embedding
+    // worker: the model is owned and used single-threadedly.
+    while let Ok(command) = commands.recv() {
+        match command {
+            ImageCommand::Generate {
+                request,
+                deadline,
+                respond,
+            } => {
+                // Queue time counts toward the reply timeout. An abandoned
+                // request must not start another expensive GPU generation.
+                if Instant::now() >= deadline {
+                    let _ = respond.send(Err(ImageError::Timeout));
+                    continue;
+                }
+                // A request the family rejects up front is the caller's
+                // fault (`400`); a failure after that is the model's (`500`)
+                // unless the model raises an `InvalidImageRequest` (`400`).
+                let result = run_guarded(stream.as_ref(), || {
+                    validate_request(model.as_ref(), &request)
+                        .map_err(|e| ImageError::InvalidInput(format!("{e:#}")))?;
+                    run_request(model.as_ref(), &request).map_err(classify_model_error)
+                });
+                let _ = respond.send(result);
+            }
+            ImageCommand::Shutdown => break,
+        }
+    }
+}
+
+/// A model's [`InvalidImageRequest`] is the client's fault (`400`); anything
+/// else is a generation failure (`500`).
+fn classify_model_error(error: anyhow::Error) -> ImageError {
+    match error.downcast_ref::<InvalidImageRequest>() {
+        Some(invalid) => ImageError::InvalidInput(invalid.0.clone()),
+        None => ImageError::Internal(format!("{error:#}")),
+    }
+}
+
+fn run_guarded<F>(
+    stream: Option<&mlxcel_core::UniquePtr<mlxcel_core::MlxThreadLocalStream>>,
+    call: F,
+) -> Result<Vec<GeneratedImage>, ImageError>
+where
+    F: FnOnce() -> Result<Vec<GeneratedImage>, ImageError>,
+{
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call));
+    synchronize_thread_local_stream(stream);
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => {
+            let detail = if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "image request panicked".to_string()
+            };
+            tracing::error!(
+                target: "mlxcel::imagegen",
+                "image worker recovered from panic: {detail}"
+            );
+            Err(ImageError::Internal(format!(
+                "image worker recovered from panic: {detail}"
+            )))
+        }
+    }
+}
+
+/// [`ImageModelProvider`] backed by an [`ImageWorker`].
+pub struct ImageWorkerProvider {
+    worker: ImageWorker,
+    model_id: String,
+    created_at: i64,
+}
+
+impl std::fmt::Debug for ImageWorkerProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageWorkerProvider")
+            .field("model_id", &self.model_id)
+            .field("info", &self.worker.info())
+            .finish()
+    }
+}
+
+impl ImageWorkerProvider {
+    /// Spawn the worker and load the checkpoint at `model_path` on it.
+    ///
+    /// Returns `Err` when the thread cannot start, no family is recognized, the
+    /// family is not supported by this build, or the checkpoint fails to load.
+    pub fn load(
+        model_path: &Path,
+        model_id: String,
+        queue_depth: usize,
+        request_timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        Self::load_with_families(model_path, model_id, queue_depth, request_timeout, FAMILIES)
+    }
+
+    /// [`Self::load`] against an explicit family table, so tests can serve a
+    /// stub family.
+    pub(crate) fn load_with_families(
+        model_path: &Path,
+        model_id: String,
+        queue_depth: usize,
+        request_timeout: Duration,
+        families: &'static [ImageFamily],
+    ) -> anyhow::Result<Self> {
+        let model_path = model_path.to_path_buf();
+        Self::from_loader(model_id, queue_depth, request_timeout, move || {
+            load_image_model_from(&model_path, families)
+        })
+    }
+
+    /// Spawn the worker around an arbitrary loader.
+    pub(crate) fn from_loader<L>(
+        model_id: String,
+        queue_depth: usize,
+        request_timeout: Duration,
+        loader: L,
+    ) -> anyhow::Result<Self>
+    where
+        L: FnOnce() -> anyhow::Result<Box<dyn ImageGenerationModel>> + Send + 'static,
+    {
+        let worker = ImageWorker::spawn("image-worker", queue_depth, request_timeout, loader)?;
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        Ok(Self {
+            worker,
+            model_id,
+            created_at,
+        })
+    }
+
+    pub(crate) fn info(&self) -> ImageWorkerInfo {
+        self.worker.info()
+    }
+}
+
+impl ImageModelProvider for ImageWorkerProvider {
+    fn generate(&self, req: ImageRequest) -> Result<Vec<GeneratedImage>, ImageError> {
+        self.worker.generate(req)
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn created_at(&self) -> i64 {
+        self.created_at
+    }
+
+    fn family(&self) -> &str {
+        self.worker.info().family
+    }
+
+    fn variant(&self) -> Option<&'static str> {
+        self.worker.info().variant
+    }
+
+    fn supports(&self, task: ImageTask) -> bool {
+        match task {
+            ImageTask::Generate => self.worker.info().supports_generate,
+            ImageTask::Edit => self.worker.info().supports_edit,
+        }
+    }
+
+    fn defaults(&self, task: ImageTask) -> ImageSamplingDefaults {
+        match task {
+            ImageTask::Generate => self.worker.info().generate_defaults,
+            ImageTask::Edit => self.worker.info().edit_defaults,
+        }
+    }
+
+    fn size_multiple(&self) -> u32 {
+        self.worker.info().size_multiple
+    }
+
+    fn default_edit_size(&self, width: u32, height: u32) -> (u32, u32) {
+        (self.worker.info().default_edit_size)(width, height)
+    }
+
+    fn shutdown_and_wait(&self, timeout: Duration) -> anyhow::Result<()> {
+        self.worker.shutdown_and_wait(timeout)
+    }
+}
+
+#[cfg(test)]
+#[path = "image_worker_tests.rs"]
+mod tests;

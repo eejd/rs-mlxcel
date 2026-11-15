@@ -114,6 +114,24 @@ fn max_abs_diff(a: &MlxArray, b: &MlxArray) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
+#[test]
+fn native_batched_decode_matches_three_unequal_rows_across_the_window() {
+    let _guard = test_guard().lock().unwrap();
+    let model = tiny_model();
+    crate::models::batched_decode_harness::assert_batched_decode_matches_sequential(
+        &model,
+        &[&[1, 2], &[3, 4, 5, 6, 7], &[8, 9, 1, 2, 3, 4, 5]],
+        &[6, 7, 8],
+        1e-4,
+    );
+    crate::models::batched_decode_harness::assert_single_row_batch_is_single_sequence_forward(
+        &model,
+        &[1, 3, 5, 7, 9],
+        2,
+    );
+    crate::models::batched_decode_harness::assert_empty_batch_returns_empty_logits(&model);
+}
+
 /// Every last-logits entry point must return the full forward's row at
 /// `last_pos`, `[1, 1, vocab]`, while projecting only that row through the LM
 /// head. Checked at the final position (what prefill samples) and at an
@@ -214,4 +232,19 @@ fn prefill_matches_token_by_token_decode_inside_and_beyond_the_window() {
     assert_eq!(mlxcel_core::array_shape(&got), vec![1, 1, vocab]);
     let diff = max_abs_diff(&decode_last(seq.len()), &got);
     assert!(diff < 1e-4, "chunked prefill: max |diff| {diff}");
+}
+
+// Issue #2798: the sliding window is validated before the dense prefill mask
+// reads it.
+#[test]
+fn rejects_a_sliding_window_a_dense_prefill_mask_cannot_take() {
+    for window in [0usize, i32::MAX as usize + 1] {
+        let mut config = tiny_config();
+        config.sliding_window = window;
+        let err = Cohere2Model::from_weights(&WeightMap::new(), &config)
+            .err()
+            .expect("an unusable sliding window must fail the load");
+        assert!(err.contains("Cohere2"), "{err}");
+        assert!(err.contains(&format!("got {window}")), "{err}");
+    }
 }

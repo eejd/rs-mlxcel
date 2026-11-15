@@ -15,9 +15,10 @@
 mod common;
 
 use std::net::{IpAddr, TcpListener};
+use std::sync::Arc;
 use std::time::Duration;
 
-use common::repo_model_dir;
+use common::{repo_model_dir, test_cluster_auth};
 use mlxcel::distributed::pipeline::{
     RemotePipelineRuntime, RemotePipelineRuntimeConfig, RemoteStageResponse,
     RemoteStageServiceConfig, RemoteStageServiceHandle, StageAssignment,
@@ -68,6 +69,8 @@ fn spawn_remote_runtime(
     let num_layers = resolve_in_process_pipeline_num_layers(model_dir).unwrap();
     let assignments = two_stage_assignments(num_layers, split_override.unwrap_or(num_layers / 2));
 
+    let auth = test_cluster_auth();
+    let coordinator_addr = format!("{}:{}", bind_ip, reserve_port(bind_ip));
     let stage0_addr = format!("{}:{}", bind_ip, reserve_port(bind_ip));
     let stage1_addr = format!("{}:{}", bind_ip, reserve_port(bind_ip));
 
@@ -77,8 +80,10 @@ fn spawn_remote_runtime(
         transport_backend,
         stage_assignment: assignments[1].clone(),
         num_stages: 2,
+        coordinator_peer: coordinator_addr.clone(),
         upstream_peer: Some(stage0_addr.clone()),
         downstream_peer: None,
+        auth: Arc::clone(&auth),
     })
     .unwrap();
     let stage0 = RemoteStageServiceHandle::spawn(RemoteStageServiceConfig {
@@ -87,8 +92,10 @@ fn spawn_remote_runtime(
         transport_backend,
         stage_assignment: assignments[0].clone(),
         num_stages: 2,
+        coordinator_peer: coordinator_addr.clone(),
         upstream_peer: None,
         downstream_peer: Some(stage1_addr.clone()),
+        auth: Arc::clone(&auth),
     })
     .unwrap();
 
@@ -98,8 +105,10 @@ fn spawn_remote_runtime(
     let runtime = RemotePipelineRuntime::new(RemotePipelineRuntimeConfig {
         stage_peers: vec![stage0_addr, stage1_addr],
         transport_backend,
-        bind_address: format!("{}:{}", bind_ip, reserve_port(bind_ip)),
+        bind_address: coordinator_addr,
         stage_timeout: Duration::from_secs(30),
+        auth,
+        vocab_size: mlxcel::read_vocab_size(model_dir),
     })
     .unwrap();
 
@@ -138,7 +147,7 @@ fn assert_remote_runtime_matches_full_model(
     let full_decode = model.forward(&decode_ids, &mut full_caches, None);
 
     let seq_id = SequenceId::from_raw(seq_raw);
-    runtime.prepare_sequence_state(seq_id);
+    runtime.prepare_sequence_state(seq_id).unwrap();
     let remote_prefill = runtime.forward_sequence(seq_id, &prompt_ids, None).unwrap();
     let remote_decode = runtime.forward_sequence(seq_id, &decode_ids, None).unwrap();
 
@@ -190,7 +199,7 @@ fn pipeline_remote_runtime_llama_real_model_parity_and_cleanup() {
     let full_decode = model.forward(&decode_ids, &mut full_caches, None);
 
     let seq_id = SequenceId::from_raw(42);
-    runtime.prepare_sequence_state(seq_id);
+    runtime.prepare_sequence_state(seq_id).unwrap();
     let remote_prefill = runtime.forward_sequence(seq_id, &prompt_ids, None).unwrap();
     let remote_decode = runtime.forward_sequence(seq_id, &decode_ids, None).unwrap();
 
@@ -220,7 +229,6 @@ fn pipeline_remote_runtime_llama_real_model_parity_and_cleanup() {
         state,
         RemoteStageResponse::State {
             state,
-            pending_entry_replies: 0,
             ..
         } if state.in_flight_requests == 0
     )));
@@ -249,7 +257,7 @@ fn pipeline_remote_runtime_llama_drain_and_shutdown_transition() {
     );
 
     let seq_id = SequenceId::from_raw(77);
-    runtime.prepare_sequence_state(seq_id);
+    runtime.prepare_sequence_state(seq_id).unwrap();
     runtime.begin_drain().unwrap();
 
     let draining_states = runtime.probe_stages().unwrap();
@@ -258,10 +266,12 @@ fn pipeline_remote_runtime_llama_drain_and_shutdown_transition() {
         RemoteStageResponse::State { state, .. } if state.draining && !state.shutdown
     )));
 
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runtime.prepare_sequence_state(SequenceId::from_raw(78));
-    }));
-    assert!(panic.is_err(), "draining runtime must reject new sequences");
+    assert!(
+        runtime
+            .prepare_sequence_state(SequenceId::from_raw(78))
+            .is_err(),
+        "draining runtime must reject new sequences"
+    );
 
     runtime.release_sequence_state_by_id(seq_id);
     runtime.shutdown().unwrap();
@@ -304,7 +314,7 @@ fn pipeline_remote_runtime_llama_thunderbolt_bridge_parity() {
     let full_decode = model.forward(&decode_ids, &mut full_caches, None);
 
     let seq_id = SequenceId::from_raw(99);
-    runtime.prepare_sequence_state(seq_id);
+    runtime.prepare_sequence_state(seq_id).unwrap();
     let remote_prefill = runtime.forward_sequence(seq_id, &prompt_ids, None).unwrap();
     let remote_decode = runtime.forward_sequence(seq_id, &decode_ids, None).unwrap();
 
@@ -413,7 +423,7 @@ fn pipeline_remote_runtime_llama_rdma_real_model_parity_and_cleanup() {
     let full_decode = model.forward(&decode_ids, &mut full_caches, None);
 
     let seq_id = SequenceId::from_raw(343);
-    runtime.prepare_sequence_state(seq_id);
+    runtime.prepare_sequence_state(seq_id).unwrap();
     let remote_prefill = runtime.forward_sequence(seq_id, &prompt_ids, None).unwrap();
     let remote_decode = runtime.forward_sequence(seq_id, &decode_ids, None).unwrap();
 

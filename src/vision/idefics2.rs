@@ -301,13 +301,25 @@ impl Idefics2PerceiverResampler {
         heads: Idefics2PerceiverHeads,
         eps: f32,
     ) -> Result<Self, String> {
-        let latents = weights
-            .get(&format!("{prefix}.latents"))
-            .map(|v| mlxcel_core::copy(v))
-            .ok_or_else(|| format!("Weight not found: {prefix}.latents"))?;
-        let latents_shape = mlxcel_core::array_shape(&latents);
-        let n_latents = latents_shape[0];
-        let hidden = latents_shape[1];
+        let latents_key = format!("{prefix}.latents");
+        let stored = weights
+            .get(&latents_key)
+            .ok_or_else(|| format!("Weight not found: {latents_key}"))?;
+        let stored_shape = mlxcel_core::array_shape(stored);
+        if stored_shape.len() != 2 || stored_shape[0] <= 0 {
+            return Err(format!(
+                "{latents_key} must be a non-empty 2D table, got shape {stored_shape:?}"
+            ));
+        }
+        let n_latents = stored_shape[0];
+        let hidden = i32::try_from(args.hidden_size)
+            .map_err(|_| format!("{latents_key} width exceeds i32"))?;
+        let latents = crate::vision::weights::load_dense_param(
+            weights,
+            &latents_key,
+            &[n_latents, hidden],
+            Some((args.group_size(), args.bits())),
+        )?;
 
         // Derive the layer count from the checkpoint (the 4-bit config strips
         // `resampler_depth`).
@@ -494,6 +506,10 @@ fn load_rms_norm(weights: &WeightMap, prefix: &str, eps: f32) -> Result<RMSNorm,
 // runtime to inject pre-merged inputs. EOS ids are overridden so the server stop
 // path uses Idefics2's configured stop tokens.
 impl LanguageModel for Idefics2Model {
+    fn batched_decode_kind(&self) -> mlxcel_core::generate::BatchedDecodeKind {
+        self.text_model.batched_decode_kind()
+    }
+
     fn forward(
         &self,
         input_ids: &MlxArray,
